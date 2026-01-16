@@ -1,0 +1,20 @@
+# -*- coding: utf-8 -*-
+version: '3.8'
+
+services:
+  prozzorro-parser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: prozzorro-parser
+    restart: unless-stopped
+    # Розкоментуйте, якщо потрібно монтувати том для даних
+    # volumes:
+    #   - ./data:/app/data
+    # Змінні середовища (розкоментуйте та налаштуйте за потреби)
+    # environment:
+    #   - PYTHONUNBUFFERED=1
+    #   - ENV_VAR=value
+    # Якщо потрібно відкрити порти
+    # ports:
+    #   - "8000:8000"
