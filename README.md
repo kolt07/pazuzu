@@ -53,8 +53,6 @@ docker-compose up
 
 Для запуску у фоновому режимі:```bash
 docker-compose up -d
-```
-
-Для зупинки:```bash
+```Для зупинки:```bash
 docker-compose down
 ```
