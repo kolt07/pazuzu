@@ -92,6 +92,17 @@ class ProZorroService:
                 response.raise_for_status()
                 
                 print(f"Статус відповіді: {response.status_code}")
+                
+                # Обробка статусу 204 (No Content) - немає даних для повернення
+                if response.status_code == 204:
+                    print("Немає даних (статус 204 - No Content)")
+                    break
+                
+                # Перевірка, чи є вміст для парсингу
+                if not response.text or not response.text.strip():
+                    print("Порожня відповідь від API")
+                    break
+                
                 response_data = response.json()
                 
                 # Діагностичне логування структури відповіді
