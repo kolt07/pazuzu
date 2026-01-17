@@ -1,0 +1,23 @@
+# -*- coding: utf-8 -*-
+# Приклад конфігураційного файлу для Pazuzu
+# Скопіюйте цей файл як config.yaml та заповніть API ключі
+
+# Налаштування LLM провайдерів
+llm:
+  # Провайдер за замовчуванням: gemini, openai, anthropic
+  provider: gemini
+  
+  # Обмеження швидкості запитів
+  rate_limit:
+    calls_per_minute: 15
+  
+  # API ключі для різних провайдерів
+  api_keys:
+    # Google Gemini API ключ
+    gemini: ""
+    
+    # OpenAI (ChatGPT) API ключ
+    openai: ""
+    
+    # Anthropic (Claude) API ключ
+    anthropic: ""
