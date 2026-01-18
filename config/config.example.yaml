@@ -1,0 +1,27 @@
+# Приклад конфігураційного файлу для Pazuzu
+# Скопіюйте цей файл як config.yaml та заповніть API ключі
+
+# Налаштування LLM провайдерів
+llm:
+  # Провайдер за замовчуванням: gemini, openai, anthropic
+  provider: gemini
+  
+  # Назва моделі (для Gemini: gemini-2.5-flash, gemini-2.5-pro, gemini-2.5-flash-lite)
+  # Старі моделі (gemini-1.5-*) більше не підтримуються
+  model_name: gemini-2.5-flash
+  
+  # Обмеження швидкості запитів
+  # Для безкоштовного тарифу Gemini ліміт 5 запитів/хвилину, тому використовуємо 4 для безпеки
+  rate_limit:
+    calls_per_minute: 4
+  
+  # API ключі для різних провайдерів
+  api_keys:
+    # Google Gemini API ключ
+    gemini: ""
+    
+    # OpenAI (ChatGPT) API ключ
+    openai: ""
+    
+    # Anthropic (Claude) API ключ
+    anthropic: ""

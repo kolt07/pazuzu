@@ -79,3 +79,10 @@ def save_csv_to_file(data: List[Dict[str, Any]], file_path: str, fieldnames: Lis
         )
         writer.writeheader()
         writer.writerows(data)
+    
+    # Підтвердження збереження
+    if os.path.exists(file_path):
+        file_size = os.path.getsize(file_path)
+        print(f"✓ CSV файл збережено: {file_path} ({file_size} байт)")
+    else:
+        print(f"⚠ Помилка: файл не знайдено після збереження: {file_path}")
