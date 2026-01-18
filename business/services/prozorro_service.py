@@ -14,6 +14,7 @@ from config.settings import Settings
 from transport.dto.prozorro_dto import AuctionDTO, AuctionsResponseDTO
 from utils.date_utils import get_date_range, format_datetime_for_api, format_datetime_for_byDateModified
 from utils.file_utils import save_json_to_file, save_csv_to_file, generate_json_filename, ensure_directory_exists
+from business.services.llm_service import LLMService
 
 
 class ProZorroService:
@@ -32,6 +33,13 @@ class ProZorroService:
             'User-Agent': self.settings.user_agent,
             'Accept': 'application/json'
         })
+        # Ініціалізація LLM сервісу (може викликати помилку, якщо API ключ не вказано)
+        self.llm_service = None
+        try:
+            self.llm_service = LLMService(self.settings)
+        except (ValueError, ImportError) as e:
+            print(f"Попередження: LLM сервіс недоступний: {e}")
+            print("Парсинг описів через LLM буде пропущено")
 
     def get_real_estate_auctions(self, days: int = 1) -> List[AuctionDTO]:
         """
@@ -339,11 +347,31 @@ class ProZorroService:
             'auction_step',
             'participants_count',
             'min_participants_count',
-            'arrests'
+            # Арешти (розбиті на колонки)
+            'arrests_count',
+            'arrests_info',
+            # Парсинг опису через LLM
+            'cadastral_number',
+            'area',
+            'area_unit',
+            'address_region',
+            'address_city',
+            'address_street',
+            'address_street_type',
+            'address_building',
+            'floor',
+            'property_type',
+            'utilities'
         ]
         
+        from tqdm import tqdm
+        
         auctions_data = []
-        for auction in auctions:
+        total_auctions = len(auctions)
+        print(f"Початок обробки {total_auctions} аукціонів для збереження в CSV...")
+        
+        # Прогрес-бар для обробки аукціонів
+        for auction in tqdm(auctions, desc="Обробка аукціонів", unit="аукціон", ncols=100):
             if not auction.data:
                 continue
             
@@ -411,12 +439,54 @@ class ProZorroService:
             # Мінімальна кількість учасників
             min_participants_count = data.get('minNumberOfQualifiedBids', '')
             
-            # Арешти
+            # Арешти - розбиваємо на окремі колонки
             arrests_data = data.get('arrests', [])
-            arrests_str = ''
+            arrests_count = 0
+            arrests_info = ''
             if arrests_data and isinstance(arrests_data, list):
-                # Форматуємо арешти як JSON рядок для збереження в CSV
-                arrests_str = json.dumps(arrests_data, ensure_ascii=False)
+                arrests_count = len(arrests_data)
+                # Формуємо читабельний текст з інформації про арешти
+                arrests_parts = []
+                for idx, arrest in enumerate(arrests_data, 1):
+                    if isinstance(arrest, dict):
+                        arrest_info_parts = []
+                        # Збираємо всі доступні поля з арешту
+                        for key, value in arrest.items():
+                            if value:
+                                arrest_info_parts.append(f"{key}: {value}")
+                        if arrest_info_parts:
+                            arrests_parts.append(f"Арешт {idx}: {'; '.join(arrest_info_parts)}")
+                    elif isinstance(arrest, str):
+                        arrests_parts.append(f"Арешт {idx}: {arrest}")
+                arrests_info = ' | '.join(arrests_parts) if arrests_parts else ''
+            
+            # Парсинг опису через LLM для отримання структурованої інформації
+            parsed_info = {
+                'cadastral_number': '',
+                'area': '',
+                'area_unit': '',
+                'address_region': '',
+                'address_city': '',
+                'address_street': '',
+                'address_street_type': '',
+                'address_building': '',
+                'floor': '',
+                'property_type': '',
+                'utilities': ''
+            }
+            
+            if description and self.llm_service:
+                try:
+                    # Парсинг опису через LLM (прогрес-бар вже показує прогрес обробки)
+                    parsed_info = self.llm_service.parse_auction_description(description)
+                except KeyboardInterrupt:
+                    # Переривання користувача - пробрасуємо далі
+                    raise
+                except Exception as e:
+                    # Інші помилки - просто пропускаємо парсинг для цього аукціону
+                    # Не виводимо помилку для кожного аукціону, щоб не засмічувати прогрес-бар
+                    pass
+                    # parsed_info залишається порожнім (вже ініціалізовано вище)
             
             auction_row = {
                 'auction_url': ensure_string(auction_url),
@@ -429,12 +499,28 @@ class ProZorroService:
                 'auction_step': ensure_string(auction_step),
                 'participants_count': ensure_string(participants_count),
                 'min_participants_count': ensure_string(min_participants_count) if min_participants_count else '',
-                'arrests': ensure_string(arrests_str)
+                # Арешти
+                'arrests_count': ensure_string(arrests_count),
+                'arrests_info': ensure_string(arrests_info),
+                # Парсинг опису
+                'cadastral_number': ensure_string(parsed_info.get('cadastral_number', '')),
+                'area': ensure_string(parsed_info.get('area', '')),
+                'area_unit': ensure_string(parsed_info.get('area_unit', '')),
+                'address_region': ensure_string(parsed_info.get('address_region', '')),
+                'address_city': ensure_string(parsed_info.get('address_city', '')),
+                'address_street': ensure_string(parsed_info.get('address_street', '')),
+                'address_street_type': ensure_string(parsed_info.get('address_street_type', '')),
+                'address_building': ensure_string(parsed_info.get('address_building', '')),
+                'floor': ensure_string(parsed_info.get('floor', '')),
+                'property_type': ensure_string(parsed_info.get('property_type', '')),
+                'utilities': ensure_string(parsed_info.get('utilities', ''))
             }
             
             auctions_data.append(auction_row)
 
+        print(f"Підготовлено {len(auctions_data)} рядків для збереження в CSV")
         save_csv_to_file(auctions_data, file_path, fieldnames)
+        print(f"Файл успішно збережено: {file_path}")
         return file_path
 
     def fetch_and_save_real_estate_auctions(

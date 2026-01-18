@@ -52,17 +52,19 @@ class Settings:
             'active,active.tendering,active.auction,active.qualification'
         ).split(',')
         
-        # Завантаження конфігурації з YAML файлу
-        self._load_config()
-        
-        # Налаштування LLM
+        # Налаштування LLM (ініціалізуємо перед завантаженням конфігурації)
         self.llm_provider = os.getenv('LLM_PROVIDER', 'gemini')
-        self.llm_rate_limit_calls_per_minute = int(os.getenv('LLM_RATE_LIMIT_CALLS_PER_MINUTE', '15'))
+        self.llm_model_name = os.getenv('LLM_MODEL_NAME', 'gemini-2.5-flash')  # Актуальна модель Gemini
+        # Для безкоштовного тарифу Gemini ліміт 5 запитів/хвилину, тому використовуємо 4 для безпеки
+        self.llm_rate_limit_calls_per_minute = int(os.getenv('LLM_RATE_LIMIT_CALLS_PER_MINUTE', '4'))
         self.llm_api_keys = {
             'gemini': os.getenv('LLM_API_KEY_GEMINI', ''),
             'openai': os.getenv('LLM_API_KEY_OPENAI', ''),
             'anthropic': os.getenv('LLM_API_KEY_ANTHROPIC', '')
         }
+        
+        # Завантаження конфігурації з YAML файлу (перезаписує значення за замовчуванням)
+        self._load_config()
     
     def _load_config(self) -> None:
         """
@@ -78,6 +80,8 @@ class Settings:
                         llm_config = config['llm']
                         if 'provider' in llm_config:
                             self.llm_provider = llm_config['provider']
+                        if 'model_name' in llm_config:
+                            self.llm_model_name = llm_config['model_name']
                         if 'rate_limit' in llm_config and 'calls_per_minute' in llm_config['rate_limit']:
                             self.llm_rate_limit_calls_per_minute = llm_config['rate_limit']['calls_per_minute']
                         if 'api_keys' in llm_config:

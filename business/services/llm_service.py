@@ -1,0 +1,508 @@
+# -*- coding: utf-8 -*-
+"""
+Сервіс для роботи з LLM API (Gemini, ChatGPT, Claude).
+"""
+
+import time
+import json
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timedelta
+from abc import ABC, abstractmethod
+
+from config.settings import Settings
+
+
+class RateLimiter:
+    """Клас для обмеження швидкості викликів API."""
+    
+    def __init__(self, calls_per_minute: int = 15):
+        """
+        Ініціалізація rate limiter.
+        
+        Args:
+            calls_per_minute: Максимальна кількість викликів за хвилину
+        """
+        self.calls_per_minute = calls_per_minute
+        self.min_interval = 60.0 / calls_per_minute  # Мінімальний інтервал між викликами в секундах
+        self.last_call_time: Optional[float] = None
+    
+    def wait_if_needed(self) -> None:
+        """Чекає, якщо потрібно, щоб не перевищити ліміт викликів."""
+        if self.last_call_time is not None:
+            elapsed = time.time() - self.last_call_time
+            if elapsed < self.min_interval:
+                sleep_time = self.min_interval - elapsed
+                time.sleep(sleep_time)
+        
+        self.last_call_time = time.time()
+
+
+class BaseLLMProvider(ABC):
+    """Базовий клас для LLM провайдерів."""
+    
+    def __init__(self, api_key: str, rate_limiter: RateLimiter):
+        """
+        Ініціалізація провайдера.
+        
+        Args:
+            api_key: API ключ для доступу до сервісу
+            rate_limiter: Об'єкт для обмеження швидкості викликів
+        """
+        self.api_key = api_key
+        self.rate_limiter = rate_limiter
+    
+    @abstractmethod
+    def parse_auction_description(self, description: str) -> Dict[str, Any]:
+        """
+        Парсить опис аукціону та повертає структуровані дані.
+        
+        Args:
+            description: Текст опису аукціону
+            
+        Returns:
+            Dict з полями: cadastral_number, area, area_unit, address_region,
+            address_city, address_street, address_street_type, address_building,
+            floor, property_type, utilities
+        """
+        pass
+    
+    def _create_parsing_prompt(self, description: str) -> str:
+        """
+        Створює промпт для парсингу опису аукціону.
+        
+        Args:
+            description: Текст опису аукціону
+            
+        Returns:
+            Текст промпту
+        """
+        return f"""Проаналізуй наступний опис аукціону нерухомості та витягни структуровану інформацію.
+Якщо інформація відсутня або невизначена, поверни порожнє значення або null.
+
+Опис:
+{description}
+
+Витягни та поверни JSON з наступними полями:
+- cadastral_number: кадастровий номер, номерр земельного кадастру (строка, якщо є)
+- area: площа (число, якщо є)
+- area_unit: одиниця вимірювання площі (м², га, сотка тощо)
+- address_region: область
+- address_city: місто/населений пункт
+- address_street: назва вулиці
+- address_street_type: тип вулиці (вул., просп., бул. тощо)
+- address_building: номер будинку/будівлі
+- floor: поверх (якщо є)
+- property_type: тип приміщення (житлове, комерційне, офісне тощо)
+- utilities: підведені комунікації (через кому, наприклад: електрика, вода, газ, опалення)
+
+Якщо адреса неповна, спробуй доповнити її на основі доступної інформації.
+Використвуй виключно ту інформацію, яка є в описі аукціону, або таку, яку можна отримати на базі інформації з опису аукціону не вигадуй іншу інформацію.
+Поверни ТІЛЬКИ валідний JSON без додаткових пояснень."""
+
+
+class GeminiLLMProvider(BaseLLMProvider):
+    """Провайдер для Google Gemini API."""
+    
+    def __init__(self, api_key: str, rate_limiter: RateLimiter, model_name: str = 'gemini-2.5-flash'):
+        super().__init__(api_key, rate_limiter)
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            # Список моделей для спроби (в порядку пріоритету)
+            # Актуальні моделі: gemini-2.5-flash, gemini-2.5-pro, gemini-2.5-flash-lite
+            self.model_name = model_name
+            self.model = None
+            self._initialize_model(model_name)
+        except ImportError:
+            raise ImportError("Для використання Gemini потрібно встановити google-generativeai: pip install google-generativeai")
+    
+    def _initialize_model(self, preferred_model: str):
+        """Ініціалізує модель, спробувавши кілька варіантів."""
+        import google.generativeai as genai
+        
+        # Список моделей для спроби (в порядку пріоритету)
+        models_to_try = [
+            preferred_model,
+            'gemini-2.5-flash',
+            'gemini-2.5-pro',
+            'gemini-2.5-flash-lite',
+            'gemini-pro'  # Стара модель на випадок, якщо нові недоступні
+        ]
+        
+        # Видаляємо дублікати, зберігаючи порядок
+        seen = set()
+        models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
+        
+        last_error = None
+        for model_name in models_to_try:
+            try:
+                self.model = genai.GenerativeModel(model_name)
+                # Перевіряємо, чи модель доступна, виконавши тестовий запит
+                # Але не робимо реальний запит, просто перевіряємо ініціалізацію
+                self.model_name = model_name
+                print(f"Використовується модель Gemini: {model_name}")
+                return
+            except Exception as e:
+                last_error = e
+                continue
+        
+        # Якщо жодна модель не спрацювала, викидаємо помилку
+        if last_error:
+            raise ValueError(f"Не вдалося ініціалізувати жодну модель Gemini. Остання помилка: {last_error}")
+        else:
+            raise ValueError("Не вдалося ініціалізувати модель Gemini")
+    
+    def parse_auction_description(self, description: str) -> Dict[str, Any]:
+        """Парсить опис аукціону через Gemini API."""
+        if not description or not description.strip():
+            return self._empty_result()
+        
+        self.rate_limiter.wait_if_needed()
+        
+        max_retries = 3
+        retry_delay = 5  # Початкова затримка в секундах
+        
+        for attempt in range(max_retries):
+            try:
+                prompt = self._create_parsing_prompt(description)
+                
+                # Виконуємо запит без таймауту
+                response = self.model.generate_content(prompt)
+                
+                # Витягуємо JSON з відповіді
+                response_text = response.text.strip()
+                
+                # Спробуємо знайти JSON у відповіді
+                json_text = self._extract_json_from_response(response_text)
+                
+                result = json.loads(json_text)
+                return self._normalize_result(result)
+            except KeyboardInterrupt:
+                # Переривання користувача - не обробляємо, просто пробрасуємо далі
+                raise
+            except Exception as e:
+                error_str = str(e)
+                # Перевіряємо, чи це помилка квоти (429)
+                if '429' in error_str or 'quota' in error_str.lower() or 'exceeded' in error_str.lower():
+                    # Спробуємо витягти час очікування з помилки
+                    import re
+                    retry_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str, re.IGNORECASE)
+                    if retry_match:
+                        retry_delay = float(retry_match.group(1)) + 1  # Додаємо 1 секунду для безпеки
+                    else:
+                        retry_delay = min(retry_delay * 2, 60)  # Подвоюємо затримку, але не більше 60 секунд
+                    
+                    if attempt < max_retries - 1:
+                        print(f"Перевищено квоту Gemini. Очікування {retry_delay:.1f} секунд перед повторною спробою...")
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        print(f"Помилка при парсингу через Gemini (досягнуто максимум спроб): {e}")
+                        return self._empty_result()
+                else:
+                    # Інша помилка - не повторюємо
+                    print(f"Помилка при парсингу через Gemini: {e}")
+                    return self._empty_result()
+        
+        return self._empty_result()
+    
+    def _extract_json_from_response(self, text: str) -> str:
+        """Витягує JSON з текстової відповіді."""
+        # Шукаємо JSON у тексті (може бути обгорнутий в markdown код блоки)
+        text = text.strip()
+        
+        # Якщо текст починається з ```json або ```
+        if text.startswith('```'):
+            lines = text.split('\n')
+            # Пропускаємо перший рядок з ```
+            json_lines = []
+            in_json = False
+            for line in lines:
+                if line.strip().startswith('```'):
+                    if not in_json:
+                        in_json = True
+                    else:
+                        break
+                    continue
+                if in_json:
+                    json_lines.append(line)
+            return '\n'.join(json_lines)
+        
+        # Якщо текст починається з {, спробуємо знайти перший { і останній }
+        if '{' in text:
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                return text[start:end+1]
+        
+        return text
+    
+    def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Нормалізує результат парсингу."""
+        return {
+            'cadastral_number': result.get('cadastral_number', ''),
+            'area': result.get('area', ''),
+            'area_unit': result.get('area_unit', ''),
+            'address_region': result.get('address_region', ''),
+            'address_city': result.get('address_city', ''),
+            'address_street': result.get('address_street', ''),
+            'address_street_type': result.get('address_street_type', ''),
+            'address_building': result.get('address_building', ''),
+            'floor': result.get('floor', ''),
+            'property_type': result.get('property_type', ''),
+            'utilities': result.get('utilities', '')
+        }
+    
+    def _empty_result(self) -> Dict[str, Any]:
+        """Повертає порожній результат."""
+        return {
+            'cadastral_number': '',
+            'area': '',
+            'area_unit': '',
+            'address_region': '',
+            'address_city': '',
+            'address_street': '',
+            'address_street_type': '',
+            'address_building': '',
+            'floor': '',
+            'property_type': '',
+            'utilities': ''
+        }
+
+
+class OpenAILLMProvider(BaseLLMProvider):
+    """Провайдер для OpenAI (ChatGPT) API."""
+    
+    def __init__(self, api_key: str, rate_limiter: RateLimiter):
+        super().__init__(api_key, rate_limiter)
+        try:
+            from openai import OpenAI
+            self.client = OpenAI(api_key=self.api_key)
+        except ImportError:
+            raise ImportError("Для використання OpenAI потрібно встановити openai: pip install openai")
+    
+    def parse_auction_description(self, description: str) -> Dict[str, Any]:
+        """Парсить опис аукціону через OpenAI API."""
+        if not description or not description.strip():
+            return self._empty_result()
+        
+        self.rate_limiter.wait_if_needed()
+        
+        try:
+            prompt = self._create_parsing_prompt(description)
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "Ти експерт з аналізу описів нерухомості. Повертай тільки валідний JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            json_text = self._extract_json_from_response(response_text)
+            result = json.loads(json_text)
+            return self._normalize_result(result)
+        except Exception as e:
+            print(f"Помилка при парсингу через OpenAI: {e}")
+            return self._empty_result()
+    
+    def _extract_json_from_response(self, text: str) -> str:
+        """Витягує JSON з текстової відповіді."""
+        text = text.strip()
+        
+        if text.startswith('```'):
+            lines = text.split('\n')
+            json_lines = []
+            in_json = False
+            for line in lines:
+                if line.strip().startswith('```'):
+                    if not in_json:
+                        in_json = True
+                    else:
+                        break
+                    continue
+                if in_json:
+                    json_lines.append(line)
+            return '\n'.join(json_lines)
+        
+        if '{' in text:
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                return text[start:end+1]
+        
+        return text
+    
+    def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Нормалізує результат парсингу."""
+        return {
+            'cadastral_number': result.get('cadastral_number', ''),
+            'area': result.get('area', ''),
+            'area_unit': result.get('area_unit', ''),
+            'address_region': result.get('address_region', ''),
+            'address_city': result.get('address_city', ''),
+            'address_street': result.get('address_street', ''),
+            'address_street_type': result.get('address_street_type', ''),
+            'address_building': result.get('address_building', ''),
+            'floor': result.get('floor', ''),
+            'property_type': result.get('property_type', ''),
+            'utilities': result.get('utilities', '')
+        }
+    
+    def _empty_result(self) -> Dict[str, Any]:
+        """Повертає порожній результат."""
+        return {
+            'cadastral_number': '',
+            'area': '',
+            'area_unit': '',
+            'address_region': '',
+            'address_city': '',
+            'address_street': '',
+            'address_street_type': '',
+            'address_building': '',
+            'floor': '',
+            'property_type': '',
+            'utilities': ''
+        }
+
+
+class AnthropicLLMProvider(BaseLLMProvider):
+    """Провайдер для Anthropic (Claude) API."""
+    
+    def __init__(self, api_key: str, rate_limiter: RateLimiter):
+        super().__init__(api_key, rate_limiter)
+        try:
+            from anthropic import Anthropic
+            self.client = Anthropic(api_key=self.api_key)
+        except ImportError:
+            raise ImportError("Для використання Anthropic потрібно встановити anthropic: pip install anthropic")
+    
+    def parse_auction_description(self, description: str) -> Dict[str, Any]:
+        """Парсить опис аукціону через Anthropic API."""
+        if not description or not description.strip():
+            return self._empty_result()
+        
+        self.rate_limiter.wait_if_needed()
+        
+        try:
+            prompt = self._create_parsing_prompt(description)
+            message = self.client.messages.create(
+                model="claude-3-haiku-20240307",
+                max_tokens=1024,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            
+            response_text = message.content[0].text.strip()
+            json_text = self._extract_json_from_response(response_text)
+            result = json.loads(json_text)
+            return self._normalize_result(result)
+        except Exception as e:
+            print(f"Помилка при парсингу через Anthropic: {e}")
+            return self._empty_result()
+    
+    def _extract_json_from_response(self, text: str) -> str:
+        """Витягує JSON з текстової відповіді."""
+        text = text.strip()
+        
+        if text.startswith('```'):
+            lines = text.split('\n')
+            json_lines = []
+            in_json = False
+            for line in lines:
+                if line.strip().startswith('```'):
+                    if not in_json:
+                        in_json = True
+                    else:
+                        break
+                    continue
+                if in_json:
+                    json_lines.append(line)
+            return '\n'.join(json_lines)
+        
+        if '{' in text:
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                return text[start:end+1]
+        
+        return text
+    
+    def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Нормалізує результат парсингу."""
+        return {
+            'cadastral_number': result.get('cadastral_number', ''),
+            'area': result.get('area', ''),
+            'area_unit': result.get('area_unit', ''),
+            'address_region': result.get('address_region', ''),
+            'address_city': result.get('address_city', ''),
+            'address_street': result.get('address_street', ''),
+            'address_street_type': result.get('address_street_type', ''),
+            'address_building': result.get('address_building', ''),
+            'floor': result.get('floor', ''),
+            'property_type': result.get('property_type', ''),
+            'utilities': result.get('utilities', '')
+        }
+    
+    def _empty_result(self) -> Dict[str, Any]:
+        """Повертає порожній результат."""
+        return {
+            'cadastral_number': '',
+            'area': '',
+            'area_unit': '',
+            'address_region': '',
+            'address_city': '',
+            'address_street': '',
+            'address_street_type': '',
+            'address_building': '',
+            'floor': '',
+            'property_type': '',
+            'utilities': ''
+        }
+
+
+class LLMService:
+    """Сервіс для роботи з LLM провайдерами."""
+    
+    def __init__(self, settings: Optional[Settings] = None):
+        """
+        Ініціалізація сервісу.
+        
+        Args:
+            settings: Налаштування застосунку
+        """
+        self.settings = settings or Settings()
+        self.rate_limiter = RateLimiter(self.settings.llm_rate_limit_calls_per_minute)
+        self.provider = self._create_provider()
+    
+    def _create_provider(self) -> BaseLLMProvider:
+        """Створює провайдера на основі налаштувань."""
+        provider_name = self.settings.llm_provider.lower()
+        api_key = self.settings.llm_api_keys.get(provider_name, '')
+        
+        if not api_key:
+            raise ValueError(f"API ключ для провайдера {provider_name} не вказано в конфігурації")
+        
+        if provider_name == 'gemini':
+            model_name = getattr(self.settings, 'llm_model_name', 'gemini-1.5-flash')
+            return GeminiLLMProvider(api_key, self.rate_limiter, model_name)
+        elif provider_name == 'openai':
+            return OpenAILLMProvider(api_key, self.rate_limiter)
+        elif provider_name == 'anthropic':
+            return AnthropicLLMProvider(api_key, self.rate_limiter)
+        else:
+            raise ValueError(f"Невідомий провайдер LLM: {provider_name}")
+    
+    def parse_auction_description(self, description: str) -> Dict[str, Any]:
+        """
+        Парсить опис аукціону та повертає структуровані дані.
+        
+        Args:
+            description: Текст опису аукціону
+            
+        Returns:
+            Dict з структурованою інформацією
+        """
+        return self.provider.parse_auction_description(description)
