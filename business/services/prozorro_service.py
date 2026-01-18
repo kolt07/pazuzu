@@ -13,7 +13,7 @@ import time
 from config.settings import Settings
 from transport.dto.prozorro_dto import AuctionDTO, AuctionsResponseDTO
 from utils.date_utils import get_date_range, format_datetime_for_api, format_datetime_for_byDateModified
-from utils.file_utils import save_json_to_file, save_csv_to_file, generate_json_filename, ensure_directory_exists
+from utils.file_utils import save_json_to_file, save_csv_to_file, save_excel_to_file, generate_json_filename, ensure_directory_exists
 from business.services.llm_service import LLMService
 
 
@@ -311,12 +311,13 @@ class ProZorroService:
 
     def save_auctions_to_csv(self, auctions: List[AuctionDTO], days: int = 1, output_dir: Optional[str] = None) -> str:
         """
-        Зберігає список аукціонів у CSV файл з вибраними полями.
+        Зберігає список аукціонів у Excel файл з вибраними полями.
+        Фільтрує лише продажі (без оренди) та зберігає в каталог "archives".
 
         Args:
             auctions: Список аукціонів для збереження
             days: Кількість днів виборки (для метаданих)
-            output_dir: Директорія для збереження. Якщо не вказано, використовується temp/
+            output_dir: Директорія для збереження. Якщо не вказано, використовується archives/
 
         Returns:
             str: Шлях до збереженого файлу
@@ -327,48 +328,97 @@ class ProZorroService:
                 return ''
             return str(value)
         
+        def format_address(address_street_type: str, address_street: str, address_building: str) -> str:
+            """Формує повну адресу з компонентів."""
+            parts = []
+            if address_street_type:
+                parts.append(address_street_type)
+            if address_street:
+                parts.append(address_street)
+            if address_building:
+                parts.append(address_building)
+            return ', '.join(parts) if parts else ''
+        
+        def format_arrests(arrests_data: List[Dict[str, Any]], parsed_arrests_info: str) -> str:
+            """Формує інформацію про арешти у правильному форматі."""
+            # Якщо є інформація з парсингу, використовуємо її
+            if parsed_arrests_info:
+                return parsed_arrests_info
+            
+            # Інакше формуємо з даних API
+            if not arrests_data or not isinstance(arrests_data, list):
+                return ''
+            
+            arrests_parts = []
+            for idx, arrest in enumerate(arrests_data, 1):
+                if isinstance(arrest, dict):
+                    # Витягуємо ключові поля
+                    restriction_org = arrest.get('restrictionOrganization', '')
+                    restriction_date = arrest.get('restrictionDate', '')
+                    is_removable = arrest.get('isRemovable', False)
+                    
+                    # Форматуємо дату
+                    date_str = ''
+                    if restriction_date:
+                        try:
+                            if restriction_date.endswith('Z'):
+                                restriction_date = restriction_date.replace('Z', '+00:00')
+                            dt = datetime.fromisoformat(restriction_date)
+                            date_str = dt.strftime('%Y-%m-%d')
+                        except (ValueError, AttributeError):
+                            date_str = str(restriction_date)
+                    
+                    # Форматуємо організацію
+                    org_str = ''
+                    if restriction_org:
+                        # Можливо, це об'єкт з полем "Видавник" або просто рядок
+                        if isinstance(restriction_org, dict):
+                            org_str = restriction_org.get('Видавник', restriction_org.get('name', str(restriction_org)))
+                        else:
+                            org_str = str(restriction_org)
+                    
+                    # Формуємо рядок
+                    arrest_parts = []
+                    if org_str:
+                        arrest_parts.append(f"Видав {org_str}")
+                    if date_str:
+                        arrest_parts.append(f"Дата: {date_str}")
+                    arrest_parts.append(f"Можливе зняття {'так' if is_removable else 'ні'}")
+                    
+                    arrests_parts.append(f"Арешт {idx}: {', '.join(arrest_parts)}")
+            
+            return '\n'.join(arrests_parts) if arrests_parts else ''
+        
+        # Використовуємо каталог "archives" за замовчуванням
         if output_dir is None:
-            output_dir = self.settings.temp_directory
+            output_dir = 'archives'
 
         ensure_directory_exists(output_dir)
 
-        filename = generate_json_filename(prefix='prozorro_real_estate_auctions', extension='csv')
+        filename = generate_json_filename(prefix='prozorro_real_estate_auctions', extension='xlsx')
         file_path = f'{output_dir}/{filename}'
 
-        # Поля для збереження в CSV
+        # Порядок колонок: область, населений пункт, адрес, площа, стартова ціна, розмір взноса, 
+        # дата финальной подачи докуметов, дата торгов, кадастровий номер, арешти, посилання
         fieldnames = [
-            'auction_url',
-            'auction_id',
-            'auction_type',
-            'description',
-            'auction_start_date',
-            'previous_auctions_count',
-            'base_price',
-            'auction_step',
-            'participants_count',
-            'min_participants_count',
-            # Арешти (розбиті на колонки)
-            'arrests_count',
-            'arrests_info',
-            # Парсинг опису через LLM
-            'cadastral_number',
-            'area',
-            'area_unit',
-            'address_region',
-            'address_city',
-            'address_street',
-            'address_street_type',
-            'address_building',
-            'floor',
-            'property_type',
-            'utilities'
+            'address_region',           # Область
+            'address_city',              # Населений пункт
+            'address',                   # Адрес (повна адреса)
+            'area',                      # Площа
+            'base_price',                # Стартова ціна
+            'deposit_amount',            # Розмір взносу
+            'document_submission_deadline',  # Дата фінальної подачі документів
+            'auction_start_date',        # Дата торгів
+            'cadastral_number',          # Кадастровий номер
+            'arrests_info',              # Арешти
+            'auction_url'                # Посилання
         ]
         
         from tqdm import tqdm
         
         auctions_data = []
         total_auctions = len(auctions)
-        print(f"Початок обробки {total_auctions} аукціонів для збереження в CSV...")
+        print(f"Початок обробки {total_auctions} аукціонів для збереження в Excel...")
         
         # Прогрес-бар для обробки аукціонів
         for auction in tqdm(auctions, desc="Обробка аукціонів", unit="аукціон", ncols=100):
@@ -377,24 +427,19 @@ class ProZorroService:
             
             data = auction.data
             
-            # Посилання на аукціон
-            # Використовуємо auctionId для формування URL (більш читабельний ідентифікатор)
-            auction_id = data.get('auctionId') or data.get('_id') or auction.id
-            # Формат URL: https://prozorro.sale/auction/{auctionId}
-            auction_url = f"https://prozorro.sale/auction/{auction_id}"
-            
-            # Ідентифікатор аукціону
-            auction_identifier = auction_id
-            
-            # Тип аукціону (продаж, аренда)
+            # Тип аукціону (продаж, аренда) - фільтруємо лише продажі
             sale_type = data.get('saleType', '')
             lease_type = data.get('leaseType', '')
             if 'lease' in sale_type.lower() or lease_type:
-                auction_type = 'аренда'
-            elif 'sale' in sale_type.lower():
-                auction_type = 'продаж'
-            else:
-                auction_type = sale_type or 'не вказано'
+                # Пропускаємо оренду
+                continue
+            elif 'sale' not in sale_type.lower() and not sale_type:
+                # Якщо не вказано тип, пропускаємо
+                continue
+            
+            # Посилання на аукціон
+            auction_id = data.get('auctionId') or data.get('_id') or auction.id
+            auction_url = f"https://prozorro.sale/auction/{auction_id}"
             
             # Опис
             description = ''
@@ -411,10 +456,17 @@ class ProZorroService:
             if auction_period and 'startDate' in auction_period:
                 auction_start_date = auction_period['startDate']
             
-            # Кількість попередніх аукціонів
-            previous_auctions_count = data.get('tenderAttempts', 0)
+            # Дата фінальної подачі документів (enquiryPeriod.endDate або qualificationPeriod.endDate)
+            document_submission_deadline = ''
+            enquiry_period = data.get('enquiryPeriod', {})
+            if enquiry_period and 'endDate' in enquiry_period:
+                document_submission_deadline = enquiry_period['endDate']
+            else:
+                qualification_period = data.get('qualificationPeriod', {})
+                if qualification_period and 'endDate' in qualification_period:
+                    document_submission_deadline = qualification_period['endDate']
             
-            # Базова ставка
+            # Базова ставка (стартова ціна)
             base_price = ''
             value = data.get('value', {})
             if value and 'amount' in value:
@@ -423,42 +475,17 @@ class ProZorroService:
                 if currency:
                     base_price += f' {currency}'
             
-            # Крок аукціону
-            auction_step = ''
-            minimal_step = data.get('minimalStep', {})
-            if minimal_step and 'amount' in minimal_step:
-                auction_step = str(minimal_step['amount'])
-                currency = minimal_step.get('currency', '')
+            # Розмір взносу (guarantee.amount)
+            deposit_amount = ''
+            guarantee = data.get('guarantee', {})
+            if guarantee and 'amount' in guarantee:
+                deposit_amount = str(guarantee['amount'])
+                currency = guarantee.get('currency', '')
                 if currency:
-                    auction_step += f' {currency}'
+                    deposit_amount += f' {currency}'
             
-            # Кількість учасників
-            bids = data.get('bids', [])
-            participants_count = len(bids) if isinstance(bids, list) else 0
-            
-            # Мінімальна кількість учасників
-            min_participants_count = data.get('minNumberOfQualifiedBids', '')
-            
-            # Арешти - розбиваємо на окремі колонки
+            # Арешти
             arrests_data = data.get('arrests', [])
-            arrests_count = 0
-            arrests_info = ''
-            if arrests_data and isinstance(arrests_data, list):
-                arrests_count = len(arrests_data)
-                # Формуємо читабельний текст з інформації про арешти
-                arrests_parts = []
-                for idx, arrest in enumerate(arrests_data, 1):
-                    if isinstance(arrest, dict):
-                        arrest_info_parts = []
-                        # Збираємо всі доступні поля з арешту
-                        for key, value in arrest.items():
-                            if value:
-                                arrest_info_parts.append(f"{key}: {value}")
-                        if arrest_info_parts:
-                            arrests_parts.append(f"Арешт {idx}: {'; '.join(arrest_info_parts)}")
-                    elif isinstance(arrest, str):
-                        arrests_parts.append(f"Арешт {idx}: {arrest}")
-                arrests_info = ' | '.join(arrests_parts) if arrests_parts else ''
             
             # Парсинг опису через LLM для отримання структурованої інформації
             parsed_info = {
@@ -472,7 +499,8 @@ class ProZorroService:
                 'address_building': '',
                 'floor': '',
                 'property_type': '',
-                'utilities': ''
+                'utilities': '',
+                'arrests_info': ''
             }
             
             if description and self.llm_service:
@@ -484,42 +512,45 @@ class ProZorroService:
                     raise
                 except Exception as e:
                     # Інші помилки - просто пропускаємо парсинг для цього аукціону
-                    # Не виводимо помилку для кожного аукціону, щоб не засмічувати прогрес-бар
                     pass
-                    # parsed_info залишається порожнім (вже ініціалізовано вище)
+            
+            # Формуємо адресу
+            address = format_address(
+                parsed_info.get('address_street_type', ''),
+                parsed_info.get('address_street', ''),
+                parsed_info.get('address_building', '')
+            )
+            
+            # Формуємо площу з одиницею
+            area = ''
+            area_value = parsed_info.get('area', '')
+            area_unit = parsed_info.get('area_unit', '')
+            if area_value:
+                area = str(area_value)
+                if area_unit:
+                    area += f' {area_unit}'
+            
+            # Формуємо арешти
+            arrests_info = format_arrests(arrests_data, parsed_info.get('arrests_info', ''))
             
             auction_row = {
-                'auction_url': ensure_string(auction_url),
-                'auction_id': ensure_string(auction_identifier),
-                'auction_type': ensure_string(auction_type),
-                'description': ensure_string(description),
-                'auction_start_date': ensure_string(auction_start_date),
-                'previous_auctions_count': ensure_string(previous_auctions_count),
-                'base_price': ensure_string(base_price),
-                'auction_step': ensure_string(auction_step),
-                'participants_count': ensure_string(participants_count),
-                'min_participants_count': ensure_string(min_participants_count) if min_participants_count else '',
-                # Арешти
-                'arrests_count': ensure_string(arrests_count),
-                'arrests_info': ensure_string(arrests_info),
-                # Парсинг опису
-                'cadastral_number': ensure_string(parsed_info.get('cadastral_number', '')),
-                'area': ensure_string(parsed_info.get('area', '')),
-                'area_unit': ensure_string(parsed_info.get('area_unit', '')),
                 'address_region': ensure_string(parsed_info.get('address_region', '')),
                 'address_city': ensure_string(parsed_info.get('address_city', '')),
-                'address_street': ensure_string(parsed_info.get('address_street', '')),
-                'address_street_type': ensure_string(parsed_info.get('address_street_type', '')),
-                'address_building': ensure_string(parsed_info.get('address_building', '')),
-                'floor': ensure_string(parsed_info.get('floor', '')),
-                'property_type': ensure_string(parsed_info.get('property_type', '')),
-                'utilities': ensure_string(parsed_info.get('utilities', ''))
+                'address': ensure_string(address),
+                'area': ensure_string(area),
+                'base_price': ensure_string(base_price),
+                'deposit_amount': ensure_string(deposit_amount),
+                'document_submission_deadline': ensure_string(document_submission_deadline),
+                'auction_start_date': ensure_string(auction_start_date),
+                'cadastral_number': ensure_string(parsed_info.get('cadastral_number', '')),
+                'arrests_info': ensure_string(arrests_info),
+                'auction_url': ensure_string(auction_url)
             }
             
             auctions_data.append(auction_row)
 
-        print(f"Підготовлено {len(auctions_data)} рядків для збереження в CSV")
-        save_csv_to_file(auctions_data, file_path, fieldnames)
+        print(f"Підготовлено {len(auctions_data)} рядків для збереження в Excel (тільки продажі)")
+        save_excel_to_file(auctions_data, file_path, fieldnames)
         print(f"Файл успішно збережено: {file_path}")
         return file_path
 

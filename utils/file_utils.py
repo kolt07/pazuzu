@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, List
 from datetime import datetime
 
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
 
 def ensure_directory_exists(directory_path: str) -> None:
     """
@@ -84,5 +90,33 @@ def save_csv_to_file(data: List[Dict[str, Any]], file_path: str, fieldnames: Lis
     if os.path.exists(file_path):
         file_size = os.path.getsize(file_path)
         print(f"✓ CSV файл збережено: {file_path} ({file_size} байт)")
+    else:
+        print(f"⚠ Помилка: файл не знайдено після збереження: {file_path}")
+
+
+def save_excel_to_file(data: List[Dict[str, Any]], file_path: str, fieldnames: List[str]) -> None:
+    """
+    Зберігає дані у Excel файл (.xlsx) з кодуванням UTF-8.
+    
+    Args:
+        data: Список словників з даними для збереження
+        file_path: Шлях до файлу
+        fieldnames: Список назв колонок
+    """
+    if not PANDAS_AVAILABLE:
+        raise ImportError("Для збереження в Excel потрібно встановити pandas та openpyxl: pip install pandas openpyxl")
+    
+    ensure_directory_exists(os.path.dirname(file_path) if os.path.dirname(file_path) else '.')
+    
+    # Створюємо DataFrame з даних
+    df = pd.DataFrame(data, columns=fieldnames)
+    
+    # Зберігаємо в Excel
+    df.to_excel(file_path, index=False, engine='openpyxl')
+    
+    # Підтвердження збереження
+    if os.path.exists(file_path):
+        file_size = os.path.getsize(file_path)
+        print(f"✓ Excel файл збережено: {file_path} ({file_size} байт)")
     else:
         print(f"⚠ Помилка: файл не знайдено після збереження: {file_path}")

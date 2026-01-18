@@ -83,20 +83,25 @@ class BaseLLMProvider(ABC):
 {description}
 
 Витягни та поверни JSON з наступними полями:
-- cadastral_number: кадастровий номер, номерр земельного кадастру (строка, якщо є)
+- cadastral_number: кадастровий номер, номер земельного кадастру (строка, якщо є)
 - area: площа (число, якщо є)
 - area_unit: одиниця вимірювання площі (м², га, сотка тощо)
-- address_region: область
+- address_region: область у форматі "Волинська", "Тернопільська" тощо (без скорочень, без додаткових слів). 
+  м. Київ та м. Симферополь НЕ входять в склад областей - для них залишай порожнє значення.
+  Крим пиши як "АР Крим".
+  Якщо в тексті не зустрічається назва області, але за назвою міста або іншого топоніма можна виявити, в якій він області знаходиться - доповни інформацію про область.
 - address_city: місто/населений пункт
 - address_street: назва вулиці
 - address_street_type: тип вулиці (вул., просп., бул. тощо)
 - address_building: номер будинку/будівлі
 - floor: поверх (якщо є)
-- property_type: тип приміщення (житлове, комерційне, офісне тощо)
+- property_type: тип нерухомості зі списку: "Земля під будівництво", "Землі с/г призначення", "Нерухомість", "інше"
 - utilities: підведені комунікації (через кому, наприклад: електрика, вода, газ, опалення)
+- arrests_info: інформація про обтяження майна (арешти) у форматі: "Арешт 1: Видав ХХХХХ, Дата: УУУУ, Можливе зняття так/ні" 
+  (якщо є декілька арештів - кожен на окремому рядку, наприклад: "Арешт 1: ...\\nАрешт 2: ...")
 
 Якщо адреса неповна, спробуй доповнити її на основі доступної інформації.
-Використвуй виключно ту інформацію, яка є в описі аукціону, або таку, яку можна отримати на базі інформації з опису аукціону не вигадуй іншу інформацію.
+Використовуй виключно ту інформацію, яка є в описі аукціону, або таку, яку можна отримати на базі інформації з опису аукціону. Не вигадуй іншу інформацію.
 Поверни ТІЛЬКИ валідний JSON без додаткових пояснень."""
 
 
@@ -250,7 +255,8 @@ class GeminiLLMProvider(BaseLLMProvider):
             'address_building': result.get('address_building', ''),
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
-            'utilities': result.get('utilities', '')
+            'utilities': result.get('utilities', ''),
+            'arrests_info': result.get('arrests_info', '')
         }
     
     def _empty_result(self) -> Dict[str, Any]:
@@ -266,7 +272,8 @@ class GeminiLLMProvider(BaseLLMProvider):
             'address_building': '',
             'floor': '',
             'property_type': '',
-            'utilities': ''
+            'utilities': '',
+            'arrests_info': ''
         }
 
 
@@ -347,7 +354,8 @@ class OpenAILLMProvider(BaseLLMProvider):
             'address_building': result.get('address_building', ''),
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
-            'utilities': result.get('utilities', '')
+            'utilities': result.get('utilities', ''),
+            'arrests_info': result.get('arrests_info', '')
         }
     
     def _empty_result(self) -> Dict[str, Any]:
@@ -363,7 +371,8 @@ class OpenAILLMProvider(BaseLLMProvider):
             'address_building': '',
             'floor': '',
             'property_type': '',
-            'utilities': ''
+            'utilities': '',
+            'arrests_info': ''
         }
 
 
@@ -443,7 +452,8 @@ class AnthropicLLMProvider(BaseLLMProvider):
             'address_building': result.get('address_building', ''),
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
-            'utilities': result.get('utilities', '')
+            'utilities': result.get('utilities', ''),
+            'arrests_info': result.get('arrests_info', '')
         }
     
     def _empty_result(self) -> Dict[str, Any]:
@@ -459,7 +469,8 @@ class AnthropicLLMProvider(BaseLLMProvider):
             'address_building': '',
             'floor': '',
             'property_type': '',
-            'utilities': ''
+            'utilities': '',
+            'arrests_info': ''
         }
 
 
