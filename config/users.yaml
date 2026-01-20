@@ -1,0 +1,19 @@
+users:
+- user_id: 390636278
+  role: admin
+  nickname: Developer
+  is_blocked: false
+  last_modified_by: system
+  last_modified_at: '2026-01-18T12:00:00Z'
+- user_id: 140724612
+  role: admin
+  nickname: Стас Адмін
+  is_blocked: false
+  last_modified_by: '390636278'
+  last_modified_at: '2026-01-18T11:43:40.953749+00:00'
+- user_id: 8503555980
+  role: admin
+  nickname: Pazuzuadm2
+  is_blocked: false
+  last_modified_by: '140724612'
+  last_modified_at: '2026-01-19T07:58:56.752471+00:00'

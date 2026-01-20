@@ -68,3 +68,6 @@ temp/
 
 # Configuration files with API keys
 config/config.yaml
+
+# LLM cache
+data/cache/llm_cache.json

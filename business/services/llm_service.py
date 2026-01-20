@@ -145,7 +145,6 @@ class GeminiLLMProvider(BaseLLMProvider):
                 # Перевіряємо, чи модель доступна, виконавши тестовий запит
                 # Але не робимо реальний запит, просто перевіряємо ініціалізацію
                 self.model_name = model_name
-                print(f"Використовується модель Gemini: {model_name}")
                 return
             except Exception as e:
                 last_error = e
@@ -175,12 +174,35 @@ class GeminiLLMProvider(BaseLLMProvider):
                 response = self.model.generate_content(prompt)
                 
                 # Витягуємо JSON з відповіді
-                response_text = response.text.strip()
+                # Перевіряємо, чи response.text існує та є рядком
+                if not hasattr(response, 'text') or response.text is None:
+                    raise ValueError("Відповідь від Gemini не містить тексту")
+                
+                response_text = str(response.text).strip()
+                
+                if not response_text:
+                    raise ValueError("Відповідь від Gemini порожня")
                 
                 # Спробуємо знайти JSON у відповіді
                 json_text = self._extract_json_from_response(response_text)
                 
+                if not json_text:
+                    raise ValueError("Не вдалося витягти JSON з відповіді")
+                
                 result = json.loads(json_text)
+                
+                # Перевіряємо тип результату
+                if isinstance(result, list):
+                    # Якщо це список, беремо перший елемент
+                    if len(result) > 0 and isinstance(result[0], dict):
+                        result = result[0]
+                    else:
+                        # Якщо список порожній або не містить словників, повертаємо порожній результат
+                        return self._empty_result()
+                elif not isinstance(result, dict):
+                    # Якщо це не словник і не список, повертаємо порожній результат
+                    return self._empty_result()
+                
                 return self._normalize_result(result)
             except KeyboardInterrupt:
                 # Переривання користувача - не обробляємо, просто пробрасуємо далі

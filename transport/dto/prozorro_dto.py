@@ -168,8 +168,14 @@ class AuctionDTO:
                 print(f"Помилка парсингу dateModified '{date_str}': {e}")
                 date_modified = datetime.now(timezone.utc)
 
+        # Спробуємо знайти ID в різних місцях
+        auction_id = data.get('id') or data.get('_id') or ''
+        # Якщо ID все ще порожній, спробуємо знайти в data
+        if not auction_id and isinstance(data.get('data'), dict):
+            auction_id = data['data'].get('id') or data['data'].get('_id') or ''
+        
         return cls(
-            id=data.get('id', ''),
+            id=auction_id,
             date_created=date_created,
             date_modified=date_modified,
             status=data.get('status', ''),

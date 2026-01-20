@@ -63,6 +63,13 @@ class Settings:
             'anthropic': os.getenv('LLM_API_KEY_ANTHROPIC', '')
         }
         
+        # Налаштування Telegram бота
+        self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
+        self.telegram_users_config_path = os.getenv(
+            'TELEGRAM_USERS_CONFIG_PATH',
+            str(Path(__file__).parent / 'users.yaml')
+        )
+        
         # Завантаження конфігурації з YAML файлу (перезаписує значення за замовчуванням)
         self._load_config()
     
@@ -76,22 +83,32 @@ class Settings:
             try:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = yaml.safe_load(f)
-                    if config and 'llm' in config:
-                        llm_config = config['llm']
-                        if 'provider' in llm_config:
-                            self.llm_provider = llm_config['provider']
-                        if 'model_name' in llm_config:
-                            self.llm_model_name = llm_config['model_name']
-                        if 'rate_limit' in llm_config and 'calls_per_minute' in llm_config['rate_limit']:
-                            self.llm_rate_limit_calls_per_minute = llm_config['rate_limit']['calls_per_minute']
-                        if 'api_keys' in llm_config:
-                            api_keys = llm_config['api_keys']
-                            if 'gemini' in api_keys:
-                                self.llm_api_keys['gemini'] = api_keys['gemini']
-                            if 'openai' in api_keys:
-                                self.llm_api_keys['openai'] = api_keys['openai']
-                            if 'anthropic' in api_keys:
-                                self.llm_api_keys['anthropic'] = api_keys['anthropic']
+                    if config:
+                        # Налаштування LLM
+                        if 'llm' in config:
+                            llm_config = config['llm']
+                            if 'provider' in llm_config:
+                                self.llm_provider = llm_config['provider']
+                            if 'model_name' in llm_config:
+                                self.llm_model_name = llm_config['model_name']
+                            if 'rate_limit' in llm_config and 'calls_per_minute' in llm_config['rate_limit']:
+                                self.llm_rate_limit_calls_per_minute = llm_config['rate_limit']['calls_per_minute']
+                            if 'api_keys' in llm_config:
+                                api_keys = llm_config['api_keys']
+                                if 'gemini' in api_keys:
+                                    self.llm_api_keys['gemini'] = api_keys['gemini']
+                                if 'openai' in api_keys:
+                                    self.llm_api_keys['openai'] = api_keys['openai']
+                                if 'anthropic' in api_keys:
+                                    self.llm_api_keys['anthropic'] = api_keys['anthropic']
+                        
+                        # Налаштування Telegram бота
+                        if 'telegram' in config:
+                            telegram_config = config['telegram']
+                            if 'bot_token' in telegram_config:
+                                self.telegram_bot_token = telegram_config['bot_token']
+                            if 'users_config_path' in telegram_config:
+                                self.telegram_users_config_path = telegram_config['users_config_path']
             except Exception as e:
                 print(f"Попередження: не вдалося завантажити конфігурацію з {config_path}: {e}")
                 print("Використовуються значення за замовчуванням або змінні оточення")

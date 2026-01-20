@@ -25,3 +25,11 @@ llm:
     
     # Anthropic (Claude) API ключ
     anthropic: ""
+
+# Налаштування Telegram бота
+telegram:
+  # Токен бота від @BotFather
+  bot_token: ""
+  
+  # Шлях до файлу з користувачами (опціонально, за замовчуванням config/users.yaml)
+  # users_config_path: "config/users.yaml"
