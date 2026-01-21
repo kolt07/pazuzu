@@ -70,6 +70,14 @@ class Settings:
             str(Path(__file__).parent / 'users.yaml')
         )
         
+        # Налаштування MongoDB
+        self.mongodb_host = os.getenv('MONGODB_HOST', 'localhost')
+        self.mongodb_port = int(os.getenv('MONGODB_PORT', '27017'))
+        self.mongodb_database_name = os.getenv('MONGODB_DATABASE_NAME', 'pazuzu')
+        self.mongodb_username = os.getenv('MONGODB_USERNAME', '')
+        self.mongodb_password = os.getenv('MONGODB_PASSWORD', '')
+        self.mongodb_auth_source = os.getenv('MONGODB_AUTH_SOURCE', 'admin')
+        
         # Завантаження конфігурації з YAML файлу (перезаписує значення за замовчуванням)
         self._load_config()
     
@@ -109,6 +117,22 @@ class Settings:
                                 self.telegram_bot_token = telegram_config['bot_token']
                             if 'users_config_path' in telegram_config:
                                 self.telegram_users_config_path = telegram_config['users_config_path']
+                        
+                        # Налаштування MongoDB
+                        if 'mongodb' in config:
+                            mongodb_config = config['mongodb']
+                            if 'host' in mongodb_config:
+                                self.mongodb_host = mongodb_config['host']
+                            if 'port' in mongodb_config:
+                                self.mongodb_port = int(mongodb_config['port'])
+                            if 'database_name' in mongodb_config:
+                                self.mongodb_database_name = mongodb_config['database_name']
+                            if 'username' in mongodb_config:
+                                self.mongodb_username = mongodb_config['username']
+                            if 'password' in mongodb_config:
+                                self.mongodb_password = mongodb_config['password']
+                            if 'auth_source' in mongodb_config:
+                                self.mongodb_auth_source = mongodb_config['auth_source']
             except Exception as e:
                 print(f"Попередження: не вдалося завантажити конфігурацію з {config_path}: {e}")
                 print("Використовуються значення за замовчуванням або змінні оточення")

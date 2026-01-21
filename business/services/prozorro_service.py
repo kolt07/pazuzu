@@ -72,7 +72,7 @@ class ProZorroService:
         if date_to.tzinfo is None:
             date_to = date_to.replace(tzinfo=timezone.utc)
         
-        return self._get_auctions_internal(date_from, date_to)
+        return self._get_auctions_by_date_modified(date_from, date_to)
     
     def get_real_estate_auctions(self, days: int = 1) -> List[AuctionDTO]:
         """
@@ -90,7 +90,7 @@ class ProZorroService:
             requests.RequestException: При помилках HTTP запитів
         """
         date_from, date_to = get_date_range(days)
-        return self._get_auctions_internal(date_from, date_to)
+        return self._get_auctions_by_date_modified(date_from, date_to)
     
     def _get_auctions_by_date_modified(self, date_from: datetime, date_to: datetime) -> List[AuctionDTO]:
         """
@@ -111,6 +111,9 @@ class ProZorroService:
 
         # Використовуємо ендпоінт /api/search/byDateModified/{date} з нової ЦБД
         base_url = f'{self.settings.prozorro_sale_search_api_base_url}/search/byDateModified'
+        
+        # ТИМЧАСОВО: Збір сирих JSON даних для збереження одним файлом
+        all_raw_responses = []
         
         # Обробка відповіді API з підтримкою пагінації
         auctions = []
@@ -147,7 +150,17 @@ class ProZorroService:
                     print("Порожня відповідь від API")
                     break
                 
+                # Парсимо JSON відповідь
                 response_data = response.json()
+                
+                # ТИМЧАСОВО: Збираємо сирі JSON дані для збереження одним файлом
+                all_raw_responses.append({
+                    'url': url,
+                    'date_str': date_str,
+                    'page': page_count,
+                    'timestamp': datetime.now().isoformat(),
+                    'data': response_data
+                })
                 
                 # Отримуємо список аукціонів з відповіді
                 auctions_data = []
@@ -189,8 +202,48 @@ class ProZorroService:
                         in_date_range = created_in_range or modified_in_range
                         
                         if in_date_range:
-                            # Додаємо до списку без фільтрації (фільтрацію застосуємо пізніше в _get_auctions_internal)
-                            auctions.append(auction)
+                            # Застосовуємо фільтрацію
+                            if self._should_include_auction(auction, date_from, date_to, skip_date_check=True):
+                                auctions.append(auction)
+                            else:
+                                # Підраховуємо причини відсіву для статистики
+                                if not auction.data:
+                                    filtered_by_status_count += 1
+                                else:
+                                    status = auction.data.get('status', '')
+                                    active_statuses = ['active', 'active.tendering', 'active.auction', 'active.qualification', 
+                                                      'active_rectification', 'active_tendering', 'active_auction', 'active_qualification']
+                                    is_active = any(
+                                        status.startswith(active_status.replace('_', '.')) or 
+                                        status == active_status or
+                                        status.startswith(active_status.replace('.', '_'))
+                                        for active_status in active_statuses
+                                    )
+                                    if not is_active:
+                                        filtered_by_status_count += 1
+                                    else:
+                                        # Перевіряємо інші причини
+                                        auction_period = auction.data.get('auctionPeriod', {})
+                                        auction_start_date_str = auction_period.get('startDate')
+                                        if auction_start_date_str:
+                                            try:
+                                                if auction_start_date_str.endswith('Z'):
+                                                    auction_start_date_str = auction_start_date_str.replace('Z', '+00:00')
+                                                auction_start_date = datetime.fromisoformat(auction_start_date_str)
+                                                if auction_start_date.tzinfo:
+                                                    auction_start_date = auction_start_date.astimezone(timezone.utc)
+                                                else:
+                                                    auction_start_date = auction_start_date.replace(tzinfo=timezone.utc)
+                                                now = datetime.now(timezone.utc)
+                                                days_since_start = (now - auction_start_date).days
+                                                if auction_start_date <= now and days_since_start > 7:
+                                                    filtered_by_start_date_count += 1
+                                                else:
+                                                    filtered_by_property_type_count += 1
+                                            except:
+                                                filtered_by_start_date_count += 1
+                                        else:
+                                            filtered_by_property_type_count += 1
                         else:
                             filtered_by_date_count += 1
                     except (KeyError, ValueError) as e:
@@ -215,6 +268,32 @@ class ProZorroService:
                 # Невелика пауза для уникнення перевантаження API
                 time.sleep(0.1)
             
+            # ТИМЧАСОВО: Збереження всіх сирих JSON даних одним файлом
+            if all_raw_responses:
+                try:
+                    temp_dir = Path(__file__).parent.parent.parent / 'temp'
+                    temp_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Формуємо ім'я файлу з діапазоном дат
+                    safe_date_from = format_datetime_for_byDateModified(date_from).replace(':', '-').replace('/', '-').replace('\\', '-').replace('T', '_').replace('Z', '')
+                    safe_date_to = format_datetime_for_byDateModified(date_to).replace(':', '-').replace('/', '-').replace('\\', '-').replace('T', '_').replace('Z', '')
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    filename = f'api_responses_{safe_date_from}_to_{safe_date_to}_{timestamp}.json'
+                    filepath = temp_dir / filename
+                    
+                    # Зберігаємо всі відповіді одним файлом
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        json.dump({
+                            'date_from': date_from.isoformat(),
+                            'date_to': date_to.isoformat(),
+                            'total_responses': len(all_raw_responses),
+                            'responses': all_raw_responses
+                        }, f, ensure_ascii=False, indent=2)
+                    
+                    print(f"\nЗбережено всі сирі дані одним файлом: {filepath}")
+                except Exception as e:
+                    print(f"Помилка збереження сирих даних: {e}")
+            
             print(f"\nСтатистика обробки:")
             print(f"  Оброблено сторінок: {page_count}")
             print(f"  Всього аукціонів оброблено: {all_auctions_processed}")
@@ -230,121 +309,6 @@ class ProZorroService:
         except requests.exceptions.RequestException as e:
             print(f"Помилка при запиті до API ProZorro.Sale (byDateModified): {e}")
             raise
-    
-    def _get_auctions_internal(self, date_from: datetime, date_to: datetime) -> List[AuctionDTO]:
-        """
-        Внутрішній метод для отримання аукціонів у діапазоні дат.
-        Отримує аукціони за dateModified через ендпоінт /api/search/byDateModified/{date}.
-        Фільтрує за dateCreated АБО dateModified в межах заданого діапазону.
-        
-        Args:
-            date_from: Початкова дата діапазону
-            date_to: Кінцева дата діапазону
-            
-        Returns:
-            List[AuctionDTO]: Список активних аукціонів
-        """
-        
-        print(f"Діапазон дат для фільтрації:")
-        print(f"  Від: {date_from} ({format_datetime_for_api(date_from)})")
-        print(f"  До: {date_to} ({format_datetime_for_api(date_to)})")
-        
-        # Отримуємо аукціони за dateModified
-        auctions_modified = self._get_auctions_by_date_modified(date_from, date_to)
-        
-        # Об'єднуємо результати, видаляючи дублікати за ID
-        all_auctions_dict = {}
-        empty_id_count = 0
-        
-        # Додаємо аукціони, видаляючи дублікати за ID
-        for auction in auctions_modified:
-            if not auction.id or auction.id.strip() == '':
-                empty_id_count += 1
-                # Якщо ID порожній, використовуємо унікальний ключ
-                all_auctions_dict[f'_empty_{len(all_auctions_dict)}'] = auction
-            else:
-                # Якщо аукціон з таким ID вже є, залишаємо перший
-                if auction.id not in all_auctions_dict:
-                    all_auctions_dict[auction.id] = auction
-        
-        # Конвертуємо назад в список
-        all_auctions = list(all_auctions_dict.values())
-        
-        print(f"\nОб'єднано результати:")
-        print(f"  За dateModified: {len(auctions_modified)}")
-        print(f"  Аукціонів з порожнім ID: {empty_id_count}")
-        print(f"  Всього унікальних (до фільтрації): {len(all_auctions)}")
-        
-        # Застосовуємо фільтрацію до об'єднаних результатів
-        filtered_auctions = []
-        filtered_by_date_count = 0
-        filtered_by_status_count = 0
-        filtered_by_start_date_count = 0
-        filtered_by_property_type_count = 0
-        
-        for auction in all_auctions:
-            # Перевірка дати (created OR modified)
-            date_created = auction.date_created
-            date_modified = auction.date_modified
-            created_in_range = date_from <= date_created <= date_to
-            modified_in_range = date_from <= date_modified <= date_to
-            in_date_range = created_in_range or modified_in_range
-            
-            if not in_date_range:
-                filtered_by_date_count += 1
-                continue
-            
-            # Застосовуємо решту фільтрації (дату вже перевірили вище)
-            if self._should_include_auction(auction, date_from, date_to, skip_date_check=True):
-                filtered_auctions.append(auction)
-            else:
-                # Підраховуємо причини відсіву для статистики
-                if not auction.data:
-                    filtered_by_status_count += 1
-                else:
-                    status = auction.data.get('status', '')
-                    active_statuses = ['active', 'active.tendering', 'active.auction', 'active.qualification', 
-                                      'active_rectification', 'active_tendering', 'active_auction', 'active_qualification']
-                    is_active = any(
-                        status.startswith(active_status.replace('_', '.')) or 
-                        status == active_status or
-                        status.startswith(active_status.replace('.', '_'))
-                        for active_status in active_statuses
-                    )
-                    if not is_active:
-                        filtered_by_status_count += 1
-                    else:
-                        # Перевіряємо інші причини
-                        auction_period = auction.data.get('auctionPeriod', {})
-                        auction_start_date_str = auction_period.get('startDate')
-                        if auction_start_date_str:
-                            try:
-                                if auction_start_date_str.endswith('Z'):
-                                    auction_start_date_str = auction_start_date_str.replace('Z', '+00:00')
-                                auction_start_date = datetime.fromisoformat(auction_start_date_str)
-                                if auction_start_date.tzinfo:
-                                    auction_start_date = auction_start_date.astimezone(timezone.utc)
-                                else:
-                                    auction_start_date = auction_start_date.replace(tzinfo=timezone.utc)
-                                now = datetime.now(timezone.utc)
-                                days_since_start = (now - auction_start_date).days
-                                if auction_start_date <= now and days_since_start > 7:
-                                    filtered_by_start_date_count += 1
-                                else:
-                                    filtered_by_property_type_count += 1
-                            except:
-                                filtered_by_start_date_count += 1
-                        else:
-                            filtered_by_property_type_count += 1
-        
-        print(f"Після фільтрації:")
-        print(f"  Відфільтровано за датою: {filtered_by_date_count}")
-        print(f"  Відфільтровано за статусом: {filtered_by_status_count}")
-        print(f"  Відфільтровано за датою старту торгів: {filtered_by_start_date_count}")
-        print(f"  Відфільтровано за типом: {filtered_by_property_type_count}")
-        print(f"  Успішно оброблено: {len(filtered_auctions)}")
-        
-        return filtered_auctions
     
     def _should_include_auction(self, auction: AuctionDTO, date_from: datetime, date_to: datetime, skip_date_check: bool = False) -> bool:
         """
@@ -517,6 +481,123 @@ class ProZorroService:
         
         # За замовчуванням вважаємо, що це не аренда (продаж)
         return False
+    
+    def _extract_structured_info_from_items(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Витягує структуровані дані з items аукціону перед парсингом через LLM.
+        
+        Args:
+            data: Дані аукціону з auction.data
+            
+        Returns:
+            Dict з структурованою інформацією
+        """
+        result = {
+            'cadastral_number': '',
+            'area': '',
+            'area_unit': '',
+            'address_region': '',
+            'address_city': '',
+            'address_street': '',
+            'address_street_type': '',
+            'address_building': '',
+            'floor': '',
+            'property_type': '',
+            'utilities': '',
+            'arrests_info': ''
+        }
+        
+        items = data.get('items', [])
+        if not isinstance(items, list) or len(items) == 0:
+            return result
+        
+        # Беремо перший item (зазвичай є один)
+        item = items[0]
+        
+        # Кадастровий номер
+        item_props = item.get('itemProps', {})
+        if item_props:
+            cadastral = item_props.get('cadastralNumber', '')
+            if cadastral:
+                result['cadastral_number'] = str(cadastral)
+            
+            # Площа та одиниця виміру
+            land_area = item_props.get('landArea')
+            if land_area is not None:
+                result['area'] = str(land_area)
+            
+            # Комунікації
+            has_utilities = item_props.get('hasUtilitiesAvailability', False)
+            has_encumbrances = item_props.get('hasEncumbrances', False)
+            
+            if has_utilities:
+                result['utilities'] = 'електрика, вода, газ, опалення'  # Загальна інформація
+            elif has_utilities is False:
+                result['utilities'] = 'відсутні'
+            
+            if has_encumbrances:
+                result['arrests_info'] = 'Є обтяження'
+        
+        # Одиниця виміру
+        unit = item.get('unit', {})
+        if unit:
+            unit_name = unit.get('name', {})
+            if isinstance(unit_name, dict):
+                unit_ua = unit_name.get('uk_UA', '')
+                if unit_ua:
+                    result['area_unit'] = unit_ua
+        
+        # Адреса
+        address = item.get('address', {})
+        if address:
+            region = address.get('region', {})
+            if isinstance(region, dict):
+                region_ua = region.get('uk_UA', '')
+                if region_ua:
+                    # Прибираємо слово "область" для консистентності
+                    region_ua = region_ua.replace(' область', '').replace(' обл.', '').strip()
+                    result['address_region'] = region_ua
+            
+            locality = address.get('locality', {})
+            if isinstance(locality, dict):
+                locality_ua = locality.get('uk_UA', '')
+                if locality_ua:
+                    result['address_city'] = locality_ua
+            
+            street_address = address.get('streetAddress', {})
+            if isinstance(street_address, dict):
+                street_ua = street_address.get('uk_UA', '')
+                if street_ua:
+                    # Спробуємо розділити тип вулиці та назву
+                    street_parts = street_ua.split(' ', 1)
+                    if len(street_parts) > 1:
+                        result['address_street_type'] = street_parts[0]
+                        result['address_street'] = street_parts[1]
+                    else:
+                        result['address_street'] = street_ua
+            
+            # Додаткова інформація про населений пункт
+            address_id = address.get('addressID', {})
+            if address_id:
+                address_name = address_id.get('name', {})
+                if isinstance(address_name, dict):
+                    name_ua = address_name.get('uk_UA', '')
+                    if name_ua and not result['address_city']:
+                        result['address_city'] = name_ua
+        
+        # Тип нерухомості
+        classification = item.get('classification', {})
+        if classification:
+            class_id = classification.get('id', '')
+            if class_id:
+                if class_id.startswith('06'):
+                    result['property_type'] = 'Земля під будівництво'
+                elif class_id.startswith('04'):
+                    result['property_type'] = 'Нерухомість'
+                else:
+                    result['property_type'] = 'інше'
+        
+        return result
 
     def save_auctions_to_csv(self, auctions: List[AuctionDTO], days: int = 1, output_dir: Optional[str] = None, user_id: Optional[int] = None) -> str:
         """
@@ -736,40 +817,17 @@ class ProZorroService:
             # Арешти
             arrests_data = data.get('arrests', [])
             
+            # Спочатку витягуємо структуровані дані з items (якщо є)
+            structured_info = self._extract_structured_info_from_items(data)
+            
             # Перевірка, чи це аренда (якщо так - пропускаємо обробку через LLM)
             is_rental = self._is_rental_auction(data)
             if is_rental:
-                # Пропускаємо обробку через LLM для аренди
-                parsed_info = {
-                    'cadastral_number': '',
-                    'area': '',
-                    'area_unit': '',
-                    'address_region': '',
-                    'address_city': '',
-                    'address_street': '',
-                    'address_street_type': '',
-                    'address_building': '',
-                    'floor': '',
-                    'property_type': '',
-                    'utilities': '',
-                    'arrests_info': ''
-                }
+                # Пропускаємо обробку через LLM для аренди, використовуємо тільки структуровані дані
+                parsed_info = structured_info
             else:
                 # Парсинг опису через LLM для отримання структурованої інформації
-                parsed_info = {
-                    'cadastral_number': '',
-                    'area': '',
-                    'area_unit': '',
-                    'address_region': '',
-                    'address_city': '',
-                    'address_street': '',
-                    'address_street_type': '',
-                    'address_building': '',
-                    'floor': '',
-                    'property_type': '',
-                    'utilities': '',
-                    'arrests_info': ''
-                }
+                parsed_info = structured_info.copy()  # Починаємо зі структурованих даних
             
             if description and self.llm_service and not is_rental:
                 try:
@@ -778,12 +836,17 @@ class ProZorroService:
                     
                     if cached_result is not None:
                         # Використовуємо результат з кешу
-                        parsed_info = cached_result
+                        llm_result = cached_result
                     else:
                         # Парсинг опису через LLM (прогрес-бар вже показує прогрес обробки)
-                        parsed_info = self.llm_service.parse_auction_description(description)
+                        llm_result = self.llm_service.parse_auction_description(description)
                         # Зберігаємо результат в кеш
-                        self.llm_cache_service.save_result(description, parsed_info)
+                        self.llm_cache_service.save_result(description, llm_result)
+                    
+                    # Об'єднуємо результати: структуровані дані мають пріоритет, але LLM може доповнити порожні поля
+                    for key in parsed_info:
+                        if not parsed_info.get(key) and llm_result.get(key):
+                            parsed_info[key] = llm_result[key]
                 except KeyboardInterrupt:
                     # Переривання користувача - пробрасуємо далі
                     raise

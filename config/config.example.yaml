@@ -33,3 +33,23 @@ telegram:
   
   # Шлях до файлу з користувачами (опціонально, за замовчуванням config/users.yaml)
   # users_config_path: "config/users.yaml"
+
+# Налаштування MongoDB
+mongodb:
+  # Хост MongoDB (за замовчуванням localhost)
+  host: localhost
+  
+  # Порт MongoDB (за замовчуванням 27017)
+  port: 27017
+  
+  # Назва бази даних (за замовчуванням pazuzu)
+  database_name: pazuzu
+  
+  # Ім'я користувача (опціонально, для локального MongoDB зазвичай не потрібно)
+  # username: ""
+  
+  # Пароль (опціонально, для локального MongoDB зазвичай не потрібно)
+  # password: ""
+  
+  # База даних для аутентифікації (за замовчуванням admin)
+  # auth_source: admin
