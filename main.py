@@ -8,6 +8,8 @@ import threading
 from config.settings import Settings
 from business.services import ProZorroService
 from business.services.telegram_bot_service import TelegramBotService
+from business.services.logging_service import LoggingService
+from data.database.connection import MongoDBConnection
 
 
 class Application:
@@ -20,6 +22,24 @@ class Application:
         self.prozorro_service = None
         self.telegram_bot_service = None
         self._bot_thread = None
+        
+        # Ініціалізуємо MongoDB підключення ПЕРЕД створенням сервісів, які його використовують
+        try:
+            MongoDBConnection.initialize(self.settings)
+        except Exception as e:
+            print(f"Попередження: не вдалося ініціалізувати MongoDB: {e}")
+        
+        # Тепер створюємо сервіси після ініціалізації MongoDB
+        self.logging_service = LoggingService()
+        
+        # Логуємо старт застосунку
+        try:
+            self.logging_service.log_app_event(
+                message="Застосунок запущено",
+                event_type='start'
+            )
+        except Exception as e:
+            print(f"Попередження: не вдалося залогувати подію старту: {e}")
 
     def initialize(self):
         """Ініціалізація компонентів застосунку."""
@@ -96,6 +116,15 @@ class Application:
         # Зупиняємо Telegram бота
         if self.telegram_bot_service:
             self.telegram_bot_service.stop()
+        
+        # Логуємо зупинку
+        try:
+            self.logging_service.log_app_event(
+                message="Застосунок зупинено",
+                event_type='stop'
+            )
+        except:
+            pass
         
         print("Застосунок зупинено")
 

@@ -27,7 +27,8 @@ from telegram.ext import (
 from config.settings import Settings
 from business.services.prozorro_service import ProZorroService
 from business.services.user_service import UserService
-from utils.file_utils import find_latest_auction_file, create_zip_archive, extract_date_range_from_filename
+from business.services.logging_service import LoggingService
+from utils.file_utils import create_zip_archive
 
 
 # Стани для ConversationHandler
@@ -47,6 +48,7 @@ class TelegramBotService:
         self.settings = settings
         self.user_service = UserService(settings.telegram_users_config_path)
         self.prozorro_service = ProZorroService(settings)
+        self.logging_service = LoggingService()
         self.application = None
         self._running = False
         
@@ -68,23 +70,20 @@ class TelegramBotService:
         user_id = update.effective_user.id
         is_admin = self.user_service.is_admin(user_id)
         
-        # Знаходимо найсвіжіші файли для відображення періодів
-        latest_day_file = find_latest_auction_file(1)
-        latest_week_file = find_latest_auction_file(7)
+        # Отримуємо дати оновлень з БД
+        from data.repositories.app_data_repository import AppDataRepository
+        app_data_repo = AppDataRepository()
+        update_dates = app_data_repo.get_all_update_dates()
         
         day_period = ""
-        if latest_day_file:
-            date_range = extract_date_range_from_filename(os.path.basename(latest_day_file))
-            if date_range:
-                date_from, date_to = date_range
-                day_period = f" (оновлено {date_to.strftime('%d.%m, %H:%M')})"
+        if update_dates.get('1d'):
+            update_date = update_dates['1d']
+            day_period = f" (оновлено {update_date.strftime('%d.%m, %H:%M')})"
         
         week_period = ""
-        if latest_week_file:
-            date_range = extract_date_range_from_filename(os.path.basename(latest_week_file))
-            if date_range:
-                date_from, date_to = date_range
-                week_period = f" (оновлено {date_to.strftime('%d.%m, %H:%M')})"
+        if update_dates.get('7d'):
+            update_date = update_dates['7d']
+            week_period = f" (оновлено {update_date.strftime('%d.%m, %H:%M')})"
         
         keyboard = [
             [KeyboardButton(f"📥 Скачати файл за добу{day_period}")],
@@ -201,51 +200,79 @@ class TelegramBotService:
         return WAITING_BLOCK_USER_ID
     
     async def handle_get_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE, days: int) -> None:
-        """Обробка отримання останнього файлу."""
+        """Обробка отримання файлу з БД за період до збереженої дати оновлення."""
         message = update.message or (update.callback_query.message if update.callback_query else None)
         if not message:
             return
         
-        await message.reply_text("Шукаю файл...")
+        user_id = update.effective_user.id
         
-        file_path = find_latest_auction_file(days)
-        
-        if not file_path:
-            await message.reply_text(f"Файл за {days} {'день' if days == 1 else 'днів'} не знайдено.")
-            return
+        await message.reply_text("Формую файл з даних БД...")
         
         try:
-            # Формуємо нову назву файлу для архіву та всередині архіву
-            date_range = extract_date_range_from_filename(os.path.basename(file_path))
-            if date_range:
-                date_from, date_to = date_range
-                archive_internal_name = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{date_to.strftime('%d.%m.%Y')}).xlsx"
-                zip_filename = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{date_to.strftime('%d.%m.%Y')}).zip"
-            else:
-                archive_internal_name = os.path.basename(file_path)
-                zip_filename = os.path.basename(file_path).replace('.xlsx', '.zip')
+            # Генеруємо Excel в пам'яті з даних БД
+            excel_bytes = self.prozorro_service.generate_excel_from_db(days)
             
-            # Створюємо ZIP архів з перейменованим файлом всередині
-            zip_path = create_zip_archive(file_path, arcname=archive_internal_name)
+            if not excel_bytes:
+                await message.reply_text(f"Дані за {days} {'день' if days == 1 else 'днів'} не знайдено в БД.")
+                self.logging_service.log_user_action(
+                    user_id=user_id,
+                    action='download_file',
+                    message=f"Спроба скачати файл за {days} днів - дані не знайдено",
+                    metadata={'days': days}
+                )
+                return
+            
+            # Отримуємо дату оновлення для формування назви файлу
+            from data.repositories.app_data_repository import AppDataRepository
+            app_data_repo = AppDataRepository()
+            update_date = app_data_repo.get_update_date(days)
+            
+            if update_date:
+                date_from = update_date - timedelta(days=days)
+                archive_internal_name = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{update_date.strftime('%d.%m.%Y')}).xlsx"
+                zip_filename = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{update_date.strftime('%d.%m.%Y')}).zip"
+            else:
+                archive_internal_name = f"Звіт по нерухомості ({days} днів).xlsx"
+                zip_filename = f"Звіт по нерухомості ({days} днів).zip"
+            
+            # Створюємо тимчасовий ZIP файл в пам'яті
+            import zipfile
+            from io import BytesIO
+            
+            zip_bytes = BytesIO()
+            with zipfile.ZipFile(zip_bytes, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                excel_bytes.seek(0)
+                zipf.writestr(archive_internal_name, excel_bytes.read())
+            
+            zip_bytes.seek(0)
             
             # Відправляємо файл
-            with open(zip_path, 'rb') as f:
-                await context.bot.send_document(
-                    chat_id=message.chat_id,
-                    document=f,
-                    filename=zip_filename
-                )
+            await context.bot.send_document(
+                chat_id=message.chat_id,
+                document=zip_bytes,
+                filename=zip_filename
+            )
             
             await message.reply_text("Файл успішно відправлено!")
             
-            # Видаляємо тимчасовий ZIP файл
-            try:
-                os.remove(zip_path)
-            except:
-                pass
+            # Логуємо успішне скачування
+            self.logging_service.log_user_action(
+                user_id=user_id,
+                action='download_file',
+                message=f"Скачано файл за {days} днів з БД",
+                metadata={'days': days, 'update_date': update_date.isoformat() if update_date else None}
+            )
                 
         except Exception as e:
-            await message.reply_text(f"Помилка при відправці файлу: {e}")
+            await message.reply_text(f"Помилка при формуванні та відправці файлу: {e}")
+            self.logging_service.log_user_action(
+                user_id=user_id,
+                action='download_file',
+                message=f"Помилка скачування файлу за {days} днів",
+                metadata={'days': days},
+                error=str(e)
+            )
     
     async def handle_generate_file_week_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Показує підтвердження для формування файлу за тиждень."""
@@ -277,6 +304,14 @@ class TelegramBotService:
         
         await message.reply_text(f"Почато формування файлу за {days} {'день' if days == 1 else 'днів'}...")
         
+        # Логуємо початок формування файлу
+        self.logging_service.log_user_action(
+            user_id=user_id,
+            action='generate_file',
+            message=f"Запит на формування файлу за {days} днів",
+            metadata={'days': days}
+        )
+        
         # Запускаємо формування файлу асинхронно
         asyncio.create_task(self._generate_file_async(chat_id, user_id, days))
     
@@ -299,19 +334,53 @@ class TelegramBotService:
                     days
                 )
                 
-                # Відправляємо повідомлення про кількість аукціонів
-                await self._send_progress_message(
-                    chat_id,
-                    f"Знайдено {len(auctions)} аукціонів для обробки.\n"
-                    f"Приблизний час обробки: {len(auctions) * 14 / 60:.1f} хвилин."
-                )
-                
                 if not auctions:
                     await self._send_progress_message(
                         chat_id,
                         "Аукціони не знайдено."
                     )
                     return
+                
+                # Підраховуємо кількість аукціонів, які потребують обробки через LLM (без кешу)
+                # Для цього перевіряємо кожен аукціон на наявність опису та кешу
+                llm_requests_estimated = 0
+                for auction in auctions:
+                    if not auction.data:
+                        continue
+                    data = auction.data
+                    # Перевіряємо, чи це аренда (пропускаємо LLM)
+                    is_rental = self.prozorro_service._is_rental_auction(data)
+                    if is_rental:
+                        continue
+                    # Перевіряємо наявність опису
+                    description = ''
+                    if 'description' in data:
+                        desc_obj = data['description']
+                        if isinstance(desc_obj, dict):
+                            description = desc_obj.get('uk_UA', desc_obj.get('en_US', ''))
+                        elif isinstance(desc_obj, str):
+                            description = desc_obj
+                    if description:
+                        # Перевіряємо кеш
+                        cached_result = self.prozorro_service.llm_cache_service.get_cached_result(description)
+                        if cached_result is None:
+                            llm_requests_estimated += 1
+                
+                # Відправляємо повідомлення про кількість аукціонів
+                if llm_requests_estimated > 0:
+                    estimated_minutes = llm_requests_estimated * 14 / 60
+                    await self._send_progress_message(
+                        chat_id,
+                        f"Знайдено {len(auctions)} аукціонів для обробки.\n"
+                        f"Приблизний час обробки: {estimated_minutes:.1f} хвилин "
+                        f"({llm_requests_estimated} аукціонів потребують обробки через LLM)."
+                    )
+                else:
+                    await self._send_progress_message(
+                        chat_id,
+                        f"Знайдено {len(auctions)} аукціонів для обробки.\n"
+                        f"Всі аукціони мають кешовані результати LLM - обробка буде швидкою."
+                    )
             
             # Зберігаємо файл (синхронна операція, виконуємо в executor)
             result = await loop.run_in_executor(
@@ -331,53 +400,80 @@ class TelegramBotService:
             if result['success']:
                 await self._send_progress_message(
                     chat_id,
-                    "Файл успішно сформовано."
+                    f"Дані успішно оновлено. Знайдено {result.get('count', 0)} аукціонів."
                 )
                 
-                # Відправляємо файл користувачу
-                file_path = result.get('file_path')
-                if file_path and os.path.exists(file_path):
-                    try:
-                        # Формуємо нову назву файлу для архіву та всередині архіву
-                        date_range = extract_date_range_from_filename(os.path.basename(file_path))
-                        if date_range:
-                            date_from, date_to = date_range
-                            archive_internal_name = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{date_to.strftime('%d.%m.%Y')}).xlsx"
-                            zip_filename = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{date_to.strftime('%d.%m.%Y')}).zip"
+                # Логуємо успішне оновлення
+                self.logging_service.log_user_action(
+                    user_id=user_id,
+                    action='generate_file',
+                    message=f"Дані за {days} днів успішно оновлено",
+                    metadata={
+                        'days': days,
+                        'count': result.get('count'),
+                        'update_date': result.get('update_date').isoformat() if result.get('update_date') else None
+                    }
+                )
+                
+                # Генеруємо та відправляємо файл користувачу
+                try:
+                    excel_bytes = self.prozorro_service.generate_excel_from_db(days)
+                    if excel_bytes:
+                        update_date = result.get('update_date')
+                        if update_date:
+                            date_from = update_date - timedelta(days=days)
+                            archive_internal_name = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{update_date.strftime('%d.%m.%Y')}).xlsx"
+                            zip_filename = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{update_date.strftime('%d.%m.%Y')}).zip"
                         else:
-                            archive_internal_name = os.path.basename(file_path)
-                            zip_filename = os.path.basename(file_path).replace('.xlsx', '.zip')
+                            archive_internal_name = f"Звіт по нерухомості ({days} днів).xlsx"
+                            zip_filename = f"Звіт по нерухомості ({days} днів).zip"
                         
-                        # Створюємо ZIP архів з перейменованим файлом всередині
-                        zip_path = create_zip_archive(file_path, arcname=archive_internal_name)
+                        # Створюємо ZIP в пам'яті
+                        import zipfile
+                        from io import BytesIO
+                        
+                        zip_bytes = BytesIO()
+                        with zipfile.ZipFile(zip_bytes, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                            excel_bytes.seek(0)
+                            zipf.writestr(archive_internal_name, excel_bytes.read())
+                        
+                        zip_bytes.seek(0)
                         
                         # Відправляємо файл
-                        with open(zip_path, 'rb') as f:
-                            await self.application.bot.send_document(
-                                chat_id=chat_id,
-                                document=f,
-                                filename=zip_filename
-                            )
-                        
-                        # Видаляємо тимчасовий ZIP файл
-                        try:
-                            os.remove(zip_path)
-                        except:
-                            pass
-                    except Exception as e:
-                        await self._send_progress_message(
-                            chat_id,
-                            f"Помилка при відправці файлу: {e}"
+                        await self.application.bot.send_document(
+                            chat_id=chat_id,
+                            document=zip_bytes,
+                            filename=zip_filename
                         )
+                except Exception as e:
+                    await self._send_progress_message(
+                        chat_id,
+                        f"Помилка при формуванні та відправці файлу: {e}"
+                    )
             else:
+                error_msg = result.get('message', 'Невідома помилка')
                 await self._send_progress_message(
                     chat_id,
-                    f"Помилка при формуванні файлу: {result.get('message', 'Невідома помилка')}"
+                    f"Помилка при формуванні файлу: {error_msg}"
+                )
+                self.logging_service.log_user_action(
+                    user_id=user_id,
+                    action='generate_file',
+                    message=f"Помилка формування файлу за {days} днів",
+                    metadata={'days': days},
+                    error=error_msg
                 )
         except Exception as e:
             await self._send_progress_message(
                 chat_id,
                 f"Помилка: {e}"
+            )
+            self.logging_service.log_user_action(
+                user_id=user_id,
+                action='generate_file',
+                message=f"Виняток при формуванні файлу за {days} днів",
+                metadata={'days': days},
+                error=str(e)
             )
     
     async def _send_progress_message(self, chat_id: int, text: str) -> None:
@@ -577,9 +673,22 @@ class TelegramBotService:
             await update.message.reply_text(
                 f"Користувач {nickname} (ID: {user_id_to_add}) успішно додано як {role}."
             )
+            self.logging_service.log_user_action(
+                user_id=user_id,
+                action='admin_action',
+                message=f"Додано користувача {nickname} (ID: {user_id_to_add}) як {role}",
+                metadata={'action': 'add_user', 'target_user_id': user_id_to_add, 'role': role}
+            )
         else:
             await update.message.reply_text(
                 "Помилка: не вдалося додати користувача. Можливо, він вже існує."
+            )
+            self.logging_service.log_user_action(
+                user_id=user_id,
+                action='admin_action',
+                message=f"Спроба додати користувача {user_id_to_add} - помилка",
+                metadata={'action': 'add_user', 'target_user_id': user_id_to_add},
+                error='Користувач вже існує або помилка збереження'
             )
         context.user_data.clear()
         await self.show_admin_menu(update, context)
@@ -592,8 +701,21 @@ class TelegramBotService:
         success = self.user_service.block_user(user_id_to_block, user_id)
         if success:
             await update.message.reply_text(f"Користувач (ID: {user_id_to_block}) успішно заблокований.")
+            self.logging_service.log_user_action(
+                user_id=user_id,
+                action='admin_action',
+                message=f"Заблоковано користувача (ID: {user_id_to_block})",
+                metadata={'action': 'block_user', 'target_user_id': user_id_to_block}
+            )
         else:
             await update.message.reply_text("Помилка: не вдалося заблокувати користувача.")
+            self.logging_service.log_user_action(
+                user_id=user_id,
+                action='admin_action',
+                message=f"Спроба заблокувати користувача {user_id_to_block} - помилка",
+                metadata={'action': 'block_user', 'target_user_id': user_id_to_block},
+                error='Користувач не знайдено або помилка збереження'
+            )
         context.user_data.clear()
         await self.show_admin_menu(update, context)
         return ConversationHandler.END

@@ -1,0 +1,131 @@
+# -*- coding: utf-8 -*-
+"""
+Сервіс для логування подій в колекцію logs.
+"""
+
+from typing import Optional, Dict, Any
+from data.repositories.logs_repository import LogsRepository
+
+
+class LoggingService:
+    """Сервіс для логування подій."""
+    
+    # Типи подій
+    EVENT_TYPE_API_EXCHANGE = 'api_exchange'
+    EVENT_TYPE_USER_ACTION = 'user_action'
+    EVENT_TYPE_APP_EVENT = 'app_event'
+    
+    def __init__(self):
+        """Ініціалізація сервісу логування."""
+        self.repository = LogsRepository()
+    
+    def log_api_exchange(
+        self,
+        message: str,
+        url: Optional[str] = None,
+        method: Optional[str] = None,
+        status_code: Optional[int] = None,
+        error: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Логує обмін з API.
+        
+        Args:
+            message: Повідомлення про подію
+            url: URL запиту
+            method: HTTP метод
+            status_code: Код статусу відповіді
+            error: Текст помилки (якщо є)
+            metadata: Додаткові метадані
+            
+        Returns:
+            ID створеного запису
+        """
+        api_metadata = {
+            'url': url,
+            'method': method,
+            'status_code': status_code
+        }
+        
+        if metadata:
+            api_metadata.update(metadata)
+        
+        return self.repository.create_log(
+            event_type=self.EVENT_TYPE_API_EXCHANGE,
+            message=message,
+            initiator='api',
+            metadata=api_metadata,
+            error=error
+        )
+    
+    def log_user_action(
+        self,
+        user_id: int,
+        action: str,
+        message: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None
+    ) -> str:
+        """
+        Логує дію користувача через бот.
+        
+        Args:
+            user_id: Ідентифікатор користувача
+            action: Тип дії (download_file, generate_file, admin_action тощо)
+            message: Повідомлення про подію
+            metadata: Додаткові метадані
+            error: Текст помилки (якщо є)
+            
+        Returns:
+            ID створеного запису
+        """
+        user_metadata = {
+            'action': action
+        }
+        
+        if metadata:
+            user_metadata.update(metadata)
+        
+        msg = message or f"Користувач {user_id} виконав дію: {action}"
+        
+        return self.repository.create_log(
+            event_type=self.EVENT_TYPE_USER_ACTION,
+            message=msg,
+            initiator=str(user_id),
+            metadata=user_metadata,
+            error=error
+        )
+    
+    def log_app_event(
+        self,
+        message: str,
+        event_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None
+    ) -> str:
+        """
+        Логує загальну подію застосунку.
+        
+        Args:
+            message: Повідомлення про подію
+            event_type: Тип події (start, stop, error тощо)
+            metadata: Додаткові метадані
+            error: Текст помилки (якщо є)
+            
+        Returns:
+            ID створеного запису
+        """
+        app_metadata = {}
+        if event_type:
+            app_metadata['event_type'] = event_type
+        if metadata:
+            app_metadata.update(metadata)
+        
+        return self.repository.create_log(
+            event_type=self.EVENT_TYPE_APP_EVENT,
+            message=message,
+            initiator='system',
+            metadata=app_metadata,
+            error=error
+        )

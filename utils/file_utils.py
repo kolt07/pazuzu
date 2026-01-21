@@ -6,6 +6,7 @@
 import os
 import json
 import csv
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime
@@ -125,6 +126,152 @@ def save_csv_to_file(data: List[Dict[str, Any]], file_path: str, fieldnames: Lis
         print(f"✓ CSV файл збережено: {file_path} ({file_size} байт)")
     else:
         print(f"⚠ Помилка: файл не знайдено після збереження: {file_path}")
+
+
+def generate_excel_in_memory(data: List[Dict[str, Any]], fieldnames: List[str], column_headers: Optional[Dict[str, str]] = None) -> BytesIO:
+    """
+    Генерує Excel файл в пам'яті (BytesIO) з кодуванням UTF-8 та покращеним форматуванням.
+    
+    Args:
+        data: Список словників з даними для збереження
+        fieldnames: Список назв колонок (ключі)
+        column_headers: Словник з українськими назвами колонок (ключ -> назва)
+        
+    Returns:
+        BytesIO: Об'єкт з Excel файлом в пам'яті
+    """
+    if not PANDAS_AVAILABLE:
+        raise ImportError("Для збереження в Excel потрібно встановити pandas та openpyxl: pip install pandas openpyxl")
+    
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        raise ImportError("Для форматування Excel потрібно встановити openpyxl: pip install openpyxl")
+    
+    # Створюємо DataFrame з даних
+    df = pd.DataFrame(data, columns=fieldnames)
+    
+    # Створюємо Workbook в пам'яті
+    wb = Workbook()
+    ws = wb.active
+    
+    # Заповнюємо дані
+    for row_idx, row_data in enumerate(df.itertuples(index=False), start=2):
+        for col_idx, value in enumerate(row_data, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.value = value
+    
+    # Стилі для шапки
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    
+    # Стилі для комірок
+    cell_alignment = Alignment(vertical="top", wrap_text=True)
+    border_style = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+    
+    # Форматуємо шапку
+    for col_idx, fieldname in enumerate(fieldnames, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        # Використовуємо українську назву, якщо вказано
+        if column_headers and fieldname in column_headers:
+            cell.value = column_headers[fieldname]
+        else:
+            cell.value = fieldname
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_alignment
+        cell.border = border_style
+    
+    # Закріплюємо шапку
+    ws.freeze_panes = 'A2'
+    
+    # Знаходимо індекс колонки з посиланнями
+    url_column_idx = None
+    if 'auction_url' in fieldnames:
+        url_column_idx = fieldnames.index('auction_url') + 1
+    
+    # Стиль для гіперпосилань
+    hyperlink_font = Font(underline="single", color="0563C1")
+    # Стиль для жирного шрифту
+    bold_font = Font(bold=True)
+    
+    # Форматуємо комірки з даними
+    for row_idx in range(2, len(data) + 2):
+        row_data = data[row_idx - 2]  # Індекс в масиві data
+        # Перевіряємо, чи є додатковий класифікатор 03.07
+        has_bold = row_data.get('_has_additional_classification_03_07', False)
+        
+        for col_idx, fieldname in enumerate(fieldnames, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.alignment = cell_alignment
+            
+            # Якщо це колонка з посиланнями, створюємо гіперпосилання
+            if col_idx == url_column_idx and cell.value:
+                url = str(cell.value).strip()
+                if url and (url.startswith('http://') or url.startswith('https://')):
+                    cell.hyperlink = url
+                    cell.value = "Посилання"
+                    # Комбінуємо стиль гіперпосилання з жирним, якщо потрібно
+                    if has_bold:
+                        cell.font = Font(underline="single", color="0563C1", bold=True)
+                    else:
+                        cell.font = hyperlink_font
+                    cell.border = border_style
+                elif cell.value and str(cell.value).strip():
+                    if has_bold:
+                        cell.font = bold_font
+                    cell.border = border_style
+                else:
+                    cell.border = Border()
+            # Додаємо сітку тільки якщо є дані
+            elif cell.value and str(cell.value).strip():
+                if has_bold:
+                    cell.font = bold_font
+                cell.border = border_style
+            else:
+                # Прибираємо сітку для порожніх комірок
+                cell.border = Border()
+    
+    # Автоматично підганяємо ширину колонок
+    for col_idx, fieldname in enumerate(fieldnames, start=1):
+        column_letter = get_column_letter(col_idx)
+        max_length = 0
+        
+        # Перевіряємо довжину в шапці
+        cell = ws.cell(row=1, column=col_idx)
+        if cell.value:
+            max_length = len(str(cell.value))
+        
+        # Перевіряємо довжину в даних
+        for row_idx in range(2, len(data) + 2):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            if cell.value:
+                cell_value = str(cell.value)
+                # Для багаторядкових значень беремо найдовший рядок
+                if '\n' in cell_value:
+                    max_line_length = max(len(line) for line in cell_value.split('\n'))
+                    max_length = max(max_length, max_line_length)
+                else:
+                    max_length = max(max_length, len(cell_value))
+        
+        # Встановлюємо ширину з невеликим запасом
+        adjusted_width = min(max_length + 2, 50)  # Максимум 50 символів
+        ws.column_dimensions[column_letter].width = adjusted_width
+    
+    # Зберігаємо в BytesIO
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    
+    return output
 
 
 def save_excel_to_file(data: List[Dict[str, Any]], file_path: str, fieldnames: List[str], column_headers: Optional[Dict[str, str]] = None) -> None:

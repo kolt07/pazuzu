@@ -88,16 +88,24 @@ class BaseLLMProvider(ABC):
 - area: площа (число, якщо є). Шукай числа з одиницями виміру (га, м², сотка). 
   Якщо площа вказана в гектарах - конвертуй в число (наприклад, "0,5296 га" -> 0.5296).
 - area_unit: одиниця вимірювання площі (га, м², сотка тощо). Якщо в тексті є "га" - пиши "гектар", якщо "м²" - пиши "м²".
-- address_region: область у форматі "Волинська", "Тернопільська", "Харківська" тощо (без скорочень, без додаткових слів). 
-  м. Київ та м. Симферополь НЕ входять в склад областей - для них залишай порожнє значення.
-  Крим пиши як "АР Крим".
-  Якщо в тексті є "Харківська область" - пиши "Харківська", якщо "Лозівський район" - це Харківська область.
-  Якщо в тексті не зустрічається назва області, але за назвою міста або іншого топоніма можна виявити, в якій він області знаходиться - доповни інформацію про область.
-- address_city: місто/населений пункт/село. Шукай назви населених пунктів (наприклад, "с. Верхньоводяне" -> "Верхньоводяне").
-  Якщо є "на території с. Верхньоводяне" - витягни "Верхньоводяне".
-- address_street: назва вулиці (без типу, наприклад "Незалежності" замість "вул. Незалежності")
-- address_street_type: тип вулиці (вул., просп., бул., пров., пл. тощо). Якщо в тексті є "вул." - пиши "вул."
-- address_building: номер будинку/будівлі (тільки номер, наприклад "39" або "27")
+- addresses: масив адрес (якщо в тексті є кілька адрес - витягни всі). Кожна адреса - об'єкт з полями:
+  * region: область у форматі "Волинська", "Тернопільська", "Харківська" тощо (без скорочень, без додаткових слів). 
+    м. Київ та м. Симферополь НЕ входять в склад областей - для них залишай порожнє значення.
+    Крим пиши як "АР Крим".
+    Якщо в тексті є "Харківська область" - пиши "Харківська", якщо "Лозівський район" - це Харківська область.
+    Якщо в тексті не зустрічається назва області, але за назвою міста або іншого топоніма можна виявити, в якій він області знаходиться - доповни інформацію про область.
+  * district: район (якщо є, наприклад "Лозівський", "Бориспільський" тощо)
+  * settlement_type: скорочено тип населеного пункту (м., с., смт., с-ще тощо) - якщо є в тексті
+  * settlement: населений пункт/місто/село БЕЗ приставок м., с. тощо, з великої літери (наприклад, "Верхньоводяне", "Київ", "Львів").
+    Якщо є "с. Верхньоводяне" - пиши "Верхньоводяне", якщо "м. Київ" - пиши "Київ".
+    Якщо є "на території с. Верхньоводяне" - витягни "Верхньоводяне".
+    Може бути також топонім типу "сільрада", "міськрада", "районна рада" тощо - витягни як є.
+  * settlement_district: район населеного пункту (якщо є, наприклад "Шевченківський район м. Києва")
+  * street_type: тип вулиці (вул., просп., бул., пров., пл. тощо). Якщо в тексті є "вул." - пиши "вул."
+  * street: назва вулиці (без типу, наприклад "Незалежності" замість "вул. Незалежності")
+  * building: номер будинку/будівлі (тільки номер, наприклад "39" або "27")
+  * building_part: номер блоку/корпусу (якщо є, наприклад "корпус А", "блок 1" тощо)
+  * room: номер приміщення (офіс, квартира, тощо, якщо є, наприклад "кв. 5", "офіс 12")
 - floor: поверх (якщо є, тільки для будівель)
 - property_type: тип нерухомості зі списку: "Земля під будівництво", "Землі с/г призначення", "Нерухомість", "інше"
   Якщо в описі є "земельна ділянка" або "землі житлової забудови" - це "Земля під будівництво".
@@ -111,8 +119,9 @@ class BaseLLMProvider(ABC):
 ВАЖЛИВО:
 - Уважно читай весь текст, включаючи деталі про адресу, площу, кадастровий номер.
 - Якщо інформація вказана в різних форматах (наприклад, "0,5296 га" і "0.5296 га") - використовуй той, що згадується першим.
-- Для адреси: якщо є "Харківська область, Лозівський район, на території с. Верхньоводяне" - 
-  область: "Харківська", місто: "Верхньоводяне", вулиця може бути порожня.
+- Для адреси: якщо є "Харківська область, Лозівський район, на території с. Верхньоводяне, вул. Центральна, 15" - 
+  витягни як: {{"region": "Харківська", "district": "Лозівський", "settlement_type": "с.", "settlement": "Верхньоводяне", "street_type": "вул.", "street": "Центральна", "building": "15"}}
+- Якщо в тексті є кілька адрес - витягни всі в масив addresses.
 - Якщо адреса неповна, спробуй доповнити її на основі доступної інформації.
 - Використовуй виключно ту інформацію, яка є в описі аукціону, або таку, яку можна отримати на базі інформації з опису аукціону. Не вигадуй іншу інформацію.
 - Поверни ТІЛЬКИ валідний JSON без додаткових пояснень."""
@@ -124,20 +133,17 @@ class GeminiLLMProvider(BaseLLMProvider):
     def __init__(self, api_key: str, rate_limiter: RateLimiter, model_name: str = 'gemini-2.5-flash'):
         super().__init__(api_key, rate_limiter)
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
+            from google import genai
+            self.client = genai.Client(api_key=self.api_key)
             # Список моделей для спроби (в порядку пріоритету)
             # Актуальні моделі: gemini-2.5-flash, gemini-2.5-pro, gemini-2.5-flash-lite
             self.model_name = model_name
-            self.model = None
-            self._initialize_model(model_name)
+            self._validate_model(model_name)
         except ImportError:
-            raise ImportError("Для використання Gemini потрібно встановити google-generativeai: pip install google-generativeai")
+            raise ImportError("Для використання Gemini потрібно встановити google-genai: pip install google-genai")
     
-    def _initialize_model(self, preferred_model: str):
-        """Ініціалізує модель, спробувавши кілька варіантів."""
-        import google.generativeai as genai
-        
+    def _validate_model(self, preferred_model: str):
+        """Валідує модель, спробувавши кілька варіантів."""
         # Список моделей для спроби (в порядку пріоритету)
         models_to_try = [
             preferred_model,
@@ -149,25 +155,10 @@ class GeminiLLMProvider(BaseLLMProvider):
         
         # Видаляємо дублікати, зберігаючи порядок
         seen = set()
-        models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
+        self._available_models = [m for m in models_to_try if not (m in seen or seen.add(m))]
         
-        last_error = None
-        for model_name in models_to_try:
-            try:
-                self.model = genai.GenerativeModel(model_name)
-                # Перевіряємо, чи модель доступна, виконавши тестовий запит
-                # Але не робимо реальний запит, просто перевіряємо ініціалізацію
-                self.model_name = model_name
-                return
-            except Exception as e:
-                last_error = e
-                continue
-        
-        # Якщо жодна модель не спрацювала, викидаємо помилку
-        if last_error:
-            raise ValueError(f"Не вдалося ініціалізувати жодну модель Gemini. Остання помилка: {last_error}")
-        else:
-            raise ValueError("Не вдалося ініціалізувати модель Gemini")
+        # Зберігаємо першу модель як активну (перевірка доступності буде при першому запиті)
+        self.model_name = self._available_models[0]
     
     def parse_auction_description(self, description: str) -> Dict[str, Any]:
         """Парсить опис аукціону через Gemini API."""
@@ -183,8 +174,11 @@ class GeminiLLMProvider(BaseLLMProvider):
             try:
                 prompt = self._create_parsing_prompt(description)
                 
-                # Виконуємо запит без таймауту
-                response = self.model.generate_content(prompt)
+                # Виконуємо запит через новий API
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt
+                )
                 
                 # Витягуємо JSON з відповіді
                 # Перевіряємо, чи response.text існує та є рядком
@@ -279,15 +273,29 @@ class GeminiLLMProvider(BaseLLMProvider):
     
     def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """Нормалізує результат парсингу."""
+        # Обробляємо адреси - підтримуємо як старий формат (для сумісності), так і новий (масив)
+        addresses = result.get('addresses', [])
+        if not addresses:
+            # Якщо немає масиву адрес, але є старі поля - створюємо адресу з них
+            if result.get('address_region') or result.get('address_city'):
+                addresses = [{
+                    'region': result.get('address_region', ''),
+                    'district': result.get('address_district', ''),
+                    'settlement_type': result.get('address_settlement_type', ''),
+                    'settlement': result.get('address_city', ''),
+                    'settlement_district': result.get('address_settlement_district', ''),
+                    'street_type': result.get('address_street_type', ''),
+                    'street': result.get('address_street', ''),
+                    'building': result.get('address_building', ''),
+                    'building_part': result.get('address_building_part', ''),
+                    'room': result.get('address_room', '')
+                }]
+        
         return {
             'cadastral_number': result.get('cadastral_number', ''),
             'area': result.get('area', ''),
             'area_unit': result.get('area_unit', ''),
-            'address_region': result.get('address_region', ''),
-            'address_city': result.get('address_city', ''),
-            'address_street': result.get('address_street', ''),
-            'address_street_type': result.get('address_street_type', ''),
-            'address_building': result.get('address_building', ''),
+            'addresses': addresses,  # Масив адрес
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
             'utilities': result.get('utilities', ''),
@@ -300,11 +308,7 @@ class GeminiLLMProvider(BaseLLMProvider):
             'cadastral_number': '',
             'area': '',
             'area_unit': '',
-            'address_region': '',
-            'address_city': '',
-            'address_street': '',
-            'address_street_type': '',
-            'address_building': '',
+            'addresses': [],  # Порожній масив адрес
             'floor': '',
             'property_type': '',
             'utilities': '',
@@ -378,15 +382,29 @@ class OpenAILLMProvider(BaseLLMProvider):
     
     def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """Нормалізує результат парсингу."""
+        # Обробляємо адреси - підтримуємо як старий формат (для сумісності), так і новий (масив)
+        addresses = result.get('addresses', [])
+        if not addresses:
+            # Якщо немає масиву адрес, але є старі поля - створюємо адресу з них
+            if result.get('address_region') or result.get('address_city'):
+                addresses = [{
+                    'region': result.get('address_region', ''),
+                    'district': result.get('address_district', ''),
+                    'settlement_type': result.get('address_settlement_type', ''),
+                    'settlement': result.get('address_city', ''),
+                    'settlement_district': result.get('address_settlement_district', ''),
+                    'street_type': result.get('address_street_type', ''),
+                    'street': result.get('address_street', ''),
+                    'building': result.get('address_building', ''),
+                    'building_part': result.get('address_building_part', ''),
+                    'room': result.get('address_room', '')
+                }]
+        
         return {
             'cadastral_number': result.get('cadastral_number', ''),
             'area': result.get('area', ''),
             'area_unit': result.get('area_unit', ''),
-            'address_region': result.get('address_region', ''),
-            'address_city': result.get('address_city', ''),
-            'address_street': result.get('address_street', ''),
-            'address_street_type': result.get('address_street_type', ''),
-            'address_building': result.get('address_building', ''),
+            'addresses': addresses,  # Масив адрес
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
             'utilities': result.get('utilities', ''),
@@ -399,11 +417,7 @@ class OpenAILLMProvider(BaseLLMProvider):
             'cadastral_number': '',
             'area': '',
             'area_unit': '',
-            'address_region': '',
-            'address_city': '',
-            'address_street': '',
-            'address_street_type': '',
-            'address_building': '',
+            'addresses': [],  # Порожній масив адрес
             'floor': '',
             'property_type': '',
             'utilities': '',
@@ -476,15 +490,29 @@ class AnthropicLLMProvider(BaseLLMProvider):
     
     def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """Нормалізує результат парсингу."""
+        # Обробляємо адреси - підтримуємо як старий формат (для сумісності), так і новий (масив)
+        addresses = result.get('addresses', [])
+        if not addresses:
+            # Якщо немає масиву адрес, але є старі поля - створюємо адресу з них
+            if result.get('address_region') or result.get('address_city'):
+                addresses = [{
+                    'region': result.get('address_region', ''),
+                    'district': result.get('address_district', ''),
+                    'settlement_type': result.get('address_settlement_type', ''),
+                    'settlement': result.get('address_city', ''),
+                    'settlement_district': result.get('address_settlement_district', ''),
+                    'street_type': result.get('address_street_type', ''),
+                    'street': result.get('address_street', ''),
+                    'building': result.get('address_building', ''),
+                    'building_part': result.get('address_building_part', ''),
+                    'room': result.get('address_room', '')
+                }]
+        
         return {
             'cadastral_number': result.get('cadastral_number', ''),
             'area': result.get('area', ''),
             'area_unit': result.get('area_unit', ''),
-            'address_region': result.get('address_region', ''),
-            'address_city': result.get('address_city', ''),
-            'address_street': result.get('address_street', ''),
-            'address_street_type': result.get('address_street_type', ''),
-            'address_building': result.get('address_building', ''),
+            'addresses': addresses,  # Масив адрес
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
             'utilities': result.get('utilities', ''),
@@ -497,11 +525,7 @@ class AnthropicLLMProvider(BaseLLMProvider):
             'cadastral_number': '',
             'area': '',
             'area_unit': '',
-            'address_region': '',
-            'address_city': '',
-            'address_street': '',
-            'address_street_type': '',
-            'address_building': '',
+            'addresses': [],  # Порожній масив адрес
             'floor': '',
             'property_type': '',
             'utilities': '',
