@@ -180,15 +180,38 @@ class ProZorroService:
                         pass
                     raise
                 
-                # Обробка статусу 204 (No Content) - немає даних для повернення
+                # Обробка статусу 204 (No Content) - немає даних для цієї конкретної дати/часу
                 if response.status_code == 204:
-                    print("Немає даних (статус 204 - No Content)")
-                    break
+                    print(f"Немає даних для дати {date_str} (статус 204 - No Content)")
+                    # Якщо отримано 204, це означає, що для цієї конкретної дати/часу немає даних
+                    # Оновлюємо current_date для продовження пагінації
+                    # Додаємо 1 день до поточної дати для переходу до наступного дня
+                    next_date = current_date + timedelta(days=1)
+                    # Встановлюємо час на початок дня для наступної ітерації
+                    next_date = next_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                    
+                    # Перевіряємо, чи не вийшли за межі діапазону
+                    if next_date > date_to:
+                        # Якщо наступна дата виходить за межі діапазону - завершуємо обробку
+                        break
+                    
+                    # Оновлюємо current_date для наступної ітерації
+                    current_date = next_date
+                    continue
                 
                 # Перевірка, чи є вміст для парсингу
                 if not response.text or not response.text.strip():
-                    print("Порожня відповідь від API")
-                    break
+                    print(f"Порожня відповідь від API для дати {date_str}")
+                    # Якщо відповідь порожня, але статус не 204 - це може бути помилка
+                    # Але для безпеки також переходимо до наступної дати
+                    next_date = current_date + timedelta(days=1)
+                    next_date = next_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                    
+                    if next_date > date_to:
+                        break
+                    
+                    current_date = next_date
+                    continue
                 
                 # Парсимо JSON відповідь
                 response_data = response.json()
@@ -201,8 +224,16 @@ class ProZorroService:
                     auctions_data = response_data
                 
                 if not auctions_data:
-                    print("Немає більше аукціонів для обробки")
-                    break
+                    print(f"Немає більше аукціонів для обробки для дати {date_str}")
+                    # Якщо отримано порожній список аукціонів, переходимо до наступного дня
+                    next_date = current_date + timedelta(days=1)
+                    next_date = next_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                    
+                    if next_date > date_to:
+                        break
+                    
+                    current_date = next_date
+                    continue
                 
                 # Обробляємо аукціони на поточній сторінці
                 last_auction_on_page = None
@@ -286,8 +317,17 @@ class ProZorroService:
                 
                 # Перевіряємо, чи потрібно продовжувати
                 if max_date_modified is None:
-                    # Якщо не знайшли жодної дати, зупиняємось
-                    break
+                    # Якщо не знайшли жодної дати модифікації в отриманих даних
+                    # (наприклад, порожній список або дані без dateModified)
+                    # Переходимо до наступного дня
+                    next_date = current_date + timedelta(days=1)
+                    next_date = next_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                    
+                    if next_date > date_to:
+                        break
+                    
+                    current_date = next_date
+                    continue
                 
                 if max_date_modified >= date_to:
                     # Якщо максимальна дата досягнула або перевищила date_to, зупиняємось
@@ -331,8 +371,10 @@ class ProZorroService:
                 pass
 
             # Зберігаємо аукціони в MongoDB
+            llm_requests_count = 0
             if auctions:
-                self._save_auctions_to_database(auctions)
+                save_result = self._save_auctions_to_database(auctions)
+                llm_requests_count = save_result['llm_requests_count']
             
             # Логуємо завершення обміну з API
             try:
@@ -367,7 +409,7 @@ class ProZorroService:
                 pass  # Якщо логування не працює, просто продовжуємо
             raise
     
-    def _save_auctions_to_database(self, auctions: List[AuctionDTO]) -> None:
+    def _save_auctions_to_database(self, auctions: List[AuctionDTO]) -> Dict[str, Any]:
         """
         Зберігає аукціони в MongoDB з перевіркою версій.
         
@@ -375,18 +417,34 @@ class ProZorroService:
         Перевіряє, чи змінились дані в порівнянні з тим, що збережено у базі.
         Якщо дані ті ж самі - нічого не міняємо. Якщо версія змінилася - записуємо нові дані.
         Записує ті, яких там ще немає.
+        Обробляє описи через LLM для нових/оновлених аукціонів.
         
         Args:
             auctions: Список аукціонів для збереження
+            
+        Returns:
+            Dict[str, Any]: Словник зі статистикою: llm_requests_count, saved_count (кількість збережених без аренди)
         """
         if not auctions:
-            return
+            return {'llm_requests_count': 0, 'saved_count': 0}
         
         updated_count = 0
         created_count = 0
         unchanged_count = 0
         errors_count = 0
+        llm_requests_count = 0  # Кількість викликів LLM без кешу
+        deleted_rental_count = 0  # Кількість видалених аукціонів-аренди
         
+        # Прогрес-бар для обробки LLM (без попереднього підрахунку, оновлюється динамічно)
+        from tqdm import tqdm
+        llm_progress = tqdm(
+            desc="Обробка через LLM",
+            unit="запит",
+            ncols=100,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        )
+        
+        # Обробляємо аукціони
         for auction in auctions:
             try:
                 if not auction.data:
@@ -414,13 +472,33 @@ class ProZorroService:
                 if description:
                     description_hash = calculate_description_hash(description)
                 
+                # Перевіряємо, чи це аренда - аренду не зберігаємо в БД
+                is_rental = self._is_rental_auction(auction_data)
+                
                 # Шукаємо аукціон у базі
                 existing_auction = self.auctions_repository.find_by_auction_id(auction_id)
                 
+                # Якщо це аренда - не зберігаємо в БД
+                if is_rental:
+                    # Якщо аренда вже є в БД - видаляємо її
+                    if existing_auction:
+                        self.auctions_repository.delete_by_id(existing_auction['_id'])
+                        deleted_rental_count += 1
+                    continue
+                
                 if existing_auction:
+                    existing_description_hash = existing_auction.get('description_hash')
                     # Перевіряємо, чи змінилася версія
                     if existing_auction.get('version_hash') == version_hash:
-                        # Версія не змінилася - нічого не робимо
+                        # Версія не змінилася - перевіряємо, чи є результат LLM в кеші
+                        # (на випадок, якщо промпт змінився і кеш очистили)
+                        if existing_description_hash and description:
+                            cached_entry = self.llm_cache_service.repository.find_by_description_hash(existing_description_hash)
+                            if not cached_entry:
+                                # Хеш є в БД, але немає в кеші - викликаємо LLM
+                                if self.llm_service:
+                                    llm_requests_count += self._process_auction_with_llm(auction_data)
+                                    llm_progress.update(1)
                         unchanged_count += 1
                     else:
                         # Версія змінилася - оновлюємо
@@ -432,6 +510,14 @@ class ProZorroService:
                             last_updated=datetime.now(timezone.utc)
                         )
                         updated_count += 1
+                        # Обробляємо через LLM для оновлених аукціонів
+                        # Перевіряємо кеш по description_hash перед викликом LLM
+                        if description_hash and self.llm_service:
+                            cached_entry = self.llm_cache_service.repository.find_by_description_hash(description_hash)
+                            if not cached_entry:
+                                # Немає в кеші - викликаємо LLM
+                                llm_requests_count += self._process_auction_with_llm(auction_data)
+                                llm_progress.update(1)
                 else:
                     # Аукціону немає в базі - додаємо
                     self.auctions_repository.upsert_auction(
@@ -442,6 +528,13 @@ class ProZorroService:
                         last_updated=datetime.now(timezone.utc)
                     )
                     created_count += 1
+                    # Обробляємо через LLM для нових аукціонів
+                    # Перевіряємо кеш по description_hash перед викликом LLM
+                    if description_hash and self.llm_service:
+                        cached_entry = self.llm_cache_service.repository.find_by_description_hash(description_hash)
+                        if not cached_entry:
+                            # Немає в кеші - викликаємо LLM
+                            llm_requests_count += self._process_auction_with_llm(auction_data)
                     
             except Exception as e:
                 errors_count += 1
@@ -456,11 +549,16 @@ class ProZorroService:
                 except:
                     pass
         
+        # Закриваємо прогрес-бар
+        llm_progress.close()
+        
         print(f"\nСтатистика збереження в MongoDB:")
         print(f"  Створено нових: {created_count}")
         print(f"  Оновлено: {updated_count}")
         print(f"  Без змін: {unchanged_count}")
+        print(f"  Видалено аренди: {deleted_rental_count}")
         print(f"  Помилок: {errors_count}")
+        print(f"  Викликів LLM: {llm_requests_count}")
         
         # Логуємо збереження в MongoDB
         try:
@@ -472,11 +570,153 @@ class ProZorroService:
                     'created': created_count,
                     'updated': updated_count,
                     'unchanged': unchanged_count,
-                    'errors': errors_count
+                    'deleted_rental': deleted_rental_count,
+                    'errors': errors_count,
+                    'llm_requests': llm_requests_count
                 }
             )
         except:
             pass
+        
+        # Рахуємо кількість збережених аукціонів (без аренди)
+        saved_count = created_count + updated_count + unchanged_count
+        
+        return {
+            'llm_requests_count': llm_requests_count,
+            'saved_count': saved_count
+        }
+    
+    def _analyze_auctions_before_save(self, auctions: List[AuctionDTO]) -> Dict[str, int]:
+        """
+        Аналізує аукціони перед збереженням для отримання статистики.
+        
+        Args:
+            auctions: Список аукціонів для аналізу
+            
+        Returns:
+            Словник зі статистикою: total, unchanged, changed, llm_planned
+        """
+        if not auctions:
+            return {'total': 0, 'unchanged': 0, 'changed': 0, 'llm_planned': 0}
+        
+        total = 0
+        unchanged = 0
+        changed = 0
+        llm_planned = 0
+        
+        for auction in auctions:
+            try:
+                if not auction.data:
+                    continue
+                
+                auction_data = auction.data
+                auction_id = extract_auction_id(auction_data)
+                
+                if not auction_id:
+                    continue
+                
+                # Перевіряємо, чи це аренда - аренду не враховуємо
+                if self._is_rental_auction(auction_data):
+                    continue
+                
+                total += 1
+                
+                # Обчислюємо версію об'єкта
+                version_hash = calculate_object_version_hash(auction_data)
+                
+                # Витягуємо опис для обчислення хешу опису
+                description = ''
+                if 'description' in auction_data:
+                    desc_obj = auction_data['description']
+                    if isinstance(desc_obj, dict):
+                        description = desc_obj.get('uk_UA', desc_obj.get('en_US', ''))
+                    elif isinstance(desc_obj, str):
+                        description = desc_obj
+                
+                description_hash = None
+                if description:
+                    description_hash = calculate_description_hash(description)
+                
+                # Шукаємо аукціон у базі
+                existing_auction = self.auctions_repository.find_by_auction_id(auction_id)
+                
+                if existing_auction:
+                    # Перевіряємо, чи змінилася версія
+                    if existing_auction.get('version_hash') == version_hash:
+                        unchanged += 1
+                        # Перевіряємо, чи потрібен виклик LLM (немає в кеші)
+                        existing_description_hash = existing_auction.get('description_hash')
+                        if existing_description_hash and description:
+                            cached_entry = self.llm_cache_service.repository.find_by_description_hash(existing_description_hash)
+                            if not cached_entry and self.llm_service:
+                                llm_planned += 1
+                    else:
+                        changed += 1
+                        # Перевіряємо, чи потрібен виклик LLM (немає в кеші)
+                        if description_hash and self.llm_service:
+                            cached_entry = self.llm_cache_service.repository.find_by_description_hash(description_hash)
+                            if not cached_entry:
+                                llm_planned += 1
+                else:
+                    # Новий аукціон
+                    changed += 1
+                    # Перевіряємо, чи потрібен виклик LLM (немає в кеші)
+                    if description_hash and self.llm_service:
+                        cached_entry = self.llm_cache_service.repository.find_by_description_hash(description_hash)
+                        if not cached_entry:
+                            llm_planned += 1
+            except Exception:
+                # Помилка аналізу - пропускаємо
+                pass
+        
+        return {
+            'total': total,
+            'unchanged': unchanged,
+            'changed': changed,
+            'llm_planned': llm_planned
+        }
+    
+    def _process_auction_with_llm(self, auction_data: Dict[str, Any]) -> int:
+        """
+        Обробляє аукціон через LLM для парсингу опису.
+        
+        Викликається тільки якщо:
+        - Це не аренда
+        - Є опис
+        - Є LLM сервіс
+        - Немає результату в кеші по description_hash
+        
+        Args:
+            auction_data: Дані аукціону
+            
+        Returns:
+            int: 1 якщо був успішний виклик LLM, 0 якщо виникла помилка
+        """
+        # Витягуємо опис
+        description = ''
+        if 'description' in auction_data:
+            desc_obj = auction_data['description']
+            if isinstance(desc_obj, dict):
+                description = desc_obj.get('uk_UA', desc_obj.get('en_US', ''))
+            elif isinstance(desc_obj, str):
+                description = desc_obj
+        
+        if not description or not self.llm_service:
+            return 0
+        
+        try:
+            # Викликаємо LLM
+            llm_result = self.llm_service.parse_auction_description(description)
+            # Зберігаємо результат в кеш
+            self.llm_cache_service.save_result(description, llm_result)
+            # Повертаємо 1, оскільки був реальний виклик LLM
+            return 1
+        except KeyboardInterrupt:
+            # Переривання користувача - пробрасуємо далі
+            raise
+        except Exception as e:
+            # Помилка обробки - не рахуємо
+            return 0
     
     def _should_include_auction(self, auction: AuctionDTO, date_from: datetime, date_to: datetime, skip_date_check: bool = False) -> bool:
         """
@@ -662,8 +902,8 @@ class ProZorroService:
         """
         result = {
             'cadastral_number': '',
-            'area': '',
-            'area_unit': '',
+            'building_area_sqm': 0.0,  # Площа нерухомості в м²
+            'land_area_ha': 0.0,       # Площа земельної ділянки в га
             'address_region': '',
             'address_city': '',
             'address_street': '',
@@ -674,6 +914,11 @@ class ProZorroService:
             'utilities': '',
             'arrests_info': ''
         }
+        
+        # Витягуємо площі з усіх items
+        areas = self._extract_areas_from_items(data)
+        result['building_area_sqm'] = areas['building_area_sqm']
+        result['land_area_ha'] = areas['land_area_ha']
         
         items = data.get('items', [])
         if not isinstance(items, list) or len(items) == 0:
@@ -689,10 +934,7 @@ class ProZorroService:
             if cadastral:
                 result['cadastral_number'] = str(cadastral)
             
-            # Площа та одиниця виміру
-            land_area = item_props.get('landArea')
-            if land_area is not None:
-                result['area'] = str(land_area)
+            # Площі вже витягнуті через _extract_areas_from_items на початку методу
             
             # Комунікації
             has_utilities = item_props.get('hasUtilitiesAvailability', False)
@@ -705,15 +947,6 @@ class ProZorroService:
             
             if has_encumbrances:
                 result['arrests_info'] = 'Є обтяження'
-        
-        # Одиниця виміру
-        unit = item.get('unit', {})
-        if unit:
-            unit_name = unit.get('name', {})
-            if isinstance(unit_name, dict):
-                unit_ua = unit_name.get('uk_UA', '')
-                if unit_ua:
-                    result['area_unit'] = unit_ua
         
         # Адреса
         address = item.get('address', {})
@@ -764,6 +997,379 @@ class ProZorroService:
                     result['property_type'] = 'Нерухомість'
                 else:
                     result['property_type'] = 'інше'
+        
+        return result
+
+    def _extract_address_from_item_address(self, address: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Конвертує адресу з формату items.address у формат системи.
+        
+        Args:
+            address: Адреса з item.address
+            
+        Returns:
+            Dict з адресою у форматі системи або None, якщо адреса відсутня
+        """
+        if not address:
+            return None
+        
+        # Створюємо об'єкт адреси у форматі системи
+        address_obj = {
+            'region': '',
+            'district': '',
+            'settlement_type': '',
+            'settlement': '',
+            'settlement_district': '',
+            'street_type': '',
+            'street': '',
+            'building': '',
+            'building_part': '',
+            'room': ''
+        }
+        
+        # Область
+        region = address.get('region', {})
+        if isinstance(region, dict):
+            region_ua = region.get('uk_UA', '')
+            if region_ua:
+                # Прибираємо слово "область" для консистентності
+                region_ua = region_ua.replace(' область', '').replace(' обл.', '').strip()
+                address_obj['region'] = region_ua
+        
+        # Населений пункт (locality)
+        locality = address.get('locality', {})
+        if isinstance(locality, dict):
+            locality_ua = locality.get('uk_UA', '')
+            if locality_ua:
+                # Парсимо тип населеного пункту (м., с., смт. тощо)
+                locality_ua = locality_ua.strip()
+                # Перевіряємо, чи починається з типу населеного пункту
+                # Спочатку перевіряємо довші патерни, потім коротші
+                settlement_type_patterns = [
+                    'смт.', 'смт ', 'с-ще', 'с-ще ',
+                    'м.', 'м ', 'с.', 'с '
+                ]
+                settlement_type = ''
+                settlement = locality_ua
+                
+                for pattern in settlement_type_patterns:
+                    if locality_ua.startswith(pattern):
+                        settlement_type = pattern.rstrip(' ')
+                        settlement = locality_ua[len(pattern):].strip()
+                        break
+                
+                address_obj['settlement_type'] = settlement_type
+                address_obj['settlement'] = settlement
+        
+        # Вулиця (streetAddress)
+        street_address = address.get('streetAddress', {})
+        if isinstance(street_address, dict):
+            street_ua = street_address.get('uk_UA', '')
+            if street_ua:
+                # Парсимо вулицю (може бути "вулиця Івана Богуна" або "вул. Соборності, 7")
+                street_ua = street_ua.strip()
+                
+                # Спробуємо розділити тип вулиці, назву та номер будинку
+                # Формати можуть бути: "вул. Соборності, 7", "вул. Соборності 7", "вул. Соборності", "вулиця Івана Богуна"
+                street_parts = street_ua.split(',', 1)
+                street_part = street_parts[0].strip()
+                building_part = street_parts[1].strip() if len(street_parts) > 1 else ''
+                
+                # Розділяємо тип вулиці та назву
+                street_type_patterns = [
+                    'вулиця', 'вул.', 'просп.', 'бул.', 'пров.', 'пл.',
+                    'вулиця ', 'вул ', 'просп ', 'бул ', 'пров ', 'пл '
+                ]
+                street_type = ''
+                street = street_part
+                
+                for pattern in street_type_patterns:
+                    if street_part.startswith(pattern):
+                        # Конвертуємо "вулиця" в "вул."
+                        if pattern.startswith('вулиця'):
+                            street_type = 'вул.'
+                        else:
+                            street_type = pattern.rstrip(' ')
+                        street = street_part[len(pattern):].strip()
+                        break
+                
+                address_obj['street_type'] = street_type
+                address_obj['street'] = street
+                
+                # Номер будинку
+                if building_part:
+                    # Можуть бути формати: "7", "7 корпус А", "7, корпус А"
+                    building_part = building_part.replace(',', ' ').strip()
+                    building_parts = building_part.split(' ', 1)
+                    address_obj['building'] = building_parts[0]
+                    if len(building_parts) > 1:
+                        address_obj['building_part'] = building_parts[1]
+                else:
+                    # Спробуємо знайти номер будинку в кінці назви вулиці
+                    street_words = street.split()
+                    if street_words and street_words[-1].isdigit():
+                        address_obj['building'] = street_words[-1]
+                        address_obj['street'] = ' '.join(street_words[:-1])
+        
+        # Перевіряємо, чи є хоча б одна заповнена частина адреси
+        has_address = any([
+            address_obj['region'],
+            address_obj['settlement'],
+            address_obj['street'],
+            address_obj['building']
+        ])
+        
+        return address_obj if has_address else None
+
+    def _extract_addresses_from_items(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Витягує адреси з масиву items та конвертує їх у формат системи.
+        
+        Args:
+            data: Дані аукціону з auction.data
+            
+        Returns:
+            Список адрес у форматі системи (може бути порожнім)
+        """
+        items = data.get('items', [])
+        if not isinstance(items, list) or len(items) == 0:
+            return []
+        
+        addresses = []
+        for item in items:
+            address = item.get('address', {})
+            if address:
+                address_obj = self._extract_address_from_item_address(address)
+                if address_obj:
+                    addresses.append(address_obj)
+        
+        return addresses
+
+    def _is_area_unit(self, unit: str) -> bool:
+        """
+        Перевіряє, чи одиниця виміру є одиницею площі.
+        
+        Args:
+            unit: Одиниця виміру
+            
+        Returns:
+            True, якщо одиниця є одиницею площі
+        """
+        if not unit:
+            return False
+        
+        unit_lower = unit.lower()
+        # Одиниці площі
+        area_units = [
+            'гектар', 'hectare', 'га',
+            'квадратний метр', 'square metre', 'м²', 'м2', 'кв.м', 'кв м', 'квадратних метрів',
+            'сотка', 'соток', 'ar'
+        ]
+        
+        return any(area_unit in unit_lower for area_unit in area_units)
+    
+    def _normalize_area_unit(self, unit: str) -> str:
+        """
+        Нормалізує одиницю виміру площі до стандартного формату.
+        
+        Args:
+            unit: Одиниця виміру
+            
+        Returns:
+            Нормалізована одиниця виміру: 'гектар', 'м²', 'сотка' або порожній рядок
+        """
+        if not unit:
+            return ''
+        
+        unit_lower = unit.lower()
+        
+        # Гектари
+        if any(x in unit_lower for x in ['гектар', 'hectare', 'га']):
+            return 'гектар'
+        
+        # Квадратні метри
+        if any(x in unit_lower for x in ['квадратний метр', 'square metre', 'м²', 'м2', 'кв.м', 'кв м', 'квадратних метрів']):
+            return 'м²'
+        
+        # Сотки
+        if any(x in unit_lower for x in ['сотка', 'соток', 'ar']):
+            return 'сотка'
+        
+        return ''
+    
+    def _convert_area_to_sqm(self, value: float, unit: str) -> float:
+        """
+        Конвертує площу в квадратні метри.
+        
+        Args:
+            value: Значення площі
+            unit: Одиниця виміру ('гектар', 'м²', 'сотка', 'акр' тощо)
+            
+        Returns:
+            Площа в квадратних метрах
+        """
+        if not value or not unit:
+            return 0.0
+        
+        unit_lower = unit.lower()
+        
+        # Вже в квадратних метрах
+        if any(x in unit_lower for x in ['м²', 'м2', 'кв.м', 'кв м', 'квадратний метр', 'square metre']):
+            return float(value)
+        
+        # Гектари → м² (1 га = 10000 м²)
+        if any(x in unit_lower for x in ['гектар', 'hectare', 'га']):
+            return float(value) * 10000.0
+        
+        # Сотки → м² (1 сотка = 100 м²)
+        if any(x in unit_lower for x in ['сотка', 'соток', 'ar']):
+            return float(value) * 100.0
+        
+        # Акре → м² (1 акр ≈ 4046.86 м²)
+        if any(x in unit_lower for x in ['акр', 'acre', 'ac']):
+            return float(value) * 4046.86
+        
+        # Якщо одиниця невідома, повертаємо як є (припускаємо, що це вже м²)
+        return float(value)
+    
+    def _convert_area_to_hectares(self, value: float, unit: str) -> float:
+        """
+        Конвертує площу в гектари.
+        
+        Args:
+            value: Значення площі
+            unit: Одиниця виміру ('гектар', 'м²', 'сотка', 'акр' тощо)
+            
+        Returns:
+            Площа в гектарах
+        """
+        if not value or not unit:
+            return 0.0
+        
+        unit_lower = unit.lower()
+        
+        # Вже в гектарах
+        if any(x in unit_lower for x in ['гектар', 'hectare', 'га']):
+            return float(value)
+        
+        # м² → га (1 м² = 0.0001 га)
+        if any(x in unit_lower for x in ['м²', 'м2', 'кв.м', 'кв м', 'квадратний метр', 'square metre']):
+            return float(value) * 0.0001
+        
+        # Сотки → га (1 сотка = 0.01 га)
+        if any(x in unit_lower for x in ['сотка', 'соток', 'ar']):
+            return float(value) * 0.01
+        
+        # Акре → га (1 акр ≈ 0.404686 га)
+        if any(x in unit_lower for x in ['акр', 'acre', 'ac']):
+            return float(value) * 0.404686
+        
+        # Якщо одиниця невідома, припускаємо що це м²
+        return float(value) * 0.0001
+    
+    def _extract_areas_from_items(self, data: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Витягує та сумує площі нерухомості та земельних ділянок з усіх items.
+        Аналізує кількість об'єктів, щоб уникнути подвійного підрахунку.
+        
+        Args:
+            data: Дані аукціону з auction.data
+            
+        Returns:
+            Dict з ключами 'building_area_sqm' (площа нерухомості в м²) та 'land_area_ha' (площа землі в га)
+        """
+        result = {
+            'building_area_sqm': 0.0,
+            'land_area_ha': 0.0
+        }
+        
+        items = data.get('items', [])
+        if not isinstance(items, list) or len(items) == 0:
+            return result
+        
+        # Аналізуємо items для визначення унікальних об'єктів
+        # Групуємо items за ID, кадастровим номером або комбінацією полів, щоб уникнути подвійного підрахунку
+        processed_items = set()  # Множина оброблених унікальних ідентифікаторів
+        
+        for item in items:
+            # Формуємо унікальний ідентифікатор об'єкта
+            item_id = item.get('id', '')
+            item_props = item.get('itemProps', {})
+            cadastral_number = item_props.get('cadastralNumber', '') if item_props else ''
+            
+            # Використовуємо item_id якщо є, інакше кадастровий номер, інакше індекс
+            unique_id = item_id if item_id else (cadastral_number if cadastral_number else f"item_{items.index(item)}")
+            
+            if unique_id in processed_items:
+                continue  # Пропускаємо дублікати
+            
+            # Визначаємо тип об'єкта
+            item_props_type = item_props.get('itemPropsType', '')
+            classification = item.get('classification', {})
+            class_id = classification.get('id', '') if classification else ''
+            
+            # Визначаємо одиницю виміру
+            unit = item.get('unit', {})
+            unit_ua = ''
+            if unit:
+                unit_name = unit.get('name', {})
+                if isinstance(unit_name, dict):
+                    unit_ua = unit_name.get('uk_UA', '')
+            
+            # Перевіряємо, чи одиниця виміру є одиницею площі
+            is_area_unit = self._is_area_unit(unit_ua) if unit_ua else False
+            
+            if not is_area_unit:
+                continue  # Пропускаємо, якщо одиниця не є одиницею площі
+            
+            normalized_unit = self._normalize_area_unit(unit_ua)
+            
+            # Для землі використовуємо landArea
+            if item_props_type == 'land' or (class_id and class_id.startswith('06')):
+                land_area = item_props.get('landArea')
+                if land_area is not None:
+                    # Конвертуємо в гектари
+                    if normalized_unit == 'гектар':
+                        area_ha = float(land_area)
+                    elif normalized_unit == 'м²':
+                        area_ha = float(land_area) * 0.0001
+                    elif normalized_unit == 'сотка':
+                        area_ha = float(land_area) * 0.01
+                    else:
+                        # Якщо одиниця невідома, припускаємо гектари
+                        area_ha = float(land_area)
+                    
+                    result['land_area_ha'] += area_ha
+                    processed_items.add(unique_id)
+            else:
+                # Для будівель/нерухомості використовуємо totalObjectArea або totalBuildingArea
+                total_object_area = item_props.get('totalObjectArea')
+                total_building_area = item_props.get('totalBuildingArea')
+                usable_area = item_props.get('usableArea')
+                
+                # Пріоритет: totalObjectArea > totalBuildingArea > usableArea
+                building_area = None
+                if total_object_area is not None:
+                    building_area = total_object_area
+                elif total_building_area is not None:
+                    building_area = total_building_area
+                elif usable_area is not None:
+                    building_area = usable_area
+                
+                if building_area is not None:
+                    # Конвертуємо в квадратні метри
+                    if normalized_unit == 'м²':
+                        area_sqm = float(building_area)
+                    elif normalized_unit == 'гектар':
+                        area_sqm = float(building_area) * 10000.0
+                    elif normalized_unit == 'сотка':
+                        area_sqm = float(building_area) * 100.0
+                    else:
+                        # Якщо одиниця невідома, припускаємо м²
+                        area_sqm = float(building_area)
+                    
+                    result['building_area_sqm'] += area_sqm
+                    processed_items.add(unique_id)
         
         return result
 
@@ -926,7 +1532,7 @@ class ProZorroService:
         file_path = f'{output_dir}/{filename}'
 
         # Порядок колонок: Область, Населений пункт, Адреса, Тип нерухомості, Кадастровий номер,
-        # Площа, Стартова ціна, Розмір взносу, Дата торгів, Дата фінальної подачі документів,
+        # Площа нерухомості (кв. м.), Площа земельної ділянки (га), Стартова ціна, Розмір взносу, Дата торгів, Дата фінальної подачі документів,
         # Мінімальна кількість учасників, Кількість зареєстрованих учасників, Арешти, Опис, Посилання, Код класифікатора
         fieldnames = [
             'address_region',                    # Область
@@ -934,7 +1540,8 @@ class ProZorroService:
             'address',                           # Адреса
             'property_type',                     # Тип нерухомості
             'cadastral_number',                  # Кадастровий номер
-            'area',                              # Площа
+            'building_area_sqm',                 # Площа нерухомості (кв. м.)
+            'land_area_ha',                      # Площа земельної ділянки (га)
             'base_price',                        # Стартова ціна
             'deposit_amount',                    # Розмір взносу
             'auction_start_date',                # Дата торгів
@@ -954,7 +1561,8 @@ class ProZorroService:
             'address': 'Адреса',
             'property_type': 'Тип нерухомості',
             'cadastral_number': 'Кадастровий номер',
-            'area': 'Площа',
+            'building_area_sqm': 'Площа нерухомості (кв. м.)',
+            'land_area_ha': 'Площа земельної ділянки (га)',
             'base_price': 'Стартова ціна',
             'deposit_amount': 'Розмір взносу',
             'auction_start_date': 'Дата торгів',
@@ -1051,7 +1659,7 @@ class ProZorroService:
             # Арешти
             arrests_data = data.get('arrests', [])
             
-            # Спочатку витягуємо структуровані дані з items (якщо є)
+            # Спочатку витягуємо структуровані дані з items (якщо є) - fallback
             structured_info = self._extract_structured_info_from_items(data)
             
             # Перевірка, чи це аренда (якщо так - пропускаємо обробку через LLM)
@@ -1064,6 +1672,7 @@ class ProZorroService:
                 parsed_info = structured_info.copy()  # Починаємо зі структурованих даних
             
             if description and self.llm_service and not is_rental:
+                import traceback
                 try:
                     # Спочатку перевіряємо кеш
                     cached_result = self.llm_cache_service.get_cached_result(description)
@@ -1073,6 +1682,7 @@ class ProZorroService:
                         llm_result = cached_result
                     else:
                         # Парсинг опису через LLM (прогрес-бар вже показує прогрес обробки)
+                        desc_hash = calculate_description_hash(description)
                         llm_result = self.llm_service.parse_auction_description(description)
                         # Зберігаємо результат в кеш
                         self.llm_cache_service.save_result(description, llm_result)
@@ -1080,14 +1690,15 @@ class ProZorroService:
                         llm_requests_count += 1
                     
                     # Об'єднуємо результати: структуровані дані мають пріоритет, але LLM може доповнити порожні поля
-                    # Обробляємо адреси з масиву
+                    # Спочатку витягуємо адреси з items (якщо є)
+                    items_addresses = self._extract_addresses_from_items(data)
+                    
+                    # Обробляємо адреси з масиву LLM
                     llm_addresses = llm_result.get('addresses', [])
-                    if llm_addresses:
-                        parsed_info['addresses'] = llm_addresses
-                    else:
+                    if not llm_addresses:
                         # Якщо немає масиву адрес, але є старі поля - створюємо адресу
                         if llm_result.get('address_region') or llm_result.get('address_city'):
-                            parsed_info['addresses'] = [{
+                            llm_addresses = [{
                                 'region': llm_result.get('address_region', ''),
                                 'district': llm_result.get('address_district', ''),
                                 'settlement_type': llm_result.get('address_settlement_type', ''),
@@ -1100,34 +1711,168 @@ class ProZorroService:
                                 'room': llm_result.get('address_room', '')
                             }]
                     
-                    # Об'єднуємо інші поля
-                    for key in ['cadastral_number', 'area', 'area_unit', 'floor', 'property_type', 'utilities', 'arrests_info']:
+                    # Формуємо фінальний масив адрес:
+                    # - Якщо є адреси з items - вони стають основними (першими)
+                    # - Адреси з LLM додаються як додаткові (після адрес з items)
+                    final_addresses = []
+                    if items_addresses:
+                        # Адреси з items - основні
+                        final_addresses.extend(items_addresses)
+                        # Додаємо адреси з LLM як додаткові
+                        final_addresses.extend(llm_addresses)
+                    else:
+                        # Якщо немає адрес з items - використовуємо адреси з LLM
+                        final_addresses = llm_addresses
+                    
+                    parsed_info['addresses'] = final_addresses
+                    
+                    # Об'єднуємо інші поля: структуровані дані мають пріоритет, LLM доповнює порожні
+                    for key in ['cadastral_number', 'floor', 'property_type', 'utilities', 'arrests_info']:
                         if not parsed_info.get(key) and llm_result.get(key):
                             parsed_info[key] = llm_result[key]
+                    
+                    # Окремо обробляємо площі з LLM - конвертуємо в стандартні одиниці та сумуємо
+                    # Площа нерухомості (building_area_sqm)
+                    if llm_result.get('building_area_sqm'):
+                        try:
+                            llm_building_area = float(str(llm_result.get('building_area_sqm', '')).replace(',', '.').replace(' ', ''))
+                            # Додаємо до існуючої площі (якщо є з items)
+                            current_building_area = parsed_info.get('building_area_sqm', 0.0)
+                            if isinstance(current_building_area, (int, float)):
+                                parsed_info['building_area_sqm'] = current_building_area + llm_building_area
+                            else:
+                                parsed_info['building_area_sqm'] = llm_building_area
+                        except (ValueError, AttributeError):
+                            pass
+                    
+                    # Площа землі (land_area_ha)
+                    if llm_result.get('land_area_ha'):
+                        try:
+                            llm_land_area = float(str(llm_result.get('land_area_ha', '')).replace(',', '.').replace(' ', ''))
+                            # Додаємо до існуючої площі (якщо є з items)
+                            current_land_area = parsed_info.get('land_area_ha', 0.0)
+                            if isinstance(current_land_area, (int, float)):
+                                parsed_info['land_area_ha'] = current_land_area + llm_land_area
+                            else:
+                                parsed_info['land_area_ha'] = llm_land_area
+                        except (ValueError, AttributeError):
+                            pass
+                    
+                    # Якщо є старі поля area та area_unit - конвертуємо їх (для сумісності зі старими кешами)
+                    if llm_result.get('area') and not llm_result.get('building_area_sqm') and not llm_result.get('land_area_ha'):
+                        try:
+                            old_area = float(str(llm_result.get('area', '')).replace(',', '.').replace(' ', ''))
+                            old_unit = llm_result.get('area_unit', '').lower()
+                            
+                            if any(x in old_unit for x in ['гектар', 'hectare', 'га']):
+                                # Додаємо до існуючої площі землі
+                                current_land_area = parsed_info.get('land_area_ha', 0.0)
+                                if isinstance(current_land_area, (int, float)):
+                                    parsed_info['land_area_ha'] = current_land_area + old_area
+                                else:
+                                    parsed_info['land_area_ha'] = old_area
+                            elif any(x in old_unit for x in ['м²', 'м2', 'кв.м', 'квадратний метр']):
+                                # Додаємо до існуючої площі нерухомості
+                                current_building_area = parsed_info.get('building_area_sqm', 0.0)
+                                if isinstance(current_building_area, (int, float)):
+                                    parsed_info['building_area_sqm'] = current_building_area + old_area
+                                else:
+                                    parsed_info['building_area_sqm'] = old_area
+                            elif any(x in old_unit for x in ['сотка', 'соток']):
+                                # Сотки - визначаємо за значенням
+                                if old_area < 100:
+                                    # Швидше за все це гектари (менше 1 га)
+                                    area_ha = old_area * 0.01
+                                    current_land_area = parsed_info.get('land_area_ha', 0.0)
+                                    if isinstance(current_land_area, (int, float)):
+                                        parsed_info['land_area_ha'] = current_land_area + area_ha
+                                    else:
+                                        parsed_info['land_area_ha'] = area_ha
+                                else:
+                                    # Швидше за все це м²
+                                    area_sqm = old_area * 100
+                                    current_building_area = parsed_info.get('building_area_sqm', 0.0)
+                                    if isinstance(current_building_area, (int, float)):
+                                        parsed_info['building_area_sqm'] = current_building_area + area_sqm
+                                    else:
+                                        parsed_info['building_area_sqm'] = area_sqm
+                            else:
+                                # Якщо одиниця невідома - визначаємо за значенням
+                                if old_area > 1000:
+                                    current_building_area = parsed_info.get('building_area_sqm', 0.0)
+                                    if isinstance(current_building_area, (int, float)):
+                                        parsed_info['building_area_sqm'] = current_building_area + old_area
+                                    else:
+                                        parsed_info['building_area_sqm'] = old_area
+                                elif old_area < 10:
+                                    current_land_area = parsed_info.get('land_area_ha', 0.0)
+                                    if isinstance(current_land_area, (int, float)):
+                                        parsed_info['land_area_ha'] = current_land_area + old_area
+                                    else:
+                                        parsed_info['land_area_ha'] = old_area
+                        except (ValueError, AttributeError):
+                            pass
                 except KeyboardInterrupt:
                     # Переривання користувача - пробрасуємо далі
                     raise
                 except Exception as e:
+                    # Детальне логування помилки
+                    error_traceback = traceback.format_exc()
+                    desc_hash = calculate_description_hash(description) if description else None
+                    description_preview = description[:200] + "..." if len(description) > 200 else description
+                    print(f"\n[LLM ПОМИЛКА] Помилка обробки через LLM для аукціону {auction_id}")
+                    print(f"[LLM ПОМИЛКА] Хеш опису: {desc_hash[:16] if desc_hash else 'N/A'}...")
+                    print(f"[LLM ПОМИЛКА] Тип помилки: {type(e).__name__}")
+                    print(f"[LLM ПОМИЛКА] Повідомлення: {str(e)}")
+                    print(f"[LLM ПОМИЛКА] Опис (перші 200 символів): {description_preview}")
+                    print(f"[LLM ПОМИЛКА] Повний traceback:")
+                    print(error_traceback)
+                    
+                    # Логуємо в сервіс логування
+                    try:
+                        self.logging_service.log_app_event(
+                            message=f"Помилка обробки через LLM для аукціону {auction_id}",
+                            event_type='llm_error',
+                            metadata={
+                                'auction_id': auction_id,
+                                'description_hash': desc_hash[:16] if desc_hash else None,
+                                'description_preview': description_preview,
+                                'error_type': type(e).__name__,
+                                'error_message': str(e)
+                            },
+                            error=error_traceback
+                        )
+                    except:
+                        pass
+                    
                     # Інші помилки - просто пропускаємо парсинг для цього аукціону
                     pass
             
-            # Обробляємо адреси
+            # Обробляємо адреси: перевіряємо, чи є адреси з items (якщо LLM не використовувався)
             addresses = parsed_info.get('addresses', [])
             if not addresses:
-                # Якщо немає масиву адрес, але є старі поля - створюємо адресу
-                if parsed_info.get('address_region') or parsed_info.get('address_city'):
-                    addresses = [{
-                        'region': parsed_info.get('address_region', ''),
-                        'district': parsed_info.get('address_district', ''),
-                        'settlement_type': parsed_info.get('address_settlement_type', ''),
-                        'settlement': parsed_info.get('address_city', ''),
-                        'settlement_district': parsed_info.get('address_settlement_district', ''),
-                        'street_type': parsed_info.get('address_street_type', ''),
-                        'street': parsed_info.get('address_street', ''),
-                        'building': parsed_info.get('address_building', ''),
-                        'building_part': parsed_info.get('address_building_part', ''),
-                        'room': parsed_info.get('address_room', '')
-                    }]
+                # Якщо немає масиву адрес, спочатку перевіряємо items
+                items_addresses = self._extract_addresses_from_items(data)
+                if items_addresses:
+                    addresses = items_addresses
+                else:
+                    # Якщо немає адрес з items, але є старі поля - створюємо адресу
+                    if parsed_info.get('address_region') or parsed_info.get('address_city'):
+                        addresses = [{
+                            'region': parsed_info.get('address_region', ''),
+                            'district': parsed_info.get('address_district', ''),
+                            'settlement_type': parsed_info.get('address_settlement_type', ''),
+                            'settlement': parsed_info.get('address_city', ''),
+                            'settlement_district': parsed_info.get('address_settlement_district', ''),
+                            'street_type': parsed_info.get('address_street_type', ''),
+                            'street': parsed_info.get('address_street', ''),
+                            'building': parsed_info.get('address_building', ''),
+                            'building_part': parsed_info.get('address_building_part', ''),
+                            'room': parsed_info.get('address_room', '')
+                        }]
+            
+            # Оновлюємо parsed_info з фінальним масивом адрес
+            parsed_info['addresses'] = addresses
             
             # Беремо першу адресу для полів область та місто
             first_address = addresses[0] if addresses else {}
@@ -1153,14 +1898,33 @@ class ProZorroService:
                     parsed_info.get('address_building', '')
                 )
             
-            # Формуємо площу з одиницею
-            area = ''
-            area_value = parsed_info.get('area', '')
-            area_unit = parsed_info.get('area_unit', '')
-            if area_value:
-                area = str(area_value)
-                if area_unit:
-                    area += f' {area_unit}'
+            # Формуємо площі нерухомості та землі окремо
+            # Беремо площі зі структурованих даних (items) та з LLM, об'єднуємо їх
+            building_area_sqm = parsed_info.get('building_area_sqm', 0.0)
+            land_area_ha = parsed_info.get('land_area_ha', 0.0)
+            
+            # Конвертуємо в числа
+            try:
+                if building_area_sqm:
+                    if isinstance(building_area_sqm, str):
+                        building_area_sqm = float(str(building_area_sqm).replace(',', '.').replace(' ', ''))
+                    else:
+                        building_area_sqm = float(building_area_sqm)
+                else:
+                    building_area_sqm = 0.0
+            except (ValueError, AttributeError, TypeError):
+                building_area_sqm = 0.0
+            
+            try:
+                if land_area_ha:
+                    if isinstance(land_area_ha, str):
+                        land_area_ha = float(str(land_area_ha).replace(',', '.').replace(' ', ''))
+                    else:
+                        land_area_ha = float(land_area_ha)
+                else:
+                    land_area_ha = 0.0
+            except (ValueError, AttributeError, TypeError):
+                land_area_ha = 0.0
             
             # Формуємо арешти
             arrests_info = format_arrests(arrests_data, parsed_info.get('arrests_info', ''))
@@ -1197,7 +1961,8 @@ class ProZorroService:
                 'address': ensure_string(address),
                 'property_type': ensure_string(parsed_info.get('property_type', '')),
                 'cadastral_number': ensure_string(parsed_info.get('cadastral_number', '')),
-                'area': ensure_string(area),
+                'building_area_sqm': ensure_string(building_area_sqm) if building_area_sqm > 0 else '',
+                'land_area_ha': ensure_string(land_area_ha) if land_area_ha > 0 else '',
                 'base_price': ensure_string(base_price),
                 'deposit_amount': ensure_string(deposit_amount),
                 'auction_start_date': ensure_string(auction_start_date),
@@ -1264,7 +2029,7 @@ class ProZorroService:
     def generate_excel_from_db(self, days: int) -> Optional[BytesIO]:
         """
         Генерує Excel файл в пам'яті з даних БД за період до збереженої дати оновлення.
-        Не виконує звернень до API і LLM.
+        Викликає LLM для аукціонів, у яких description_hash є в БД, але немає в кеші LLM.
         
         Args:
             days: Кількість днів періоду (1 або 7)
@@ -1280,13 +2045,71 @@ class ProZorroService:
         if not auctions_docs:
             return None
         
-        # Конвертуємо документи БД в AuctionDTO
+        # Конвертуємо документи БД в AuctionDTO та перевіряємо кеш LLM
+        # Навіть якщо версія не змінилась, перевіряємо кеш на випадок зміни промпту
         auctions = []
         for doc in auctions_docs:
             auction_data = doc.get('auction_data', {})
+            description_hash = doc.get('description_hash')
+            
             if auction_data:
                 try:
                     auction = AuctionDTO.from_dict(auction_data)
+                    # Перевіряємо, чи є description_hash і чи є він в кеші
+                    # Навіть якщо версія не змінилась, перевіряємо кеш на випадок зміни промпту
+                    if description_hash:
+                        cached_entry = self.llm_cache_service.repository.find_by_description_hash(description_hash)
+                        if not cached_entry:
+                            # Якщо хеш є в БД, але немає в кеші - потрібно викликати LLM
+                            # Передаємо опис для обробки
+                            description = ''
+                            if 'description' in auction_data:
+                                desc_obj = auction_data['description']
+                                if isinstance(desc_obj, dict):
+                                    description = desc_obj.get('uk_UA', desc_obj.get('en_US', ''))
+                                elif isinstance(desc_obj, str):
+                                    description = desc_obj
+                            
+                            if description and self.llm_service and not self._is_rental_auction(auction_data):
+                                import traceback
+                                try:
+                                    # Викликаємо LLM для парсингу
+                                    auction_id_from_doc = doc.get('auction_id', 'unknown')
+                                    desc_hash = calculate_description_hash(description)
+                                    llm_result = self.llm_service.parse_auction_description(description)
+                                    # Зберігаємо результат в кеш
+                                    self.llm_cache_service.save_result(description, llm_result)
+                                except Exception as e:
+                                    # Детальне логування помилки
+                                    error_traceback = traceback.format_exc()
+                                    auction_id_from_doc = doc.get('auction_id', 'unknown')
+                                    desc_hash = calculate_description_hash(description) if description else None
+                                    description_preview = description[:200] + "..." if len(description) > 200 else description
+                                    print(f"\n[LLM ПОМИЛКА] Помилка обробки через LLM для аукціону {auction_id_from_doc}")
+                                    print(f"[LLM ПОМИЛКА] Хеш опису: {desc_hash[:16] if desc_hash else 'N/A'}...")
+                                    print(f"[LLM ПОМИЛКА] Тип помилки: {type(e).__name__}")
+                                    print(f"[LLM ПОМИЛКА] Повідомлення: {str(e)}")
+                                    print(f"[LLM ПОМИЛКА] Опис (перші 200 символів): {description_preview}")
+                                    print(f"[LLM ПОМИЛКА] Повний traceback:")
+                                    print(error_traceback)
+                                    
+                                    # Логуємо в сервіс логування
+                                    try:
+                                        self.logging_service.log_app_event(
+                                            message=f"Помилка обробки через LLM для аукціону {auction_id_from_doc}",
+                                            event_type='llm_error',
+                                            metadata={
+                                                'auction_id': auction_id_from_doc,
+                                                'description_hash': desc_hash[:16] if desc_hash else None,
+                                                'description_preview': description_preview,
+                                                'error_type': type(e).__name__,
+                                                'error_message': str(e)
+                                            },
+                                            error=error_traceback
+                                        )
+                                    except:
+                                        pass
+                    
                     auctions.append(auction)
                 except Exception as e:
                     print(f"Помилка конвертації аукціону з БД: {e}")
@@ -1295,14 +2118,14 @@ class ProZorroService:
         if not auctions:
             return None
         
-        # Формуємо дані для Excel (використовуємо ту саму логіку, що і в save_auctions_to_csv)
-        # Але без обробки через LLM - використовуємо тільки структуровані дані
-        excel_data = self._prepare_auctions_data_for_excel(auctions, skip_llm=True)
+        # Формуємо дані для Excel з обробкою через LLM (якщо потрібно)
+        # Використовуємо стандартний метод з fallback на структуровані дані
+        excel_data = self._prepare_auctions_data_for_excel(auctions, skip_llm=False)
         
         # Визначаємо fieldnames та column_headers
         fieldnames = [
             'address_region', 'address_city', 'address', 'property_type',
-            'cadastral_number', 'area', 'base_price', 'deposit_amount',
+            'cadastral_number', 'building_area_sqm', 'land_area_ha', 'base_price', 'deposit_amount',
             'auction_start_date', 'document_submission_deadline',
             'min_participants_count', 'participants_count', 'arrests_info',
             'description', 'auction_url', 'classification_code'
@@ -1314,7 +2137,8 @@ class ProZorroService:
             'address': 'Адреса',
             'property_type': 'Тип нерухомості',
             'cadastral_number': 'Кадастровий номер',
-            'area': 'Площа',
+            'building_area_sqm': 'Площа нерухомості (кв. м.)',
+            'land_area_ha': 'Площа земельної ділянки (га)',
             'base_price': 'Стартова ціна',
             'deposit_amount': 'Розмір взносу',
             'auction_start_date': 'Дата торгів',
@@ -1329,6 +2153,398 @@ class ProZorroService:
         
         # Генеруємо Excel в пам'яті
         return generate_excel_in_memory(excel_data, fieldnames, column_headers)
+    
+    def _prepare_auctions_data_for_excel_with_hashes(
+        self,
+        auctions_with_hashes: List[tuple]
+    ) -> List[Dict[str, Any]]:
+        """
+        Підготовлює дані аукціонів для збереження в Excel з урахуванням description_hash.
+        Використовує тільки результати LLM, без fallback на структуровані дані.
+        
+        Args:
+            auctions_with_hashes: Список кортежів (AuctionDTO, description_hash)
+            
+        Returns:
+            Список словників з даними для Excel
+        """
+        def ensure_string(value):
+            """Конвертує значення в рядок, обробляючи None та інші типи."""
+            if value is None:
+                return ''
+            return str(value)
+        
+        def format_full_address(address_obj: Dict[str, Any]) -> str:
+            """Формує повну адресу з об'єкта адреси."""
+            parts = []
+            if address_obj.get('region'):
+                parts.append(address_obj['region'])
+            if address_obj.get('district'):
+                parts.append(address_obj['district'])
+            settlement_type = address_obj.get('settlement_type', '')
+            settlement = address_obj.get('settlement', '')
+            if settlement:
+                if settlement_type:
+                    parts.append(f"{settlement_type} {settlement}")
+                else:
+                    parts.append(settlement)
+            if address_obj.get('settlement_district'):
+                parts.append(address_obj['settlement_district'])
+            street_type = address_obj.get('street_type', '')
+            street = address_obj.get('street', '')
+            if street:
+                if street_type:
+                    parts.append(f"{street_type} {street}")
+                else:
+                    parts.append(street)
+            if address_obj.get('building'):
+                parts.append(address_obj['building'])
+            if address_obj.get('building_part'):
+                parts.append(address_obj['building_part'])
+            if address_obj.get('room'):
+                parts.append(address_obj['room'])
+            return ', '.join(parts) if parts else ''
+        
+        def format_date(date_str: str) -> str:
+            """Форматує дату у форматі дд.ММ.рррр ГГ:ХХ."""
+            if not date_str:
+                return ''
+            try:
+                if date_str.endswith('Z'):
+                    date_str = date_str.replace('Z', '+00:00')
+                dt = datetime.fromisoformat(date_str)
+                if dt.tzinfo:
+                    dt = dt.astimezone(timezone.utc)
+                return dt.strftime('%d.%m.%Y %H:%M')
+            except (ValueError, AttributeError):
+                return str(date_str)
+        
+        excel_data = []
+        
+        for auction, description_hash in auctions_with_hashes:
+            if not auction.data:
+                continue
+            
+            data = auction.data
+            
+            # Посилання на аукціон
+            auction_id = data.get('auctionId') or data.get('_id') or auction.id
+            auction_url = f"https://prozorro.sale/auction/{auction_id}"
+            
+            # Опис
+            description = ''
+            if 'description' in data:
+                desc_obj = data['description']
+                if isinstance(desc_obj, dict):
+                    description = desc_obj.get('uk_UA', desc_obj.get('en_US', ''))
+                elif isinstance(desc_obj, str):
+                    description = desc_obj
+            
+            # Дата старту торгів
+            auction_start_date = ''
+            auction_period = data.get('auctionPeriod', {})
+            if auction_period and 'startDate' in auction_period:
+                auction_start_date = format_date(auction_period['startDate'])
+            
+            # Дата фінальної подачі документів
+            document_submission_deadline = ''
+            enquiry_period = data.get('enquiryPeriod', {})
+            if enquiry_period and 'endDate' in enquiry_period:
+                document_submission_deadline = format_date(enquiry_period['endDate'])
+            else:
+                qualification_period = data.get('qualificationPeriod', {})
+                if qualification_period and 'endDate' in qualification_period:
+                    document_submission_deadline = format_date(qualification_period['endDate'])
+            
+            # Кількість учасників
+            bids = data.get('bids', [])
+            participants_count = len(bids) if isinstance(bids, list) else 0
+            
+            # Мінімальна кількість учасників
+            min_participants_count = data.get('minNumberOfQualifiedBids', '')
+            if min_participants_count:
+                min_participants_count = str(min_participants_count)
+            
+            # Базова ставка (стартова ціна)
+            base_price = ''
+            value = data.get('value', {})
+            if value and 'amount' in value:
+                base_price = str(value['amount'])
+                currency = value.get('currency', '')
+                if currency:
+                    base_price += f' {currency}'
+            
+            # Розмір взносу
+            deposit_amount = ''
+            guarantee = data.get('guarantee', {})
+            if guarantee and 'amount' in guarantee:
+                deposit_amount = str(guarantee['amount'])
+                currency = guarantee.get('currency', '')
+                if currency:
+                    deposit_amount += f' {currency}'
+            
+            # Арешти
+            arrests_data = data.get('arrests', [])
+            
+            # Спочатку витягуємо структуровані дані з items (якщо є) - fallback
+            structured_info = self._extract_structured_info_from_items(data)
+            
+            # Перевірка, чи це аренда
+            is_rental = self._is_rental_auction(data)
+            if is_rental:
+                # Пропускаємо обробку через LLM для аренди, використовуємо тільки структуровані дані
+                parsed_info = structured_info
+            else:
+                # Парсинг опису через LLM для отримання структурованої інформації
+                parsed_info = structured_info.copy()  # Починаємо зі структурованих даних
+            
+            if description and self.llm_service and not is_rental:
+                import traceback
+                try:
+                    cached_result = self.llm_cache_service.get_cached_result(description)
+                    if cached_result is not None:
+                        llm_result = cached_result
+                    else:
+                        # Якщо немає в кеші, але є description_hash - викликаємо LLM
+                        # (description_hash вказує, що раніше був виклик LLM для цього опису)
+                        desc_hash = calculate_description_hash(description)
+                        if description_hash:
+                            llm_result = self.llm_service.parse_auction_description(description)
+                            self.llm_cache_service.save_result(description, llm_result)
+                        else:
+                            # Якщо немає description_hash - це новий опис, також викликаємо LLM
+                            llm_result = self.llm_service.parse_auction_description(description)
+                            self.llm_cache_service.save_result(description, llm_result)
+                    
+                    if llm_result:
+                        # Об'єднуємо результати: структуровані дані мають пріоритет, але LLM може доповнити порожні поля
+                        llm_addresses = llm_result.get('addresses', [])
+                        if llm_addresses:
+                            parsed_info['addresses'] = llm_addresses
+                        elif llm_result.get('address_region') or llm_result.get('address_city'):
+                            parsed_info['addresses'] = [{
+                                'region': llm_result.get('address_region', ''),
+                                'district': llm_result.get('address_district', ''),
+                                'settlement_type': llm_result.get('address_settlement_type', ''),
+                                'settlement': llm_result.get('address_city', ''),
+                                'settlement_district': llm_result.get('address_settlement_district', ''),
+                                'street_type': llm_result.get('address_street_type', ''),
+                                'street': llm_result.get('address_street', ''),
+                                'building': llm_result.get('address_building', ''),
+                                'building_part': llm_result.get('address_building_part', ''),
+                                'room': llm_result.get('address_room', '')
+                            }]
+                        
+                        # Об'єднуємо інші поля: структуровані дані мають пріоритет, LLM доповнює порожні
+                        for key in ['cadastral_number', 'floor', 'property_type', 'utilities', 'arrests_info']:
+                            if not parsed_info.get(key) and llm_result.get(key):
+                                parsed_info[key] = llm_result[key]
+                        
+                        # Окремо обробляємо площі з LLM - конвертуємо в стандартні одиниці
+                        # Площа нерухомості (building_area_sqm)
+                        if llm_result.get('building_area_sqm'):
+                            try:
+                                llm_building_area = float(str(llm_result.get('building_area_sqm', '')).replace(',', '.').replace(' ', ''))
+                                # Додаємо до існуючої площі (якщо є з items)
+                                current_building_area = parsed_info.get('building_area_sqm', 0.0)
+                                if isinstance(current_building_area, (int, float)):
+                                    parsed_info['building_area_sqm'] = current_building_area + llm_building_area
+                                else:
+                                    parsed_info['building_area_sqm'] = llm_building_area
+                            except (ValueError, AttributeError):
+                                pass
+                        
+                        # Площа землі (land_area_ha)
+                        if llm_result.get('land_area_ha'):
+                            try:
+                                llm_land_area = float(str(llm_result.get('land_area_ha', '')).replace(',', '.').replace(' ', ''))
+                                # Додаємо до існуючої площі (якщо є з items)
+                                current_land_area = parsed_info.get('land_area_ha', 0.0)
+                                if isinstance(current_land_area, (int, float)):
+                                    parsed_info['land_area_ha'] = current_land_area + llm_land_area
+                                else:
+                                    parsed_info['land_area_ha'] = llm_land_area
+                            except (ValueError, AttributeError):
+                                pass
+                except Exception as e:
+                    # Детальне логування помилки
+                    error_traceback = traceback.format_exc()
+                    desc_hash = calculate_description_hash(description) if description else None
+                    description_preview = description[:200] + "..." if len(description) > 200 else description
+                    print(f"\n[LLM ПОМИЛКА] Помилка обробки через LLM для аукціону {auction_id}")
+                    print(f"[LLM ПОМИЛКА] Хеш опису: {desc_hash[:16] if desc_hash else 'N/A'}...")
+                    print(f"[LLM ПОМИЛКА] Тип помилки: {type(e).__name__}")
+                    print(f"[LLM ПОМИЛКА] Повідомлення: {str(e)}")
+                    print(f"[LLM ПОМИЛКА] Опис (перші 200 символів): {description_preview}")
+                    print(f"[LLM ПОМИЛКА] Повний traceback:")
+                    print(error_traceback)
+                    
+                    # Логуємо в сервіс логування
+                    try:
+                        self.logging_service.log_app_event(
+                            message=f"Помилка обробки через LLM для аукціону {auction_id}",
+                            event_type='llm_error',
+                            metadata={
+                                'auction_id': auction_id,
+                                'description_hash': desc_hash[:16] if desc_hash else None,
+                                'description_preview': description_preview,
+                                'error_type': type(e).__name__,
+                                'error_message': str(e)
+                            },
+                            error=error_traceback
+                        )
+                    except:
+                        pass
+            
+            # Обробляємо адреси: перевіряємо, чи є адреси з items (якщо LLM не використовувався)
+            addresses = parsed_info.get('addresses', [])
+            if not addresses:
+                # Якщо немає масиву адрес, спочатку перевіряємо items
+                items_addresses = self._extract_addresses_from_items(data)
+                if items_addresses:
+                    addresses = items_addresses
+                else:
+                    # Якщо немає адрес з items, але є старі поля - створюємо адресу
+                    if parsed_info.get('address_region') or parsed_info.get('address_city'):
+                        addresses = [{
+                            'region': parsed_info.get('address_region', ''),
+                            'district': parsed_info.get('address_district', ''),
+                            'settlement_type': parsed_info.get('address_settlement_type', ''),
+                            'settlement': parsed_info.get('address_city', ''),
+                            'settlement_district': parsed_info.get('address_settlement_district', ''),
+                            'street_type': parsed_info.get('address_street_type', ''),
+                            'street': parsed_info.get('address_street', ''),
+                            'building': parsed_info.get('address_building', ''),
+                            'building_part': parsed_info.get('address_building_part', ''),
+                            'room': parsed_info.get('address_room', '')
+                        }]
+            
+            # Оновлюємо parsed_info з фінальним масивом адрес
+            parsed_info['addresses'] = addresses
+            
+            first_address = addresses[0] if addresses else {}
+            address_region = first_address.get('region', '')
+            address_city = first_address.get('settlement', '')
+            
+            if addresses:
+                formatted_addresses = []
+                for idx, addr in enumerate(addresses, 1):
+                    formatted_addr = format_full_address(addr)
+                    if formatted_addr:
+                        if len(addresses) > 1:
+                            formatted_addresses.append(f"адреса {idx}: {formatted_addr}")
+                        else:
+                            formatted_addresses.append(formatted_addr)
+                address = ', '.join(formatted_addresses) if formatted_addresses else ''
+            else:
+                address = ''
+            
+            # Формуємо площі нерухомості та землі окремо
+            # Беремо площі зі структурованих даних (items) та з LLM, об'єднуємо їх
+            building_area_sqm = parsed_info.get('building_area_sqm', 0.0)
+            land_area_ha = parsed_info.get('land_area_ha', 0.0)
+            
+            # Конвертуємо в числа
+            try:
+                if building_area_sqm:
+                    if isinstance(building_area_sqm, str):
+                        building_area_sqm = float(str(building_area_sqm).replace(',', '.').replace(' ', ''))
+                    else:
+                        building_area_sqm = float(building_area_sqm)
+                else:
+                    building_area_sqm = 0.0
+            except (ValueError, AttributeError, TypeError):
+                building_area_sqm = 0.0
+            
+            try:
+                if land_area_ha:
+                    if isinstance(land_area_ha, str):
+                        land_area_ha = float(str(land_area_ha).replace(',', '.').replace(' ', ''))
+                    else:
+                        land_area_ha = float(land_area_ha)
+                else:
+                    land_area_ha = 0.0
+            except (ValueError, AttributeError, TypeError):
+                land_area_ha = 0.0
+            
+            # Формуємо арешти
+            arrests_info = ''
+            if arrests_data and isinstance(arrests_data, list):
+                arrests_parts = []
+                for idx, arrest in enumerate(arrests_data, 1):
+                    if isinstance(arrest, dict):
+                        restriction_org = arrest.get('restrictionOrganization', '')
+                        restriction_date = arrest.get('restrictionDate', '')
+                        is_removable = arrest.get('isRemovable', False)
+                        
+                        date_str = format_date(restriction_date) if restriction_date else ''
+                        org_str = ''
+                        if restriction_org:
+                            if isinstance(restriction_org, dict):
+                                org_str = restriction_org.get('Видавник', restriction_org.get('name', str(restriction_org)))
+                            else:
+                                org_str = str(restriction_org)
+                        
+                        arrest_parts = []
+                        if org_str:
+                            arrest_parts.append(f"Видав {org_str}")
+                        if date_str:
+                            arrest_parts.append(f"Дата: {date_str}")
+                        arrest_parts.append(f"Можливе зняття {'так' if is_removable else 'ні'}")
+                        arrests_parts.append(f"Арешт {idx}: {', '.join(arrest_parts)}")
+                arrests_info = '\n'.join(arrests_parts) if arrests_parts else ''
+            elif parsed_info.get('arrests_info'):
+                arrests_info = parsed_info.get('arrests_info', '')
+            
+            # Код класифікатора
+            classification_code = ''
+            has_additional_classification_03_07 = False
+            items = data.get('items', [])
+            if isinstance(items, list) and len(items) > 0:
+                for item in items:
+                    classification = item.get('classification', {})
+                    if classification:
+                        scheme = classification.get('scheme', '')
+                        class_id = classification.get('id', '')
+                        if scheme == 'CAV' and class_id:
+                            classification_code = class_id
+                            break
+                    
+                    additional_classifications = item.get('additionalClassifications', [])
+                    if isinstance(additional_classifications, list):
+                        for add_class in additional_classifications:
+                            if isinstance(add_class, dict):
+                                add_class_id = add_class.get('id', '')
+                                if add_class_id == '03.07':
+                                    has_additional_classification_03_07 = True
+                                    break
+                    if has_additional_classification_03_07:
+                        break
+            
+            auction_row = {
+                'address_region': ensure_string(address_region),
+                'address_city': ensure_string(address_city),
+                'address': ensure_string(address),
+                'property_type': ensure_string(parsed_info.get('property_type', '')),
+                'cadastral_number': ensure_string(parsed_info.get('cadastral_number', '')),
+                'building_area_sqm': ensure_string(building_area_sqm) if building_area_sqm > 0 else '',
+                'land_area_ha': ensure_string(land_area_ha) if land_area_ha > 0 else '',
+                'base_price': ensure_string(base_price),
+                'deposit_amount': ensure_string(deposit_amount),
+                'auction_start_date': ensure_string(auction_start_date),
+                'document_submission_deadline': ensure_string(document_submission_deadline),
+                'min_participants_count': ensure_string(min_participants_count),
+                'participants_count': ensure_string(participants_count),
+                'arrests_info': ensure_string(arrests_info),
+                'description': ensure_string(description),
+                'auction_url': ensure_string(auction_url),
+                'classification_code': ensure_string(classification_code),
+                '_has_additional_classification_03_07': has_additional_classification_03_07
+            }
+            
+            excel_data.append(auction_row)
+        
+        return excel_data
     
     def _prepare_auctions_data_for_excel(
         self,
@@ -1463,30 +2679,40 @@ class ProZorroService:
             # Арешти
             arrests_data = data.get('arrests', [])
             
-            # Витягуємо структуровані дані з items
+            # Спочатку витягуємо структуровані дані з items (якщо є) - fallback
             structured_info = self._extract_structured_info_from_items(data)
             
             # Перевірка, чи це аренда
             is_rental = self._is_rental_auction(data)
+            if is_rental:
+                # Пропускаємо обробку через LLM для аренди, використовуємо тільки структуровані дані
+                parsed_info = structured_info
+            else:
+                # Парсинг опису через LLM для отримання структурованої інформації
+                parsed_info = structured_info.copy()  # Починаємо зі структурованих даних
             
             # Якщо не пропускаємо LLM і це не аренда, обробляємо через LLM
-            parsed_info = structured_info.copy()
             if not skip_llm and description and self.llm_service and not is_rental:
+                import traceback
                 try:
                     cached_result = self.llm_cache_service.get_cached_result(description)
                     if cached_result is not None:
                         llm_result = cached_result
                     else:
+                        desc_hash = calculate_description_hash(description)
                         llm_result = self.llm_service.parse_auction_description(description)
                         self.llm_cache_service.save_result(description, llm_result)
                     
-                    # Об'єднуємо результати
+                    # Об'єднуємо результати: структуровані дані мають пріоритет, але LLM може доповнити порожні поля
+                    # Спочатку витягуємо адреси з items (якщо є)
+                    items_addresses = self._extract_addresses_from_items(data)
+                    
+                    # Обробляємо адреси з масиву LLM
                     llm_addresses = llm_result.get('addresses', [])
-                    if llm_addresses:
-                        parsed_info['addresses'] = llm_addresses
-                    else:
+                    if not llm_addresses:
+                        # Якщо немає масиву адрес, але є старі поля - створюємо адресу
                         if llm_result.get('address_region') or llm_result.get('address_city'):
-                            parsed_info['addresses'] = [{
+                            llm_addresses = [{
                                 'region': llm_result.get('address_region', ''),
                                 'district': llm_result.get('address_district', ''),
                                 'settlement_type': llm_result.get('address_settlement_type', ''),
@@ -1499,28 +2725,162 @@ class ProZorroService:
                                 'room': llm_result.get('address_room', '')
                             }]
                     
-                    for key in ['cadastral_number', 'area', 'area_unit', 'floor', 'property_type', 'utilities', 'arrests_info']:
+                    # Формуємо фінальний масив адрес:
+                    # - Якщо є адреси з items - вони стають основними (першими)
+                    # - Адреси з LLM додаються як додаткові (після адрес з items)
+                    final_addresses = []
+                    if items_addresses:
+                        # Адреси з items - основні
+                        final_addresses.extend(items_addresses)
+                        # Додаємо адреси з LLM як додаткові
+                        final_addresses.extend(llm_addresses)
+                    else:
+                        # Якщо немає адрес з items - використовуємо адреси з LLM
+                        final_addresses = llm_addresses
+                    
+                    parsed_info['addresses'] = final_addresses
+                    
+                    # Об'єднуємо інші поля: структуровані дані мають пріоритет, LLM доповнює порожні
+                    for key in ['cadastral_number', 'floor', 'property_type', 'utilities', 'arrests_info']:
                         if not parsed_info.get(key) and llm_result.get(key):
                             parsed_info[key] = llm_result[key]
-                except Exception:
-                    pass
+                    
+                    # Окремо обробляємо площі з LLM - конвертуємо в стандартні одиниці та сумуємо
+                    # Площа нерухомості (building_area_sqm)
+                    if llm_result.get('building_area_sqm'):
+                        try:
+                            llm_building_area = float(str(llm_result.get('building_area_sqm', '')).replace(',', '.').replace(' ', ''))
+                            # Додаємо до існуючої площі (якщо є з items)
+                            current_building_area = parsed_info.get('building_area_sqm', 0.0)
+                            if isinstance(current_building_area, (int, float)):
+                                parsed_info['building_area_sqm'] = current_building_area + llm_building_area
+                            else:
+                                parsed_info['building_area_sqm'] = llm_building_area
+                        except (ValueError, AttributeError):
+                            pass
+                    
+                    # Площа землі (land_area_ha)
+                    if llm_result.get('land_area_ha'):
+                        try:
+                            llm_land_area = float(str(llm_result.get('land_area_ha', '')).replace(',', '.').replace(' ', ''))
+                            # Додаємо до існуючої площі (якщо є з items)
+                            current_land_area = parsed_info.get('land_area_ha', 0.0)
+                            if isinstance(current_land_area, (int, float)):
+                                parsed_info['land_area_ha'] = current_land_area + llm_land_area
+                            else:
+                                parsed_info['land_area_ha'] = llm_land_area
+                        except (ValueError, AttributeError):
+                            pass
+                    
+                    # Якщо є старі поля area та area_unit - конвертуємо їх (для сумісності зі старими кешами)
+                    if llm_result.get('area') and not llm_result.get('building_area_sqm') and not llm_result.get('land_area_ha'):
+                        try:
+                            old_area = float(str(llm_result.get('area', '')).replace(',', '.').replace(' ', ''))
+                            old_unit = llm_result.get('area_unit', '').lower()
+                            
+                            if any(x in old_unit for x in ['гектар', 'hectare', 'га']):
+                                # Додаємо до існуючої площі землі
+                                current_land_area = parsed_info.get('land_area_ha', 0.0)
+                                if isinstance(current_land_area, (int, float)):
+                                    parsed_info['land_area_ha'] = current_land_area + old_area
+                                else:
+                                    parsed_info['land_area_ha'] = old_area
+                            elif any(x in old_unit for x in ['м²', 'м2', 'кв.м', 'квадратний метр']):
+                                # Додаємо до існуючої площі нерухомості
+                                current_building_area = parsed_info.get('building_area_sqm', 0.0)
+                                if isinstance(current_building_area, (int, float)):
+                                    parsed_info['building_area_sqm'] = current_building_area + old_area
+                                else:
+                                    parsed_info['building_area_sqm'] = old_area
+                            elif any(x in old_unit for x in ['сотка', 'соток']):
+                                # Сотки - визначаємо за значенням
+                                if old_area < 100:
+                                    # Швидше за все це гектари (менше 1 га)
+                                    area_ha = old_area * 0.01
+                                    current_land_area = parsed_info.get('land_area_ha', 0.0)
+                                    if isinstance(current_land_area, (int, float)):
+                                        parsed_info['land_area_ha'] = current_land_area + area_ha
+                                    else:
+                                        parsed_info['land_area_ha'] = area_ha
+                                else:
+                                    # Швидше за все це м²
+                                    area_sqm = old_area * 100
+                                    current_building_area = parsed_info.get('building_area_sqm', 0.0)
+                                    if isinstance(current_building_area, (int, float)):
+                                        parsed_info['building_area_sqm'] = current_building_area + area_sqm
+                                    else:
+                                        parsed_info['building_area_sqm'] = area_sqm
+                            else:
+                                # Якщо одиниця невідома - визначаємо за значенням
+                                if old_area > 1000:
+                                    current_building_area = parsed_info.get('building_area_sqm', 0.0)
+                                    if isinstance(current_building_area, (int, float)):
+                                        parsed_info['building_area_sqm'] = current_building_area + old_area
+                                    else:
+                                        parsed_info['building_area_sqm'] = old_area
+                                elif old_area < 10:
+                                    current_land_area = parsed_info.get('land_area_ha', 0.0)
+                                    if isinstance(current_land_area, (int, float)):
+                                        parsed_info['land_area_ha'] = current_land_area + old_area
+                                    else:
+                                        parsed_info['land_area_ha'] = old_area
+                        except (ValueError, AttributeError):
+                            pass
+                except Exception as e:
+                    # Детальне логування помилки
+                    error_traceback = traceback.format_exc()
+                    desc_hash = calculate_description_hash(description) if description else None
+                    description_preview = description[:200] + "..." if len(description) > 200 else description
+                    print(f"\n[LLM ПОМИЛКА] Помилка обробки через LLM для аукціону {auction_id}")
+                    print(f"[LLM ПОМИЛКА] Хеш опису: {desc_hash[:16] if desc_hash else 'N/A'}...")
+                    print(f"[LLM ПОМИЛКА] Тип помилки: {type(e).__name__}")
+                    print(f"[LLM ПОМИЛКА] Повідомлення: {str(e)}")
+                    print(f"[LLM ПОМИЛКА] Опис (перші 200 символів): {description_preview}")
+                    print(f"[LLM ПОМИЛКА] Повний traceback:")
+                    print(error_traceback)
+                    
+                    # Логуємо в сервіс логування
+                    try:
+                        self.logging_service.log_app_event(
+                            message=f"Помилка обробки через LLM для аукціону {auction_id}",
+                            event_type='llm_error',
+                            metadata={
+                                'auction_id': auction_id,
+                                'description_hash': desc_hash[:16] if desc_hash else None,
+                                'description_preview': description_preview,
+                                'error_type': type(e).__name__,
+                                'error_message': str(e)
+                            },
+                            error=error_traceback
+                        )
+                    except:
+                        pass
             
-            # Обробляємо адреси
+            # Обробляємо адреси: перевіряємо, чи є адреси з items (якщо LLM не використовувався)
             addresses = parsed_info.get('addresses', [])
             if not addresses:
-                if parsed_info.get('address_region') or parsed_info.get('address_city'):
-                    addresses = [{
-                        'region': parsed_info.get('address_region', ''),
-                        'district': parsed_info.get('address_district', ''),
-                        'settlement_type': parsed_info.get('address_settlement_type', ''),
-                        'settlement': parsed_info.get('address_city', ''),
-                        'settlement_district': parsed_info.get('address_settlement_district', ''),
-                        'street_type': parsed_info.get('address_street_type', ''),
-                        'street': parsed_info.get('address_street', ''),
-                        'building': parsed_info.get('address_building', ''),
-                        'building_part': parsed_info.get('address_building_part', ''),
-                        'room': parsed_info.get('address_room', '')
-                    }]
+                # Якщо немає масиву адрес, спочатку перевіряємо items
+                items_addresses = self._extract_addresses_from_items(data)
+                if items_addresses:
+                    addresses = items_addresses
+                else:
+                    # Якщо немає адрес з items, але є старі поля - створюємо адресу
+                    if parsed_info.get('address_region') or parsed_info.get('address_city'):
+                        addresses = [{
+                            'region': parsed_info.get('address_region', ''),
+                            'district': parsed_info.get('address_district', ''),
+                            'settlement_type': parsed_info.get('address_settlement_type', ''),
+                            'settlement': parsed_info.get('address_city', ''),
+                            'settlement_district': parsed_info.get('address_settlement_district', ''),
+                            'street_type': parsed_info.get('address_street_type', ''),
+                            'street': parsed_info.get('address_street', ''),
+                            'building': parsed_info.get('address_building', ''),
+                            'building_part': parsed_info.get('address_building_part', ''),
+                            'room': parsed_info.get('address_room', '')
+                        }]
+            
+            # Оновлюємо parsed_info з фінальним масивом адрес
+            parsed_info['addresses'] = addresses
             
             first_address = addresses[0] if addresses else {}
             address_region = first_address.get('region', '')
@@ -1539,14 +2899,33 @@ class ProZorroService:
             else:
                 address = ''
             
-            # Формуємо площу
-            area = ''
-            area_value = parsed_info.get('area', '')
-            area_unit = parsed_info.get('area_unit', '')
-            if area_value:
-                area = str(area_value)
-                if area_unit:
-                    area += f' {area_unit}'
+            # Формуємо площі нерухомості та землі окремо
+            # Беремо площі зі структурованих даних (items) та з LLM, об'єднуємо їх
+            building_area_sqm = parsed_info.get('building_area_sqm', 0.0)
+            land_area_ha = parsed_info.get('land_area_ha', 0.0)
+            
+            # Конвертуємо в числа
+            try:
+                if building_area_sqm:
+                    if isinstance(building_area_sqm, str):
+                        building_area_sqm = float(str(building_area_sqm).replace(',', '.').replace(' ', ''))
+                    else:
+                        building_area_sqm = float(building_area_sqm)
+                else:
+                    building_area_sqm = 0.0
+            except (ValueError, AttributeError, TypeError):
+                building_area_sqm = 0.0
+            
+            try:
+                if land_area_ha:
+                    if isinstance(land_area_ha, str):
+                        land_area_ha = float(str(land_area_ha).replace(',', '.').replace(' ', ''))
+                    else:
+                        land_area_ha = float(land_area_ha)
+                else:
+                    land_area_ha = 0.0
+            except (ValueError, AttributeError, TypeError):
+                land_area_ha = 0.0
             
             # Формуємо арешти
             arrests_info = ''
@@ -1608,7 +2987,8 @@ class ProZorroService:
                 'address': ensure_string(address),
                 'property_type': ensure_string(parsed_info.get('property_type', '')),
                 'cadastral_number': ensure_string(parsed_info.get('cadastral_number', '')),
-                'area': ensure_string(area),
+                'building_area_sqm': ensure_string(building_area_sqm) if building_area_sqm > 0 else '',
+                'land_area_ha': ensure_string(land_area_ha) if land_area_ha > 0 else '',
                 'base_price': ensure_string(base_price),
                 'deposit_amount': ensure_string(deposit_amount),
                 'auction_start_date': ensure_string(auction_start_date),
@@ -1682,7 +3062,8 @@ class ProZorroService:
         self,
         days: Optional[int] = None,
         output_dir: Optional[str] = None,
-        user_id: Optional[int] = None
+        user_id: Optional[int] = None,
+        auctions: Optional[List[AuctionDTO]] = None
     ) -> Dict[str, Any]:
         """
         Отримує та зберігає список аукціонів про нерухомість за останні N днів.
@@ -1693,6 +3074,7 @@ class ProZorroService:
             days: Кількість днів для виборки. Якщо не вказано, використовується значення з налаштувань
             output_dir: Директорія для збереження (не використовується, залишено для сумісності)
             user_id: Ідентифікатор користувача, який сформував файл (опціонально)
+            auctions: Вже отримані аукціони (опціонально, якщо вказано - не викликається API)
 
         Returns:
             Dict[str, Any]: Результат операції з інформацією про кількість знайдених аукціонів
@@ -1706,11 +3088,15 @@ class ProZorroService:
         
         # Для інших періодів використовуємо стандартну обробку
         try:
-            print(
-                f"Отримання аукціонів з ProZorro.Sale за останні {days} днів"
-                f" (dateModified в діапазоні)..."
-            )
-            auctions = self.get_real_estate_auctions(days)
+            # Якщо аукціони вже передані - використовуємо їх, інакше отримуємо з API
+            if auctions is None:
+                print(
+                    f"Отримання аукціонів з ProZorro.Sale за останні {days} днів"
+                    f" (dateModified в діапазоні)..."
+                )
+                auctions = self.get_real_estate_auctions(days)
+            else:
+                print(f"Використовуються передані аукціони ({len(auctions)} шт.)")
             
             days_text = "день" if days == 1 else ("дні" if days < 5 else "днів")
             print(f"Знайдено {len(auctions)} аукціонів про нерухомість за останні {days} {days_text}")
@@ -1724,6 +3110,11 @@ class ProZorroService:
                     'message': 'Аукціони не знайдено'
                 }
 
+            # Зберігаємо аукціони в MongoDB та обробляємо через LLM
+            save_result = self._save_auctions_to_database(auctions)
+            llm_requests_count = save_result['llm_requests_count']
+            saved_count = save_result['saved_count']
+            
             # Зберігаємо дату оновлення в БД
             update_date = datetime.now(timezone.utc)
             self.app_data_repository.set_update_date(days, update_date)
@@ -1733,13 +3124,15 @@ class ProZorroService:
                 self.app_data_repository.set_update_date(1, update_date)
             
             print(f"Дата оновлення збережена: {update_date.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"Викликів LLM: {llm_requests_count}")
             
             return {
                 'success': True,
-                'count': len(auctions),
+                'count': saved_count,  # Кількість збережених аукціонів (без аренди)
                 'file_path': None,  # Файли більше не зберігаються
                 'update_date': update_date,
-                'message': f'Успішно оновлено {len(auctions)} аукціонів'
+                'llm_requests_count': llm_requests_count,
+                'message': f'Успішно оновлено {saved_count} аукціонів'
             }
 
         except Exception as e:
@@ -1829,6 +3222,11 @@ class ProZorroService:
             
             print(f"Об'єднано дані за 7 днів. Всього унікальних аукціонів: {total_count}")
             
+            # Зберігаємо аукціони в MongoDB та обробляємо через LLM
+            save_result = self._save_auctions_to_database(final_auctions)
+            llm_requests_count = save_result['llm_requests_count']
+            saved_count = save_result['saved_count']
+            
             # Зберігаємо дату оновлення в БД
             update_date = datetime.now(timezone.utc)
             self.app_data_repository.set_update_date(7, update_date)
@@ -1836,13 +3234,15 @@ class ProZorroService:
             self.app_data_repository.set_update_date(1, update_date)
             
             print(f"Дата оновлення збережена: {update_date.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"Викликів LLM: {llm_requests_count}")
             
             return {
                 'success': True,
-                'count': total_count,
+                'count': saved_count,  # Кількість збережених аукціонів (без аренди)
                 'file_path': None,  # Файли більше не зберігаються
                 'update_date': update_date,
-                'message': f'Успішно оновлено {total_count} аукціонів за тиждень'
+                'llm_requests_count': llm_requests_count,
+                'message': f'Успішно оновлено {saved_count} аукціонів за тиждень'
             }
             
         except Exception as e:

@@ -341,55 +341,49 @@ class TelegramBotService:
                     )
                     return
                 
-                # Підраховуємо кількість аукціонів, які потребують обробки через LLM (без кешу)
-                # Для цього перевіряємо кожен аукціон на наявність опису та кешу
-                llm_requests_estimated = 0
-                for auction in auctions:
-                    if not auction.data:
-                        continue
-                    data = auction.data
-                    # Перевіряємо, чи це аренда (пропускаємо LLM)
-                    is_rental = self.prozorro_service._is_rental_auction(data)
-                    if is_rental:
-                        continue
-                    # Перевіряємо наявність опису
-                    description = ''
-                    if 'description' in data:
-                        desc_obj = data['description']
-                        if isinstance(desc_obj, dict):
-                            description = desc_obj.get('uk_UA', desc_obj.get('en_US', ''))
-                        elif isinstance(desc_obj, str):
-                            description = desc_obj
-                    if description:
-                        # Перевіряємо кеш
-                        cached_result = self.prozorro_service.llm_cache_service.get_cached_result(description)
-                        if cached_result is None:
-                            llm_requests_estimated += 1
+                # Аналізуємо аукціони перед збереженням для отримання статистики
+                stats = await loop.run_in_executor(
+                    None,
+                    self.prozorro_service._analyze_auctions_before_save,
+                    auctions
+                )
                 
-                # Відправляємо повідомлення про кількість аукціонів
-                if llm_requests_estimated > 0:
-                    estimated_minutes = llm_requests_estimated * 14 / 60
-                    await self._send_progress_message(
-                        chat_id,
-                        f"Знайдено {len(auctions)} аукціонів для обробки.\n"
-                        f"Приблизний час обробки: {estimated_minutes:.1f} хвилин "
-                        f"({llm_requests_estimated} аукціонів потребують обробки через LLM)."
+                # Відправляємо повідомлення про статистику тільки якщо планується викликів LLM
+                if stats['llm_planned'] > 0:
+                    message = (
+                        f"Знайдено {stats['total']} попередньо відібраних аукціонів.\n"
+                        f"З них:\n"
+                        f"• Без змін: {stats['unchanged']}\n"
+                        f"• Змінено: {stats['changed']}\n"
+                        f"• Планується викликів LLM: {stats['llm_planned']}"
                     )
-                else:
-                    await self._send_progress_message(
-                        chat_id,
-                        f"Знайдено {len(auctions)} аукціонів для обробки.\n"
-                        f"Всі аукціони мають кешовані результати LLM - обробка буде швидкою."
-                    )
+                    
+                    estimated_minutes = stats['llm_planned'] * 14 / 60
+                    message += f"\n\nПриблизний час обробки: {estimated_minutes:.1f} хвилин"
+                    
+                    await self._send_progress_message(chat_id, message)
             
             # Зберігаємо файл (синхронна операція, виконуємо в executor)
-            result = await loop.run_in_executor(
-                None,
-                lambda: self.prozorro_service.fetch_and_save_real_estate_auctions(
-                    days=days,
-                    user_id=user_id
+            # Передаємо вже отримані аукціони, щоб уникнути повторного виклику API
+            if days == 7:
+                # Для тижня не передаємо аукціони, бо там використовується оптимізована обробка
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: self.prozorro_service.fetch_and_save_real_estate_auctions(
+                        days=days,
+                        user_id=user_id
+                    )
                 )
-            )
+            else:
+                # Для інших періодів передаємо вже отримані аукціони
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: self.prozorro_service.fetch_and_save_real_estate_auctions(
+                        days=days,
+                        user_id=user_id,
+                        auctions=auctions
+                    )
+                )
             
             if days == 7 and result.get('success'):
                 await self._send_progress_message(

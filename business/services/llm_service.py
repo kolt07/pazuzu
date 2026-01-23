@@ -85,9 +85,20 @@ class BaseLLMProvider(ABC):
 Витягни та поверни JSON з наступними полями:
 - cadastral_number: кадастровий номер, номер земельного кадастру (строка, якщо є). 
   Шукай формати типу "6320685503:03:000:0202" або подібні. Якщо є кілька номерів - використовуй основний.
-- area: площа (число, якщо є). Шукай числа з одиницями виміру (га, м², сотка). 
-  Якщо площа вказана в гектарах - конвертуй в число (наприклад, "0,5296 га" -> 0.5296).
-- area_unit: одиниця вимірювання площі (га, м², сотка тощо). Якщо в тексті є "га" - пиши "гектар", якщо "м²" - пиши "м²".
+- building_area_sqm: площа нерухомості (будівель, споруд, приміщень) в квадратних метрах (число, якщо є).
+  Шукай фрази типу "площею", "загальною площею", "площею будівлі", "площею об'єкта", "площею приміщень", "кв.м", "м²".
+  Якщо площа вказана в квадратних метрах - використовуй число як є (наприклад, "956,7 м²" -> 956.7, "25 659,90 кв.м" -> 25659.90).
+  Якщо площа вказана в гектарах - конвертуй в м² (1 га = 10000 м², наприклад "0,5 га" -> 5000).
+  Якщо площа вказана в сотках - конвертуй в м² (1 сотка = 100 м², наприклад "5 соток" -> 500).
+  Якщо є кілька значень площі нерухомості - СУМУЙ їх (наприклад, якщо є "2,2 кв.м" і "19,8 кв.м" -> 22.0).
+  Якщо вказана тільки площа земельної ділянки без площі будівель - залишай порожнім.
+- land_area_ha: площа земельної ділянки в гектарах (число, якщо є).
+  Шукай фрази типу "земельна ділянка", "площею", "на земельній ділянці", "га", "гектар".
+  Якщо площа вказана в гектарах - використовуй число як є (наприклад, "5,1545 га" -> 5.1545, "0,5296 га" -> 0.5296).
+  Якщо площа вказана в квадратних метрах - конвертуй в га (1 м² = 0.0001 га, наприклад "10000 м²" -> 1.0).
+  Якщо площа вказана в сотках - конвертуй в га (1 сотка = 0.01 га, наприклад "50 соток" -> 0.5).
+  Якщо є кілька значень площі землі - СУМУЙ їх.
+  Якщо вказана тільки площа будівель без земельної ділянки - залишай порожнім.
 - addresses: масив адрес (якщо в тексті є кілька адрес - витягни всі). Кожна адреса - об'єкт з полями:
   * region: область у форматі "Волинська", "Тернопільська", "Харківська" тощо (без скорочень, без додаткових слів). 
     м. Київ та м. Симферополь НЕ входять в склад областей - для них залишай порожнє значення.
@@ -170,73 +181,93 @@ class GeminiLLMProvider(BaseLLMProvider):
         max_retries = 3
         retry_delay = 5  # Початкова затримка в секундах
         
-        for attempt in range(max_retries):
-            try:
-                prompt = self._create_parsing_prompt(description)
-                
-                # Виконуємо запит через новий API
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt
-                )
-                
-                # Витягуємо JSON з відповіді
-                # Перевіряємо, чи response.text існує та є рядком
-                if not hasattr(response, 'text') or response.text is None:
-                    raise ValueError("Відповідь від Gemini не містить тексту")
-                
-                response_text = str(response.text).strip()
-                
-                if not response_text:
-                    raise ValueError("Відповідь від Gemini порожня")
-                
-                # Спробуємо знайти JSON у відповіді
-                json_text = self._extract_json_from_response(response_text)
-                
-                if not json_text:
-                    raise ValueError("Не вдалося витягти JSON з відповіді")
-                
-                result = json.loads(json_text)
-                
-                # Перевіряємо тип результату
-                if isinstance(result, list):
-                    # Якщо це список, беремо перший елемент
-                    if len(result) > 0 and isinstance(result[0], dict):
-                        result = result[0]
-                    else:
-                        # Якщо список порожній або не містить словників, повертаємо порожній результат
-                        return self._empty_result()
-                elif not isinstance(result, dict):
-                    # Якщо це не словник і не список, повертаємо порожній результат
-                    return self._empty_result()
-                
-                return self._normalize_result(result)
-            except KeyboardInterrupt:
-                # Переривання користувача - не обробляємо, просто пробрасуємо далі
-                raise
-            except Exception as e:
-                error_str = str(e)
-                # Перевіряємо, чи це помилка квоти (429)
-                if '429' in error_str or 'quota' in error_str.lower() or 'exceeded' in error_str.lower():
-                    # Спробуємо витягти час очікування з помилки
-                    import re
-                    retry_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str, re.IGNORECASE)
-                    if retry_match:
-                        retry_delay = float(retry_match.group(1)) + 1  # Додаємо 1 секунду для безпеки
-                    else:
-                        retry_delay = min(retry_delay * 2, 60)  # Подвоюємо затримку, але не більше 60 секунд
+        # Список моделей для спроби (якщо перша не спрацює)
+        models_to_try = getattr(self, '_available_models', [self.model_name])
+        last_error = None
+        success = False
+        
+        for model_name in models_to_try:
+            for attempt in range(max_retries):
+                try:
+                    prompt = self._create_parsing_prompt(description)
                     
-                    if attempt < max_retries - 1:
-                        print(f"Перевищено квоту Gemini. Очікування {retry_delay:.1f} секунд перед повторною спробою...")
-                        time.sleep(retry_delay)
-                        continue
-                    else:
-                        print(f"Помилка при парсингу через Gemini (досягнуто максимум спроб): {e}")
+                    # Виконуємо запит через новий API
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=prompt
+                    )
+                    
+                    # Витягуємо JSON з відповіді
+                    # Перевіряємо, чи response.text існує та є рядком
+                    if not hasattr(response, 'text') or response.text is None:
+                        raise ValueError("Відповідь від Gemini не містить тексту")
+                    
+                    response_text = str(response.text).strip()
+                    
+                    if not response_text:
+                        raise ValueError("Відповідь від Gemini порожня")
+                    
+                    # Спробуємо знайти JSON у відповіді
+                    json_text = self._extract_json_from_response(response_text)
+                    
+                    if not json_text:
+                        raise ValueError("Не вдалося витягти JSON з відповіді")
+                    
+                    result = json.loads(json_text)
+                    
+                    # Перевіряємо тип результату
+                    if isinstance(result, list):
+                        # Якщо це список, беремо перший елемент
+                        if len(result) > 0 and isinstance(result[0], dict):
+                            result = result[0]
+                        else:
+                            # Якщо список порожній або не містить словників, повертаємо порожній результат
+                            return self._empty_result()
+                    elif not isinstance(result, dict):
+                        # Якщо це не словник і не список, повертаємо порожній результат
                         return self._empty_result()
-                else:
-                    # Інша помилка - не повторюємо
-                    print(f"Помилка при парсингу через Gemini: {e}")
-                    return self._empty_result()
+                    
+                    # Оновлюємо активну модель, якщо використали іншу
+                    if model_name != self.model_name:
+                        self.model_name = model_name
+                    
+                    success = True
+                    return self._normalize_result(result)
+                except KeyboardInterrupt:
+                    # Переривання користувача - не обробляємо, просто пробрасуємо далі
+                    raise
+                except Exception as e:
+                    error_str = str(e)
+                    last_error = e
+                    
+                    # Перевіряємо, чи це помилка квоти (429)
+                    if '429' in error_str or 'quota' in error_str.lower() or 'exceeded' in error_str.lower():
+                        # Спробуємо витягти час очікування з помилки
+                        import re
+                        retry_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str, re.IGNORECASE)
+                        if retry_match:
+                            retry_delay = float(retry_match.group(1)) + 1  # Додаємо 1 секунду для безпеки
+                        else:
+                            retry_delay = min(retry_delay * 2, 60)  # Подвоюємо затримку, але не більше 60 секунд
+                        
+                        if attempt < max_retries - 1:
+                            print(f"Перевищено квоту Gemini. Очікування {retry_delay:.1f} секунд перед повторною спробою...")
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            # Якщо досягнуто максимум спроб для цієї моделі, пробуємо наступну
+                            break
+                    else:
+                        # Інша помилка - пробуємо наступну модель
+                        break
+            
+            # Якщо успішно виконали запит, виходимо з циклу по моделях
+            if success:
+                break
+        
+        # Якщо всі моделі не спрацювали
+        if last_error and not success:
+            print(f"Помилка при парсингу через Gemini (спробовано всі моделі): {last_error}")
         
         return self._empty_result()
     
@@ -291,10 +322,43 @@ class GeminiLLMProvider(BaseLLMProvider):
                     'room': result.get('address_room', '')
                 }]
         
+        # Обробляємо площі - конвертуємо в стандартні одиниці
+        building_area_sqm = result.get('building_area_sqm', '')
+        land_area_ha = result.get('land_area_ha', '')
+        
+        # Якщо є старі поля area та area_unit - конвертуємо їх
+        if not building_area_sqm and not land_area_ha:
+            old_area = result.get('area', '')
+            old_unit = result.get('area_unit', '')
+            if old_area:
+                try:
+                    area_value = float(str(old_area).replace(',', '.').replace(' ', ''))
+                    if old_unit:
+                        unit_lower = old_unit.lower()
+                        # Визначаємо тип площі за одиницею
+                        if any(x in unit_lower for x in ['гектар', 'hectare', 'га']):
+                            land_area_ha = area_value
+                        elif any(x in unit_lower for x in ['м²', 'м2', 'кв.м', 'квадратний метр']):
+                            building_area_sqm = area_value
+                        elif any(x in unit_lower for x in ['сотка', 'соток']):
+                            # Сотки можуть бути і для землі, і для нерухомості - за значенням визначаємо
+                            if area_value < 100:  # Швидше за все це гектари (менше 1 га)
+                                land_area_ha = area_value * 0.01
+                            else:  # Швидше за все це м²
+                                building_area_sqm = area_value * 100
+                    else:
+                        # Якщо одиниця не вказана - визначаємо за значенням
+                        if area_value > 1000:
+                            building_area_sqm = area_value
+                        elif area_value < 10:
+                            land_area_ha = area_value
+                except (ValueError, AttributeError):
+                    pass
+        
         return {
             'cadastral_number': result.get('cadastral_number', ''),
-            'area': result.get('area', ''),
-            'area_unit': result.get('area_unit', ''),
+            'building_area_sqm': building_area_sqm if building_area_sqm else '',
+            'land_area_ha': land_area_ha if land_area_ha else '',
             'addresses': addresses,  # Масив адрес
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
@@ -306,8 +370,8 @@ class GeminiLLMProvider(BaseLLMProvider):
         """Повертає порожній результат."""
         return {
             'cadastral_number': '',
-            'area': '',
-            'area_unit': '',
+            'building_area_sqm': '',
+            'land_area_ha': '',
             'addresses': [],  # Порожній масив адрес
             'floor': '',
             'property_type': '',
@@ -400,10 +464,43 @@ class OpenAILLMProvider(BaseLLMProvider):
                     'room': result.get('address_room', '')
                 }]
         
+        # Обробляємо площі - конвертуємо в стандартні одиниці
+        building_area_sqm = result.get('building_area_sqm', '')
+        land_area_ha = result.get('land_area_ha', '')
+        
+        # Якщо є старі поля area та area_unit - конвертуємо їх
+        if not building_area_sqm and not land_area_ha:
+            old_area = result.get('area', '')
+            old_unit = result.get('area_unit', '')
+            if old_area:
+                try:
+                    area_value = float(str(old_area).replace(',', '.').replace(' ', ''))
+                    if old_unit:
+                        unit_lower = old_unit.lower()
+                        # Визначаємо тип площі за одиницею
+                        if any(x in unit_lower for x in ['гектар', 'hectare', 'га']):
+                            land_area_ha = area_value
+                        elif any(x in unit_lower for x in ['м²', 'м2', 'кв.м', 'квадратний метр']):
+                            building_area_sqm = area_value
+                        elif any(x in unit_lower for x in ['сотка', 'соток']):
+                            # Сотки можуть бути і для землі, і для нерухомості - за значенням визначаємо
+                            if area_value < 100:  # Швидше за все це гектари (менше 1 га)
+                                land_area_ha = area_value * 0.01
+                            else:  # Швидше за все це м²
+                                building_area_sqm = area_value * 100
+                    else:
+                        # Якщо одиниця не вказана - визначаємо за значенням
+                        if area_value > 1000:
+                            building_area_sqm = area_value
+                        elif area_value < 10:
+                            land_area_ha = area_value
+                except (ValueError, AttributeError):
+                    pass
+        
         return {
             'cadastral_number': result.get('cadastral_number', ''),
-            'area': result.get('area', ''),
-            'area_unit': result.get('area_unit', ''),
+            'building_area_sqm': building_area_sqm if building_area_sqm else '',
+            'land_area_ha': land_area_ha if land_area_ha else '',
             'addresses': addresses,  # Масив адрес
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
@@ -415,8 +512,8 @@ class OpenAILLMProvider(BaseLLMProvider):
         """Повертає порожній результат."""
         return {
             'cadastral_number': '',
-            'area': '',
-            'area_unit': '',
+            'building_area_sqm': '',
+            'land_area_ha': '',
             'addresses': [],  # Порожній масив адрес
             'floor': '',
             'property_type': '',
@@ -508,10 +605,43 @@ class AnthropicLLMProvider(BaseLLMProvider):
                     'room': result.get('address_room', '')
                 }]
         
+        # Обробляємо площі - конвертуємо в стандартні одиниці
+        building_area_sqm = result.get('building_area_sqm', '')
+        land_area_ha = result.get('land_area_ha', '')
+        
+        # Якщо є старі поля area та area_unit - конвертуємо їх
+        if not building_area_sqm and not land_area_ha:
+            old_area = result.get('area', '')
+            old_unit = result.get('area_unit', '')
+            if old_area:
+                try:
+                    area_value = float(str(old_area).replace(',', '.').replace(' ', ''))
+                    if old_unit:
+                        unit_lower = old_unit.lower()
+                        # Визначаємо тип площі за одиницею
+                        if any(x in unit_lower for x in ['гектар', 'hectare', 'га']):
+                            land_area_ha = area_value
+                        elif any(x in unit_lower for x in ['м²', 'м2', 'кв.м', 'квадратний метр']):
+                            building_area_sqm = area_value
+                        elif any(x in unit_lower for x in ['сотка', 'соток']):
+                            # Сотки можуть бути і для землі, і для нерухомості - за значенням визначаємо
+                            if area_value < 100:  # Швидше за все це гектари (менше 1 га)
+                                land_area_ha = area_value * 0.01
+                            else:  # Швидше за все це м²
+                                building_area_sqm = area_value * 100
+                    else:
+                        # Якщо одиниця не вказана - визначаємо за значенням
+                        if area_value > 1000:
+                            building_area_sqm = area_value
+                        elif area_value < 10:
+                            land_area_ha = area_value
+                except (ValueError, AttributeError):
+                    pass
+        
         return {
             'cadastral_number': result.get('cadastral_number', ''),
-            'area': result.get('area', ''),
-            'area_unit': result.get('area_unit', ''),
+            'building_area_sqm': building_area_sqm if building_area_sqm else '',
+            'land_area_ha': land_area_ha if land_area_ha else '',
             'addresses': addresses,  # Масив адрес
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
@@ -523,8 +653,8 @@ class AnthropicLLMProvider(BaseLLMProvider):
         """Повертає порожній результат."""
         return {
             'cadastral_number': '',
-            'area': '',
-            'area_unit': '',
+            'building_area_sqm': '',
+            'land_area_ha': '',
             'addresses': [],  # Порожній масив адрес
             'floor': '',
             'property_type': '',
