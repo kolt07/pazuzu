@@ -1034,8 +1034,6 @@ Respond in Ukrainian language."""
             if function_calls:
                 logger.info(f"Починаю обробку {len(function_calls)} викликів функцій")
                 # Виконуємо функції та продовжуємо діалог
-                if stream_callback:
-                    stream_callback("🤔 Аналізую запит та використовую інструменти...\n\n")
                 
                 # Створюємо conversation history
                 conversation_parts = [
@@ -1131,9 +1129,6 @@ Respond in Ukrainian language."""
                         logger.info(f"Виклик інструменту: {func_name}")
                         logger.debug(f"Аргументи інструменту {func_name}: {json.dumps(func_args, indent=2, ensure_ascii=False, default=str)}")
                         
-                        if stream_callback:
-                            stream_callback(f"🔧 Викликаю інструмент: **{func_name}**\n")
-                        
                         # Викликаємо інструмент
                         result = self._call_tool(func_name, func_args)
                         
@@ -1142,12 +1137,6 @@ Respond in Ukrainian language."""
                             logger.debug(f"Успішний результат {func_name}: {json.dumps(result, indent=2, ensure_ascii=False, default=str)[:500]}...")
                         else:
                             logger.error(f"Помилка інструменту {func_name}: {result.get('error', 'Невідома помилка')}")
-                        
-                        if stream_callback:
-                            if result.get('success'):
-                                stream_callback(f"✓ Інструмент виконано успішно\n")
-                            else:
-                                stream_callback(f"✗ Помилка: {result.get('error', 'Невідома помилка')}\n")
                         
                         # Додаємо відповідь функції
                         # FunctionResponse.response очікує словник (dict), а не JSON-рядок
@@ -1179,15 +1168,10 @@ Respond in Ukrainian language."""
                             )
                         )
                     
-                    if stream_callback:
-                        stream_callback(f"💭 Обробляю результати функцій (ітерація {iteration})...\n\n")
-                    
                     # Продовжуємо цикл для отримання наступної відповіді від моделі
                     continue
                 
                 # Після завершення циклу отримуємо фінальну відповідь
-                if stream_callback:
-                    stream_callback("\n💭 Формую фінальну відповідь...\n\n")
                 
                 try:
                     logger.info("Отримую фінальну відповідь від LLM...")
@@ -1212,8 +1196,6 @@ Respond in Ukrainian language."""
                             # Перевіряємо, чи є додаткові виклики функцій
                             if hasattr(part, 'function_call') and part.function_call:
                                 logger.warning(f"Модель намагається викликати функцію {part.function_call.name} повторно")
-                                if stream_callback:
-                                    stream_callback(f"⚠️ Модель намагається викликати функцію {part.function_call.name} повторно\n")
                         
                         logger.info(f"Фінальний текст (довжина: {len(final_text)} символів): {final_text[:500]}...")
                         
@@ -1223,8 +1205,6 @@ Respond in Ukrainian language."""
                             if hasattr(final_response.prompt_feedback, 'block_reason'):
                                 feedback_info += f", Block reason: {final_response.prompt_feedback.block_reason}"
                             logger.warning(f"Prompt feedback: {feedback_info}")
-                            if stream_callback:
-                                stream_callback(f"⚠️ {feedback_info}\n")
                         
                         if final_text and final_text.strip():
                             logger.info("Повертаю фінальну відповідь")
@@ -1250,8 +1230,6 @@ Respond in Ukrainian language."""
                 except Exception as e:
                     logger.exception(f"Помилка при формуванні відповіді: {str(e)}")
                     error_msg = f"Помилка при формуванні відповіді: {str(e)}"
-                    if stream_callback:
-                        stream_callback(f"⚠️ {error_msg}\n")
                     return error_msg
             else:
                 # Звичайна текстова відповідь

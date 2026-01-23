@@ -618,9 +618,6 @@ Important: Use terms from the glossary correctly."""
         user_msg = HumanMessage(content=user_query)
         self.conversation_history.append(user_msg)
         
-        if stream_callback:
-            stream_callback("🤔 Аналізую запит та планую дії...\n\n")
-        
         # Явний цикл агента (plan → act → observe)
         iteration = 0
         max_iterations = self.MAX_ITERATIONS
@@ -628,9 +625,6 @@ Important: Use terms from the glossary correctly."""
         while iteration < max_iterations:
             iteration += 1
             logger.info(f"--- Ітерація {iteration}/{max_iterations} ---")
-            
-            if stream_callback:
-                stream_callback(f"🔄 Ітерація {iteration}/{max_iterations}\n")
             
             try:
                 # Bind tools до LLM
@@ -670,8 +664,6 @@ Important: Use terms from the glossary correctly."""
                     
                     if response_content and response_content.strip():
                         logger.info("Знайдено фінальну текстову відповідь")
-                        if stream_callback:
-                            stream_callback(f"✅ Формую фінальну відповідь...\n\n")
                         return response_content
                 
                 # Обмежуємо кількість викликів tools за ітерацію
@@ -698,9 +690,6 @@ Important: Use terms from the glossary correctly."""
                     
                     logger.info(f"🔧 Виклик tool: {tool_name}")
                     logger.debug(f"Аргументи: {json.dumps(tool_args, indent=2, ensure_ascii=False, default=str)}")
-                    
-                    if stream_callback:
-                        stream_callback(f"🔧 Викликаю інструмент: **{tool_name}**\n")
                     
                     # Знаходимо відповідний tool
                     tool_func = None
@@ -781,12 +770,6 @@ Important: Use terms from the glossary correctly."""
                     
                     logger.info(f"Результат tool {tool_name}: success={tool_result.get('success', False)}")
                     
-                    if stream_callback:
-                        if tool_result.get('success'):
-                            stream_callback(f"✓ Інструмент виконано успішно\n")
-                        else:
-                            stream_callback(f"✗ Помилка: {tool_result.get('error', 'Невідома помилка')}\n")
-                    
                     # Створюємо ToolMessage для LangChain
                     tool_message = ToolMessage(
                         content=json.dumps(tool_result, ensure_ascii=False, default=str),
@@ -797,23 +780,16 @@ Important: Use terms from the glossary correctly."""
                 # Додаємо результати tools до історії
                 self.conversation_history.extend(tool_messages)
                 
-                if stream_callback:
-                    stream_callback(f"💭 Обробляю результати інструментів...\n\n")
-                
                 # Продовжуємо цикл для отримання наступної відповіді
                 continue
                 
             except Exception as e:
                 logger.exception(f"Помилка в ітерації {iteration}: {e}")
                 error_msg = f"Помилка обробки запиту: {str(e)}"
-                if stream_callback:
-                    stream_callback(f"⚠️ {error_msg}\n")
                 return error_msg
         
         # Якщо досягнуто максимум ітерацій
         logger.warning(f"Досягнуто максимум ітерацій ({max_iterations})")
-        if stream_callback:
-            stream_callback(f"⚠️ Досягнуто максимум ітерацій. Формую відповідь на основі поточних результатів...\n\n")
         
         # Спробуємо отримати фінальну відповідь
         try:
