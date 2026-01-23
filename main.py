@@ -4,8 +4,31 @@
 """
 
 import argparse
+import logging
 import threading
+import subprocess
+import sys
+from pathlib import Path
 from config.settings import Settings
+
+# Налаштування логування для всього проекту
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Зменшуємо рівень логування для сторонніх бібліотек, щоб не засмічувати вивід
+logging.getLogger('pymongo').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+
+# Встановлюємо INFO для нашого модуля LLM агента
+logging.getLogger('business.services.llm_agent_service').setLevel(logging.DEBUG)
 from business.services import ProZorroService
 from business.services.telegram_bot_service import TelegramBotService
 from business.services.logging_service import LoggingService
@@ -22,6 +45,7 @@ class Application:
         self.prozorro_service = None
         self.telegram_bot_service = None
         self._bot_thread = None
+        self._mcp_processes = []
         
         # Ініціалізуємо MongoDB підключення ПЕРЕД створенням сервісів, які його використовують
         try:
@@ -106,6 +130,34 @@ class Application:
         except Exception as e:
             print(f"Помилка запуску Telegram бота: {e}")
     
+    def start_mcp_servers(self):
+        """Запускає всі MCP сервери у фоновому режимі."""
+        project_root = Path(__file__).parent
+        mcp_servers = [
+            'mcp_servers.schema_mcp_server',
+            'mcp_servers.query_builder_mcp_server',
+            'mcp_servers.analytics_mcp_server',
+            'mcp_servers.report_mcp_server'
+        ]
+        
+        print("Запуск MCP серверів...")
+        
+        for server_module in mcp_servers:
+            try:
+                process = subprocess.Popen(
+                    [sys.executable, '-m', server_module],
+                    cwd=str(project_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self._mcp_processes.append((server_module, process))
+                print(f"✓ Запущено MCP сервер: {server_module} (PID: {process.pid})")
+            except Exception as e:
+                print(f"✗ Помилка запуску MCP сервера {server_module}: {e}")
+        
+        if self._mcp_processes:
+            print(f"Запущено {len(self._mcp_processes)} MCP серверів")
+    
     def stop(self):
         """Зупинка застосунку."""
         if not self._running:
@@ -116,6 +168,19 @@ class Application:
         # Зупиняємо Telegram бота
         if self.telegram_bot_service:
             self.telegram_bot_service.stop()
+        
+        # Зупиняємо MCP сервери
+        if self._mcp_processes:
+            print("Зупинка MCP серверів...")
+            for server_module, process in self._mcp_processes:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                    print(f"✓ Зупинено MCP сервер: {server_module}")
+                except Exception as e:
+                    print(f"✗ Помилка зупинки MCP сервера {server_module}: {e}")
+                    process.kill()
+            self._mcp_processes = []
         
         # Логуємо зупинку
         try:
@@ -151,6 +216,11 @@ def main():
         default=None,
         help="Кількість днів для виборки (використовується тільки з --generate-file).",
     )
+    parser.add_argument(
+        "--start-mcp",
+        action="store_true",
+        help="Запустити MCP сервери при старті застосунку.",
+    )
 
     args = parser.parse_args()
 
@@ -159,6 +229,10 @@ def main():
         return Application()
 
     app = Application()
+    
+    # Запускаємо MCP сервери, якщо вказано
+    if args.start_mcp:
+        app.start_mcp_servers()
     
     # Запускаємо формування файлу, якщо вказано
     if args.generate_file:

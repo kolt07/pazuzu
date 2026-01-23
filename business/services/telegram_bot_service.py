@@ -9,6 +9,7 @@ import re
 import zipfile
 import tempfile
 import yaml
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -28,11 +29,12 @@ from config.settings import Settings
 from business.services.prozorro_service import ProZorroService
 from business.services.user_service import UserService
 from business.services.logging_service import LoggingService
+from business.services.llm_agent_service import LLMAgentService
 from utils.file_utils import create_zip_archive
 
 
 # Стани для ConversationHandler
-WAITING_USER_ID, WAITING_NICKNAME, WAITING_CONFIRM_USER, WAITING_BLOCK_USER_ID, WAITING_CONFIRM_BLOCK = range(5)
+WAITING_USER_ID, WAITING_NICKNAME, WAITING_CONFIRM_USER, WAITING_BLOCK_USER_ID, WAITING_CONFIRM_BLOCK, WAITING_LLM_QUERY = range(6)
 
 
 class TelegramBotService:
@@ -49,6 +51,7 @@ class TelegramBotService:
         self.user_service = UserService(settings.telegram_users_config_path)
         self.prozorro_service = ProZorroService(settings)
         self.logging_service = LoggingService()
+        self.llm_agent_service = None  # Ініціалізується при першому використанні
         self.application = None
         self._running = False
         
@@ -93,6 +96,7 @@ class TelegramBotService:
         ]
         
         if is_admin:
+            keyboard.append([KeyboardButton("🤖 Спитати LLM")])
             keyboard.append([KeyboardButton("⚙️ Адміністрування")])
         
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -610,6 +614,20 @@ class TelegramBotService:
     
     def setup_handlers(self) -> None:
         """Налаштовує обробники команд та повідомлень."""
+        # ConversationHandler для LLM запитів
+        llm_conv_handler = ConversationHandler(
+            entry_points=[
+                MessageHandler(filters.Regex("^🤖 Спитати LLM$"), self.start_llm_query)
+            ],
+            states={
+                WAITING_LLM_QUERY: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^🔙 Повернутись$"), self.handle_llm_query),
+                    MessageHandler(filters.Regex("^🔙 Повернутись$"), self._back_to_main_menu)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel)]
+        )
+        
         # ConversationHandler для адміністраторських діалогів
         admin_conv_handler = ConversationHandler(
             entry_points=[
@@ -645,6 +663,7 @@ class TelegramBotService:
         
         # Додаємо обробники (спочатку ConversationHandler, потім обробник документів, потім загальний MessageHandler)
         self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(llm_conv_handler)
         self.application.add_handler(admin_conv_handler)
         self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
@@ -840,6 +859,190 @@ class TelegramBotService:
             await update.message.reply_text(f"Помилка при обробці файлу: {e}")
             context.user_data.pop('waiting_for_prozorro_config', None)
             await self.show_admin_menu(update, context)
+    
+    async def start_llm_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Починає діалог з LLM."""
+        user_id = update.effective_user.id
+        
+        if not self.user_service.is_admin(user_id):
+            await update.message.reply_text("Ця функція доступна тільки для адміністраторів.")
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            "🤖 Задайте питання LLM аналітику.\n\n"
+            "Аналітик може:\n"
+            "• Дослідити структуру бази даних\n"
+            "• Виконати аналітичні запити\n"
+            "• Згенерувати звіти\n"
+            "• Відповісти на питання про дані\n\n"
+            "Напишіть ваше питання або натисніть '🔙 Повернутись' для виходу.",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🔙 Повернутись")]], resize_keyboard=True)
+        )
+        
+        return WAITING_LLM_QUERY
+    
+    async def handle_llm_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Обробляє запит до LLM."""
+        user_id = update.effective_user.id
+        user_query = update.message.text
+        
+        if not self.user_service.is_admin(user_id):
+            await update.message.reply_text("Ця функція доступна тільки для адміністраторів.")
+            return ConversationHandler.END
+        
+        # Ініціалізуємо LLM агента, якщо ще не ініціалізовано
+        if self.llm_agent_service is None:
+            try:
+                self.llm_agent_service = LLMAgentService(self.settings)
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Помилка ініціалізації LLM агента: {str(e)}\n"
+                    "Перевірте налаштування LLM в конфігурації."
+                )
+                return ConversationHandler.END
+        
+        # Відправляємо повідомлення про початок обробки
+        status_message = await update.message.reply_text("🤔 Обробляю запит...")
+        
+        # Функція для трансляції проміжних результатів
+        async def stream_callback(text: str):
+            """Транслює проміжні результати користувачу."""
+            try:
+                # Оновлюємо повідомлення з новим текстом
+                current_text = status_message.text or ""
+                new_text = current_text + text
+                # Обмежуємо довжину повідомлення (Telegram має ліміт 4096 символів)
+                if len(new_text) > 4000:
+                    new_text = new_text[-4000:] + "\n\n... (текст обрізано)"
+                await status_message.edit_text(new_text)
+            except Exception:
+                pass  # Ігноруємо помилки оновлення повідомлення
+        
+        try:
+            # Створюємо список для зберігання проміжних повідомлень
+            intermediate_messages = []
+            last_update_time = [time.time()]  # Використовуємо список для nonlocal
+            
+            # Функція для збору проміжних повідомлень
+            # Використовуємо threading.Event для синхронізації
+            import threading
+            import queue
+            update_event = threading.Event()
+            update_queue = queue.Queue()
+            
+            def collect_messages(text: str):
+                intermediate_messages.append(text)
+                current_time = time.time()
+                # Оновлюємо повідомлення кожні 0.5 секунди або кожні 3 повідомлення
+                if (current_time - last_update_time[0] > 0.5) or (len(intermediate_messages) % 3 == 0):
+                    combined_text = "".join(intermediate_messages)
+                    try:
+                        update_queue.put_nowait(combined_text[-500:])
+                        update_event.set()
+                    except queue.Full:
+                        pass  # Ігноруємо, якщо черга переповнена
+                    last_update_time[0] = current_time
+            
+            # Створюємо завдання для оновлення повідомлень
+            stop_updates = asyncio.Event()
+            
+            async def update_messages_task():
+                """Завдання для оновлення повідомлень з черги."""
+                while not stop_updates.is_set():
+                    try:
+                        # Перевіряємо чергу
+                        try:
+                            text = update_queue.get_nowait()
+                            await stream_callback(text)
+                        except queue.Empty:
+                            pass
+                        await asyncio.sleep(0.1)
+                    except Exception:
+                        break
+            
+            # Запускаємо завдання оновлення повідомлень
+            update_task = asyncio.create_task(update_messages_task())
+            
+            # Обробляємо запит в окремому потоці, щоб не блокувати event loop
+            import concurrent.futures
+            
+            def process_in_thread():
+                try:
+                    return self.llm_agent_service.process_query(
+                        user_query,
+                        stream_callback=collect_messages
+                    )
+                finally:
+                    # Сигналізуємо про завершення обробки
+                    stop_updates.set()
+                    update_event.set()
+            
+            # Виконуємо в thread pool
+            try:
+                loop = asyncio.get_event_loop()
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    response = await loop.run_in_executor(executor, process_in_thread)
+            finally:
+                # Зупиняємо завдання оновлення
+                stop_updates.set()
+                update_task.cancel()
+                try:
+                    await update_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Оновлюємо повідомлення з усіма проміжними результатами
+            all_messages = "".join(intermediate_messages)
+            if all_messages:
+                await status_message.edit_text(all_messages[-4000:])
+            
+            # Відправляємо фінальну відповідь
+            if len(response) > 4096:
+                # Якщо відповідь занадто довга, розбиваємо на частини
+                parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
+                for i, part in enumerate(parts):
+                    if i == 0 and not all_messages:
+                        await status_message.edit_text(part)
+                    else:
+                        await update.message.reply_text(part)
+            else:
+                if not all_messages:
+                    await status_message.edit_text(response)
+                else:
+                    await update.message.reply_text(response)
+            
+            # Логуємо дію
+            self.logging_service.log_user_action(
+                user_id=user_id,
+                action='llm_query',
+                message=f"Запит до LLM: {user_query[:100]}...",
+                metadata={'query_length': len(user_query), 'response_length': len(response)}
+            )
+        
+        except Exception as e:
+            error_msg = f"❌ Помилка обробки запиту: {str(e)}"
+            await status_message.edit_text(error_msg)
+            
+            self.logging_service.log_user_action(
+                user_id=user_id,
+                action='llm_query',
+                message=f"Помилка запиту до LLM: {user_query[:100]}...",
+                error=str(e)
+            )
+        
+        # Повертаємо до стану очікування наступного запиту
+        await update.message.reply_text(
+            "Задайте наступне питання або натисніть '🔙 Повернутись' для виходу.",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🔙 Повернутись")]], resize_keyboard=True)
+        )
+        
+        return WAITING_LLM_QUERY
+    
+    async def _back_to_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Повертає до головного меню."""
+        context.user_data.clear()
+        await self.show_main_menu(update, context)
+        return ConversationHandler.END
     
     async def post_init(self, application: Application) -> None:
         """Викликається після ініціалізації бота."""

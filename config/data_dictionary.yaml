@@ -1,0 +1,400 @@
+# Data Dictionary - єдине джерело правди про структуру даних у базі
+# Використовується для:
+# - MCP серверів (схема метаданих)
+# - MongoDB валідації
+# - Генерації документації
+
+collections:
+  prozorro_auctions:
+    description: "Колекція з даними про аукціони ProZorro.Sale"
+    mongo_collection: "prozorro_auctions"
+    indexes:
+      - field: "auction_id"
+        unique: true
+        description: "Унікальний ідентифікатор аукціону"
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+        description: "MongoDB ObjectId"
+        mongo_generated: true
+      
+      auction_id:
+        type: "string"
+        required: true
+        description: "Унікальний ідентифікатор аукціону з ProZorro"
+        example: "UA-EA-2024-01-15-000123"
+        indexed: true
+      
+      auction_data:
+        type: "object"
+        required: true
+        description: "Повні дані аукціону з ProZorro API"
+        nested_fields:
+          id:
+            type: "string"
+            description: "ID аукціону"
+          status:
+            type: "string"
+            description: "Статус аукціону"
+            enum: ["active", "active.tendering", "active.auction", "active.qualification", "active.awarded", "complete", "cancelled", "unsuccessful"]
+          dateCreated:
+            type: "datetime"
+            description: "Дата створення аукціону"
+          dateModified:
+            type: "datetime"
+            description: "Дата останньої модифікації"
+          value:
+            type: "object"
+            description: "Інформація про ціну"
+            nested_fields:
+              amount:
+                type: "number"
+                unit: "UAH"
+                description: "Сума в гривнях"
+              valueAddedTaxIncluded:
+                type: "boolean"
+                description: "Чи включений ПДВ"
+          items:
+            type: "array"
+            description: "Список предметів аукціону"
+            item_type: "object"
+          bids:
+            type: "array"
+            description: "Список заявок (bids) на участь в аукціоні. Кожен bid містить інформацію про учасника(ів)."
+            item_type: "object"
+            nested_fields:
+              id:
+                type: "string"
+                description: "Унікальний ідентифікатор заявки"
+              bidders:
+                type: "array"
+                description: "Список учасників (bidders) у цій заявці. Кожен bidder має identifier.id - унікальний ідентифікатор учасника."
+                item_type: "object"
+                nested_fields:
+                  identifier:
+                    type: "object"
+                    description: "Ідентифікатор учасника"
+                    nested_fields:
+                      id:
+                        type: "string"
+                        description: "Унікальний ідентифікатор учасника (IPN, EDRPOU тощо)"
+                      scheme:
+                        type: "string"
+                        description: "Схема ідентифікації (UA-IPN, UA-EDR тощо)"
+              owner:
+                type: "string"
+                description: "Платформа, через яку подана заявка"
+              value:
+                type: "object"
+                description: "Ціна, запропонована в заявці"
+                nested_fields:
+                  amount:
+                    type: "number"
+                    description: "Сума в гривнях"
+              status:
+                type: "string"
+                description: "Статус заявки (active, invalid, disqualified тощо)"
+          period:
+            type: "object"
+            description: "Періоди аукціону"
+            nested_fields:
+              startDate:
+                type: "datetime"
+                description: "Дата початку"
+              endDate:
+                type: "datetime"
+                description: "Дата закінчення"
+          description:
+            type: "string"
+            description: "Опис аукціону"
+      
+      version_hash:
+        type: "string"
+        required: true
+        description: "MD5 хеш версії об'єкта для відстеження змін"
+        example: "a1b2c3d4e5f6..."
+      
+      description_hash:
+        type: "string"
+        required: false
+        description: "MD5 хеш опису аукціону для зв'язку з llm_cache"
+        example: "f6e5d4c3b2a1..."
+        indexed: true
+      
+      last_updated:
+        type: "datetime"
+        required: true
+        description: "Дата та час останнього оновлення запису"
+      
+      created_at:
+        type: "datetime"
+        required: true
+        description: "Дата та час створення запису"
+    
+    relationships:
+      - type: "reference"
+        field: "description_hash"
+        target_collection: "llm_cache"
+        target_field: "description_hash"
+        description: "Зв'язок з кешованими результатами LLM парсингу опису"
+        cardinality: "many-to-one"
+    
+    # ВИРІВНЯНІ ПОЛЯ (Flattened Fields) - поля, які використовуються для експорту та аналітики
+    # Ці поля формуються з auction_data та llm_cache.result при експорті
+    # ВАЖЛИВО: LLM має використовувати ці поля при запитах та аналітиці
+    flattened_fields:
+      # Адресні поля (формуються з auction_data.items[].address та llm_cache.result.addresses[])
+      address_region:
+        type: "string"
+        description: "Область (наприклад: 'Київська', 'Харківська', 'Львівська'). Формується з auction_data.items[].address.region.uk_UA або llm_cache.result.addresses[].region. Для аналітики використовуй це поле для групування за регіонами."
+        example: "Київська"
+        source: "auction_data.items[].address.region.uk_UA або llm_cache.result.addresses[].region"
+        usage: "Використовується для експорту та аналітики (groupBy: 'region')"
+      
+      address_city:
+        type: "string"
+        description: "Населений пункт/місто (наприклад: 'Київ', 'Львів', 'Верхньоводяне'). Формується з auction_data.items[].address.locality.uk_UA або llm_cache.result.addresses[].settlement. Для аналітики використовуй це поле для групування за містами."
+        example: "Київ"
+        source: "auction_data.items[].address.locality.uk_UA або llm_cache.result.addresses[].settlement"
+        usage: "Використовується для експорту та аналітики (groupBy: 'city')"
+      
+      address:
+        type: "string"
+        description: "Повна адреса (форматується з різних компонентів адреси). Використовуй для відображення повної адреси в звітах."
+        example: "Київська область, м. Київ, вул. Хрещатик, 1"
+        source: "Формується з auction_data.items[].address або llm_cache.result.addresses[]"
+        usage: "Використовується для експорту"
+      
+      # Поля про нерухомість
+      property_type:
+        type: "string"
+        description: "Тип нерухомості. Можливі значення: 'Земля під будівництво', 'Землі с/г призначення', 'Нерухомість', 'інше'. Формується з auction_data.items[].classification.id або llm_cache.result.property_type. Для аналітики використовуй це поле для групування за типом нерухомості."
+        example: "Нерухомість"
+        source: "auction_data.items[].classification.id або llm_cache.result.property_type"
+        usage: "Використовується для експорту та аналітики (groupBy: 'property_type')"
+      
+      cadastral_number:
+        type: "string"
+        description: "Кадастровий номер у форматі '6320685503:03:000:0202'. Формується з auction_data.items[].additionalClassifications[] або llm_cache.result.cadastral_number."
+        example: "6320685503:03:000:0202"
+        source: "auction_data.items[].additionalClassifications[] або llm_cache.result.cadastral_number"
+        usage: "Використовується для експорту"
+      
+      building_area_sqm:
+        type: "number"
+        unit: "m²"
+        description: "Площа нерухомості (будівель, споруд, приміщень) в квадратних метрах. Формується з auction_data.items[].quantity.value або llm_cache.result.building_area_sqm. Для аналітики використовуй це поле в метриках 'area' та 'building_area'."
+        example: 956.7
+        source: "auction_data.items[].quantity.value (якщо unit='м²') або llm_cache.result.building_area_sqm"
+        usage: "Використовується для експорту та аналітики (метрики: area, building_area)"
+      
+      land_area_ha:
+        type: "number"
+        unit: "ha"
+        description: "Площа земельної ділянки в гектарах. Формується з auction_data.items[].quantity.value або llm_cache.result.land_area_ha. Для аналітики використовуй це поле в метриці 'land_area'."
+        example: 0.5296
+        source: "auction_data.items[].quantity.value (якщо unit='га') або llm_cache.result.land_area_ha"
+        usage: "Використовується для експорту та аналітики (метрика: land_area)"
+      
+      # Фінансові поля (формуються з auction_data)
+      base_price:
+        type: "string"
+        description: "Стартова ціна аукціону у форматі 'сума валюта' (наприклад: '1000000 UAH'). Формується з auction_data.value.amount та auction_data.value.currency. Для аналітики використовуй auction_data.value.amount (число) в метриках 'base_price' та 'total_price'."
+        example: "1000000 UAH"
+        source: "auction_data.value.amount + auction_data.value.currency"
+        usage: "Використовується для експорту. Для аналітики використовуй auction_data.value.amount"
+      
+      priceFinal:
+        type: "number"
+        unit: "UAH"
+        description: "Фінальна ціна аукціону в гривнях (число). Формується з auction_data.contracts[].value.amount або auction_data.awards[].value.amount. Для аналітики використовуй це поле в метриках 'total_price' та 'average_price_per_m2'."
+        example: 1500000
+        source: "auction_data.contracts[].value.amount або auction_data.awards[].value.amount"
+        usage: "Використовується для аналітики (метрики: total_price, average_price_per_m2)"
+      
+      deposit_amount:
+        type: "string"
+        description: "Розмір взносу у форматі 'сума валюта' (наприклад: '100000 UAH'). Формується з auction_data.guarantee.amount та auction_data.guarantee.currency."
+        example: "100000 UAH"
+        source: "auction_data.guarantee.amount + auction_data.guarantee.currency"
+        usage: "Використовується для експорту"
+      
+      # Дати (формуються з auction_data)
+      auction_start_date:
+        type: "string"
+        description: "Дата торгів у форматі 'DD.MM.YYYY'. Формується з auction_data.auctionPeriod.startDate."
+        example: "15.01.2024"
+        source: "auction_data.auctionPeriod.startDate"
+        usage: "Використовується для експорту"
+      
+      document_submission_deadline:
+        type: "string"
+        description: "Дата фінальної подачі документів у форматі 'DD.MM.YYYY'. Формується з auction_data.enquiryPeriod.endDate або auction_data.qualificationPeriod.endDate."
+        example: "10.01.2024"
+        source: "auction_data.enquiryPeriod.endDate або auction_data.qualificationPeriod.endDate"
+        usage: "Використовується для експорту"
+      
+      # Статус та учасники (формуються з auction_data)
+      status:
+        type: "string"
+        description: "Статус аукціону. Можливі значення: 'active', 'active.tendering', 'active.auction', 'active.qualification', 'active.awarded', 'complete', 'cancelled', 'unsuccessful'. Для аналітики використовуй це поле для групування за статусом."
+        enum: ["active", "active.tendering", "active.auction", "active.qualification", "active.awarded", "complete", "cancelled", "unsuccessful"]
+        source: "auction_data.status"
+        usage: "Використовується для експорту та аналітики (groupBy: 'status')"
+      
+      min_participants_count:
+        type: "string"
+        description: "Мінімальна кількість учасників (рядок). Формується з auction_data.minNumberOfQualifiedBids."
+        example: "2"
+        source: "auction_data.minNumberOfQualifiedBids"
+        usage: "Використовується для експорту"
+      
+      participants_count:
+        type: "number"
+        description: "Кількість унікальних зареєстрованих учасників. Формується з підрахунку унікальних identifier.id з усіх auction_data.bids[].bidders[].identifier.id. Кожен bid може містити кілька bidders, тому потрібно рахувати унікальних учасників, а не кількість bids."
+        example: 5
+        source: "Унікальні identifier.id з auction_data.bids[].bidders[].identifier.id"
+        calculation: "Підрахунок унікальних значень identifier.id з усіх bids[].bidders[].identifier.id"
+        usage: "Використовується для аналітики та сортування аукціонів за кількістю учасників"
+        usage: "Використовується для експорту"
+      
+      # Додаткові поля
+      arrests_info:
+        type: "string"
+        description: "Інформація про обтяження майна (арешти) у форматі 'Арешт 1: Видав ХХХХХ, Дата: УУУУ, Можливе зняття так/ні'. Формується з auction_data.arrests[] або llm_cache.result.arrests_info."
+        example: "Арешт 1: Видав Суд, Дата: 2024-01-01, Можливе зняття так"
+        source: "auction_data.arrests[] або llm_cache.result.arrests_info"
+        usage: "Використовується для експорту"
+      
+      description:
+        type: "string"
+        description: "Опис аукціону (текст). Формується з auction_data.description.uk_UA або auction_data.description.en_US."
+        example: "Продаж нерухомості..."
+        source: "auction_data.description.uk_UA або auction_data.description.en_US"
+        usage: "Використовується для експорту"
+      
+      auction_url:
+        type: "string"
+        description: "Посилання на аукціон на сайті ProZorro.Sale у форматі 'https://prozorro.sale/auction/{auction_id}'."
+        example: "https://prozorro.sale/auction/UA-EA-2024-01-15-000123"
+        source: "Формується з auction_id"
+        usage: "Використовується для експорту"
+      
+      classification_code:
+        type: "string"
+        description: "Код класифікатора (CPV код). Формується з auction_data.items[].classification.id."
+        example: "70111000-6"
+        source: "auction_data.items[].classification.id"
+        usage: "Використовується для експорту"
+  
+  llm_cache:
+    description: "Колекція з кешованими результатами парсингу описів аукціонів через LLM"
+    mongo_collection: "llm_cache"
+    indexes:
+      - field: "description_hash"
+        unique: true
+        description: "Унікальний хеш опису"
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+        description: "MongoDB ObjectId"
+        mongo_generated: true
+      
+      description_hash:
+        type: "string"
+        required: true
+        description: "MD5 хеш опису аукціону"
+        example: "f6e5d4c3b2a1..."
+        indexed: true
+      
+      result:
+        type: "object"
+        required: true
+        description: "Результат парсингу опису через LLM"
+        nested_fields:
+          property_type:
+            type: "string"
+            description: "Тип нерухомості"
+            example: "Житловий будинок"
+          cadastral_number:
+            type: "string"
+            description: "Кадастровий номер"
+            example: "1234567890:01:001:0001"
+          building_area_sqm:
+            type: "number"
+            unit: "m²"
+            description: "Площа будівлі в квадратних метрах"
+          land_area_ha:
+            type: "number"
+            unit: "ha"
+            description: "Площа земельної ділянки в гектарах"
+          addresses:
+            type: "array"
+            description: "Список адрес"
+            item_type: "object"
+            nested_fields:
+              region:
+                type: "string"
+                description: "Область"
+                example: "Київська"
+              city:
+                type: "string"
+                description: "Місто"
+                example: "Київ"
+              district:
+                type: "string"
+                description: "Район"
+              settlement:
+                type: "string"
+                description: "Населений пункт"
+              street:
+                type: "string"
+                description: "Вулиця"
+              building_number:
+                type: "string"
+                description: "Номер будинку"
+      
+      created_at:
+        type: "datetime"
+        required: true
+        description: "Дата та час створення запису"
+    
+    relationships:
+      - type: "reference"
+        field: "description_hash"
+        target_collection: "prozorro_auctions"
+        target_field: "description_hash"
+        description: "Зв'язок з аукціонами, які мають такий самий хеш опису"
+        cardinality: "one-to-many"
+
+# Допоміжні типи та константи
+field_types:
+  - name: "string"
+    description: "Рядок тексту"
+    mongo_type: "string"
+  - name: "number"
+    description: "Число (integer або float)"
+    mongo_type: "number"
+  - name: "boolean"
+    description: "Булеве значення"
+    mongo_type: "bool"
+  - name: "datetime"
+    description: "Дата та час"
+    mongo_type: "date"
+  - name: "ObjectId"
+    description: "MongoDB ObjectId"
+    mongo_type: "objectId"
+  - name: "object"
+    description: "Вкладений об'єкт"
+    mongo_type: "object"
+  - name: "array"
+    description: "Масив значень"
+    mongo_type: "array"
+
+# Метадані
+metadata:
+  version: "1.0.0"
+  last_updated: "2026-01-23"
+  description: "Data Dictionary для проекту Pazuzu - єдине джерело правди про структуру даних"
