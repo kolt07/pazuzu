@@ -13,7 +13,7 @@ from config.settings import Settings
 
 # Налаштування логування для всього проекту
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
@@ -26,9 +26,7 @@ logging.getLogger('pymongo').setLevel(logging.WARNING)
 logging.getLogger('telegram').setLevel(logging.WARNING)
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
-
-# Встановлюємо INFO для нашого модуля LLM агента
-logging.getLogger('business.services.llm_agent_service').setLevel(logging.DEBUG)
+logging.getLogger('asyncio').setLevel(logging.WARNING)
 from business.services import ProZorroService
 from business.services.telegram_bot_service import TelegramBotService
 from business.services.logging_service import LoggingService

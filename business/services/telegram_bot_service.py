@@ -29,8 +29,9 @@ from config.settings import Settings
 from business.services.prozorro_service import ProZorroService
 from business.services.user_service import UserService
 from business.services.logging_service import LoggingService
-from business.services.llm_agent_service import LLMAgentService
+from business.services.langchain_agent_service import LangChainAgentService
 from utils.file_utils import create_zip_archive
+from utils.date_utils import format_datetime_display
 
 
 # Стани для ConversationHandler
@@ -81,12 +82,12 @@ class TelegramBotService:
         day_period = ""
         if update_dates.get('1d'):
             update_date = update_dates['1d']
-            day_period = f" (оновлено {update_date.strftime('%d.%m, %H:%M')})"
+            day_period = f" (оновлено {format_datetime_display(update_date, '%d.%m, %H:%M')})"
         
         week_period = ""
         if update_dates.get('7d'):
             update_date = update_dates['7d']
-            week_period = f" (оновлено {update_date.strftime('%d.%m, %H:%M')})"
+            week_period = f" (оновлено {format_datetime_display(update_date, '%d.%m, %H:%M')})"
         
         keyboard = [
             [KeyboardButton(f"📥 Скачати файл за добу{day_period}")],
@@ -103,20 +104,56 @@ class TelegramBotService:
         
         text = "Виберіть дію:"
         if update.callback_query:
-            await update.callback_query.message.reply_text(text=text, reply_markup=reply_markup)
+            msg = await update.callback_query.message.reply_text(text=text, reply_markup=reply_markup)
         else:
-            await update.message.reply_text(text=text, reply_markup=reply_markup)
+            msg = await update.message.reply_text(text=text, reply_markup=reply_markup)
+        context.user_data['last_menu_message_id'] = msg.message_id
+        context.user_data['last_menu_chat_id'] = msg.chat.id
+    
+    async def _send_main_menu_to_chat(self, chat_id: int, user_id: int) -> None:
+        """Надсилає головне меню в чат (після завершення фонового завдання)."""
+        is_admin = self.user_service.is_admin(user_id)
+        from data.repositories.app_data_repository import AppDataRepository
+        app_data_repo = AppDataRepository()
+        update_dates = app_data_repo.get_all_update_dates()
+        day_period = f" (оновлено {format_datetime_display(update_dates['1d'], '%d.%m, %H:%M')})" if update_dates.get('1d') else ""
+        week_period = f" (оновлено {format_datetime_display(update_dates['7d'], '%d.%m, %H:%M')})" if update_dates.get('7d') else ""
+        keyboard = [
+            [KeyboardButton(f"📥 Скачати файл за добу{day_period}")],
+            [KeyboardButton(f"📥 Скачати файл за тиждень{week_period}")],
+            [KeyboardButton("📊 Сформувати файл за добу")],
+            [KeyboardButton("📊 Сформувати файл за тиждень")]
+        ]
+        if is_admin:
+            keyboard.append([KeyboardButton("🤖 Спитати LLM")])
+            keyboard.append([KeyboardButton("⚙️ Адміністрування")])
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        sent = await self.application.bot.send_message(chat_id=chat_id, text="Виберіть дію:", reply_markup=reply_markup)
+        if user_id not in self.application.user_data:
+            self.application.user_data[user_id] = {}
+        self.application.user_data[user_id]['last_menu_message_id'] = sent.message_id
+        self.application.user_data[user_id]['last_menu_chat_id'] = chat_id
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обробка текстових повідомлень (кнопок з клавіатури)."""
         user_id = update.effective_user.id
-        
+        chat_id = update.effective_chat.id
+
         if not self.user_service.is_user_authorized(user_id):
             await update.message.reply_text("Ваш користувач не авторизований. Зареєструйтесь у адміністратора")
             return
-        
+
+        # Видаляємо попереднє повідомлення «Виберіть дію» після вибору дії чи підтвердження
+        mid = context.user_data.pop('last_menu_message_id', None)
+        cid = context.user_data.pop('last_menu_chat_id', None)
+        if mid is not None and cid == chat_id:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            except Exception:
+                pass
+
         text = update.message.text
-        
+
         if text.startswith("📥 Скачати файл за добу"):
             await self.handle_get_file(update, context, days=1)
         elif text.startswith("📥 Скачати файл за тиждень"):
@@ -144,7 +181,7 @@ class TelegramBotService:
             if context.user_data.get('pending_generate_week'):
                 context.user_data.pop('pending_generate_week')
                 await self.handle_generate_file(update, context, days=7)
-                # Повертаємося на стартове меню
+                # Повертаємо головне меню, щоб клавіатура змінилась з «Так/Відміна» на основні кнопки
                 await self.show_main_menu(update, context)
             else:
                 await update.message.reply_text("Немає активного запиту на підтвердження.")
@@ -234,8 +271,8 @@ class TelegramBotService:
             
             if update_date:
                 date_from = update_date - timedelta(days=days)
-                archive_internal_name = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{update_date.strftime('%d.%m.%Y')}).xlsx"
-                zip_filename = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{update_date.strftime('%d.%m.%Y')}).zip"
+                archive_internal_name = f"Звіт по нерухомості ({format_datetime_display(date_from, '%d.%m.%Y')}-{format_datetime_display(update_date, '%d.%m.%Y')}).xlsx"
+                zip_filename = f"Звіт по нерухомості ({format_datetime_display(date_from, '%d.%m.%Y')}-{format_datetime_display(update_date, '%d.%m.%Y')}).zip"
             else:
                 archive_internal_name = f"Звіт по нерухомості ({days} днів).xlsx"
                 zip_filename = f"Звіт по нерухомості ({days} днів).zip"
@@ -324,13 +361,8 @@ class TelegramBotService:
         try:
             loop = asyncio.get_event_loop()
             
-            # Для тижня використовуємо оптимізовану паралельну обробку
-            if days == 7:
-                await self._send_progress_message(
-                    chat_id,
-                    "Почато оптимізовану обробку тижня: паралельна обробка по днях..."
-                )
-            else:
+            # Для тижня використовуємо оптимізовану паралельну обробку (без окремого повідомлення)
+            if days != 7:
                 # Отримуємо аукціони (синхронна операція, виконуємо в executor)
                 auctions = await loop.run_in_executor(
                     None,
@@ -389,12 +421,6 @@ class TelegramBotService:
                     )
                 )
             
-            if days == 7 and result.get('success'):
-                await self._send_progress_message(
-                    chat_id,
-                    f"Паралельна обробка завершена. Об'єдную файли..."
-                )
-            
             if result['success']:
                 await self._send_progress_message(
                     chat_id,
@@ -420,8 +446,8 @@ class TelegramBotService:
                         update_date = result.get('update_date')
                         if update_date:
                             date_from = update_date - timedelta(days=days)
-                            archive_internal_name = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{update_date.strftime('%d.%m.%Y')}).xlsx"
-                            zip_filename = f"Звіт по нерухомості ({date_from.strftime('%d.%m.%Y')}-{update_date.strftime('%d.%m.%Y')}).zip"
+                            archive_internal_name = f"Звіт по нерухомості ({format_datetime_display(date_from, '%d.%m.%Y')}-{format_datetime_display(update_date, '%d.%m.%Y')}).xlsx"
+                            zip_filename = f"Звіт по нерухомості ({format_datetime_display(date_from, '%d.%m.%Y')}-{format_datetime_display(update_date, '%d.%m.%Y')}).zip"
                         else:
                             archive_internal_name = f"Звіт по нерухомості ({days} днів).xlsx"
                             zip_filename = f"Звіт по нерухомості ({days} днів).zip"
@@ -443,6 +469,7 @@ class TelegramBotService:
                             document=zip_bytes,
                             filename=zip_filename
                         )
+                        await self._send_main_menu_to_chat(chat_id, user_id)
                 except Exception as e:
                     await self._send_progress_message(
                         chat_id,
@@ -893,7 +920,7 @@ class TelegramBotService:
         # Ініціалізуємо LLM агента, якщо ще не ініціалізовано
         if self.llm_agent_service is None:
             try:
-                self.llm_agent_service = LLMAgentService(self.settings)
+                self.llm_agent_service = LangChainAgentService(self.settings)
             except Exception as e:
                 await update.message.reply_text(
                     f"❌ Помилка ініціалізації LLM агента: {str(e)}\n"
@@ -995,6 +1022,33 @@ class TelegramBotService:
             all_messages = "".join(intermediate_messages)
             if all_messages:
                 await status_message.edit_text(all_messages[-4000:])
+            
+            # Перевіряємо, чи є Excel файли в результатах tools
+            excel_files = []
+            if hasattr(self.llm_agent_service, '_extract_excel_files_from_history'):
+                excel_files = self.llm_agent_service._extract_excel_files_from_history()
+            
+            # Відправляємо Excel файли, якщо є
+            if excel_files:
+                import base64
+                from io import BytesIO
+                
+                for excel_file in excel_files:
+                    try:
+                        # Декодуємо base64
+                        file_bytes = base64.b64decode(excel_file['file_base64'])
+                        file_io = BytesIO(file_bytes)
+                        file_io.seek(0)
+                        
+                        # Відправляємо файл
+                        await context.bot.send_document(
+                            chat_id=update.message.chat_id,
+                            document=file_io,
+                            filename=excel_file['filename'],
+                            caption=f"📊 Excel файл з результатами запиту\nРядків: {excel_file.get('rows_count', 0)}, Колонок: {excel_file.get('columns_count', 0)}"
+                        )
+                    except Exception as e:
+                        await update.message.reply_text(f"Помилка відправки Excel файлу: {e}")
             
             # Відправляємо фінальну відповідь
             if len(response) > 4096:

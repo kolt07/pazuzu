@@ -106,15 +106,10 @@ class AnalyticsBuilder:
             )
         
         # Перевіряємо фільтри на наявність полів, що потребують llm_cache
+        llm_filter_fields = ['region', 'city', 'property_type', 'building_area_sqm', 'land_area_ha', 'building_area', 'land_area']
         if filters:
             filter_keys = list(filters.keys()) if isinstance(filters, dict) else []
-            if any(key in ['region', 'city', 'property_type'] for key in filter_keys):
-                needs_llm_lookup = True
-        
-        # Для метрики count з фільтрами за region/city/property_type також потрібен lookup
-        if metric_name == 'count' and filters:
-            filter_keys = list(filters.keys()) if isinstance(filters, dict) else []
-            if any(key in ['region', 'city', 'property_type'] for key in filter_keys):
+            if any(key in llm_filter_fields for key in filter_keys):
                 needs_llm_lookup = True
         
         # 1. Match stage для фільтрів (тільки ті, що не потребують llm_cache)
@@ -473,7 +468,12 @@ class AnalyticsBuilder:
         mongo_filters = {}
         
         for key, value in filters.items():
-            if isinstance(value, dict) and 'from' in value and 'to' in value:
+            # Обробка $or оператора (має бути на верхньому рівні)
+            if key == '$or':
+                if isinstance(value, list):
+                    mongo_filters['$or'] = [self._build_match_filters(item, skip_llm_fields, only_llm_fields) for item in value]
+                continue
+            elif isinstance(value, dict) and 'from' in value and 'to' in value:
                 # Діапазон дат
                 from_date = datetime.fromisoformat(value['from'])
                 to_date = datetime.fromisoformat(value['to'])
@@ -509,25 +509,53 @@ class AnalyticsBuilder:
                 elif key == 'region':
                     # Для регіону потрібен lookup з llm_cache
                     if only_llm_fields:
-                        # Фільтруємо після lookup - шукаємо в масиві addresses
-                        mongo_filters['llm_result.result.addresses'] = {
-                            '$elemMatch': {
-                                'region': value
+                        # Підтримуємо $in для множинних значень
+                        if isinstance(value, dict) and '$in' in value:
+                            mongo_filters['llm_result.result.addresses'] = {
+                                '$elemMatch': {
+                                    'region': {'$in': value['$in']}
+                                }
                             }
-                        }
+                        else:
+                            # Фільтруємо після lookup - шукаємо в масиві addresses
+                            mongo_filters['llm_result.result.addresses'] = {
+                                '$elemMatch': {
+                                    'region': value
+                                }
+                            }
                 elif key == 'city':
                     # Для міста потрібен lookup з llm_cache
                     if only_llm_fields:
-                        # Фільтруємо після lookup - шукаємо в масиві addresses
-                        mongo_filters['llm_result.result.addresses'] = {
-                            '$elemMatch': {
-                                'settlement': value
+                        # Підтримуємо $in для множинних значень
+                        if isinstance(value, dict) and '$in' in value:
+                            mongo_filters['llm_result.result.addresses'] = {
+                                '$elemMatch': {
+                                    'settlement': {'$in': value['$in']}
+                                }
                             }
-                        }
+                        else:
+                            # Фільтруємо після lookup - шукаємо в масиві addresses
+                            mongo_filters['llm_result.result.addresses'] = {
+                                '$elemMatch': {
+                                    'settlement': value
+                                }
+                            }
                 elif key == 'property_type':
                     # Для типу нерухомості потрібен lookup з llm_cache
                     if only_llm_fields:
                         mongo_filters['llm_result.result.property_type'] = value
+                elif key in ['building_area_sqm', 'land_area_ha', 'building_area', 'land_area']:
+                    # Для площі потрібен lookup з llm_cache
+                    if only_llm_fields:
+                        # Підтримуємо MongoDB оператори ($lte, $gte, $lt, $gt, $eq)
+                        if isinstance(value, dict):
+                            # Якщо значення - словник з операторами (наприклад, {"$lte": 200})
+                            field_name = 'building_area_sqm' if key in ['building_area_sqm', 'building_area'] else 'land_area_ha'
+                            mongo_filters[f'llm_result.result.{field_name}'] = value
+                        else:
+                            # Якщо просте значення, використовуємо $eq
+                            field_name = 'building_area_sqm' if key in ['building_area_sqm', 'building_area'] else 'land_area_ha'
+                            mongo_filters[f'llm_result.result.{field_name}'] = value
                 else:
                     if not only_llm_fields:
                         mongo_filters[f'auction_data.{key}'] = value

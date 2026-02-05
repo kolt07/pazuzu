@@ -100,6 +100,23 @@ class ProZorroAuctionsRepository(BaseRepository):
         """
         return self.find_many({'version_hash': version_hash})
     
+    def get_auctions_by_description_hash(self, description_hash: str, exclude_auction_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Знаходить аукціони за хешем опису.
+        
+        Args:
+            description_hash: Хеш опису
+            exclude_auction_id: Ідентифікатор аукціону, який потрібно виключити з результату
+            
+        Returns:
+            Список документів
+        """
+        self._ensure_indexes()
+        filter_dict = {'description_hash': description_hash}
+        if exclude_auction_id:
+            filter_dict['auction_id'] = {'$ne': exclude_auction_id}
+        return self.find_many(filter_dict)
+    
     def get_auctions_by_date_range(self, date_from: datetime, date_to: datetime) -> List[Dict[str, Any]]:
         """
         Отримує аукціони, які були створені або змінені в діапазоні дат.
@@ -170,3 +187,37 @@ class ProZorroAuctionsRepository(BaseRepository):
                 filtered_auctions.append(auction)
         
         return filtered_auctions
+    
+    def get_active_auctions(self) -> List[Dict[str, Any]]:
+        """
+        Отримує всі активні аукціони з бази даних.
+        
+        Активними вважаються аукціони зі статусами, що починаються з 'active'.
+        
+        Returns:
+            Список документів з активними аукціонами
+        """
+        self._ensure_indexes()
+        all_auctions = self.find_many()
+        
+        active_statuses = ['active', 'active.tendering', 'active.auction', 'active.qualification', 
+                          'active_rectification', 'active_tendering', 'active_auction', 'active_qualification']
+        
+        active_auctions = []
+        for auction in all_auctions:
+            auction_data = auction.get('auction_data', {})
+            if not auction_data:
+                continue
+            
+            status = auction_data.get('status', '')
+            is_active = any(
+                status.startswith(active_status.replace('_', '.')) or 
+                status == active_status or
+                status.startswith(active_status.replace('.', '_'))
+                for active_status in active_statuses
+            )
+            
+            if is_active:
+                active_auctions.append(auction)
+        
+        return active_auctions

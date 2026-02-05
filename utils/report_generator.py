@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 from datetime import datetime
 from utils.report_templates import ReportTemplates, ReportTemplate
+from utils.date_utils import KYIV_TZ
 from utils.analytics_builder import AnalyticsBuilder
 from utils.query_builder import QueryBuilder
 from utils.file_utils import generate_excel_in_memory
@@ -313,7 +314,7 @@ class ReportGenerator:
                 }
             else:
                 # Зберігаємо файл та повертаємо URL
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                timestamp = datetime.now(KYIV_TZ).strftime('%Y%m%d_%H%M%S')
                 filename = f"report_{timestamp}.{extension}"
                 file_path = self.temp_dir / filename
                 

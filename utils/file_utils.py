@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
+from utils.date_utils import KYIV_TZ
+
 try:
     import pandas as pd
     PANDAS_AVAILABLE = True
@@ -53,9 +55,9 @@ def generate_json_filename(prefix: str = 'prozorro_real_estate', extension: str 
         extension: Розширення файлу
 
     Returns:
-        str: Ім'я файлу у форматі prefix_YYYY-MM-DD_HH-MM-SS.extension
+        str: Ім'я файлу у форматі prefix_YYYY-MM-DD_HH-MM-SS.extension (час за Києвом)
     """
-    now = datetime.now()
+    now = datetime.now(KYIV_TZ)
     timestamp = now.strftime('%Y-%m-%d_%H-%M-%S')
     return f'{prefix}_{timestamp}.{extension}'
 
@@ -76,9 +78,9 @@ def generate_auction_filename(
         days: Кількість днів виборки (опціонально)
 
     Returns:
-        str: Ім'я файлу у форматі prefix_YYYY-MM-DD_HH-MM-SS[_userID][_daysD].extension
+        str: Ім'я файлу у форматі prefix_YYYY-MM-DD_HH-MM-SS[_userID][_daysD].extension (час за Києвом)
     """
-    now = datetime.now()
+    now = datetime.now(KYIV_TZ)
     timestamp = now.strftime('%Y-%m-%d_%H-%M-%S')
     
     parts = [prefix, timestamp]
@@ -193,10 +195,14 @@ def generate_excel_in_memory(data: List[Dict[str, Any]], fieldnames: List[str], 
     # Закріплюємо шапку
     ws.freeze_panes = 'A2'
     
-    # Знаходимо індекс колонки з посиланнями
+    # Знаходимо індекси колонок з посиланнями
     url_column_idx = None
     if 'auction_url' in fieldnames:
         url_column_idx = fieldnames.index('auction_url') + 1
+    
+    previous_links_column_idx = None
+    if 'previous_auctions_links' in fieldnames:
+        previous_links_column_idx = fieldnames.index('previous_auctions_links') + 1
     
     # Стиль для гіперпосилань
     hyperlink_font = Font(underline="single", color="0563C1")
@@ -229,6 +235,38 @@ def generate_excel_in_memory(data: List[Dict[str, Any]], fieldnames: List[str], 
                     if has_bold:
                         cell.font = bold_font
                     cell.border = border_style
+                else:
+                    cell.border = Border()
+            # Якщо це колонка з посиланнями на минулі аукціони, створюємо гіперпосилання
+            elif col_idx == previous_links_column_idx and cell.value:
+                links_text = str(cell.value).strip()
+                if links_text:
+                    # Знаходимо перше посилання в тексті (може бути кілька через \r\n)
+                    links = [link.strip() for link in links_text.split('\r\n') if link.strip()]
+                    first_link = None
+                    for link in links:
+                        if link.startswith('http://') or link.startswith('https://'):
+                            first_link = link
+                            break
+                    
+                    if first_link:
+                        # Створюємо гіперпосилання на перше посилання
+                        cell.hyperlink = first_link
+                        # Текст залишаємо як є (з усіма посиланнями)
+                        cell.value = links_text
+                        # Застосовуємо стиль гіперпосилання
+                        if has_bold:
+                            cell.font = Font(underline="single", color="0563C1", bold=True)
+                        else:
+                            cell.font = hyperlink_font
+                        cell.border = border_style
+                    elif links_text:
+                        # Якщо є текст, але немає посилань - просто форматуємо
+                        if has_bold:
+                            cell.font = bold_font
+                        cell.border = border_style
+                    else:
+                        cell.border = Border()
                 else:
                     cell.border = Border()
             # Додаємо сітку тільки якщо є дані
@@ -296,6 +334,13 @@ def save_excel_to_file(data: List[Dict[str, Any]], file_path: str, fieldnames: L
     
     ensure_directory_exists(os.path.dirname(file_path) if os.path.dirname(file_path) else '.')
     
+    # Переконуємося, що всі колонки з fieldnames присутні в даних
+    # Додаємо порожні значення для відсутніх колонок
+    for row in data:
+        for fieldname in fieldnames:
+            if fieldname not in row:
+                row[fieldname] = ''
+    
     # Створюємо DataFrame з даних
     df = pd.DataFrame(data, columns=fieldnames)
     
@@ -336,10 +381,14 @@ def save_excel_to_file(data: List[Dict[str, Any]], file_path: str, fieldnames: L
     # Закріплюємо шапку
     ws.freeze_panes = 'A2'
     
-    # Знаходимо індекс колонки з посиланнями
+    # Знаходимо індекси колонок з посиланнями
     url_column_idx = None
     if 'auction_url' in fieldnames:
         url_column_idx = fieldnames.index('auction_url') + 1
+    
+    previous_links_column_idx = None
+    if 'previous_auctions_links' in fieldnames:
+        previous_links_column_idx = fieldnames.index('previous_auctions_links') + 1
     
     # Стиль для гіперпосилань
     hyperlink_font = Font(underline="single", color="0563C1")
@@ -372,6 +421,38 @@ def save_excel_to_file(data: List[Dict[str, Any]], file_path: str, fieldnames: L
                     if has_bold:
                         cell.font = bold_font
                     cell.border = border_style
+                else:
+                    cell.border = Border()
+            # Якщо це колонка з посиланнями на минулі аукціони, створюємо гіперпосилання
+            elif col_idx == previous_links_column_idx and cell.value:
+                links_text = str(cell.value).strip()
+                if links_text:
+                    # Знаходимо перше посилання в тексті (може бути кілька через \r\n)
+                    links = [link.strip() for link in links_text.split('\r\n') if link.strip()]
+                    first_link = None
+                    for link in links:
+                        if link.startswith('http://') or link.startswith('https://'):
+                            first_link = link
+                            break
+                    
+                    if first_link:
+                        # Створюємо гіперпосилання на перше посилання
+                        cell.hyperlink = first_link
+                        # Текст залишаємо як є (з усіма посиланнями)
+                        cell.value = links_text
+                        # Застосовуємо стиль гіперпосилання
+                        if has_bold:
+                            cell.font = Font(underline="single", color="0563C1", bold=True)
+                        else:
+                            cell.font = hyperlink_font
+                        cell.border = border_style
+                    elif links_text:
+                        # Якщо є текст, але немає посилань - просто форматуємо
+                        if has_bold:
+                            cell.font = bold_font
+                        cell.border = border_style
+                    else:
+                        cell.border = Border()
                 else:
                     cell.border = Border()
             # Додаємо сітку тільки якщо є дані

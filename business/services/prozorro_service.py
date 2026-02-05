@@ -15,7 +15,7 @@ import time
 
 from config.settings import Settings
 from transport.dto.prozorro_dto import AuctionDTO, AuctionsResponseDTO
-from utils.date_utils import get_date_range, format_datetime_for_api, format_datetime_for_byDateModified
+from utils.date_utils import get_date_range, format_datetime_for_api, format_datetime_for_byDateModified, format_date_display, format_datetime_display
 from utils.file_utils import save_json_to_file, save_csv_to_file, save_excel_to_file, generate_json_filename, generate_auction_filename, ensure_directory_exists, merge_excel_files, generate_excel_in_memory
 from utils.hash_utils import calculate_object_version_hash, calculate_description_hash, extract_auction_id
 from business.services.llm_service import LLMService
@@ -1459,19 +1459,8 @@ class ProZorroService:
             return ', '.join(parts) if parts else ''
         
         def format_date(date_str: str) -> str:
-            """Форматує дату у форматі дд.ММ.рррр ГГ:ХХ."""
-            if not date_str:
-                return ''
-            try:
-                if date_str.endswith('Z'):
-                    date_str = date_str.replace('Z', '+00:00')
-                dt = datetime.fromisoformat(date_str)
-                # Конвертуємо в локальний час, якщо потрібно
-                if dt.tzinfo:
-                    dt = dt.astimezone(timezone.utc)
-                return dt.strftime('%d.%m.%Y %H:%M')
-            except (ValueError, AttributeError):
-                return str(date_str)
+            """Форматує дату у форматі дд.ММ.рррр ГГ:ХХ (київський час)."""
+            return format_date_display(date_str, '%d.%m.%Y %H:%M')
         
         def format_arrests(arrests_data: List[Dict[str, Any]], parsed_arrests_info: str) -> str:
             """Формує інформацію про арешти у правильному форматі."""
@@ -1533,8 +1522,10 @@ class ProZorroService:
 
         # Порядок колонок: Область, Населений пункт, Адреса, Тип нерухомості, Кадастровий номер,
         # Площа нерухомості (кв. м.), Площа земельної ділянки (га), Стартова ціна, Розмір взносу, Дата торгів, Дата фінальної подачі документів,
-        # Мінімальна кількість учасників, Кількість зареєстрованих учасників, Арешти, Опис, Посилання, Код класифікатора
+        # Мінімальна кількість учасників, Кількість зареєстрованих учасників, Арешти, Опис, Посилання, Код класифікатора,
+        # Повторний аукціон, Посилання на минулі аукціони
         fieldnames = [
+            'date_updated',                      # Дата оновлення
             'address_region',                    # Область
             'address_city',                      # Населений пункт
             'address',                           # Адреса
@@ -1551,11 +1542,14 @@ class ProZorroService:
             'arrests_info',                      # Арешти
             'description',                       # Опис
             'auction_url',                       # Посилання
-            'classification_code'                # Код класифікатора
+            'classification_code',               # Код класифікатора
+            'is_repeat_auction',                 # Повторний аукціон
+            'previous_auctions_links'            # Посилання на минулі аукціони
         ]
         
         # Українські назви колонок
         column_headers = {
+            'date_updated': 'Дата оновлення',
             'address_region': 'Область',
             'address_city': 'Населений пункт',
             'address': 'Адреса',
@@ -1572,7 +1566,9 @@ class ProZorroService:
             'arrests_info': 'Арешти',
             'description': 'Опис',
             'auction_url': 'Посилання',
-            'classification_code': 'Код класифікатора'
+            'classification_code': 'Код класифікатора',
+            'is_repeat_auction': 'Повторний аукціон',
+            'previous_auctions_links': 'Посилання на минулі аукціони'
         }
         
         from tqdm import tqdm
@@ -1601,8 +1597,12 @@ class ProZorroService:
             data = auction.data
             
             # Посилання на аукціон
-            auction_id = data.get('auctionId') or data.get('_id') or auction.id
-            auction_url = f"https://prozorro.sale/auction/{auction_id}"
+            # Використовуємо extract_auction_id для консистентності з іншими частинами коду
+            auction_id = extract_auction_id(data) or auction.id
+            if not auction_id:
+                # Якщо не вдалося витягти ID, спробуємо альтернативні методи
+                auction_id = data.get('auctionId') or data.get('_id') or auction.id
+            auction_url = f"https://prozorro.sale/auction/{auction_id}" if auction_id else ""
             
             # Опис
             description = ''
@@ -1955,6 +1955,106 @@ class ProZorroService:
                     if has_additional_classification_03_07:
                         break
             
+            # Визначаємо повторний аукціон та посилання на минулі аукціони
+            is_repeat_auction = 'ні'
+            previous_auctions_links = ''
+            
+            # Перевіряємо, чи є auction_id та description для пошуку попередніх аукціонів
+            if description and auction_id:
+                # Обчислюємо хеш опису
+                description_hash = calculate_description_hash(description)
+                
+                if description_hash:
+                    # Знаходимо інші аукціони з тим самим описом
+                    previous_auctions = self.auctions_repository.get_auctions_by_description_hash(
+                        description_hash,
+                        exclude_auction_id=auction_id
+                    )
+                    
+                    if previous_auctions:
+                        # Отримуємо дату створення поточного аукціону
+                        current_date_created = None
+                        date_created_str = data.get('dateCreated', '')
+                        if date_created_str:
+                            try:
+                                if date_created_str.endswith('Z'):
+                                    date_created_str = date_created_str.replace('Z', '+00:00')
+                                current_date_created = datetime.fromisoformat(date_created_str)
+                                if current_date_created.tzinfo:
+                                    current_date_created = current_date_created.astimezone(timezone.utc)
+                                else:
+                                    current_date_created = current_date_created.replace(tzinfo=timezone.utc)
+                            except (ValueError, AttributeError):
+                                pass
+                        
+                        # Фільтруємо попередні аукціони за датою створення
+                        previous_links = []
+                        has_earlier_auction = False
+                        
+                        for prev_auction in previous_auctions:
+                            prev_auction_data = prev_auction.get('auction_data', {})
+                            if not prev_auction_data:
+                                continue
+                            
+                            prev_auction_id = prev_auction.get('auction_id')
+                            if not prev_auction_id:
+                                continue
+                            
+                            # Отримуємо дату створення попереднього аукціону
+                            prev_date_created_str = prev_auction_data.get('dateCreated', '')
+                            prev_date_created = None
+                            
+                            if prev_date_created_str:
+                                try:
+                                    if prev_date_created_str.endswith('Z'):
+                                        prev_date_created_str = prev_date_created_str.replace('Z', '+00:00')
+                                    prev_date_created = datetime.fromisoformat(prev_date_created_str)
+                                    if prev_date_created.tzinfo:
+                                        prev_date_created = prev_date_created.astimezone(timezone.utc)
+                                    else:
+                                        prev_date_created = prev_date_created.replace(tzinfo=timezone.utc)
+                                except (ValueError, AttributeError):
+                                    pass
+                            
+                            # Якщо є дата створення поточного аукціону, порівнюємо
+                            if current_date_created and prev_date_created:
+                                if prev_date_created < current_date_created:
+                                    has_earlier_auction = True
+                                    prev_link = f"https://prozorro.sale/auction/{prev_auction_id}"
+                                    previous_links.append(prev_link)
+                            else:
+                                # Якщо немає дати створення, додаємо всі попередні аукціони
+                                has_earlier_auction = True
+                                prev_link = f"https://prozorro.sale/auction/{prev_auction_id}"
+                                previous_links.append(prev_link)
+                        
+                        # Визначаємо, чи є це повторний аукціон
+                        if has_earlier_auction:
+                            is_repeat_auction = 'так'
+                        
+                        # Формуємо посилання на минулі аукціони через символ повернення каретки і переносу строки
+                        if previous_links:
+                            previous_auctions_links = '\r\n'.join(previous_links)
+            
+            # Дата оновлення: dateModified якщо аукціон оновлювався, інакше dateCreated
+            date_modified_str = data.get('dateModified', '')
+            date_created_str = data.get('dateCreated', '')
+            date_updated_str = date_modified_str if (date_modified_str and date_modified_str != date_created_str) else (date_created_str or date_modified_str)
+            date_updated = format_date(date_updated_str) if date_updated_str else ''
+            try:
+                if date_updated_str:
+                    s = date_updated_str.replace('Z', '+00:00') if date_updated_str.endswith('Z') else date_updated_str
+                    dt = datetime.fromisoformat(s)
+                    if dt.tzinfo:
+                        dt = dt.astimezone(timezone.utc)
+                    else:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    date_updated_ts = dt
+                else:
+                    date_updated_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            except (ValueError, AttributeError):
+                date_updated_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            
             auction_row = {
                 'address_region': ensure_string(address_region),
                 'address_city': ensure_string(address_city),
@@ -1973,12 +2073,42 @@ class ProZorroService:
                 'description': ensure_string(description),
                 'auction_url': ensure_string(auction_url),
                 'classification_code': ensure_string(classification_code),
+                'is_repeat_auction': ensure_string(is_repeat_auction),
+                'previous_auctions_links': ensure_string(previous_auctions_links),
+                'date_updated': ensure_string(date_updated),
+                'date_updated_ts': date_updated_ts,
                 '_has_additional_classification_03_07': has_additional_classification_03_07  # Службове поле для форматування
             }
             
             auctions_data.append(auction_row)
 
         print(f"Підготовлено {len(auctions_data)} рядків для збереження в Excel")
+        
+        # Перевіряємо, чи всі колонки присутні в даних
+        if auctions_data:
+            sample_row = auctions_data[0]
+            missing_columns = [col for col in fieldnames if col not in sample_row]
+            if missing_columns:
+                print(f"Попередження: відсутні колонки в даних: {missing_columns}")
+            # Перевіряємо нові колонки
+            if 'is_repeat_auction' in sample_row:
+                repeat_count = sum(1 for row in auctions_data if row.get('is_repeat_auction') == 'так')
+                links_count = sum(1 for row in auctions_data if row.get('previous_auctions_links', '').strip())
+                print(f"Знайдено {repeat_count} повторних аукціонів")
+                print(f"Знайдено {links_count} аукціонів з посиланнями на минулі")
+                # Діагностика: показуємо приклад значень
+                if repeat_count > 0:
+                    example = next((row for row in auctions_data if row.get('is_repeat_auction') == 'так'), None)
+                    if example:
+                        print(f"Приклад повторного аукціону: is_repeat_auction='{example.get('is_repeat_auction')}', previous_auctions_links='{example.get('previous_auctions_links', '')[:100]}...'")
+            else:
+                print("ПОМИЛКА: колонка 'is_repeat_auction' відсутня в даних!")
+                print(f"Доступні колонки: {list(sample_row.keys())}")
+        
+        # Сортуємо за датою оновлення від найсвіжішого до найдавнішого
+        _min_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        auctions_data.sort(key=lambda r: r.get('date_updated_ts') or _min_ts, reverse=True)
+        
         save_excel_to_file(auctions_data, file_path, fieldnames, column_headers)
         print(f"Файл успішно збережено: {file_path}")
         
@@ -2124,14 +2254,17 @@ class ProZorroService:
         
         # Визначаємо fieldnames та column_headers
         fieldnames = [
+            'date_updated',
             'address_region', 'address_city', 'address', 'property_type',
             'cadastral_number', 'building_area_sqm', 'land_area_ha', 'base_price', 'deposit_amount',
             'auction_start_date', 'document_submission_deadline',
             'min_participants_count', 'participants_count', 'arrests_info',
-            'description', 'auction_url', 'classification_code'
+            'description', 'auction_url', 'classification_code',
+            'is_repeat_auction', 'previous_auctions_links'
         ]
         
         column_headers = {
+            'date_updated': 'Дата оновлення',
             'address_region': 'Область',
             'address_city': 'Населений пункт',
             'address': 'Адреса',
@@ -2148,8 +2281,14 @@ class ProZorroService:
             'arrests_info': 'Арешти',
             'description': 'Опис',
             'auction_url': 'Посилання',
-            'classification_code': 'Код класифікатора'
+            'classification_code': 'Код класифікатора',
+            'is_repeat_auction': 'Повторний аукціон',
+            'previous_auctions_links': 'Посилання на минулі аукціони'
         }
+        
+        # Сортуємо за датою оновлення від найсвіжішого до найдавнішого
+        _min_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        excel_data.sort(key=lambda r: r.get('date_updated_ts') or _min_ts, reverse=True)
         
         # Генеруємо Excel в пам'яті
         return generate_excel_in_memory(excel_data, fieldnames, column_headers)
@@ -2206,18 +2345,8 @@ class ProZorroService:
             return ', '.join(parts) if parts else ''
         
         def format_date(date_str: str) -> str:
-            """Форматує дату у форматі дд.ММ.рррр ГГ:ХХ."""
-            if not date_str:
-                return ''
-            try:
-                if date_str.endswith('Z'):
-                    date_str = date_str.replace('Z', '+00:00')
-                dt = datetime.fromisoformat(date_str)
-                if dt.tzinfo:
-                    dt = dt.astimezone(timezone.utc)
-                return dt.strftime('%d.%m.%Y %H:%M')
-            except (ValueError, AttributeError):
-                return str(date_str)
+            """Форматує дату у форматі дд.ММ.рррр ГГ:ХХ (київський час)."""
+            return format_date_display(date_str, '%d.%m.%Y %H:%M')
         
         excel_data = []
         
@@ -2599,18 +2728,8 @@ class ProZorroService:
             return ', '.join(parts) if parts else ''
         
         def format_date(date_str: str) -> str:
-            """Форматує дату у форматі дд.ММ.рррр ГГ:ХХ."""
-            if not date_str:
-                return ''
-            try:
-                if date_str.endswith('Z'):
-                    date_str = date_str.replace('Z', '+00:00')
-                dt = datetime.fromisoformat(date_str)
-                if dt.tzinfo:
-                    dt = dt.astimezone(timezone.utc)
-                return dt.strftime('%d.%m.%Y %H:%M')
-            except (ValueError, AttributeError):
-                return str(date_str)
+            """Форматує дату у форматі дд.ММ.рррр ГГ:ХХ (київський час)."""
+            return format_date_display(date_str, '%d.%m.%Y %H:%M')
         
         excel_data = []
         
@@ -2621,8 +2740,12 @@ class ProZorroService:
             data = auction.data
             
             # Посилання на аукціон
-            auction_id = data.get('auctionId') or data.get('_id') or auction.id
-            auction_url = f"https://prozorro.sale/auction/{auction_id}"
+            # Використовуємо extract_auction_id для консистентності з іншими частинами коду
+            auction_id = extract_auction_id(data) or auction.id
+            if not auction_id:
+                # Якщо не вдалося витягти ID, спробуємо альтернативні методи
+                auction_id = data.get('auctionId') or data.get('_id') or auction.id
+            auction_url = f"https://prozorro.sale/auction/{auction_id}" if auction_id else ""
             
             # Опис
             description = ''
@@ -2981,6 +3104,106 @@ class ProZorroService:
                     if has_additional_classification_03_07:
                         break
             
+            # Визначаємо повторний аукціон та посилання на минулі аукціони
+            is_repeat_auction = 'ні'
+            previous_auctions_links = ''
+            
+            # Перевіряємо, чи є auction_id та description для пошуку попередніх аукціонів
+            if description and auction_id:
+                # Обчислюємо хеш опису
+                description_hash = calculate_description_hash(description)
+                
+                if description_hash:
+                    # Знаходимо інші аукціони з тим самим описом
+                    previous_auctions = self.auctions_repository.get_auctions_by_description_hash(
+                        description_hash,
+                        exclude_auction_id=auction_id
+                    )
+                    
+                    if previous_auctions:
+                        # Отримуємо дату створення поточного аукціону
+                        current_date_created = None
+                        date_created_str = data.get('dateCreated', '')
+                        if date_created_str:
+                            try:
+                                if date_created_str.endswith('Z'):
+                                    date_created_str = date_created_str.replace('Z', '+00:00')
+                                current_date_created = datetime.fromisoformat(date_created_str)
+                                if current_date_created.tzinfo:
+                                    current_date_created = current_date_created.astimezone(timezone.utc)
+                                else:
+                                    current_date_created = current_date_created.replace(tzinfo=timezone.utc)
+                            except (ValueError, AttributeError):
+                                pass
+                        
+                        # Фільтруємо попередні аукціони за датою створення
+                        previous_links = []
+                        has_earlier_auction = False
+                        
+                        for prev_auction in previous_auctions:
+                            prev_auction_data = prev_auction.get('auction_data', {})
+                            if not prev_auction_data:
+                                continue
+                            
+                            prev_auction_id = prev_auction.get('auction_id')
+                            if not prev_auction_id:
+                                continue
+                            
+                            # Отримуємо дату створення попереднього аукціону
+                            prev_date_created_str = prev_auction_data.get('dateCreated', '')
+                            prev_date_created = None
+                            
+                            if prev_date_created_str:
+                                try:
+                                    if prev_date_created_str.endswith('Z'):
+                                        prev_date_created_str = prev_date_created_str.replace('Z', '+00:00')
+                                    prev_date_created = datetime.fromisoformat(prev_date_created_str)
+                                    if prev_date_created.tzinfo:
+                                        prev_date_created = prev_date_created.astimezone(timezone.utc)
+                                    else:
+                                        prev_date_created = prev_date_created.replace(tzinfo=timezone.utc)
+                                except (ValueError, AttributeError):
+                                    pass
+                            
+                            # Якщо є дата створення поточного аукціону, порівнюємо
+                            if current_date_created and prev_date_created:
+                                if prev_date_created < current_date_created:
+                                    has_earlier_auction = True
+                                    prev_link = f"https://prozorro.sale/auction/{prev_auction_id}"
+                                    previous_links.append(prev_link)
+                            else:
+                                # Якщо немає дати створення, додаємо всі попередні аукціони
+                                has_earlier_auction = True
+                                prev_link = f"https://prozorro.sale/auction/{prev_auction_id}"
+                                previous_links.append(prev_link)
+                        
+                        # Визначаємо, чи є це повторний аукціон
+                        if has_earlier_auction:
+                            is_repeat_auction = 'так'
+                        
+                        # Формуємо посилання на минулі аукціони через символ повернення каретки і переносу строки
+                        if previous_links:
+                            previous_auctions_links = '\r\n'.join(previous_links)
+            
+            # Дата оновлення: dateModified якщо аукціон оновлювався, інакше dateCreated
+            date_modified_str = data.get('dateModified', '')
+            date_created_str = data.get('dateCreated', '')
+            date_updated_str = date_modified_str if (date_modified_str and date_modified_str != date_created_str) else (date_created_str or date_modified_str)
+            date_updated = format_date(date_updated_str) if date_updated_str else ''
+            try:
+                if date_updated_str:
+                    s = date_updated_str.replace('Z', '+00:00') if date_updated_str.endswith('Z') else date_updated_str
+                    dt = datetime.fromisoformat(s)
+                    if dt.tzinfo:
+                        dt = dt.astimezone(timezone.utc)
+                    else:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    date_updated_ts = dt
+                else:
+                    date_updated_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            except (ValueError, AttributeError):
+                date_updated_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            
             auction_row = {
                 'address_region': ensure_string(address_region),
                 'address_city': ensure_string(address_city),
@@ -2999,6 +3222,10 @@ class ProZorroService:
                 'description': ensure_string(description),
                 'auction_url': ensure_string(auction_url),
                 'classification_code': ensure_string(classification_code),
+                'is_repeat_auction': ensure_string(is_repeat_auction),
+                'previous_auctions_links': ensure_string(previous_auctions_links),
+                'date_updated': ensure_string(date_updated),
+                'date_updated_ts': date_updated_ts,
                 '_has_additional_classification_03_07': has_additional_classification_03_07
             }
             
@@ -3088,6 +3315,9 @@ class ProZorroService:
         
         # Для інших періодів використовуємо стандартну обробку
         try:
+            # Перед завантаженням нових даних з API - швидке оновлення активних аукціонів
+            fast_update_result = self._fast_update_active_auctions()
+            
             # Якщо аукціони вже передані - використовуємо їх, інакше отримуємо з API
             if auctions is None:
                 print(
@@ -3107,7 +3337,8 @@ class ProZorroService:
                     'success': True,
                     'count': 0,
                     'file_path': None,
-                    'message': 'Аукціони не знайдено'
+                    'message': 'Аукціони не знайдено',
+                    'update_result': update_result
                 }
 
             # Зберігаємо аукціони в MongoDB та обробляємо через LLM
@@ -3123,7 +3354,7 @@ class ProZorroService:
             if days == 7:
                 self.app_data_repository.set_update_date(1, update_date)
             
-            print(f"Дата оновлення збережена: {update_date.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"Дата оновлення збережена: {format_datetime_display(update_date, '%d.%m.%Y %H:%M:%S')}")
             print(f"Викликів LLM: {llm_requests_count}")
             
             return {
@@ -3131,8 +3362,9 @@ class ProZorroService:
                 'count': saved_count,  # Кількість збережених аукціонів (без аренди)
                 'file_path': None,  # Файли більше не зберігаються
                 'update_date': update_date,
-                'llm_requests_count': llm_requests_count,
-                'message': f'Успішно оновлено {saved_count} аукціонів'
+                'llm_requests_count': llm_requests_count + fast_update_result.get('llm_requests_count', 0),
+                'message': f'Успішно оновлено {saved_count} аукціонів',
+                'fast_update_result': fast_update_result
             }
 
         except Exception as e:
@@ -3222,6 +3454,9 @@ class ProZorroService:
             
             print(f"Об'єднано дані за 7 днів. Всього унікальних аукціонів: {total_count}")
             
+            # Перед завантаженням нових даних з API - швидке оновлення активних аукціонів
+            fast_update_result = self._fast_update_active_auctions()
+            
             # Зберігаємо аукціони в MongoDB та обробляємо через LLM
             save_result = self._save_auctions_to_database(final_auctions)
             llm_requests_count = save_result['llm_requests_count']
@@ -3233,7 +3468,7 @@ class ProZorroService:
             # Оновлюємо також дату за добу (оскільки оновлення за тиждень включає останню добу)
             self.app_data_repository.set_update_date(1, update_date)
             
-            print(f"Дата оновлення збережена: {update_date.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"Дата оновлення збережена: {format_datetime_display(update_date, '%d.%m.%Y %H:%M:%S')}")
             print(f"Викликів LLM: {llm_requests_count}")
             
             return {
@@ -3241,8 +3476,9 @@ class ProZorroService:
                 'count': saved_count,  # Кількість збережених аукціонів (без аренди)
                 'file_path': None,  # Файли більше не зберігаються
                 'update_date': update_date,
-                'llm_requests_count': llm_requests_count,
-                'message': f'Успішно оновлено {saved_count} аукціонів за тиждень'
+                'llm_requests_count': llm_requests_count + fast_update_result.get('llm_requests_count', 0),
+                'message': f'Успішно оновлено {saved_count} аукціонів за тиждень',
+                'fast_update_result': fast_update_result
             }
             
         except Exception as e:
@@ -3262,7 +3498,8 @@ class ProZorroService:
         """
         Отримує детальну інформацію по конкретному аукціону.
 
-        Endpoint (ProZorro.Sale): GET {base}/auctions/{id}
+        Endpoint (ProZorro.Sale): GET {base}/procedures/{id}
+        Використовуємо procedure.prozorro.sale API для отримання деталей.
 
         Args:
             auction_id: Ідентифікатор аукціону
@@ -3273,13 +3510,297 @@ class ProZorroService:
         if not auction_id:
             raise ValueError("auction_id is required")
 
-        url = f'{self.settings.prozorro_sale_api_base_url}/auctions/{auction_id}'
+        # Використовуємо procedure.prozorro.sale API для отримання деталей
+        # Це той самий базовий URL, що використовується для пошуку
+        url = f'{self.settings.prozorro_sale_search_api_base_url}/procedures/{auction_id}'
         response = self.session.get(
             url,
             timeout=self.settings.prozorro_api_timeout
         )
+        # Перевіряємо статус вручну, щоб не виводити помилки для 404
+        if response.status_code == 404:
+            raise requests.exceptions.HTTPError(f"404 Client Error: Not Found for url: {url}", response=response)
         response.raise_for_status()
         return response.json()
+    
+    def _is_active_status(self, status: str) -> bool:
+        """
+        Перевіряє, чи статус аукціону є активним.
+        
+        Args:
+            status: Статус аукціону
+            
+        Returns:
+            bool: True якщо статус активний
+        """
+        active_statuses = ['active', 'active.tendering', 'active.auction', 'active.qualification', 
+                          'active_rectification', 'active_tendering', 'active_auction', 'active_qualification']
+        
+        return any(
+            status.startswith(active_status.replace('_', '.')) or 
+            status == active_status or
+            status.startswith(active_status.replace('.', '_'))
+            for active_status in active_statuses
+        )
+    
+    def _fast_update_active_auctions(self) -> Dict[str, Any]:
+        """
+        Швидке оновлення активних аукціонів з бази даних.
+        
+        Логіка:
+        1. Отримуємо активні аукціони з бази
+        2. Для кожного отримуємо актуальні дані з API
+        3. Перевіряємо хеш версії - якщо не змінився, пропускаємо
+        4. Якщо хеш змінився:
+           - Перевіряємо статус
+           - Якщо статус став неактивним - просто оновлюємо дані
+           - Якщо статус ще активний:
+             - Перевіряємо хеш опису
+             - Якщо немає LLM кешу для хешу опису - викликаємо LLM
+        
+        Returns:
+            Dict[str, Any]: Статистика оновлення
+        """
+        print("Швидке оновлення активних аукціонів...")
+        
+        # Отримуємо активні аукціони з бази
+        active_auctions = self.auctions_repository.get_active_auctions()
+        total_count = len(active_auctions)
+        
+        if total_count == 0:
+            print("В базі немає активних аукціонів для оновлення")
+            return {
+                'updated_count': 0,
+                'skipped_count': 0,
+                'errors_count': 0,
+                'not_found_count': 0,
+                'llm_requests_count': 0,
+                'total_count': 0
+            }
+        
+        print(f"Знайдено {total_count} активних аукціонів для перевірки оновлень")
+        
+        updated_count = 0
+        skipped_count = 0
+        errors_count = 0
+        not_found_count = 0
+        llm_requests_count = 0
+        
+        # Прогрес-бар для оновлення
+        from tqdm import tqdm
+        update_progress = tqdm(
+            total=total_count,
+            desc="Оновлення активних аукціонів",
+            unit="аукціон",
+            ncols=100,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        )
+        
+        # Оновлюємо кожен активний аукціон
+        for auction_doc in active_auctions:
+            auction_id = auction_doc.get('auction_id')
+            if not auction_id:
+                update_progress.update(1)
+                continue
+            
+            try:
+                # Отримуємо актуальні дані з API
+                auction_data = self.get_auction_details(auction_id)
+                
+                # Конвертуємо в AuctionDTO для зручності
+                auction_dto = AuctionDTO.from_dict(auction_data)
+                current_auction_data = auction_dto.data
+                
+                if not current_auction_data:
+                    update_progress.update(1)
+                    continue
+                
+                # Обчислюємо новий хеш версії
+                new_version_hash = calculate_object_version_hash(current_auction_data)
+                existing_version_hash = auction_doc.get('version_hash')
+                
+                # Якщо хеш не змінився - пропускаємо
+                if existing_version_hash == new_version_hash:
+                    skipped_count += 1
+                    update_progress.update(1)
+                    continue
+                
+                # Хеш змінився - обробляємо
+                # Витягуємо опис для обчислення хешу опису
+                description = ''
+                if 'description' in current_auction_data:
+                    desc_obj = current_auction_data['description']
+                    if isinstance(desc_obj, dict):
+                        description = desc_obj.get('uk_UA', desc_obj.get('en_US', ''))
+                    elif isinstance(desc_obj, str):
+                        description = desc_obj
+                
+                new_description_hash = None
+                if description:
+                    new_description_hash = calculate_description_hash(description)
+                
+                # Перевіряємо статус
+                current_status = current_auction_data.get('status', '')
+                is_still_active = self._is_active_status(current_status)
+                
+                # Оновлюємо дані в базі
+                self.auctions_repository.upsert_auction(
+                    auction_id=auction_id,
+                    auction_data=current_auction_data,
+                    version_hash=new_version_hash,
+                    description_hash=new_description_hash,
+                    last_updated=datetime.now(timezone.utc)
+                )
+                
+                # Якщо статус став неактивним - просто оновлюємо дані, подальшу обробку опускаємо
+                # ГАРАНТОВАНО не викликаємо LLM для неактивних аукціонів
+                if not is_still_active:
+                    updated_count += 1
+                    update_progress.update(1)
+                    continue
+                
+                # Якщо статус ще активний - перевіряємо хеш опису та LLM кеш
+                # Додаткова перевірка is_still_active для гарантії (хоча continue вище вже гарантує це)
+                if is_still_active and new_description_hash and self.llm_service:
+                    # Перевіряємо, чи є LLM кеш для цього хешу опису
+                    cached_entry = self.llm_cache_service.repository.find_by_description_hash(new_description_hash)
+                    if not cached_entry:
+                        # Немає кешу - викликаємо LLM
+                        llm_requests_count += self._process_auction_with_llm(current_auction_data)
+                
+                updated_count += 1
+                update_progress.update(1)
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response and e.response.status_code == 404:
+                    # Аукціон більше не існує в API
+                    not_found_count += 1
+                    update_progress.update(1)
+                else:
+                    # Інші HTTP помилки
+                    errors_count += 1
+                    update_progress.update(1)
+                    update_progress.write(f"Помилка при отриманні аукціону {auction_id}: {e}")
+            except Exception as e:
+                errors_count += 1
+                update_progress.update(1)
+                update_progress.write(f"Помилка при оновленні аукціону {auction_id}: {e}")
+        
+        update_progress.close()
+        
+        print(f"\nСтатистика швидкого оновлення активних аукціонів:")
+        print(f"  Всього перевірено: {total_count}")
+        print(f"  Оновлено: {updated_count}")
+        print(f"  Пропущено (без змін): {skipped_count}")
+        print(f"  Не знайдено в API (404): {not_found_count}")
+        print(f"  Помилок: {errors_count}")
+        print(f"  Викликів LLM: {llm_requests_count}")
+        
+        return {
+            'updated_count': updated_count,
+            'skipped_count': skipped_count,
+            'errors_count': errors_count,
+            'not_found_count': not_found_count,
+            'llm_requests_count': llm_requests_count,
+            'total_count': total_count
+        }
+    
+    def _update_existing_auctions_in_database(self) -> Dict[str, Any]:
+        """
+        Оновлює існуючі аукціони в базі даних, отримуючи актуальні дані з API.
+        Це дозволяє фіксувати зміни статусів аукціонів (наприклад, перехід з активного в інші стадії).
+        
+        Returns:
+            Dict[str, Any]: Статистика оновлення: updated_count, errors_count, not_found_count
+        """
+        print("Оновлення існуючих аукціонів в базі даних...")
+        
+        # Отримуємо всі auction_id з бази
+        all_auctions = self.auctions_repository.find_many()
+        total_count = len(all_auctions)
+        
+        if total_count == 0:
+            print("В базі немає аукціонів для оновлення")
+            return {
+                'updated_count': 0,
+                'errors_count': 0,
+                'not_found_count': 0,
+                'total_count': 0
+            }
+        
+        print(f"Знайдено {total_count} аукціонів в базі для перевірки оновлень")
+        
+        errors_count = 0
+        not_found_count = 0
+        
+        # Прогрес-бар для оновлення
+        from tqdm import tqdm
+        update_progress = tqdm(
+            total=total_count,
+            desc="Оновлення аукціонів",
+            unit="аукціон",
+            ncols=100,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        )
+        
+        # Оновлюємо кожен аукціон
+        updated_auctions = []
+        for auction_doc in all_auctions:
+            auction_id = auction_doc.get('auction_id')
+            if not auction_id:
+                update_progress.update(1)
+                continue
+            
+            try:
+                # Отримуємо актуальні дані з API
+                auction_data = self.get_auction_details(auction_id)
+                
+                # Конвертуємо в AuctionDTO
+                auction_dto = AuctionDTO.from_dict(auction_data)
+                
+                # Додаємо до списку для збереження
+                updated_auctions.append(auction_dto)
+                update_progress.update(1)
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response and e.response.status_code == 404:
+                    # Аукціон більше не існує в API - це нормальна ситуація, не виводимо помилку
+                    not_found_count += 1
+                    update_progress.update(1)
+                    # Не виводимо помилку для 404 - це нормальна ситуація
+                else:
+                    # Інші HTTP помилки
+                    errors_count += 1
+                    update_progress.update(1)
+                    # Виводимо помилку через tqdm.write, щоб не порушувати прогрес-бар
+                    update_progress.write(f"Помилка при отриманні аукціону {auction_id}: {e}")
+            except Exception as e:
+                errors_count += 1
+                update_progress.update(1)
+                # Виводимо помилку через tqdm.write, щоб не порушувати прогрес-бар
+                update_progress.write(f"Помилка при оновленні аукціону {auction_id}: {e}")
+        
+        update_progress.close()
+        
+        # Зберігаємо оновлені аукціони через існуючий метод
+        if updated_auctions:
+            print(f"\nЗбереження {len(updated_auctions)} оновлених аукціонів...")
+            save_result = self._save_auctions_to_database(updated_auctions)
+            # Оновлюємо статистику на основі результатів збереження
+            # (метод _save_auctions_to_database вже логує детальну статистику)
+        
+        print(f"\nСтатистика оновлення існуючих аукціонів:")
+        print(f"  Всього перевірено: {total_count}")
+        print(f"  Успішно оновлено: {len(updated_auctions)}")
+        print(f"  Не знайдено в API (404): {not_found_count}")
+        print(f"  Помилок: {errors_count}")
+        
+        return {
+            'updated_count': len(updated_auctions),
+            'errors_count': errors_count,
+            'not_found_count': not_found_count,
+            'total_count': total_count
+        }
 
     def fetch_and_save_real_estate_auction_details(
         self,

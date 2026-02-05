@@ -7,11 +7,12 @@ import json
 import re
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable, AsyncGenerator
 from config.settings import Settings
 from utils.data_dictionary import DataDictionary
+from utils.date_utils import format_datetime_display, to_kyiv
 from utils.analytics_builder import AnalyticsBuilder
 from utils.query_builder import QueryBuilder
 from utils.report_generator import ReportGenerator
@@ -27,12 +28,12 @@ except ImportError:
 
 # Налаштування логування
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # Створюємо handler для виводу в консоль, якщо його ще немає
 if not logger.handlers:
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.INFO)
     formatter = logging.Formatter(
         '[LLM Agent] %(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
@@ -663,7 +664,7 @@ Respond in Ukrainian language."""
             # Schema MCP tools
             if tool_name == 'get_database_schema':
                 schema = self.data_dictionary.to_schema_dict()
-                schema['generated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+                schema['generated_at'] = format_datetime_display(datetime.now(timezone.utc), '%Y-%m-%dT%H:%M:%S')
                 return {'success': True, 'schema': schema}
             
             elif tool_name == 'get_collection_info':
@@ -886,30 +887,31 @@ Respond in Ukrainian language."""
             logger.debug(f"Системний промпт (довжина: {len(system_prompt)} символів)")
             logger.debug(f"Перші 500 символів промпту: {system_prompt[:500]}...")
             
-            # Додаємо поточну дату та час до контексту
-            now = datetime.now()
-            current_date_time = now.strftime("%Y-%m-%d %H:%M:%S")
-            current_date = now.strftime("%Y-%m-%d")
-            current_time = now.strftime("%H:%M:%S")
+            # Додаємо поточну дату та час до контексту (київський час)
+            now_utc = datetime.now(timezone.utc)
+            now_kyiv = to_kyiv(now_utc)
+            current_date_time = format_datetime_display(now_utc, "%Y-%m-%d %H:%M:%S")
+            current_date = format_datetime_display(now_utc, "%Y-%m-%d")
+            current_time = format_datetime_display(now_utc, "%H:%M:%S")
             weekday_names = ['Понеділок', 'Вівторок', 'Середа', 'Четвер', 'П\'ятниця', 'Субота', 'Неділя']
-            weekday_name = weekday_names[now.weekday()]
+            weekday_name = weekday_names[now_kyiv.weekday()]
             
-            # Обчислюємо діапазони для зручності
-            last_24h = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
-            last_7d = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
-            last_30d = (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S")
+            # Обчислюємо діапазони для зручності (UTC для запитів)
+            last_24h = (now_utc - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+            last_7d = (now_utc - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+            last_30d = (now_utc - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S")
             
             context_info = f"""
-## Контекст поточної дати та часу:
+## Контекст поточної дати та часу (Київ):
 - Поточна дата та час: {current_date_time}
 - Поточна дата: {current_date}
 - Поточний час: {current_time}
 - День тижня: {weekday_name}
 
-## Корисні діапазони дат:
-- За останню добу (24 години): від {last_24h} до {now.strftime("%Y-%m-%dT%H:%M:%S")}
-- За останній тиждень (7 днів): від {last_7d} до {now.strftime("%Y-%m-%dT%H:%M:%S")}
-- За останній місяць (30 днів): від {last_30d} до {now.strftime("%Y-%m-%dT%H:%M:%S")}
+## Корисні діапазони дат (UTC для запитів):
+- За останню добу (24 години): від {last_24h} до {now_utc.strftime("%Y-%m-%dT%H:%M:%S")}
+- За останній тиждень (7 днів): від {last_7d} до {now_utc.strftime("%Y-%m-%dT%H:%M:%S")}
+- За останній місяць (30 днів): від {last_30d} до {now_utc.strftime("%Y-%m-%dT%H:%M:%S")}
 
 Використовуй цю інформацію для обчислення діапазонів дат у запитах типу "за останню добу", "за останній тиждень" тощо.
 """
