@@ -283,6 +283,7 @@
         detail_id: context.detail_id || "",
       };
       saveChatSessions();
+      renderChatListingPinned();
     }
     show("screen-home");
     var input = document.getElementById("chat-input");
@@ -723,6 +724,8 @@
     var userMessages = document.querySelectorAll(".chat-msg.user");
     var userQuery = userMessages.length > 0 ? userMessages[userMessages.length - 1].textContent : "";
     
+    var chat = getCurrentChat();
+    var chatId = chat ? chat.id : null;
     fetch("/api/feedback/submit", {
       method: "POST",
       headers: apiHeaders(),
@@ -730,7 +733,8 @@
         request_id: requestId,
         feedback_type: feedbackType,
         user_query: userQuery,
-        response_text: responseText
+        response_text: responseText,
+        chat_id: chatId
       })
     })
       .then(function(r) {
@@ -1402,7 +1406,89 @@
       var rebuildAnalyticsBtn = document.getElementById("admin-rebuild-analytics");
       if (rebuildAnalyticsBtn) rebuildAnalyticsBtn.addEventListener("click", adminRebuildAnalytics);
       initAdminScheduler();
+      initAdminFeedback();
     }
+  }
+
+  function initAdminFeedback() {
+    var toggle = document.getElementById("admin-feedback-toggle");
+    var content = document.getElementById("admin-feedback-content");
+    if (toggle && content) {
+      toggle.addEventListener("click", function () {
+        var collapsed = content.classList.toggle("collapsed");
+        toggle.textContent = collapsed ? "▼" : "▲";
+        toggle.setAttribute("aria-expanded", !collapsed);
+        if (!collapsed) loadAdminFeedback();
+      });
+    }
+  }
+
+  function loadAdminFeedback() {
+    var container = document.getElementById("admin-feedback-list");
+    if (!container) return;
+    container.innerHTML = "<p class=\"admin-hint\">Завантаження...</p>";
+    fetch("/api/admin/feedback/dislikes?limit=50&days=14", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка завантаження");
+        return r.json();
+      })
+      .then(function (data) {
+        var items = data.items || [];
+        container.innerHTML = "";
+        if (items.length === 0) {
+          container.innerHTML = "<p class=\"admin-hint\">Немає дизлайків за останні 14 днів.</p>";
+          return;
+        }
+        items.forEach(function (fb) {
+          var wrap = document.createElement("div");
+          wrap.className = "admin-feedback-item";
+          var created = fb.created_at ? new Date(fb.created_at).toLocaleString("uk-UA") : "";
+          var convCount = (fb.conversation || []).length;
+          var summary = "user_id=" + (fb.user_id || "") + ", " + created;
+          if (convCount) summary += ", " + convCount + " повідомлень";
+          var header = document.createElement("div");
+          header.className = "admin-feedback-item-header";
+          header.innerHTML = "<strong>" + (fb.user_query || "").slice(0, 60) + (fb.user_query && fb.user_query.length > 60 ? "…" : "") + "</strong><br><span class=\"admin-feedback-meta\">" + summary + "</span>";
+          header.onclick = function () {
+            var body = wrap.querySelector(".admin-feedback-item-body");
+            if (body) body.classList.toggle("hidden");
+          };
+          wrap.appendChild(header);
+          var body = document.createElement("div");
+          body.className = "admin-feedback-item-body hidden";
+          var parts = [];
+          if (fb.user_query) parts.push("<p><strong>Запит:</strong> " + escapeHtml(fb.user_query) + "</p>");
+          if (fb.response_text) parts.push("<p><strong>Відповідь:</strong><pre>" + escapeHtml((fb.response_text || "").slice(0, 3000)) + (fb.response_text && fb.response_text.length > 3000 ? "…" : "") + "</pre></p>");
+          if (fb.diagnostic_result && fb.diagnostic_result.issues && fb.diagnostic_result.issues.length) {
+            parts.push("<p><strong>Діагностика:</strong><ul>");
+            fb.diagnostic_result.issues.forEach(function (i) { parts.push("<li>" + escapeHtml(i) + "</li>"); });
+            parts.push("</ul></p>");
+          }
+          if (fb.conversation && fb.conversation.length) {
+            parts.push("<p><strong>Повна бесіда:</strong></p><div class=\"admin-feedback-conversation\">");
+            fb.conversation.forEach(function (m) {
+              var role = m.role === "user" ? "Користувач" : "Асистент";
+              var txt = (m.content || "").slice(0, 2000);
+              if ((m.content || "").length > 2000) txt += "…";
+              parts.push("<div class=\"admin-feedback-msg admin-feedback-msg-" + (m.role || "") + "\"><strong>" + escapeHtml(role) + ":</strong><pre>" + escapeHtml(txt) + "</pre></div>");
+            });
+            parts.push("</div>");
+          }
+          body.innerHTML = parts.join("");
+          wrap.appendChild(body);
+          container.appendChild(wrap);
+        });
+      })
+      .catch(function (err) {
+        container.innerHTML = "<p class=\"admin-hint\" style=\"color:var(--tg-theme-destructive-text-color)\">" + (err.message || "Помилка") + "</p>";
+      });
+  }
+
+  function escapeHtml(s) {
+    if (!s) return "";
+    var div = document.createElement("div");
+    div.textContent = s;
+    return div.innerHTML;
   }
 
   function initAdminScheduler() {
@@ -2380,7 +2466,7 @@
   }
 
   // Тимчасово приховано: аналітика рахується, але не показується в UI (недостатньо даних)
-  var SHOW_ANALYTICS_UI = false;
+  var SHOW_ANALYTICS_UI = true;
 
   // Конфігурація вкладок та полів для деталей (hero показує назву, ціну, статус, локацію)
   var TAB_FIELD_CONFIG_BASE = {

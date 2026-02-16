@@ -667,6 +667,74 @@ a.file-download-link:active {
   border-top: 1px solid var(--border-color-strong);
 }
 
+.admin-feedback-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.admin-feedback-item {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.admin-feedback-item-header {
+  padding: 0.5rem 0.75rem;
+  background: var(--tg-theme-secondary-bg-color);
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.admin-feedback-item-header:hover {
+  opacity: 0.9;
+}
+
+.admin-feedback-meta {
+  font-size: 0.75rem;
+  color: var(--tg-theme-hint-color);
+}
+
+.admin-feedback-item-body {
+  padding: 0.75rem;
+  font-size: 0.85rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.admin-feedback-item-body.hidden {
+  display: none;
+}
+
+.admin-feedback-item-body pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 0.8rem;
+}
+
+.admin-feedback-conversation {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.admin-feedback-msg {
+  padding: 0.5rem;
+  border-radius: 6px;
+  background: var(--tg-theme-secondary-bg-color);
+}
+
+.admin-feedback-msg-user {
+  border-left: 3px solid var(--tg-theme-button-color);
+}
+
+.admin-feedback-msg-assistant {
+  border-left: 3px solid var(--border-color-strong);
+}
+
 .admin-scheduler-events {
   margin-bottom: 1.5rem;
 }

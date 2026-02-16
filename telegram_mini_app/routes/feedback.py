@@ -21,6 +21,7 @@ class FeedbackRequest(BaseModel):
     feedback_type: str  # "like" | "dislike"
     user_query: str | None = None
     response_text: str | None = None
+    chat_id: str | None = None  # для завантаження повної бесіди при dislike
 
 
 def _get_user_id_and_services(request: Request):
@@ -98,6 +99,23 @@ def submit_feedback(request: Request, body: FeedbackRequest):
     
     diagnostic_result = None
     
+    # Якщо дизлайк — завантажуємо повну бесіду з ChatSessionRepository
+    conversation = None
+    if body.feedback_type == "dislike" and body.chat_id:
+        try:
+            from data.repositories.chat_session_repository import ChatSessionRepository
+            chat_repo = ChatSessionRepository()
+            session = chat_repo.get(str(user_id), body.chat_id)
+            messages = session.get("messages") or []
+            if messages:
+                conversation = [
+                    {"role": m.get("role", ""), "content": (m.get("content", ""))[:10000]}
+                    for m in messages
+                ]
+                logger.info("Завантажено бесіду для dislike: %s повідомлень", len(conversation))
+        except Exception as e:
+            logger.warning("Не вдалося завантажити бесіду для dislike: %s", e)
+    
     # Якщо дизлайк - запускаємо самодіагностику
     if body.feedback_type == "dislike":
         logger.info("Запуск самодіагностики для request_id=%s, user_id=%s", body.request_id, user_id)
@@ -110,7 +128,8 @@ def submit_feedback(request: Request, body: FeedbackRequest):
         user_query=user_query,
         response_text=response_text,
         feedback_type=body.feedback_type,
-        diagnostic_result=diagnostic_result
+        diagnostic_result=diagnostic_result,
+        conversation=conversation,
     )
     
     logger.info("Збережено фідбек: feedback_id=%s, request_id=%s, type=%s", 

@@ -51,7 +51,8 @@ class FeedbackRepository(BaseRepository):
         user_query: str,
         response_text: str,
         feedback_type: str,  # "like" | "dislike"
-        diagnostic_result: Optional[Dict[str, Any]] = None
+        diagnostic_result: Optional[Dict[str, Any]] = None,
+        conversation: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Зберігає фідбек користувача.
@@ -76,6 +77,7 @@ class FeedbackRepository(BaseRepository):
             "response_text": response_text[:5000],  # Обмежуємо довжину
             "feedback_type": feedback_type,
             "diagnostic_result": diagnostic_result,
+            "conversation": conversation,  # повна бесіда при dislike
             "created_at": datetime.now(timezone.utc)
         }
         

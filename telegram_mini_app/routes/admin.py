@@ -305,6 +305,20 @@ def delete_scheduler_event(request: Request, event_id: str):
     return {"success": True, "message": "Подію вимкнено."}
 
 
+@router.get("/feedback/dislikes")
+def get_feedback_dislikes(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    days: int = Query(14, ge=1, le=90),
+):
+    """Список дизлайків з повною бесідою для перегляду в панелі адміністратора."""
+    _get_admin_user(request)
+    from data.repositories.feedback_repository import FeedbackRepository
+    repo = FeedbackRepository()
+    items = repo.get_recent_dislikes(limit=limit, days=days)
+    return {"items": items, "count": len(items)}
+
+
 @router.post("/prozorro-config")
 async def upload_prozorro_config(request: Request, file: UploadFile = File(...)):
     """Завантажує файл конфігурації ProZorro (YAML)."""
