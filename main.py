@@ -5,11 +5,21 @@
 
 import argparse
 import logging
-import threading
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from config.settings import Settings
+
+# Фільтр: приховує інформаційні повідомлення сторонніх бібліотек (наприклад AFC / max remote calls від Gemini)
+class _SuppressAfcInfoFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = (record.getMessage() or "").strip()
+        if "AFC" in msg and "max remote calls" in msg.lower():
+            return False
+        return True
+
 
 # Налаштування логування для всього проекту
 logging.basicConfig(
@@ -20,6 +30,8 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+for h in logging.root.handlers:
+    h.addFilter(_SuppressAfcInfoFilter())
 
 # Зменшуємо рівень логування для сторонніх бібліотек, щоб не засмічувати вивід
 logging.getLogger('pymongo').setLevel(logging.WARNING)
@@ -27,10 +39,17 @@ logging.getLogger('telegram').setLevel(logging.WARNING)
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 logging.getLogger('asyncio').setLevel(logging.WARNING)
+# Google GenAI / LangChain: приховуємо інфо (наприклад "AFC is enabled with max remote calls: 10")
+logging.getLogger('google').setLevel(logging.WARNING)
+logging.getLogger('google.genai').setLevel(logging.WARNING)
+logging.getLogger('langchain_google_genai').setLevel(logging.WARNING)
 from business.services import ProZorroService
 from business.services.telegram_bot_service import TelegramBotService
+from business.services.scheduler_service import SchedulerService, TelegramSchedulerNotifier
+from scripts.olx_scraper.run_update import run_olx_update
 from business.services.logging_service import LoggingService
 from data.database.connection import MongoDBConnection
+from business.services.currency_rate_service import CurrencyRateService
 
 
 class Application:
@@ -43,7 +62,10 @@ class Application:
         self.prozorro_service = None
         self.telegram_bot_service = None
         self._bot_thread = None
+        self._background_update_thread = None
         self._mcp_processes = []
+        self.scheduler_service = None
+        self.currency_rate_service = None
         
         # Ініціалізуємо MongoDB підключення ПЕРЕД створенням сервісів, які його використовують
         try:
@@ -53,6 +75,10 @@ class Application:
         
         # Тепер створюємо сервіси після ініціалізації MongoDB
         self.logging_service = LoggingService()
+        try:
+            self.currency_rate_service = CurrencyRateService(self.settings)
+        except Exception as e:
+            print(f"Попередження: не вдалося ініціалізувати сервіс курсів валют: {e}")
         
         # Логуємо старт застосунку
         try:
@@ -62,6 +88,17 @@ class Application:
             )
         except Exception as e:
             print(f"Попередження: не вдалося залогувати подію старту: {e}")
+        
+        # Фонове оновлення курсу USD, якщо на сьогодні ще немає запису
+        if self.currency_rate_service is not None:
+            try:
+                threading.Thread(
+                    target=self.currency_rate_service.ensure_today_usd_rate_if_missing,
+                    daemon=True,
+                    name="UsdRateInit",
+                ).start()
+            except Exception as e:
+                print(f"Попередження: не вдалося запустити фонове оновлення курсу USD: {e}")
 
     def initialize(self):
         """Ініціалізація компонентів застосунку."""
@@ -84,10 +121,12 @@ class Application:
         self._running = True
         print("Застосунок запущено")
         
-        # Отримання та збереження аукціонів про нерухомість
+        # Отримання та збереження аукціонів про нерухомість (ProZorro)
         self.fetch_real_estate_auctions(
             days=days,
         )
+        # Оновлення оголошень OLX: нежитлова нерухомість + земельні ділянки
+        self.run_olx_data_update()
 
     def fetch_real_estate_auctions(
         self,
@@ -106,19 +145,96 @@ class Application:
         result = self.prozorro_service.fetch_and_save_real_estate_auctions(
             days=days,
         )
-        
         if result['success']:
             print(f"✓ {result['message']}")
             if result['file_path']:
                 print(f"  Файл: {result['file_path']}")
+            try:
+                from business.services.collection_knowledge_service import refresh_knowledge_after_sources
+                refresh_knowledge_after_sources(["prozorro"])
+            except Exception as e:
+                print(f"  Попередження: оновлення знань про колекції — {e}")
+            try:
+                from business.services.domain_cache_service import invalidate_domain_caches
+                invalidate_domain_caches(["prozorro"])
+            except Exception as e:
+                print(f"  Попередження: інвалідація кешів домен-шару — {e}")
         else:
             print(f"✗ Помилка: {result['message']}")
 
+    def run_olx_data_update(self, days: int = None) -> None:
+        """Оновлює оголошення OLX (нежитлова нерухомість + земельні ділянки). days=1 або 7 — зупинка по даті (минула добу/тиждень); None — обмеження лише max_pages."""
+        try:
+            result = run_olx_update(settings=self.settings, days=days)
+            if result.get("success"):
+                print(f"✓ OLX: оброблено {result.get('total_listings', 0)} оголошень, "
+                      f"завантажено деталей: {result.get('total_detail_fetches', 0)}")
+                try:
+                    from business.services.collection_knowledge_service import refresh_knowledge_after_sources
+                    refresh_knowledge_after_sources(["olx"])
+                except Exception as e:
+                    print(f"  Попередження: оновлення знань про колекції — {e}")
+                try:
+                    from business.services.domain_cache_service import invalidate_domain_caches
+                    invalidate_domain_caches(["olx"])
+                except Exception as e:
+                    print(f"  Попередження: інвалідація кешів домен-шару — {e}")
+            else:
+                print("✗ OLX: помилка оновлення")
+        except Exception as e:
+            print(f"✗ OLX: {e}")
+
+    def _background_data_update_loop(self) -> None:
+        """
+        Цикл регламентного фонового оновлення: кожні N хвилин оновлює дані за минулу добу
+        (ProZorro + OLX). Працює поки застосунок запущений.
+        """
+        logger = logging.getLogger(__name__)
+        interval_seconds = self.settings.background_update_interval_minutes * 60
+        if interval_seconds <= 0:
+            return
+        while self._running:
+            time.sleep(interval_seconds)
+            if not self._running:
+                break
+            try:
+                logger.info("Фонове оновлення даних: старт (минула добу)")
+                self.fetch_real_estate_auctions(days=1)
+                self.run_olx_data_update(days=1)
+                try:
+                    from business.services.collection_knowledge_service import refresh_knowledge_after_sources
+                    refresh_knowledge_after_sources(["prozorro", "olx"])
+                except Exception as e:
+                    logger.debug("Оновлення знань про колекції після фонового оновлення: %s", e)
+                try:
+                    from business.services.domain_cache_service import invalidate_domain_caches
+                    invalidate_domain_caches(["prozorro", "olx"])
+                except Exception as e:
+                    logger.debug("Інвалідація кешів домен-шару після фонового оновлення: %s", e)
+                logger.info("Фонове оновлення даних: завершено")
+            except Exception:
+                logger.exception("Фонове оновлення даних: помилка")
+
     def run_telegram_bot(self):
-        """Запускає Telegram бота у фоновому потоці."""
+        """Запускає Telegram бота у фоновому потоці та регламентне оновлення даних."""
         if not self.settings.telegram_bot_token:
             print("Помилка: Telegram bot token не вказано в налаштуваннях")
             return
+
+        self.initialize()
+        self._running = True
+
+        # Тимчасово вимкнено: оновлення даних — через меню адміністратора (за добу / за тиждень)
+        # if self.settings.background_update_interval_minutes > 0:
+        #     self._background_update_thread = threading.Thread(
+        #         target=self._background_data_update_loop,
+        #         daemon=True,
+        #         name="BackgroundDataUpdate",
+        #     )
+        #     self._background_update_thread.start()
+        #     print(
+        #         f"Регламентне оновлення даних: кожні {self.settings.background_update_interval_minutes} хв (минула добу)"
+        #     )
         
         try:
             self.telegram_bot_service = TelegramBotService(self.settings)
@@ -127,6 +243,35 @@ class Application:
             print("Telegram бот запущено у фоновому потоці")
         except Exception as e:
             print(f"Помилка запуску Telegram бота: {e}")
+
+        # Планувальник подій (регламентні звіти, нагадування, оновлення даних — тільки для адмінів)
+        try:
+            notifier = TelegramSchedulerNotifier(self.telegram_bot_service)
+            self.scheduler_service = SchedulerService(self.settings, notifier=notifier)
+            self.scheduler_service.set_user_service(self.telegram_bot_service.user_service)
+            self.scheduler_service.start()
+            print("Планувальник подій запущено")
+        except Exception as e:
+            print(f"Попередження: не вдалося запустити планувальник подій: {e}")
+
+        # Запуск сервера Telegram Mini App (якщо порт задано)
+        mini_app_port = getattr(self.settings, "mini_app_port", 0)
+        if mini_app_port > 0:
+            try:
+                from telegram_mini_app.server import run_server
+                self._mini_app_thread = threading.Thread(
+                    target=run_server,
+                    kwargs={"settings": self.settings, "host": "0.0.0.0", "port": mini_app_port},
+                    daemon=True,
+                    name="MiniAppServer",
+                )
+                self._mini_app_thread.start()
+                print(f"Telegram Mini App сервер запущено на порту {mini_app_port}")
+            except ModuleNotFoundError as e:
+                print(f"Попередження: не вдалося запустити Mini App сервер: {e}")
+                print("  Встановіть залежності: pip install -r requirements.txt")
+            except Exception as e:
+                print(f"Попередження: не вдалося запустити Mini App сервер: {e}")
     
     def start_mcp_servers(self):
         """Запускає всі MCP сервери у фоновому режимі."""
@@ -135,7 +280,10 @@ class Application:
             'mcp_servers.schema_mcp_server',
             'mcp_servers.query_builder_mcp_server',
             'mcp_servers.analytics_mcp_server',
-            'mcp_servers.report_mcp_server'
+            'mcp_servers.report_mcp_server',
+            'mcp_servers.export_mcp_server',
+            'mcp_servers.geocoding_mcp_server',
+            'mcp_servers.data_update_mcp_server',
         ]
         
         print("Запуск MCP серверів...")
@@ -162,6 +310,11 @@ class Application:
             return
 
         self._running = False
+
+        # Зупиняємо планувальник подій
+        if self.scheduler_service:
+            self.scheduler_service.shutdown(wait=True)
+            self.scheduler_service = None
         
         # Зупиняємо Telegram бота
         if self.telegram_bot_service:

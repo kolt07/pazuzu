@@ -3,6 +3,8 @@
 Модуль для валідації та трансформації абстрактних запитів у MongoDB запити.
 """
 
+import copy
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Set, Tuple
 from pymongo.collection import Collection
 from data.database.connection import MongoDBConnection
@@ -12,21 +14,24 @@ class QueryBuilder:
     """Клас для побудови безпечних MongoDB запитів з абстрактних запитів."""
     
     # Дозволені колекції для запитів
-    ALLOWED_COLLECTIONS = {'prozorro_auctions', 'llm_cache'}
+    ALLOWED_COLLECTIONS = {'prozorro_auctions', 'llm_cache', 'olx_listings', 'unified_listings'}
     
     # Дозволені оператори для фільтрів
     ALLOWED_OPERATORS = {
-        '$eq', '$ne', '$gt', '$gte', '$lt', '$lte', 
+        '$eq', '$ne', '$gt', '$gte', '$lt', '$lte',
         '$in', '$nin', '$exists', '$and', '$or', '$not', '$elemMatch'
     }
-    
+
+    # MCP deny-rules: верхньорівневі ключі запиту, які ніколи не приймаються
+    DENY_TOP_LEVEL_KEYS = frozenset({'raw_query', '$where', '$eval', '$function', '$expr'})
+
     # Заборонені оператори (безпека)
     FORBIDDEN_OPERATORS = {
         '$where', '$eval', '$function', '$expr', '$regex', '$text'
     }
     
     # Максимальна кількість результатів
-    MAX_RESULTS = 100
+    MAX_RESULTS = 5000
     
     # Максимальна глибина вкладеності
     MAX_NESTING_DEPTH = 5
@@ -70,10 +75,15 @@ class QueryBuilder:
         Returns:
             Кортеж (is_valid, error_message)
         """
+        # MCP deny-rules: не приймати заборонені верхньорівневі ключі
+        for key in query:
+            if key in self.DENY_TOP_LEVEL_KEYS:
+                return False, f"Параметр '{key}' заборонений (MCP deny-rules). Використовуйте абстрактний запит (collection, filters, limit)."
+
         # Перевірка обов'язкових полів
         if 'collection' not in query:
             return False, "Поле 'collection' є обов'язковим"
-        
+
         collection_name = query['collection']
         
         # Перевірка дозволених колекцій
@@ -158,9 +168,16 @@ class QueryBuilder:
                 # Вкладені умови
                 # Перевіряємо, чи є $regex в значенні
                 if '$regex' in value:
-                    # Дозволяємо $regex тільки для полів статусу
-                    if 'status' not in key.lower() and not key.endswith('.status'):
-                        return False, f"Оператор '$regex' дозволений тільки для полів статусу. Для поля '{key}' використовуйте analytics-mcp."
+                    # Дозволяємо $regex для полів статусу та fallback полів location (для пошуку за адресами)
+                    allowed_regex_fields = ['status', 'location', 'resolved_locations', 'locality', 'region']
+                    key_lower = key.lower()
+                    is_allowed = (
+                        'status' in key_lower or 
+                        key.endswith('.status') or
+                        any(field in key_lower for field in allowed_regex_fields)
+                    )
+                    if not is_allowed:
+                        return False, f"Оператор '$regex' дозволений тільки для полів статусу та location (fallback для пошуку за адресами). Для поля '{key}' використовуйте analytics-mcp або точне порівняння."
                 is_valid, error = self._validate_filters(value, depth + 1)
                 if not is_valid:
                     return False, error
@@ -197,6 +214,76 @@ class QueryBuilder:
         
         return True, None
     
+    def _parse_iso_to_utc(self, s: Any):
+        """Парсить ISO-рядок у datetime (UTC). Повертає None при помилці."""
+        if not isinstance(s, str) or not s.strip():
+            return None
+        try:
+            s = s.strip().replace('Z', '+00:00')
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            return None
+    
+    def _normalize_date_filters(self, collection_name: str, filters: Dict[str, Any]) -> None:
+        """
+        Модифікує filters in-place: для полів-дат, збережених у БД як BSON Date,
+        перетворює значення-рядки (ISO) на datetime, щоб $match коректно порівнював.
+        olx_listings: updated_at — BSON Date.
+        """
+        if collection_name != 'olx_listings':
+            return
+        if 'updated_at' not in filters or not isinstance(filters['updated_at'], dict):
+            return
+        for op in ('$gte', '$lte', '$gt', '$lt'):
+            if op in filters['updated_at'] and isinstance(filters['updated_at'][op], str):
+                parsed = self._parse_iso_to_utc(filters['updated_at'][op])
+                if parsed is not None:
+                    filters['updated_at'][op] = parsed
+
+    def _normalize_match_date_value(self, collection_name: str, obj: Dict[str, Any], date_key: str) -> None:
+        """
+        Рекурсивно знаходить у obj ключ date_key (напр. updated_at) і перетворює
+        ISO-рядки в $gte/$lte/$gt/$lt на datetime. Модифікує obj in-place.
+        """
+        if collection_name != 'olx_listings' or date_key != 'updated_at':
+            return
+        if date_key not in obj or not isinstance(obj[date_key], dict):
+            return
+        for op in ('$gte', '$lte', '$gt', '$lt'):
+            if op in obj[date_key] and isinstance(obj[date_key][op], str):
+                parsed = self._parse_iso_to_utc(obj[date_key][op])
+                if parsed is not None:
+                    obj[date_key][op] = parsed
+
+    def _normalize_aggregation_match_dates(self, collection_name: str, pipeline: List[Dict[str, Any]]) -> None:
+        """
+        Проходить по всіх $match stages у pipeline і перетворює рядкові дати (ISO)
+        на datetime для полів, збережених у БД як BSON Date (olx_listings: updated_at).
+        Модифікує pipeline in-place.
+        """
+        date_fields = ('updated_at',) if collection_name == 'olx_listings' else ()
+        if not date_fields:
+            return
+
+        def walk(d: Any) -> None:
+            if isinstance(d, dict):
+                for key in date_fields:
+                    self._normalize_match_date_value(collection_name, d, key)
+                for v in d.values():
+                    walk(v)
+            elif isinstance(d, list):
+                for item in d:
+                    walk(item)
+
+        for stage in pipeline:
+            if isinstance(stage, dict) and '$match' in stage:
+                walk(stage['$match'])
+    
     def build_mongodb_query(self, query: Dict[str, Any]) -> Dict[str, Any]:
         """
         Трансформує абстрактний запит у MongoDB aggregation pipeline.
@@ -224,6 +311,9 @@ class QueryBuilder:
                 else:
                     pre_join_filters[key] = value
         
+        # Нормалізація дат: у olx_listings поле updated_at — BSON Date; рядки ISO перетворюємо на datetime
+        self._normalize_date_filters(collection_name, pre_join_filters)
+        
         # Додаємо match stage для фільтрів ДО join
         if pre_join_filters:
             match_stage = {'$match': self._transform_filters(pre_join_filters)}
@@ -248,13 +338,15 @@ class QueryBuilder:
             add_fields_stage = {'$addFields': query['addFields']}
             pipeline.append(add_fields_stage)
         
-        # Додаємо sort stage
+        # Додаємо sort stage. Для olx_listings за замовчуванням — за зменшенням дати оновлення
         if 'sort' in query:
             sort_stage = {'$sort': query['sort']}
             pipeline.append(sort_stage)
+        elif collection_name == 'olx_listings':
+            pipeline.append({'$sort': {'updated_at': -1}})
         
-        # Додаємо projection stage
-        if 'projection' in query:
+        # Додаємо projection stage лише якщо задано непорожній список полів (порожній projection = повні документи)
+        if 'projection' in query and query['projection']:
             projection_stage = self._build_projection(query['projection'], query.get('join', []))
             pipeline.append(projection_stage)
         
@@ -599,8 +691,11 @@ class QueryBuilder:
                 'error': error
             }
         
+        # Глибока копія pipeline та нормалізація дат у $match (для olx_listings updated_at — BSON Date)
+        final_pipeline = copy.deepcopy(pipeline)
+        self._normalize_aggregation_match_dates(collection_name, final_pipeline)
+
         # Додаємо limit в кінець pipeline, якщо вказано
-        final_pipeline = pipeline.copy()
         if limit is not None:
             if limit <= 0:
                 return {
@@ -644,3 +739,53 @@ class QueryBuilder:
                 'success': False,
                 'error': f'Помилка виконання aggregation: {str(e)}'
             }
+
+    def get_distinct_values(
+        self,
+        collection_name: str,
+        field_path: str,
+        limit: int = 300,
+        unwrap_array: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Повертає список унікальних значень поля в колекції (для аналізу перед фільтрацією).
+        field_path — шлях до поля, наприклад "search_data.location" або "detail.llm.tags".
+        unwrap_array: якщо True, поле вважається масивом — виконується $unwind, потім $group по елементу;
+          використовуй для полів-масивів (наприклад detail.llm.tags), щоб отримати список унікальних тегів.
+        """
+        if collection_name not in self.ALLOWED_COLLECTIONS:
+            return {
+                'success': False,
+                'error': f"Колекція '{collection_name}' не доступна.",
+                'values': [],
+            }
+        if not field_path or not isinstance(field_path, str):
+            return {'success': False, 'error': "field_path обов'язковий (наприклад search_data.location).", 'values': []}
+        if not all(c.isalnum() or c in '._' for c in field_path):
+            return {'success': False, 'error': "field_path може містити лише літери, цифри, крапку та підкреслення.", 'values': []}
+        limit = max(1, min(limit, 500))
+        dollar_path = '$' + field_path
+        if unwrap_array:
+            pipeline = [
+                {'$unwind': {'path': dollar_path, 'preserveNullAndEmptyArrays': False}},
+                {'$group': {'_id': dollar_path}},
+                {'$match': {'_id': {'$nin': [None, '']}}},
+                {'$sort': {'_id': 1}},
+                {'$limit': limit},
+            ]
+        else:
+            pipeline = [
+                {'$group': {'_id': dollar_path}},
+                {'$match': {'_id': {'$nin': [None, '']}}},
+                {'$sort': {'_id': 1}},
+                {'$limit': limit},
+            ]
+        result = self.execute_aggregation(collection_name, pipeline, limit=limit)
+        if not result.get('success'):
+            return {'success': False, 'error': result.get('error', ''), 'values': []}
+        values = []
+        for r in result.get('results') or []:
+            vid = r.get('_id')
+            if vid is not None and vid != '':
+                values.append(vid if isinstance(vid, str) else str(vid))
+        return {'success': True, 'values': values, 'count': len(values)}

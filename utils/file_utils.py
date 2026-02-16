@@ -8,7 +8,7 @@ import json
 import csv
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
 from utils.date_utils import KYIV_TZ
@@ -130,7 +130,16 @@ def save_csv_to_file(data: List[Dict[str, Any]], file_path: str, fieldnames: Lis
         print(f"⚠ Помилка: файл не знайдено після збереження: {file_path}")
 
 
-def generate_excel_in_memory(data: List[Dict[str, Any]], fieldnames: List[str], column_headers: Optional[Dict[str, str]] = None) -> BytesIO:
+# Поля Excel з посиланнями — робляться клікабельними гіперпосиланнями
+DEFAULT_URL_FIELDNAMES = ["auction_url", "listing_url", "page_url", "previous_auctions_links"]
+
+
+def generate_excel_in_memory(
+    data: List[Dict[str, Any]],
+    fieldnames: List[str],
+    column_headers: Optional[Dict[str, str]] = None,
+    url_fieldnames: Optional[List[str]] = None,
+) -> BytesIO:
     """
     Генерує Excel файл в пам'яті (BytesIO) з кодуванням UTF-8 та покращеним форматуванням.
     
@@ -138,6 +147,7 @@ def generate_excel_in_memory(data: List[Dict[str, Any]], fieldnames: List[str], 
         data: Список словників з даними для збереження
         fieldnames: Список назв колонок (ключі)
         column_headers: Словник з українськими назвами колонок (ключ -> назва)
+        url_fieldnames: Поля з посиланнями для клікабельних гіперпосилань (за замовчуванням: auction_url, listing_url, page_url, previous_auctions_links)
         
     Returns:
         BytesIO: Об'єкт з Excel файлом в пам'яті
@@ -147,168 +157,144 @@ def generate_excel_in_memory(data: List[Dict[str, Any]], fieldnames: List[str], 
     
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
     except ImportError:
         raise ImportError("Для форматування Excel потрібно встановити openpyxl: pip install openpyxl")
-    
-    # Створюємо DataFrame з даних
-    df = pd.DataFrame(data, columns=fieldnames)
     
     # Створюємо Workbook в пам'яті
     wb = Workbook()
     ws = wb.active
+    _apply_sheet_style(ws, data, fieldnames, column_headers, url_fieldnames or DEFAULT_URL_FIELDNAMES)
     
-    # Заповнюємо дані
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+def _apply_sheet_style(
+    ws,
+    data: List[Dict[str, Any]],
+    fieldnames: List[str],
+    column_headers: Optional[Dict[str, str]],
+    url_fieldnames: Optional[List[str]] = None,
+) -> None:
+    """Заповнює аркуш даними та застосовує стилі (шапка, гіперпосилання, ширина колонок)."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    url_fieldnames = url_fieldnames or DEFAULT_URL_FIELDNAMES
+    df = pd.DataFrame(data, columns=fieldnames)
+
     for row_idx, row_data in enumerate(df.itertuples(index=False), start=2):
         for col_idx, value in enumerate(row_data, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx)
-            cell.value = value
-    
-    # Стилі для шапки
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF", size=11)
     header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    
-    # Стилі для комірок
     cell_alignment = Alignment(vertical="top", wrap_text=True)
     border_style = Border(
-        left=Side(style='thin'),
-        right=Side(style='thin'),
-        top=Side(style='thin'),
-        bottom=Side(style='thin')
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
     )
-    
-    # Форматуємо шапку
+    hyperlink_font = Font(underline="single", color="0563C1")
+    bold_font = Font(bold=True)
+
     for col_idx, fieldname in enumerate(fieldnames, start=1):
         cell = ws.cell(row=1, column=col_idx)
-        # Використовуємо українську назву, якщо вказано
-        if column_headers and fieldname in column_headers:
-            cell.value = column_headers[fieldname]
-        else:
-            cell.value = fieldname
+        cell.value = (column_headers or {}).get(fieldname, fieldname)
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = header_alignment
         cell.border = border_style
-    
-    # Закріплюємо шапку
-    ws.freeze_panes = 'A2'
-    
-    # Знаходимо індекси колонок з посиланнями
-    url_column_idx = None
-    if 'auction_url' in fieldnames:
-        url_column_idx = fieldnames.index('auction_url') + 1
-    
-    previous_links_column_idx = None
-    if 'previous_auctions_links' in fieldnames:
-        previous_links_column_idx = fieldnames.index('previous_auctions_links') + 1
-    
-    # Стиль для гіперпосилань
-    hyperlink_font = Font(underline="single", color="0563C1")
-    # Стиль для жирного шрифту
-    bold_font = Font(bold=True)
-    
-    # Форматуємо комірки з даними
+
+    ws.freeze_panes = "A2"
+
+    url_column_indices = {}
+    for fn in url_fieldnames:
+        if fn in fieldnames:
+            url_column_indices[fieldnames.index(fn) + 1] = fn
+
     for row_idx in range(2, len(data) + 2):
-        row_data = data[row_idx - 2]  # Індекс в масиві data
-        # Перевіряємо, чи є додатковий класифікатор 03.07
-        has_bold = row_data.get('_has_additional_classification_03_07', False)
-        
+        row_data = data[row_idx - 2]
+        has_bold = row_data.get("_has_additional_classification_03_07", False)
         for col_idx, fieldname in enumerate(fieldnames, start=1):
             cell = ws.cell(row=row_idx, column=col_idx)
             cell.alignment = cell_alignment
-            
-            # Якщо це колонка з посиланнями, створюємо гіперпосилання
-            if col_idx == url_column_idx and cell.value:
-                url = str(cell.value).strip()
-                if url and (url.startswith('http://') or url.startswith('https://')):
-                    cell.hyperlink = url
-                    cell.value = "Посилання"
-                    # Комбінуємо стиль гіперпосилання з жирним, якщо потрібно
-                    if has_bold:
-                        cell.font = Font(underline="single", color="0563C1", bold=True)
-                    else:
-                        cell.font = hyperlink_font
-                    cell.border = border_style
-                elif cell.value and str(cell.value).strip():
-                    if has_bold:
-                        cell.font = bold_font
-                    cell.border = border_style
-                else:
-                    cell.border = Border()
-            # Якщо це колонка з посиланнями на минулі аукціони, створюємо гіперпосилання
-            elif col_idx == previous_links_column_idx and cell.value:
-                links_text = str(cell.value).strip()
-                if links_text:
-                    # Знаходимо перше посилання в тексті (може бути кілька через \r\n)
-                    links = [link.strip() for link in links_text.split('\r\n') if link.strip()]
-                    first_link = None
-                    for link in links:
-                        if link.startswith('http://') or link.startswith('https://'):
-                            first_link = link
-                            break
-                    
-                    if first_link:
-                        # Створюємо гіперпосилання на перше посилання
-                        cell.hyperlink = first_link
-                        # Текст залишаємо як є (з усіма посиланнями)
-                        cell.value = links_text
-                        # Застосовуємо стиль гіперпосилання
-                        if has_bold:
-                            cell.font = Font(underline="single", color="0563C1", bold=True)
-                        else:
-                            cell.font = hyperlink_font
-                        cell.border = border_style
-                    elif links_text:
-                        # Якщо є текст, але немає посилань - просто форматуємо
-                        if has_bold:
-                            cell.font = bold_font
-                        cell.border = border_style
-                    else:
-                        cell.border = Border()
-                else:
-                    cell.border = Border()
-            # Додаємо сітку тільки якщо є дані
+            if col_idx in url_column_indices:
+                fn = url_column_indices[col_idx]
+                url_val = cell.value
+                if url_val and isinstance(url_val, str):
+                    url_val = url_val.strip()
+                    if fn == "previous_auctions_links":
+                        links = [l.strip() for l in url_val.split("\r\n") if l.strip()]
+                        first_link = next((l for l in links if l.startswith("http://") or l.startswith("https://")), None)
+                        if first_link:
+                            cell.hyperlink = first_link
+                            cell.value = url_val
+                            cell.font = Font(underline="single", color="0563C1", bold=has_bold) if has_bold else hyperlink_font
+                        elif url_val:
+                            cell.font = bold_font if has_bold else None
+                    elif url_val.startswith("http://") or url_val.startswith("https://"):
+                        cell.hyperlink = url_val
+                        cell.value = "Посилання"
+                        cell.font = Font(underline="single", color="0563C1", bold=has_bold) if has_bold else hyperlink_font
+                    elif url_val:
+                        cell.font = bold_font if has_bold else None
+                cell.border = border_style
             elif cell.value and str(cell.value).strip():
-                if has_bold:
-                    cell.font = bold_font
+                cell.font = bold_font if has_bold else None
                 cell.border = border_style
             else:
-                # Прибираємо сітку для порожніх комірок
                 cell.border = Border()
-    
-    # Автоматично підганяємо ширину колонок
     for col_idx, fieldname in enumerate(fieldnames, start=1):
-        column_letter = get_column_letter(col_idx)
-        max_length = 0
-        
-        # Перевіряємо довжину в шапці
-        cell = ws.cell(row=1, column=col_idx)
-        if cell.value:
-            max_length = len(str(cell.value))
-        
-        # Перевіряємо довжину в даних
+        letter = get_column_letter(col_idx)
+        max_len = 0
+        if ws.cell(row=1, column=col_idx).value:
+            max_len = len(str(ws.cell(row=1, column=col_idx).value))
         for row_idx in range(2, len(data) + 2):
-            cell = ws.cell(row=row_idx, column=col_idx)
-            if cell.value:
-                cell_value = str(cell.value)
-                # Для багаторядкових значень беремо найдовший рядок
-                if '\n' in cell_value:
-                    max_line_length = max(len(line) for line in cell_value.split('\n'))
-                    max_length = max(max_length, max_line_length)
-                else:
-                    max_length = max(max_length, len(cell_value))
-        
-        # Встановлюємо ширину з невеликим запасом
-        adjusted_width = min(max_length + 2, 50)  # Максимум 50 символів
-        ws.column_dimensions[column_letter].width = adjusted_width
-    
-    # Зберігаємо в BytesIO
+            v = ws.cell(row=row_idx, column=col_idx).value
+            if v:
+                s = str(v)
+                max_len = max(max_len, max(len(line) for line in s.split("\n")) if "\n" in s else len(s))
+        ws.column_dimensions[letter].width = min(max_len + 2, 50)
+
+
+def generate_excel_with_sheets(
+    sheets: List[Tuple[str, List[Dict[str, Any]], List[str], Optional[Dict[str, str]]]],
+) -> BytesIO:
+    """
+    Генерує Excel файл у пам'яті з кількома вкладками.
+    Кожен елемент sheets: (назва_вкладки, data, fieldnames, column_headers).
+
+    Returns:
+        BytesIO з workbook (перша вкладка активна).
+    """
+    if not PANDAS_AVAILABLE:
+        raise ImportError("Для збереження в Excel потрібно встановити pandas та openpyxl: pip install pandas openpyxl")
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        raise ImportError("Для форматування Excel потрібно встановити openpyxl: pip install openpyxl")
+
+    wb = Workbook()
+    active_set = False
+    for sheet_name, data, fieldnames, column_headers in sheets:
+        if not active_set:
+            ws = wb.active
+            ws.title = sheet_name[:31]
+            active_set = True
+        else:
+            ws = wb.create_sheet(title=sheet_name[:31])
+        for row in data:
+            for fn in fieldnames:
+                if fn not in row:
+                    row[fn] = ""
+        _apply_sheet_style(ws, data, fieldnames, column_headers, url_fieldnames=DEFAULT_URL_FIELDNAMES)
+
     output = BytesIO()
     wb.save(output)
     output.seek(0)
-    
     return output
 
 
@@ -381,87 +367,47 @@ def save_excel_to_file(data: List[Dict[str, Any]], file_path: str, fieldnames: L
     # Закріплюємо шапку
     ws.freeze_panes = 'A2'
     
-    # Знаходимо індекси колонок з посиланнями
-    url_column_idx = None
-    if 'auction_url' in fieldnames:
-        url_column_idx = fieldnames.index('auction_url') + 1
-    
-    previous_links_column_idx = None
-    if 'previous_auctions_links' in fieldnames:
-        previous_links_column_idx = fieldnames.index('previous_auctions_links') + 1
+    # Знаходимо індекси колонок з посиланнями (auction_url, listing_url, page_url, previous_auctions_links)
+    url_column_map = {fieldnames.index(fn) + 1: fn for fn in DEFAULT_URL_FIELDNAMES if fn in fieldnames}
     
     # Стиль для гіперпосилань
     hyperlink_font = Font(underline="single", color="0563C1")
-    # Стиль для жирного шрифту
     bold_font = Font(bold=True)
     
     # Форматуємо комірки з даними
     for row_idx in range(2, len(data) + 2):
-        row_data = data[row_idx - 2]  # Індекс в масиві data
-        # Перевіряємо, чи є додатковий класифікатор 03.07
+        row_data = data[row_idx - 2]
         has_bold = row_data.get('_has_additional_classification_03_07', False)
         
         for col_idx, fieldname in enumerate(fieldnames, start=1):
             cell = ws.cell(row=row_idx, column=col_idx)
             cell.alignment = cell_alignment
             
-            # Якщо це колонка з посиланнями, створюємо гіперпосилання
-            if col_idx == url_column_idx and cell.value:
-                url = str(cell.value).strip()
-                if url and (url.startswith('http://') or url.startswith('https://')):
-                    cell.hyperlink = url
-                    cell.value = "Посилання"
-                    # Комбінуємо стиль гіперпосилання з жирним, якщо потрібно
-                    if has_bold:
-                        cell.font = Font(underline="single", color="0563C1", bold=True)
-                    else:
-                        cell.font = hyperlink_font
-                    cell.border = border_style
-                elif cell.value and str(cell.value).strip():
-                    if has_bold:
-                        cell.font = bold_font
-                    cell.border = border_style
-                else:
-                    cell.border = Border()
-            # Якщо це колонка з посиланнями на минулі аукціони, створюємо гіперпосилання
-            elif col_idx == previous_links_column_idx and cell.value:
-                links_text = str(cell.value).strip()
-                if links_text:
-                    # Знаходимо перше посилання в тексті (може бути кілька через \r\n)
-                    links = [link.strip() for link in links_text.split('\r\n') if link.strip()]
-                    first_link = None
-                    for link in links:
-                        if link.startswith('http://') or link.startswith('https://'):
-                            first_link = link
-                            break
-                    
-                    if first_link:
-                        # Створюємо гіперпосилання на перше посилання
-                        cell.hyperlink = first_link
-                        # Текст залишаємо як є (з усіма посиланнями)
-                        cell.value = links_text
-                        # Застосовуємо стиль гіперпосилання
-                        if has_bold:
-                            cell.font = Font(underline="single", color="0563C1", bold=True)
-                        else:
-                            cell.font = hyperlink_font
-                        cell.border = border_style
-                    elif links_text:
-                        # Якщо є текст, але немає посилань - просто форматуємо
-                        if has_bold:
-                            cell.font = bold_font
-                        cell.border = border_style
-                    else:
-                        cell.border = Border()
-                else:
-                    cell.border = Border()
-            # Додаємо сітку тільки якщо є дані
+            if col_idx in url_column_map:
+                fn = url_column_map[col_idx]
+                url_val = cell.value
+                if url_val and isinstance(url_val, str):
+                    url_val = url_val.strip()
+                    if fn == "previous_auctions_links":
+                        links = [l.strip() for l in url_val.split("\r\n") if l.strip()]
+                        first_link = next((l for l in links if l.startswith("http://") or l.startswith("https://")), None)
+                        if first_link:
+                            cell.hyperlink = first_link
+                            cell.value = url_val
+                            cell.font = Font(underline="single", color="0563C1", bold=has_bold) if has_bold else hyperlink_font
+                        elif url_val:
+                            cell.font = bold_font if has_bold else None
+                    elif url_val.startswith("http://") or url_val.startswith("https://"):
+                        cell.hyperlink = url_val
+                        cell.value = "Посилання"
+                        cell.font = Font(underline="single", color="0563C1", bold=has_bold) if has_bold else hyperlink_font
+                    elif url_val:
+                        cell.font = bold_font if has_bold else None
+                cell.border = border_style
             elif cell.value and str(cell.value).strip():
-                if has_bold:
-                    cell.font = bold_font
+                cell.font = bold_font if has_bold else None
                 cell.border = border_style
             else:
-                # Прибираємо сітку для порожніх комірок
                 cell.border = Border()
     
     # Автоматично підганяємо ширину колонок

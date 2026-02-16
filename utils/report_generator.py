@@ -15,6 +15,7 @@ from utils.date_utils import KYIV_TZ
 from utils.analytics_builder import AnalyticsBuilder
 from utils.query_builder import QueryBuilder
 from utils.file_utils import generate_excel_in_memory
+from business.services.export_data_service import ExportDataService, EXPORT_COLLECTIONS
 
 
 class ReportGenerator:
@@ -24,6 +25,7 @@ class ReportGenerator:
         """Ініціалізація генератора звітів."""
         self.analytics_builder = AnalyticsBuilder()
         self.query_builder = QueryBuilder()
+        self.export_data_service = ExportDataService()
         self.temp_dir = Path('temp/reports')
         self.temp_dir.mkdir(parents=True, exist_ok=True)
     
@@ -45,22 +47,30 @@ class ReportGenerator:
         if not ReportTemplates.is_valid_format(format_name):
             return False, f"Формат '{format_name}' не підтримується. Доступні формати: xlsx, csv, json"
         
-        # Перевірка шаблону
+        # Варіант запиту: експорт за ідентифікаторами (ids + collection)
+        if 'ids' in request and 'collection' in request:
+            if not isinstance(request['ids'], list):
+                return False, "Поле 'ids' має бути списком ідентифікаторів"
+            if request['collection'] not in EXPORT_COLLECTIONS:
+                return False, f"Поле 'collection' має бути одним з: {list(EXPORT_COLLECTIONS)}"
+            if 'columns' in request and not isinstance(request['columns'], list):
+                return False, "Поле 'columns' має бути списком (або відсутнім)"
+            return True, None
+        
+        # Варіант запиту: звіт з джерела даних (dataSource + columns)
         if 'template' in request:
             template_name = request['template']
             if not ReportTemplates.is_valid_template(template_name):
                 available_templates = [t['name'] for t in ReportTemplates.list_templates()]
                 return False, f"Шаблон '{template_name}' не існує. Доступні шаблони: {', '.join(available_templates)}"
         
-        # Перевірка джерела даних
         if 'dataSource' not in request:
-            return False, "Поле 'dataSource' є обов'язковим"
+            return False, "Поле 'dataSource' є обов'язковим (або вкажіть 'ids' та 'collection' для експорту за ID)"
         
         data_source = request['dataSource']
         if not isinstance(data_source, str):
             return False, "Поле 'dataSource' має бути рядком у форматі 'mcp-server:query'"
         
-        # Перевірка колонок
         if 'columns' not in request:
             return False, "Поле 'columns' є обов'язковим"
         
@@ -247,6 +257,29 @@ class ReportGenerator:
             }
         
         try:
+            # Експорт за ідентифікаторами: делегуємо ExportDataService, повертаємо посилання на файл
+            if 'ids' in request and 'collection' in request:
+                result = self.export_data_service.export_to_file(
+                    ids=request['ids'],
+                    collection=request['collection'],
+                    file_format=request['format'],
+                    fields=request.get('columns'),
+                    column_headers=request.get('column_headers'),
+                    filename_prefix=request.get('filename_prefix', 'report'),
+                )
+                if not result.get('success'):
+                    return result
+                # За потреби повертаємо base64 (читаємо файл)
+                if return_base64 and result.get('url'):
+                    with open(result['url'], 'rb') as f:
+                        file_base64 = base64.b64encode(f.read()).decode('utf-8')
+                    result['data'] = file_base64
+                    result['encoding'] = 'base64'
+                    result['size'] = len(file_base64)
+                    if 'url' in result:
+                        del result['url']
+                return result
+            
             # Отримуємо шаблон
             template = None
             if 'template' in request:
@@ -337,3 +370,41 @@ class ReportGenerator:
                 'success': False,
                 'error': f'Помилка генерації звіту: {str(e)}'
             }
+
+    def get_report_data(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Отримує дані для звіту без генерації файлу (для текстової доставки регламентних звітів).
+
+        Підтримує лише варіант з dataSource (не експорт за ids).
+        Повертає success, data (список рядків), columns, column_headers або error.
+        """
+        is_valid, error = self.validate_report_request(request)
+        if not is_valid:
+            return {'success': False, 'error': error}
+        try:
+            if 'ids' in request and 'collection' in request:
+                return {'success': False, 'error': 'get_report_data не підтримує експорт за ids'}
+            template = None
+            if 'template' in request:
+                template = ReportTemplates.get_template(request['template'])
+            server_name, query = self._parse_data_source(request['dataSource'])
+            data = self._fetch_data_from_source(server_name, query)
+            if not data:
+                return {'success': False, 'error': 'Немає даних'}
+            columns = request.get('columns', [])
+            if not columns and template:
+                columns = template.default_columns
+            column_headers = {}
+            if template:
+                column_headers = template.column_headers.copy()
+            for col in columns:
+                if col not in column_headers:
+                    column_headers[col] = col.replace('_', ' ').title()
+            return {
+                'success': True,
+                'data': data,
+                'columns': columns,
+                'column_headers': column_headers,
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}

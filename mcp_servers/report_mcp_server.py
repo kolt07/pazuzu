@@ -38,7 +38,7 @@ def generate_report(request: Dict[str, Any], return_base64: bool = True) -> Dict
     """
     Генерує звіт у вказаному форматі на основі шаблону та джерела даних.
     
-    Приймає запит у форматі:
+    Варіант 1 — звіт з джерела даних (dataSource):
     {
         "format": "xlsx",
         "template": "auction_summary",
@@ -46,13 +46,15 @@ def generate_report(request: Dict[str, Any], return_base64: bool = True) -> Dict
         "columns": ["region", "avg_price_m2", "auctions_count"]
     }
     
-    Або спрощений формат:
+    Варіант 2 — експорт за ідентифікаторами оголошень у БД (файл у тимчасовій папці, повертається url):
     {
         "format": "xlsx",
-        "template": "auction_summary",
-        "dataSource": "analytics-mcp:average_price_per_m2",
-        "columns": ["region", "value"]
+        "collection": "prozorro_auctions",
+        "ids": ["auction_id_1", "auction_id_2"],
+        "columns": ["auction_id", "auction_data.value.amount"],
+        "filename_prefix": "report"
     }
+    collection: prozorro_auctions | olx_listings; columns та column_headers — опціонально.
     
     Args:
         request: Запит на генерацію звіту

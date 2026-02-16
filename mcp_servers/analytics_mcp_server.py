@@ -38,24 +38,17 @@ def execute_analytics(query: Dict[str, Any]) -> Dict[str, Any]:
     """
     Виконує аналітичний запит з метриками та агрегаціями.
     
-    Приймає аналітичний запит у форматі:
-    {
-        "metric": "average_price_per_m2",
-        "groupBy": ["region"],
-        "filters": {
-            "status": "finished",
-            "dateEnd": {
-                "from": "2024-01-01",
-                "to": "2024-12-31"
-            }
-        }
-    }
+    collection (опційно): "prozorro_auctions" (за замовч.) або "olx_listings". Для ціни за м² по регіону (Київ, область), якщо по ProZorro 0 результатів — передай collection: "olx_listings" з тими ж filters та groupBy: ["date"].
+    
+    metric — назва вбудованої (list_metrics) або кастомна з formula (ProZorro: auction_data.*, llm_result.result.*). OLX: лише average_price_per_m2, groupBy: ["date"].
+    
+    Приклад (ProZorro): { "metric": "average_price_per_m2", "groupBy": ["date"], "filters": { "auction_data.dateModified": { "$gte": "...", "$lte": "..." }, "$or": [{"city": "Київ"}, {"region": "Київська"}] } }
+    Приклад (OLX): { "collection": "olx_listings", "metric": "average_price_per_m2", "groupBy": ["date"], "filters": { "auction_data.dateModified": { "$gte": "...", "$lte": "..." }, "$or": [{"city": "Київ"}, {"region": "Київська"}] } }
     
     Args:
-        query: Аналітичний запит у форматі JSON
-        
+        query: Аналітичний запит (JSON)
     Returns:
-        Словник з результатами виконання запиту
+        Результати виконання (success, results, metric, count, ...)
     """
     global _analytics_builder
     

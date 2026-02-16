@@ -1,0 +1,30 @@
+---
+description: Оновлення домен-шару при зміні структури даних
+globs: config/data_dictionary.yaml, **/migrations/*.py, data/repositories/*.py
+alwaysApply: false
+---
+
+# Domain Layer — оновлення при зміні структури
+
+При зміні структури даних (колекції, поля, індекси) **обов'язково** оновлюй домен-шар.
+
+## Що перевіряти
+
+1. **config/data_dictionary.yaml** — оновлення `fields`, `nested_fields`, `indexes` для колекції
+2. **domain/managers/collection_manager.py** — методи `_fetch_field_values`, `_load_field_structure`, `_geo_filter_to_mongo` для відповідної колекції
+3. **domain/entities/** — властивості сутностей (UnifiedListing, ProzorroAuction, OlxListing)
+4. **utils/source_field_mapper.py** — `FIELD_MAP` для колекції (city, region, price тощо)
+
+## Чеклист при міграції
+
+- [ ] Оновлено `data_dictionary.yaml`
+- [ ] Оновлено `CollectionManager` (якщо колекція підтримується)
+- [ ] Оновлено `SourceFieldMapper.FIELD_MAP`
+- [ ] Оновлено domain-сутність (нові властивості)
+- [ ] Викликано `CollectionManager.update_cache()` після міграції (через scheduler або після оновлення даних)
+
+## Після оновлення даних з джерел
+
+Після `run_olx_update`, `fetch_real_estate_auctions` або іншого оновлення сирих даних:
+- Викликати `CollectionManager.update_cache()` для колекцій, що оновились
+- Викликати `PipelineRepository.clear_cache()` якщо змінилась логіка або структура

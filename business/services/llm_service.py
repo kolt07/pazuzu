@@ -65,6 +65,17 @@ class BaseLLMProvider(ABC):
             floor, property_type, utilities
         """
         pass
+
+    def generate_text(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.0,
+    ) -> str:
+        """
+        Генерує текст за промптом (для intent extraction тощо). За замовчуванням не реалізовано.
+        """
+        raise NotImplementedError("generate_text не реалізовано для цього провайдера")
     
     def _create_parsing_prompt(self, description: str) -> str:
         """
@@ -85,20 +96,21 @@ class BaseLLMProvider(ABC):
 Витягни та поверни JSON з наступними полями:
 - cadastral_number: кадастровий номер, номер земельного кадастру (строка, якщо є). 
   Шукай формати типу "6320685503:03:000:0202" або подібні. Якщо є кілька номерів - використовуй основний.
-- building_area_sqm: площа нерухомості (будівель, споруд, приміщень) в квадратних метрах (число, якщо є).
-  Шукай фрази типу "площею", "загальною площею", "площею будівлі", "площею об'єкта", "площею приміщень", "кв.м", "м²".
-  Якщо площа вказана в квадратних метрах - використовуй число як є (наприклад, "956,7 м²" -> 956.7, "25 659,90 кв.м" -> 25659.90).
-  Якщо площа вказана в гектарах - конвертуй в м² (1 га = 10000 м², наприклад "0,5 га" -> 5000).
-  Якщо площа вказана в сотках - конвертуй в м² (1 сотка = 100 м², наприклад "5 соток" -> 500).
-  Якщо є кілька значень площі нерухомості - СУМУЙ їх (наприклад, якщо є "2,2 кв.м" і "19,8 кв.м" -> 22.0).
-  Якщо вказана тільки площа земельної ділянки без площі будівель - залишай порожнім.
+- building_area_sqm: площа нерухомості (будівель, споруд, приміщень, квартир) в квадратних метрах (число, якщо є).
+  Це НЕ площа земельної ділянки — тільки площа будівель/приміщень. Шукай у ВСЬОМУ тексті: описі, параметрах, заголовку.
+  Фрази для пошуку: "площа", "площею", "загальна площа", "житлова площа", "корисна площа", "площа будівлі", "площа об'єкта",
+  "площа приміщень", "площа квартири", "площа будинку", "площа приміщення", "кв.м", "м²", "м2", "кв м", "квадратних метрів".
+  У параметрах (наприклад "Площа: 65 м²") — обов'язково витягуй. У заголовку ("3-к.кв. 65 м²") — також.
+  Формати чисел: "956,7 м²" -> 956.7; "25 659,90 кв.м" -> 25659.90 (пробіли як роздільник тисяч — видаляй);
+  "65м²", "65 м2", "65 кв.м" -> 65; "1 234.5" (крапка/кома як десяткова) -> 1234.5.
+  Якщо в гектарах (площа будівлі) — конвертуй: 1 га = 10000 м². Якщо в сотках — 1 сотка = 100 м².
+  Кілька значень площі нерухомості — СУМУЙ (наприклад "2,2 кв.м" і "19,8 кв.м" -> 22.0).
+  Якщо вказана тільки площа землі без будівель — залишай порожнім. Якщо є і будівля, і ділянка — витягуй обидві окремо.
 - land_area_ha: площа земельної ділянки в гектарах (число, якщо є).
-  Шукай фрази типу "земельна ділянка", "площею", "на земельній ділянці", "га", "гектар".
-  Якщо площа вказана в гектарах - використовуй число як є (наприклад, "5,1545 га" -> 5.1545, "0,5296 га" -> 0.5296).
-  Якщо площа вказана в квадратних метрах - конвертуй в га (1 м² = 0.0001 га, наприклад "10000 м²" -> 1.0).
-  Якщо площа вказана в сотках - конвертуй в га (1 сотка = 0.01 га, наприклад "50 соток" -> 0.5).
-  Якщо є кілька значень площі землі - СУМУЙ їх.
-  Якщо вказана тільки площа будівель без земельної ділянки - залишай порожнім.
+  Це площа ЗЕМЛІ, не будівель. Шукай у всьому тексті.
+  Фрази: "земельна ділянка", "площа ділянки", "площа землі", "на земельній ділянці", "га", "гектар", "соток", "соток землі".
+  Гектари — як є ("5,1545 га" -> 5.1545). Квадратні метри землі — конвертуй: 10000 м² = 1 га. Сотки — 100 соток = 1 га.
+  Кілька значень — СУМУЙ. Якщо тільки площа будівель — залишай порожнім.
 - addresses: масив адрес (якщо в тексті є кілька адрес - витягни всі). Кожна адреса - об'єкт з полями:
   * region: область у форматі "Волинська", "Тернопільська", "Харківська" тощо (без скорочень, без додаткових слів). 
     м. Київ та м. Симферополь НЕ входять в склад областей - для них залишай порожнє значення.
@@ -123,12 +135,20 @@ class BaseLLMProvider(ABC):
 - utilities: підведені комунікації (через кому, наприклад: електрика, вода, газ, опалення).
   Якщо в тексті є "електропостачання" - пиши "електрика", якщо "водопостачання" - пиши "вода".
   Якщо вказано "відсутні" або "не підведені" - пиши "відсутні".
+- tags: масив тегів (рядків) для фільтрації оголошень. Кожен тег — короткий ідентифікатор у нижньому регістрі. Витягуй усі релевантні:
+  * Призначення/тип об'єкта: крамниця, аптека, офіс, склад, кафе, ресторан, виробництво, складське приміщення, коворкінг, логістика, автосервіс, СТО, паркінг, гараж, готель, склад-холодильник тощо — якщо в тексті явно або з контексту зрозуміло.
+  * Комунікації як окремі теги (якщо згадані): газ, вода, електрика, світло, каналізація, опалення, інтернет, вентиляція. Якщо "відсутні" — не додавай теги комунікацій.
+  * Інше: ремонт (якщо згадано стан ремонту), паркінг (якщо є), під\'їзд (якщо згадано).
+  Приклад: приміщення під крамницю, газ, вода, світло, каналізація → tags: ["крамниця", "газ", "вода", "електрика", "каналізація"].
+  Не вигадуй теги — лише з того, що є в тексті. Якщо нічого не підходить — порожній масив [].
 - arrests_info: інформація про обтяження майна (арешти) у форматі: "Арешт 1: Видав ХХХХХ, Дата: УУУУ, Можливе зняття так/ні" 
   (якщо є декілька арештів - кожен на окремому рядку, наприклад: "Арешт 1: ...\\nАрешт 2: ...")
   Якщо в тексті є "не зареєстровано" або "відсутні" - пиши "відсутні".
 
 ВАЖЛИВО:
 - Уважно читай весь текст, включаючи деталі про адресу, площу, кадастровий номер.
+- Площа нерухомості (building_area_sqm) та площа землі (land_area_ha) — різні речі. Не плутай: будівля/приміщення -> building_area_sqm; ділянка/земля -> land_area_ha.
+- Шукай площу в усіх блоках: "Параметри об'єкта", "Повний опис", "Заголовок", "Локація". Часто площа є в параметрах типу "Площа: 65" або "Загальна площа: 120 м²".
 - Якщо інформація вказана в різних форматах (наприклад, "0,5296 га" і "0.5296 га") - використовуй той, що згадується першим.
 - Для адреси: якщо є "Харківська область, Лозівський район, на території с. Верхньоводяне, вул. Центральна, 15" - 
   витягни як: {{"region": "Харківська", "district": "Лозівський", "settlement_type": "с.", "settlement": "Верхньоводяне", "street_type": "вул.", "street": "Центральна", "building": "15"}}
@@ -355,6 +375,9 @@ class GeminiLLMProvider(BaseLLMProvider):
                 except (ValueError, AttributeError):
                     pass
         
+        tags_raw = result.get('tags', [])
+        tags = [str(t).strip().lower() for t in (tags_raw if isinstance(tags_raw, list) else []) if t and str(t).strip()]
+        tags = list(dict.fromkeys(tags))
         return {
             'cadastral_number': result.get('cadastral_number', ''),
             'building_area_sqm': building_area_sqm if building_area_sqm else '',
@@ -363,6 +386,7 @@ class GeminiLLMProvider(BaseLLMProvider):
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
             'utilities': result.get('utilities', ''),
+            'tags': tags,
             'arrests_info': result.get('arrests_info', '')
         }
     
@@ -376,8 +400,32 @@ class GeminiLLMProvider(BaseLLMProvider):
             'floor': '',
             'property_type': '',
             'utilities': '',
+            'tags': [],
             'arrests_info': ''
         }
+
+    def generate_text(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.0,
+    ) -> str:
+        """Генерує текст за промптом (Gemini API)."""
+        self.rate_limiter.wait_if_needed()
+        full_content = prompt
+        if system_prompt:
+            full_content = f"{system_prompt}\n\n{prompt}"
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=full_content,
+                config={"temperature": temperature},
+            )
+            if not hasattr(response, 'text') or response.text is None:
+                return ""
+            return str(response.text).strip()
+        except Exception:
+            return ""
 
 
 class OpenAILLMProvider(BaseLLMProvider):
@@ -497,6 +545,9 @@ class OpenAILLMProvider(BaseLLMProvider):
                 except (ValueError, AttributeError):
                     pass
         
+        tags_raw = result.get('tags', [])
+        tags = [str(t).strip().lower() for t in (tags_raw if isinstance(tags_raw, list) else []) if t and str(t).strip()]
+        tags = list(dict.fromkeys(tags))
         return {
             'cadastral_number': result.get('cadastral_number', ''),
             'building_area_sqm': building_area_sqm if building_area_sqm else '',
@@ -505,6 +556,7 @@ class OpenAILLMProvider(BaseLLMProvider):
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
             'utilities': result.get('utilities', ''),
+            'tags': tags,
             'arrests_info': result.get('arrests_info', '')
         }
     
@@ -518,6 +570,7 @@ class OpenAILLMProvider(BaseLLMProvider):
             'floor': '',
             'property_type': '',
             'utilities': '',
+            'tags': [],
             'arrests_info': ''
         }
 
@@ -638,6 +691,9 @@ class AnthropicLLMProvider(BaseLLMProvider):
                 except (ValueError, AttributeError):
                     pass
         
+        tags_raw = result.get('tags', [])
+        tags = [str(t).strip().lower() for t in (tags_raw if isinstance(tags_raw, list) else []) if t and str(t).strip()]
+        tags = list(dict.fromkeys(tags))
         return {
             'cadastral_number': result.get('cadastral_number', ''),
             'building_area_sqm': building_area_sqm if building_area_sqm else '',
@@ -646,6 +702,7 @@ class AnthropicLLMProvider(BaseLLMProvider):
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
             'utilities': result.get('utilities', ''),
+            'tags': tags,
             'arrests_info': result.get('arrests_info', '')
         }
     
@@ -659,6 +716,7 @@ class AnthropicLLMProvider(BaseLLMProvider):
             'floor': '',
             'property_type': '',
             'utilities': '',
+            'tags': [],
             'arrests_info': ''
         }
 
@@ -706,3 +764,128 @@ class LLMService:
             Dict з структурованою інформацією
         """
         return self.provider.parse_auction_description(description)
+
+    def extract_intent_for_routing(
+        self,
+        user_query: str,
+        context: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Визначає намір користувача для маршрутизації (без tools, тільки JSON).
+        Повертає словник: intent, confidence, опційно analysis_intent.
+        """
+        if not user_query or not user_query.strip():
+            return {"intent": "query", "confidence": 0.0}
+
+        prompt = self._create_intent_extraction_prompt(user_query, context)
+        if not hasattr(self.provider, "generate_text"):
+            return {"intent": "query", "confidence": 0.5}
+
+        try:
+            raw = self.provider.generate_text(
+                prompt,
+                system_prompt="Ти класифікатор намірів. Повертай тільки валідний JSON без пояснень.",
+                temperature=0.0,
+            )
+        except Exception:
+            return {"intent": "query", "confidence": 0.5}
+
+        if not raw:
+            return {"intent": "query", "confidence": 0.5}
+
+        json_text = self._extract_json_from_intent_response(raw)
+        if not json_text:
+            return {"intent": "query", "confidence": 0.5}
+
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError:
+            return {"intent": "query", "confidence": 0.5}
+
+        return self._normalize_intent_response(data, user_query)
+
+    def generate_text(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.0,
+    ) -> str:
+        """
+        Генерує текст за промптом (для плану аналітики тощо). Повертає порожній рядок, якщо провайдер не підтримує.
+        """
+        if not hasattr(self.provider, "generate_text"):
+            return ""
+        try:
+            return self.provider.generate_text(
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+            )
+        except Exception:
+            return ""
+
+    def _create_intent_extraction_prompt(self, user_query: str, context: Optional[str]) -> str:
+        """Промпт для LLM Intent Extractor."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        date_ctx = f"Поточна дата/час (UTC): {now.isoformat()}. Періоди: остання добу = last_1_day, останні 7 днів = last_7_days, останні 30 днів = last_30_days."
+        ctx_block = f"\nКонтекст розмови (коротко):\n{context[:800]}" if context else ""
+        return f"""Визнач намір користувача за запитом. {date_ctx}{ctx_block}
+
+Запит користувача:
+{user_query[:2000]}
+
+Поверни ТІЛЬКИ один JSON-об'єкт без коментарів з полями:
+- intent: один з "report_last_day", "report_last_week", "export_data", "query", "analytical_query"
+- confidence: число від 0 до 1 (впевненість у класифікації)
+
+Якщо intent = "analytical_query", додай об'єкт analysis_intent з полями:
+- entity: "olx_listings" або "prozorro_auctions"
+- time_range: "last_1_day" | "last_7_days" | "last_30_days" або null
+- dimensions: масив ["location"] | ["region"] | ["city"] | ["date"] | ["property_type"] або []
+- filters: об'єкт з опційними ключами city (рядок або масив), region (рядок або масив), property_type (рядок або масив)
+- metrics: масив об'єктів, кожен: {{ "field": "price"|"count"|..., "aggregation": "top"|"count"|"avg"|"sum"|"distribution"|"trend", "order": "asc"|"desc", "limit": число або null }}
+- presentation: "list" | "table" | "chart" або null
+- multi_step: true лише якщо запит вимагає порівняння двох джерел (OLX і ProZorro) або багатокрокової аналітики (наприклад "порівняй ціни OLX і ProZorro по регіонах"); інакше false або не вказуй
+
+Приклади намірів:
+- "звіт за добу по Києву" -> intent: "report_last_day", confidence: 0.95
+- "топ-10 найдорожчих оголошень OLX за тиждень по Києву" -> intent: "analytical_query", confidence: 0.85, analysis_intent: {{ entity: "olx_listings", time_range: "last_7_days", dimensions: ["location"], filters: {{ city: ["Київ"] }}, metrics: [{{ field: "price", aggregation: "top", order: "desc", limit: 10 }}], presentation: "list" }}
+- "скільки аукціонів за місяць" -> intent: "analytical_query", confidence: 0.8, analysis_intent: {{ entity: "prozorro_auctions", time_range: "last_30_days", metrics: [{{ field: "count", aggregation: "count" }}], presentation: "list" }}
+- "привіт" або незрозуміло -> intent: "query", confidence: 0.3"""
+
+    def _extract_json_from_intent_response(self, text: str) -> str:
+        """Витягує JSON з відповіді (аналог _extract_json_from_response у провайдерів)."""
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            json_lines = []
+            in_json = False
+            for line in lines:
+                if line.strip().startswith("```"):
+                    if not in_json:
+                        in_json = True
+                    else:
+                        break
+                    continue
+                if in_json:
+                    json_lines.append(line)
+            return "\n".join(json_lines)
+        if "{" in text:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return text[start : end + 1]
+        return text
+
+    def _normalize_intent_response(self, data: Dict[str, Any], user_query: str) -> Dict[str, Any]:
+        """Нормалізує відповідь LLM до формату інтерпретатора."""
+        intent = data.get("intent")
+        if intent not in ("report_last_day", "report_last_week", "export_data", "query", "analytical_query"):
+            intent = "query"
+        confidence = float(data.get("confidence", 0.5))
+        confidence = max(0.0, min(1.0, confidence))
+        out = {"intent": intent, "confidence": confidence}
+        if intent == "analytical_query" and isinstance(data.get("analysis_intent"), dict):
+            out["analysis_intent"] = data["analysis_intent"]
+        return out

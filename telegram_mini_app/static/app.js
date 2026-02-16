@@ -1,0 +1,3519 @@
+(function () {
+  "use strict";
+
+  var Tg = window.Telegram && window.Telegram.WebApp;
+  var initData = "";
+  
+  // Функція для оновлення initData
+  function updateInitData() {
+    if (Tg && Tg.initData) {
+      initData = Tg.initData;
+    } else {
+      // Fallback: спробуємо отримати з URL параметрів (для десктопного клієнта)
+      var urlParams = new URLSearchParams(window.location.search);
+      var tgInitData = urlParams.get("tgWebAppData");
+      if (tgInitData) {
+        initData = decodeURIComponent(tgInitData);
+      }
+    }
+  }
+  
+  // Оновлюємо initData при завантаженні
+  updateInitData();
+  
+  // Якщо Telegram WebApp API доступний, чекаємо на подію ready
+  if (Tg) {
+    if (Tg.ready) {
+      Tg.ready();
+    }
+    if (Tg.expand) {
+      Tg.expand();
+    }
+    // Для веб/десктоп — спроба запросити fullscreen (більше workspace)
+    var platform = (Tg.platform || "").toLowerCase();
+    var isDesktop = platform === "web" || platform === "tdesktop" || platform === "macos" || platform === "windows" || platform === "weba" || platform === "webk";
+    if (isDesktop && Tg.requestFullscreen) {
+      setTimeout(function() {
+        try {
+          Tg.requestFullscreen();
+        } catch (e) {
+          console.log("requestFullscreen skipped:", e);
+        }
+      }, 300);
+    }
+    if (Tg.onEvent) {
+      Tg.onEvent("viewportChanged", function() {
+        updateInitData();
+      });
+    }
+    setTimeout(function() {
+      updateInitData();
+    }, 100);
+    setTimeout(function() {
+      updateInitData();
+    }, 500);
+  }
+
+  function apiHeaders() {
+    var h = { "Content-Type": "application/json" };
+    updateInitData(); // Оновлюємо перед кожним запитом
+    if (initData) h["X-Telegram-Init-Data"] = initData;
+    return h;
+  }
+
+  var currentScreen = "screen-home";
+
+  var CHAT_STORAGE_KEY = "pazuzu_chat_sessions";
+  var THEME_STORAGE_KEY = "pazuzu_theme";
+  var SIDEBAR_BREAKPOINT = 768;
+
+  function getStoredTheme() {
+    try {
+      return localStorage.getItem(THEME_STORAGE_KEY);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function applyTheme(theme) {
+    var root = document.documentElement;
+    if (theme === "dark") {
+      root.setAttribute("data-theme", "dark");
+    } else {
+      root.removeAttribute("data-theme");
+    }
+  }
+
+  function initTheme() {
+    var stored = getStoredTheme();
+    if (stored === "dark" || stored === "light") {
+      applyTheme(stored);
+      return;
+    }
+    var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    if (Tg && Tg.colorScheme === "dark") {
+      applyTheme("dark");
+    } else if (prefersDark) {
+      applyTheme("dark");
+    } else {
+      applyTheme("light");
+    }
+  }
+
+  initTheme();
+
+  var chatSessions = [];
+  var currentChatId = null;
+
+  /** Контекст поточного оголошення/аукціону для переходу в чат з AI */
+  var currentDetailContext = null;
+
+  var sidebarCollapsed = false;
+  var sidebarOverlayOpen = false;
+
+  function isMobileOrNarrow() {
+    var platform = Tg && (Tg.platform || "").toLowerCase();
+    var isMobile = platform === "android" || platform === "ios";
+    var isNarrow = typeof window !== "undefined" && window.innerWidth < SIDEBAR_BREAKPOINT;
+    return isMobile || isNarrow;
+  }
+
+  function updateSidebarState() {
+    var sidebar = document.getElementById("chat-sidebar");
+    var toggleBtn = document.getElementById("sidebar-toggle");
+    var backdrop = document.getElementById("sidebar-backdrop");
+    if (!sidebar || !toggleBtn) return;
+
+    if (currentScreen !== "screen-home") {
+      sidebar.classList.add("hidden");
+      toggleBtn.classList.add("hidden");
+      if (backdrop) backdrop.classList.remove("visible");
+      sidebarOverlayOpen = false;
+      return;
+    }
+
+    sidebar.classList.remove("hidden");
+    if (sidebarCollapsed) {
+      sidebar.classList.add("collapsed");
+      if (!sidebarOverlayOpen) sidebar.classList.remove("sidebar-overlay-open");
+      toggleBtn.classList.remove("hidden");
+      toggleBtn.textContent = "☰";
+      toggleBtn.title = "Відкрити історію чатів";
+    } else {
+      sidebar.classList.remove("collapsed");
+      sidebar.classList.remove("sidebar-overlay-open");
+      toggleBtn.classList.add("hidden");
+      if (backdrop) backdrop.classList.remove("visible");
+      sidebarOverlayOpen = false;
+    }
+  }
+
+  function openSidebarOverlay() {
+    var sidebar = document.getElementById("chat-sidebar");
+    var backdrop = document.getElementById("sidebar-backdrop");
+    if (sidebar && backdrop) {
+      sidebar.classList.add("sidebar-overlay-open");
+      backdrop.classList.add("visible");
+      sidebarOverlayOpen = true;
+    }
+  }
+
+  function closeSidebarOverlay() {
+    var sidebar = document.getElementById("chat-sidebar");
+    var backdrop = document.getElementById("sidebar-backdrop");
+    if (sidebar && backdrop) {
+      sidebar.classList.remove("sidebar-overlay-open");
+      backdrop.classList.remove("visible");
+      sidebarOverlayOpen = false;
+    }
+  }
+
+  function toggleSidebar() {
+    if (sidebarCollapsed) {
+      if (sidebarOverlayOpen) {
+        closeSidebarOverlay();
+      } else {
+        openSidebarOverlay();
+      }
+    } else {
+      sidebarCollapsed = true;
+      updateSidebarState();
+    }
+  }
+
+  function initSidebarCollapse() {
+    sidebarCollapsed = isMobileOrNarrow();
+    updateSidebarState();
+
+    var toggleBtn = document.getElementById("sidebar-toggle");
+    if (toggleBtn) {
+      toggleBtn.addEventListener("click", toggleSidebar);
+    }
+
+    var backdrop = document.getElementById("sidebar-backdrop");
+    if (backdrop) {
+      backdrop.addEventListener("click", function () {
+        closeSidebarOverlay();
+      });
+    }
+
+    var collapseBtn = document.getElementById("sidebar-collapse-btn");
+    if (collapseBtn) {
+      collapseBtn.addEventListener("click", function () {
+        sidebarCollapsed = true;
+        closeSidebarOverlay();
+        updateSidebarState();
+      });
+    }
+
+    if (typeof window !== "undefined") {
+      window.addEventListener("resize", function () {
+        var shouldCollapse = isMobileOrNarrow();
+        if (shouldCollapse && !sidebarCollapsed) {
+          sidebarCollapsed = true;
+          closeSidebarOverlay();
+        } else if (!shouldCollapse && sidebarCollapsed) {
+          sidebarCollapsed = false;
+          closeSidebarOverlay();
+        }
+        updateSidebarState();
+      });
+    }
+  }
+
+  function loadChatSessions() {
+    try {
+      var raw = localStorage.getItem(CHAT_STORAGE_KEY);
+      if (raw) {
+        var parsed = JSON.parse(raw);
+        chatSessions = Array.isArray(parsed) ? parsed : [];
+      } else {
+        chatSessions = [];
+      }
+    } catch (e) {
+      console.warn("Failed to load chat sessions:", e);
+      chatSessions = [];
+    }
+  }
+
+  function saveChatSessions() {
+    try {
+      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(chatSessions));
+    } catch (e) {
+      console.warn("Failed to save chat sessions:", e);
+    }
+  }
+
+  function genChatId() {
+    return "chat_" + Date.now() + "_" + Math.random().toString(36).slice(2, 9);
+  }
+
+  function createNewChat() {
+    var id = genChatId();
+    chatSessions.unshift({
+      id: id,
+      title: "Новий чат",
+      messages: [],
+      updatedAt: Date.now()
+    });
+    saveChatSessions();
+    currentChatId = id;
+    renderChatHistoryList();
+    renderChatMessages();
+    var input = document.getElementById("chat-input");
+    if (input) {
+      input.placeholder = "Ваш запит...";
+      input.focus();
+    }
+  }
+
+  /**
+   * Відкриває новий чат з контекстом оголошення/аукціону.
+   * Контекст (посилання + короткий опис) передається окремо, не в тексті запиту.
+   * @param {Object} context - { page_url: string, summary: string }
+   */
+  function openChatWithListingContext(context) {
+    createNewChat();
+    var chat = getCurrentChat();
+    if (chat && context) {
+      chat.listingContext = {
+        page_url: context.page_url || "",
+        summary: context.summary || "",
+        detail_source: context.detail_source || "",
+        detail_id: context.detail_id || "",
+      };
+      saveChatSessions();
+    }
+    show("screen-home");
+    var input = document.getElementById("chat-input");
+    if (input) {
+      input.value = "Проаналізуй це оголошення (див. посилання вище). ";
+      input.placeholder = "Наприклад: аналітика цін у районі, оцінка розташування...";
+      input.focus();
+      input.scrollIntoView({ behavior: "smooth" });
+    }
+  }
+
+  /**
+   * Будує короткий контекст оголошення (без заголовка — він на посиланні).
+   * @returns {{ page_url: string, summary: string, detail_source: string, detail_id: string }}
+   */
+  function buildDetailContext(data, type) {
+    var parts = [];
+    var pageUrl = "";
+    var detailSource = type || "";
+    var detailId = "";
+    if (type === "prozorro") {
+      var aid = data.auction_id;
+      detailId = aid || "";
+      pageUrl = aid ? "https://prozorro.sale/auction/" + aid : "";
+      var amt = getNestedValue(data, "auction_data.value.amount");
+      if (amt != null) parts.push("ціна " + formatPrice(amt) + " ₴");
+      var refs = (data.auction_data && data.auction_data.address_refs) || [];
+      if (refs.length && refs[0]) {
+        var locParts = [];
+        if (refs[0].city && refs[0].city.name) locParts.push(refs[0].city.name);
+        if (refs[0].region && refs[0].region.name) locParts.push(refs[0].region.name);
+        if (locParts.length) parts.push(locParts.join(", "));
+      }
+      if (!parts.length && data.auction_data && data.auction_data.items && data.auction_data.items[0]) {
+        var addr = data.auction_data.items[0].address;
+        if (addr) {
+          var locParts = [];
+          if (addr.locality && (addr.locality.uk_UA || addr.locality.en_US)) locParts.push(addr.locality.uk_UA || addr.locality.en_US || "");
+          if (addr.region && (addr.region.uk_UA || addr.region.en_US)) locParts.push(addr.region.uk_UA || addr.region.en_US || "");
+          if (locParts.length) parts.push(locParts.filter(Boolean).join(", "));
+        }
+      }
+    } else if (type === "olx") {
+      pageUrl = data.url || "";
+      detailId = data.url || data.id || data._id || "";
+      var pv = getNestedValue(data, "search_data.price_value");
+      if (pv != null) parts.push("ціна " + formatPrice(pv) + " ₴");
+      var loc = getNestedValue(data, "search_data.location");
+      var location = typeof loc === "string" ? loc : (loc && loc.city ? loc.city + (loc.region ? ", " + loc.region : "") : "");
+      if (location) parts.push(location);
+    }
+    parts.push(type === "olx" ? "OLX" : "ProZorro");
+    return { page_url: pageUrl, summary: parts.join(", "), detail_source: detailSource, detail_id: detailId };
+  }
+
+  function switchChat(id) {
+    currentChatId = id;
+    renderChatHistoryList();
+    renderChatMessages();
+    if (sidebarCollapsed && sidebarOverlayOpen) {
+      closeSidebarOverlay();
+    }
+  }
+
+  function getCurrentChat() {
+    if (!currentChatId) return null;
+    return chatSessions.find(function (c) { return c.id === currentChatId; });
+  }
+
+  function addMessageToCurrentChat(role, text, requestId, excelFiles) {
+    var chat = getCurrentChat();
+    if (!chat) {
+      createNewChat();
+      chat = getCurrentChat();
+    }
+    if (!chat) return;
+    var timestamp = Date.now();
+    var msg = { role: role, text: text, requestId: requestId || null, timestamp: timestamp };
+    if (excelFiles && excelFiles.length) {
+      msg.excelFiles = excelFiles;
+    }
+    chat.messages.push(msg);
+    if (role === "user" && chat.title === "Новий чат") {
+      chat.title = text.length > 50 ? text.slice(0, 50) + "…" : text;
+    }
+    chat.updatedAt = timestamp;
+    saveChatSessions();
+    renderChatHistoryList();
+  }
+
+  function formatMessageTimestamp(ts) {
+    if (!ts || typeof ts !== "number") return "";
+    try {
+      return new Date(ts).toLocaleString("uk-UA", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit"
+      });
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function deleteChat(id, e) {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    var idx = chatSessions.findIndex(function (c) { return c.id === id; });
+    if (idx === -1) return;
+    var chat = chatSessions[idx];
+    var artifactIds = [];
+    if (chat && chat.messages) {
+      chat.messages.forEach(function (m) {
+        if (m.excelFiles && m.excelFiles.length) {
+          m.excelFiles.forEach(function (f) {
+            var aid = f.artifact_id || f.artifactId;
+            if (aid) artifactIds.push(aid);
+          });
+        }
+      });
+    }
+    if (artifactIds.length) {
+      fetch("/api/files/artifacts/delete", {
+        method: "POST",
+        headers: apiHeaders(),
+        body: JSON.stringify({ artifact_ids: artifactIds })
+      }).catch(function () {});
+    }
+    chatSessions.splice(idx, 1);
+    if (currentChatId === id) {
+      currentChatId = chatSessions.length > 0 ? chatSessions[0].id : null;
+    }
+    saveChatSessions();
+    renderChatHistoryList();
+    renderChatMessages();
+    if (sidebarOverlayOpen) closeSidebarOverlay();
+  }
+
+  function renderChatHistoryList() {
+    var list = document.getElementById("chat-history-list");
+    var sidebar = document.getElementById("chat-sidebar");
+    if (!list || !sidebar) return;
+    list.innerHTML = "";
+    if (chatSessions.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "chat-history-empty";
+      empty.textContent = "Немає чатів";
+      list.appendChild(empty);
+      return;
+    }
+    chatSessions.forEach(function (s) {
+      var item = document.createElement("div");
+      item.className = "chat-history-item" + (s.id === currentChatId ? " active" : "");
+      item.setAttribute("data-chat-id", s.id);
+      var titleSpan = document.createElement("span");
+      titleSpan.className = "chat-history-item-title";
+      titleSpan.textContent = s.title || "Без назви";
+      titleSpan.addEventListener("click", function () {
+        switchChat(s.id);
+      });
+      var delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "chat-history-item-delete";
+      delBtn.title = "Видалити чат";
+      delBtn.innerHTML = "×";
+      delBtn.addEventListener("click", function (e) {
+        deleteChat(s.id, e);
+      });
+      item.appendChild(titleSpan);
+      item.appendChild(delBtn);
+      list.appendChild(item);
+    });
+  }
+
+  function renderChatListingPinned() {
+    var wrap = document.getElementById("chat-listing-pinned");
+    if (!wrap) return;
+    var chat = getCurrentChat();
+    var lc = chat && chat.listingContext;
+    if (!lc || (!lc.page_url && !lc.detail_id)) {
+      wrap.classList.add("hidden");
+      wrap.innerHTML = "";
+      return;
+    }
+    wrap.classList.remove("hidden");
+    var summary = (lc.summary || "").slice(0, 80);
+    if (summary.length < (lc.summary || "").length) summary += "…";
+    wrap.innerHTML = "";
+    var label = document.createElement("span");
+    label.className = "chat-listing-pinned-label";
+    label.textContent = "Обговорюємо:";
+    wrap.appendChild(label);
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "chat-listing-pinned-link";
+    btn.textContent = summary || "Оголошення";
+    btn.title = "Відкрити оголошення";
+    btn.onclick = function () {
+      if (lc.detail_source && lc.detail_id) {
+        showDetail(lc.detail_source, lc.detail_id);
+      } else if (lc.page_url) {
+        if (typeof window.open === "function") window.open(lc.page_url, "_blank");
+      }
+    };
+    wrap.appendChild(btn);
+  }
+
+  function renderChatMessages() {
+    renderChatListingPinned();
+    var container = document.getElementById("chat-messages");
+    if (!container) return;
+    container.innerHTML = "";
+    var chat = getCurrentChat();
+    if (!chat || !chat.messages.length) return;
+    chat.messages.forEach(function (m) {
+      appendChatMessageDOM(container, m.role, m.text, m.requestId, m.timestamp, m.excelFiles);
+    });
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function appendChatMessageDOM(container, role, text, requestId, timestamp, excelFiles) {
+    if (!container) return;
+    var div = document.createElement("div");
+    div.className = "chat-msg " + role;
+    var contentWrap = document.createElement("div");
+    contentWrap.className = "chat-msg-content";
+    if (role === "bot") {
+      contentWrap.innerHTML = text || "";
+      div.appendChild(contentWrap);
+      if (excelFiles && excelFiles.length) {
+        excelFiles.forEach(function (f) {
+          var aid = f.artifact_id || f.artifactId;
+          var token = f.download_token || f.downloadToken;
+          var btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "btn btn-small btn-primary chat-file-download-link";
+          btn.textContent = "Отримати в чаті: " + (f.filename || "Excel");
+          btn.onclick = function () {
+            btn.disabled = true;
+            btn.textContent = "Надсилання...";
+            fetch("/api/files/send-artifact-via-bot", {
+              method: "POST",
+              headers: apiHeaders(),
+              body: JSON.stringify({ artifact_id: aid, token: token })
+            })
+              .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+              .then(function (x) {
+                if (x.ok) {
+                  btn.textContent = "Надіслано в чат";
+                } else {
+                  btn.disabled = false;
+                  btn.textContent = "Отримати в чаті: " + (f.filename || "Excel");
+                  alert(x.data.detail || "Помилка");
+                }
+              })
+              .catch(function () {
+                btn.disabled = false;
+                btn.textContent = "Отримати в чаті: " + (f.filename || "Excel");
+                alert("Помилка мережі");
+              });
+          };
+          div.appendChild(btn);
+        });
+      }
+      if (requestId) {
+        var feedbackDiv = document.createElement("div");
+        feedbackDiv.className = "chat-feedback";
+        feedbackDiv.setAttribute("data-request-id", requestId);
+        var likeBtn = document.createElement("button");
+        likeBtn.className = "feedback-btn feedback-like";
+        likeBtn.innerHTML = "👍";
+        likeBtn.title = "Відповідь корисна";
+        likeBtn.onclick = function () { submitFeedback(requestId, "like", text); };
+        var dislikeBtn = document.createElement("button");
+        dislikeBtn.className = "feedback-btn feedback-dislike";
+        dislikeBtn.innerHTML = "👎";
+        dislikeBtn.title = "Відповідь не корисна";
+        dislikeBtn.onclick = function () { submitFeedback(requestId, "dislike", text); };
+        feedbackDiv.appendChild(likeBtn);
+        feedbackDiv.appendChild(dislikeBtn);
+        div.appendChild(feedbackDiv);
+      }
+    } else {
+      contentWrap.textContent = text;
+      div.appendChild(contentWrap);
+    }
+    var tsFormatted = formatMessageTimestamp(timestamp);
+    if (tsFormatted) {
+      var timeSpan = document.createElement("span");
+      timeSpan.className = "chat-msg-time";
+      timeSpan.textContent = tsFormatted;
+      div.appendChild(timeSpan);
+    }
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function show(id) {
+    currentScreen = id || "screen-home";
+    ["screen-loading", "screen-error", "screen-home", "screen-admin", "screen-files", "screen-search", "screen-detail"].forEach(function (sid) {
+      var el = document.getElementById(sid);
+      if (el) {
+        if (sid === id) {
+          el.classList.remove("hidden");
+        } else {
+          el.classList.add("hidden");
+        }
+      }
+    });
+    updateSidebarState();
+    setNavActive(currentScreen);
+  }
+
+  function setNavActive(screenId) {
+    document.querySelectorAll(".nav a[data-screen], .nav button[data-screen]").forEach(function (el) {
+      el.classList.toggle("active", el.getAttribute("data-screen") === screenId);
+    });
+  }
+
+  function showError(msg) {
+    var el = document.getElementById("screen-error");
+    if (el) {
+      el.textContent = msg;
+      el.classList.remove("hidden");
+    }
+    show("screen-error");
+  }
+
+  function renderNav(me) {
+    var nav = document.getElementById("nav");
+    if (!nav) {
+      console.error("nav element not found");
+      return;
+    }
+    nav.innerHTML = "";
+
+    if (me && me.authorized) {
+      var a1 = document.createElement("a");
+      a1.href = "#";
+      a1.textContent = "AI-асистент";
+      a1.setAttribute("data-screen", "screen-home");
+      a1.classList.add("secondary");
+      a1.addEventListener("click", function (e) { 
+        e.preventDefault(); 
+        show("screen-home"); 
+        var homeScreen = document.getElementById("screen-home");
+        if (homeScreen) homeScreen.classList.remove("hidden");
+      });
+      nav.appendChild(a1);
+      
+      var aSearch = document.createElement("a");
+      aSearch.href = "#";
+      aSearch.textContent = "Пошук";
+      aSearch.classList.add("secondary");
+      aSearch.setAttribute("data-screen", "screen-search");
+      aSearch.addEventListener("click", function (e) { 
+        e.preventDefault(); 
+        showSearch(); 
+      });
+      nav.appendChild(aSearch);
+      
+      var a2 = document.createElement("a");
+      a2.href = "#";
+      a2.textContent = "Звіти";
+      a2.classList.add("secondary");
+      a2.setAttribute("data-screen", "screen-files");
+      a2.addEventListener("click", function (e) { 
+        e.preventDefault(); 
+        showFiles(); 
+      });
+      nav.appendChild(a2);
+      
+      if (me.is_admin) {
+        var a3 = document.createElement("a");
+        a3.href = "#";
+        a3.textContent = "Адміністрування";
+        a3.classList.add("secondary");
+        a3.setAttribute("data-screen", "screen-admin");
+        a3.addEventListener("click", function (e) { 
+          e.preventDefault(); 
+          show("screen-admin"); 
+          var adminScreen = document.getElementById("screen-admin");
+          if (adminScreen) adminScreen.classList.remove("hidden");
+        });
+        nav.appendChild(a3);
+      }
+    }
+    
+    var platform = Tg && (Tg.platform || "").toLowerCase();
+    var isDesktop = platform === "web" || platform === "tdesktop" || platform === "macos" || platform === "windows" || platform === "weba" || platform === "webk";
+    if (me && me.authorized && isDesktop && Tg && Tg.requestFullscreen) {
+      var expandBtn = document.createElement("button");
+      expandBtn.type = "button";
+      expandBtn.className = "btn-expand-nav secondary";
+      expandBtn.textContent = "⛶";
+      expandBtn.title = "Розгорнути на весь екран";
+      expandBtn.addEventListener("click", function () {
+        try {
+          if (Tg.isFullscreen && Tg.exitFullscreen) {
+            Tg.exitFullscreen();
+          } else if (Tg.requestFullscreen) {
+            Tg.requestFullscreen();
+          }
+        } catch (e) {
+          console.log("Fullscreen toggle error:", e);
+        }
+      });
+      nav.appendChild(expandBtn);
+    }
+    
+    setNavActive(currentScreen);
+  }
+
+  function appendChatMessage(role, text, requestId, excelFiles) {
+    addMessageToCurrentChat(role, text, requestId, excelFiles);
+    var container = document.getElementById("chat-messages");
+    var chat = getCurrentChat();
+    var lastMsg = chat && chat.messages.length ? chat.messages[chat.messages.length - 1] : null;
+    var ts = lastMsg ? lastMsg.timestamp : null;
+    appendChatMessageDOM(container, role, text, requestId, ts, excelFiles);
+  }
+  
+  function submitFeedback(requestId, feedbackType, responseText) {
+    // Відключаємо кнопки після натискання
+    var feedbackDiv = document.querySelector('[data-request-id="' + requestId + '"]');
+    if (feedbackDiv) {
+      var buttons = feedbackDiv.querySelectorAll(".feedback-btn");
+      buttons.forEach(function(btn) {
+        btn.disabled = true;
+        btn.style.opacity = "0.5";
+      });
+    }
+    
+    // Отримуємо оригінальний запит користувача (останнє повідомлення user)
+    var userMessages = document.querySelectorAll(".chat-msg.user");
+    var userQuery = userMessages.length > 0 ? userMessages[userMessages.length - 1].textContent : "";
+    
+    fetch("/api/feedback/submit", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({
+        request_id: requestId,
+        feedback_type: feedbackType,
+        user_query: userQuery,
+        response_text: responseText
+      })
+    })
+      .then(function(r) {
+        if (!r.ok) {
+          return r.json().then(function(body) {
+            throw new Error(body.detail || "Помилка відправки фідбеку");
+          });
+        }
+        return r.json();
+      })
+      .then(function(data) {
+        // Підсвічуємо натиснуту кнопку
+        if (feedbackDiv) {
+          var clickedBtn = feedbackDiv.querySelector(".feedback-" + feedbackType);
+          if (clickedBtn) {
+            clickedBtn.style.backgroundColor = feedbackType === "like" ? "#4CAF50" : "#f44336";
+            clickedBtn.style.color = "white";
+          }
+        }
+        
+        // Якщо дизлайк і є результат діагностики, показуємо повідомлення
+        if (feedbackType === "dislike" && data.diagnostic_result) {
+          var diagnosticMsg = "Дякуємо за фідбек! Виявлено проблеми:\n";
+          if (data.diagnostic_result.issues && data.diagnostic_result.issues.length > 0) {
+            diagnosticMsg += data.diagnostic_result.issues.join("\n");
+          }
+          if (data.diagnostic_result.suggestions && data.diagnostic_result.suggestions.length > 0) {
+            diagnosticMsg += "\n\nРекомендації:\n" + data.diagnostic_result.suggestions.join("\n");
+          }
+          // Можна показати в консолі або у вікні (для дебагу)
+          console.log("Діагностика:", diagnosticMsg);
+        }
+      })
+      .catch(function(err) {
+        console.error("Помилка відправки фідбеку:", err);
+        // Повертаємо кнопки в активний стан
+        if (feedbackDiv) {
+          var buttons = feedbackDiv.querySelectorAll(".feedback-btn");
+          buttons.forEach(function(btn) {
+            btn.disabled = false;
+            btn.style.opacity = "1";
+          });
+        }
+      });
+  }
+
+  var currentChatAbortController = null;
+
+  function appendStatusBelowUser(message) {
+    var container = document.getElementById("chat-messages");
+    if (!container) return null;
+    var statusEl = document.createElement("div");
+    statusEl.className = "chat-msg-status";
+    statusEl.textContent = message || "Обробка...";
+    container.appendChild(statusEl);
+    container.scrollTop = container.scrollHeight;
+    return statusEl;
+  }
+
+  function setInputState(processing) {
+    var input = document.getElementById("chat-input");
+    var sendBtn = document.getElementById("chat-send");
+    var stopBtn = document.getElementById("chat-stop");
+    if (input) input.disabled = processing;
+    if (sendBtn) sendBtn.classList.toggle("hidden", processing);
+    if (stopBtn) stopBtn.classList.toggle("hidden", !processing);
+  }
+
+  function sendChatMessage() {
+    var input = document.getElementById("chat-input");
+    var text = input && input.value.trim();
+    if (!text) return;
+    if (!getCurrentChat()) createNewChat();
+    appendChatMessage("user", text);
+    input.value = "";
+    var statusEl = appendStatusBelowUser("Підключення...");
+    setInputState(true);
+
+    var abortController = new AbortController();
+    currentChatAbortController = abortController;
+
+    var messagesContainer = document.getElementById("chat-messages");
+
+    function finish(err, data) {
+      currentChatAbortController = null;
+      setInputState(false);
+      if (statusEl && statusEl.parentNode) statusEl.remove();
+      if (err) {
+        appendChatMessage("bot", "Помилка: " + (err.message || err));
+      } else if (data) {
+        var requestId = data.request_id || null;
+        var excelFiles = (data.excel_files || []).filter(function (f) {
+          return f.artifact_id && f.download_token;
+        });
+        appendChatMessage("bot", data.response || "", requestId, excelFiles);
+      }
+    }
+
+    var chat = getCurrentChat();
+    var chatId = chat ? chat.id : null;
+    var listingContext = chat && chat.listingContext ? chat.listingContext : null;
+    fetch("/api/llm/chat-stream", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ text: text, chat_id: chatId, listing_context: listingContext, reply_to_text: null }),
+      signal: abortController.signal,
+    })
+      .then(function (r) {
+        if (!r.ok) {
+          return r.json().then(function (body) {
+            var msg = (body && body.detail) || (r.status === 403 ? "Немає доступу" : "Помилка " + r.status);
+            throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+          }, function () {
+            throw new Error(r.status === 403 ? "Немає доступу" : "Помилка " + r.status);
+          });
+        }
+        if (!r.body || !r.body.getReader) {
+          throw new Error("Стрімінг не підтримується");
+        }
+        return r.body.getReader();
+      })
+      .then(function (reader) {
+        var decoder = new TextDecoder();
+        var buffer = "";
+        function processEvent(eventData) {
+          try {
+            var data = JSON.parse(eventData);
+            if (data.type === "status" && statusEl) {
+              statusEl.textContent = data.message || "Обробка...";
+              if (messagesContainer) messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            } else if (data.type === "done") {
+              finish(null, data);
+              return true;
+            } else if (data.type === "error") {
+              finish(new Error(data.message || "Помилка"));
+              return true;
+            }
+          } catch (e) {}
+          return false;
+        }
+        return reader.read().then(function processChunk(result) {
+          if (result.done) {
+            finish(new Error("Потік завершено без відповіді"));
+            return;
+          }
+          buffer += decoder.decode(result.value, { stream: true });
+          var events = buffer.split("\n\n");
+          buffer = events.pop() || "";
+          for (var i = 0; i < events.length; i++) {
+            var lines = events[i].split("\n");
+            for (var j = 0; j < lines.length; j++) {
+              if (lines[j].indexOf("data: ") === 0) {
+                var jsonStr = lines[j].slice(6).trim();
+                if (jsonStr && jsonStr !== "[DONE]") {
+                  if (processEvent(jsonStr)) return;
+                }
+                break;
+              }
+            }
+          }
+          return reader.read().then(processChunk);
+        });
+      })
+      .catch(function (err) {
+        if (err.name === "AbortError") {
+          finish(new Error("Запит перервано"));
+        } else {
+          finish(err);
+        }
+      });
+  }
+
+  function stopChatRequest() {
+    if (currentChatAbortController) {
+      currentChatAbortController.abort();
+    }
+  }
+
+  function downloadReport(days) {
+    var wrap = document.getElementById("files-report-link-wrap");
+    if (wrap) {
+      wrap.classList.remove("hidden");
+      wrap.innerHTML = "<span class=\"file-download-hint\">Надсилання в чат...</span>";
+    }
+    fetch("/api/files/send-report-via-bot", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ days: days })
+    })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function (data) {
+        if (wrap) {
+          wrap.innerHTML = "<span class=\"file-download-success\">" + (data.message || "Файл надіслано в чат бота") + "</span>";
+        }
+      })
+      .catch(function (err) {
+        if (wrap) {
+          wrap.innerHTML = "<span class=\"file-download-error\">" + (err.message || "Не вдалося надіслати") + "</span>";
+        } else {
+          alert(err.message || "Не вдалося надіслати");
+        }
+      });
+  }
+
+  var reportTemplates = [];
+  var reportConstructorPrefill = null;
+
+  function showFiles() {
+    show("screen-files");
+    var filesScreen = document.getElementById("screen-files");
+    if (filesScreen) filesScreen.classList.remove("hidden");
+    loadReportTemplates();
+  }
+
+  function loadReportTemplates() {
+    fetch("/api/report-templates/", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка завантаження");
+        return r.json();
+      })
+      .then(function (data) {
+        reportTemplates = data.templates || [];
+        renderReportTemplates();
+      })
+      .catch(function (err) {
+        console.error("Report templates load error:", err);
+        reportTemplates = [];
+        renderReportTemplates();
+      });
+  }
+
+  function renderReportTemplates() {
+    var listEl = document.getElementById("report-templates-list");
+    if (!listEl) return;
+    listEl.innerHTML = "";
+    reportTemplates.forEach(function (t) {
+      var item = document.createElement("div");
+      item.className = "report-template-item";
+      item.draggable = !t.is_default;
+      item.dataset.id = t._id;
+      if (t.is_default) item.dataset.isDefault = "true";
+      var nameSpan = document.createElement("span");
+      nameSpan.className = "report-template-name";
+      nameSpan.textContent = t.name || "Без назви";
+      item.appendChild(nameSpan);
+      var actions = document.createElement("div");
+      actions.className = "report-template-actions";
+      var genBtn = document.createElement("button");
+      genBtn.type = "button";
+      genBtn.className = "btn btn-small btn-primary";
+      genBtn.textContent = "Згенерувати";
+      genBtn.addEventListener("click", function () { generateReportFromTemplate(t._id); });
+      actions.appendChild(genBtn);
+      if (!t.is_default) {
+        var delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "btn btn-small btn-danger";
+        delBtn.textContent = "Видалити";
+        delBtn.addEventListener("click", function () { deleteReportTemplate(t._id); });
+        actions.appendChild(delBtn);
+      }
+      item.appendChild(actions);
+      listEl.appendChild(item);
+    });
+    if (typeof Sortable !== "undefined") {
+      new Sortable(listEl, {
+        animation: 150,
+        handle: ".report-template-name",
+        filter: ".report-template-item[data-is-default=true]",
+        onEnd: function (evt) {
+          var ids = [];
+          listEl.querySelectorAll(".report-template-item").forEach(function (el) {
+            if (el.dataset.id) ids.push(el.dataset.id);
+          });
+          if (ids.length > 0) {
+            fetch("/api/report-templates/reorder", {
+              method: "POST",
+              headers: apiHeaders(),
+              body: JSON.stringify({ template_ids: ids })
+            }).then(function () { loadReportTemplates(); });
+          }
+        }
+      });
+    }
+  }
+
+  function generateReportFromTemplate(templateId) {
+    var statusEl = document.getElementById("files-generate-status");
+    if (statusEl) {
+      statusEl.classList.remove("hidden");
+      statusEl.textContent = "Генерація звіту...";
+    }
+    fetch("/api/report-templates/" + encodeURIComponent(templateId) + "/generate", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ send_via_bot: true })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data.success) {
+          if (statusEl) statusEl.textContent = data.error || data.detail || "Помилка";
+          return;
+        }
+        if (data.message) {
+          if (statusEl) statusEl.textContent = data.message + " (" + (data.rows_count || 0) + " рядків)";
+        } else if (data.download_url) {
+          if (statusEl) {
+            statusEl.innerHTML = "Готово (" + (data.rows_count || 0) + " рядків). ";
+            var a = document.createElement("a");
+            a.href = data.download_url;
+            a.download = "Звіт.xlsx";
+            a.className = "btn btn-primary file-download-link";
+            a.textContent = "Скачати";
+            statusEl.appendChild(a);
+          }
+        } else if (data.data) {
+          var blob = base64ToBlob(data.data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+          var a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "Звіт.xlsx";
+          a.click();
+          URL.revokeObjectURL(a.href);
+          if (statusEl) statusEl.textContent = "Готово (" + (data.rows_count || 0) + " рядків)";
+        }
+      })
+      .catch(function (err) {
+        if (statusEl) statusEl.textContent = err.message || "Помилка";
+      });
+  }
+
+  function base64ToBlob(b64, mime) {
+    var binary = atob(b64);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  }
+
+  function deleteReportTemplate(templateId) {
+    if (!confirm("Видалити шаблон?")) return;
+    fetch("/api/report-templates/" + encodeURIComponent(templateId), {
+      method: "DELETE",
+      headers: apiHeaders()
+    })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || "Помилка"); });
+        loadReportTemplates();
+      })
+      .catch(function (err) { alert(err.message); });
+  }
+
+  function openReportConstructor(prefill) {
+    reportConstructorPrefill = prefill || null;
+    var modal = document.getElementById("report-constructor-modal");
+    if (!modal) return;
+    loadFilterOptions(prefill ? prefill.region : null);
+    if (prefill) {
+      document.getElementById("constructor-source").value = prefill.source || "";
+      document.getElementById("constructor-date-filter").value = String(prefill.date_filter || 7);
+      document.getElementById("constructor-region").value = prefill.region || "";
+      document.getElementById("constructor-city").value = prefill.city || "";
+      document.getElementById("constructor-property-type").value = prefill.property_type || "";
+      document.getElementById("constructor-name").value = prefill.name || "";
+    } else {
+      document.getElementById("constructor-source").value = "";
+      document.getElementById("constructor-date-filter").value = "7";
+      document.getElementById("constructor-region").value = "";
+      document.getElementById("constructor-city").value = "";
+      document.getElementById("constructor-property-type").value = "";
+      document.getElementById("constructor-name").value = "";
+    }
+    modal.classList.remove("hidden");
+  }
+
+  function closeReportConstructor() {
+    var modal = document.getElementById("report-constructor-modal");
+    if (modal) modal.classList.add("hidden");
+    reportConstructorPrefill = null;
+  }
+
+  function getConstructorParams() {
+    var priceOp = document.getElementById("constructor-price-op").value;
+    var priceVal = document.getElementById("constructor-price-value").value;
+    var priceM2Op = document.getElementById("constructor-price-m2-op").value;
+    var priceM2Val = document.getElementById("constructor-price-m2-value").value;
+    var priceHaOp = document.getElementById("constructor-price-ha-op").value;
+    var priceHaVal = document.getElementById("constructor-price-ha-value").value;
+    var params = {
+      source: document.getElementById("constructor-source").value,
+      date_filter: parseInt(document.getElementById("constructor-date-filter").value, 10) || 7,
+      region: document.getElementById("constructor-region").value.trim() || null,
+      city: document.getElementById("constructor-city").value.trim() || null,
+      property_type: document.getElementById("constructor-property-type").value || null,
+      sort_field: document.getElementById("constructor-sort-field").value,
+      sort_order: document.getElementById("constructor-sort-order").value,
+      output_format: document.getElementById("constructor-output-format").value
+    };
+    if (priceOp && priceVal) {
+      params.price = { op: priceOp, value: parseFloat(priceVal), currency: document.getElementById("constructor-price-currency").value };
+    }
+    if (priceM2Op && priceM2Val) {
+      params.price_per_m2 = { op: priceM2Op, min: priceM2Op === "gte" ? parseFloat(priceM2Val) : null, max: priceM2Op === "lte" ? parseFloat(priceM2Val) : null, currency: document.getElementById("constructor-price-m2-currency").value };
+    }
+    if (priceHaOp && priceHaVal) {
+      params.price_per_ha = { op: priceHaOp, min: priceHaOp === "gte" ? parseFloat(priceHaVal) : null, max: priceHaOp === "lte" ? parseFloat(priceHaVal) : null, currency: document.getElementById("constructor-price-ha-currency").value };
+    }
+    return params;
+  }
+
+  function initReportTemplates() {
+    var addBtn = document.getElementById("report-add-template");
+    if (addBtn) addBtn.addEventListener("click", function () { openReportConstructor(null); });
+    var saveBtn = document.getElementById("constructor-save");
+    if (saveBtn) saveBtn.addEventListener("click", function () {
+      var name = document.getElementById("constructor-name").value.trim();
+      if (!name) { alert("Введіть назву шаблону"); return; }
+      var params = getConstructorParams();
+      fetch("/api/report-templates/", {
+        method: "POST",
+        headers: apiHeaders(),
+        body: JSON.stringify({ name: name, params: params })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function () {
+          closeReportConstructor();
+          loadReportTemplates();
+        })
+        .catch(function (err) { alert(err.message || "Помилка"); });
+    });
+    var cancelBtn = document.getElementById("constructor-cancel");
+    if (cancelBtn) cancelBtn.addEventListener("click", closeReportConstructor);
+    var genNameBtn = document.getElementById("constructor-generate-name");
+    if (genNameBtn) genNameBtn.addEventListener("click", function () {
+      var params = getConstructorParams();
+      fetch("/api/report-templates/generate-name", {
+        method: "POST",
+        headers: apiHeaders(),
+        body: JSON.stringify({ params: params })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          var nameEl = document.getElementById("constructor-name");
+          if (nameEl && d.name) nameEl.value = d.name;
+        });
+    });
+    var constRegion = document.getElementById("constructor-region");
+    var constCity = document.getElementById("constructor-city");
+    var constRegionDrop = document.getElementById("constructor-region-dropdown");
+    var constCityDrop = document.getElementById("constructor-city-dropdown");
+    if (constRegion) {
+      constRegion.addEventListener("focus", function () {
+        renderConstructorDropdown("constructor-region", "constructor-region-dropdown", filterOptions.regions, constRegion.value);
+        if (constRegionDrop) constRegionDrop.classList.remove("hidden");
+      });
+      constRegion.addEventListener("input", function () {
+        renderConstructorDropdown("constructor-region", "constructor-region-dropdown", filterOptions.regions, constRegion.value);
+      });
+    }
+    if (constCity) {
+      constCity.addEventListener("focus", function () {
+        renderConstructorDropdown("constructor-city", "constructor-city-dropdown", filterOptions.cities, constCity.value);
+        if (constCityDrop) constCityDrop.classList.remove("hidden");
+      });
+      constCity.addEventListener("input", function () {
+        renderConstructorDropdown("constructor-city", "constructor-city-dropdown", filterOptions.cities, constCity.value);
+      });
+    }
+    if (constRegionDrop) {
+      constRegionDrop.addEventListener("click", function (e) {
+        var item = e.target.closest(".filter-dropdown-item");
+        if (item && item.dataset.value !== undefined) {
+          constRegion.value = item.dataset.value;
+          constRegionDrop.classList.add("hidden");
+          filterLoadingState.cities = false;
+          loadFilterOptions(constRegion.value);
+        }
+      });
+    }
+    if (constCityDrop) {
+      constCityDrop.addEventListener("click", function (e) {
+        var item = e.target.closest(".filter-dropdown-item");
+        if (item && item.dataset.value !== undefined) {
+          constCity.value = item.dataset.value;
+          constCityDrop.classList.add("hidden");
+        }
+      });
+    }
+  }
+
+  function startGenerateSeven() {
+    var statusEl = document.getElementById("files-generate-status");
+    if (statusEl) {
+      statusEl.classList.remove("hidden");
+      statusEl.textContent = "Запуск формування...";
+    }
+    fetch("/api/files/generate?days=7", { method: "POST", headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка " + r.status);
+        return r.json();
+      })
+      .then(function (data) {
+        var taskId = data.task_id;
+        function poll() {
+          fetch("/api/files/generate/status?task_id=" + encodeURIComponent(taskId), { headers: apiHeaders() })
+            .then(function (res) { return res.json(); })
+            .then(function (st) {
+              if (statusEl) statusEl.textContent = st.message || st.status;
+              if (st.status === "done") {
+                var token = st.download_token || (st.download_url ? (st.download_url.match(/token=([^&]+)/) || [])[1] : null);
+                if (token) {
+                  statusEl.innerHTML = (st.message || "") + " ";
+                  var sendBtn = document.createElement("button");
+                  sendBtn.type = "button";
+                  sendBtn.className = "btn btn-primary";
+                  sendBtn.textContent = "Надіслати в чат";
+                  sendBtn.onclick = function () {
+                    sendBtn.disabled = true;
+                    sendBtn.textContent = "Надсилання...";
+                    fetch("/api/files/send-generated-via-bot", {
+                      method: "POST",
+                      headers: apiHeaders(),
+                      body: JSON.stringify({ task_id: taskId, token: token })
+                    })
+                      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+                      .then(function (x) {
+                        if (x.ok) sendBtn.textContent = "Надіслано в чат";
+                        else { sendBtn.disabled = false; sendBtn.textContent = "Надіслати в чат"; alert(x.data.detail || "Помилка"); }
+                      })
+                      .catch(function () { sendBtn.disabled = false; sendBtn.textContent = "Надіслати в чат"; alert("Помилка мережі"); });
+                  };
+                  statusEl.appendChild(sendBtn);
+                } else if (st.download_url) {
+                  statusEl.innerHTML = (st.message || "") + " ";
+                  var a = document.createElement("a");
+                  a.href = st.download_url;
+                  a.download = st.filename || "report.zip";
+                  a.className = "btn btn-primary file-download-link";
+                  a.textContent = "Скачати файл";
+                  statusEl.appendChild(a);
+                }
+                return;
+              }
+              if (st.status === "error") return;
+              setTimeout(poll, 2000);
+            });
+        }
+        poll();
+      })
+      .catch(function (err) {
+        if (statusEl) {
+          statusEl.textContent = err.message || "Помилка";
+          statusEl.classList.remove("hidden");
+        }
+      });
+  }
+
+  function adminAddUser() {
+    var uid = document.getElementById("admin-add-user-id");
+    var nick = document.getElementById("admin-add-nickname");
+    var role = document.getElementById("admin-add-role");
+    if (!uid || !nick || !role) return;
+    var userId = parseInt(uid.value, 10);
+    if (isNaN(userId)) { alert("Введіть коректний ID"); return; }
+    fetch("/api/admin/add-user", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ user_id: userId, role: role.value, nickname: nick.value.trim() })
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (x) {
+        if (x.ok) alert(x.data.message || "Готово");
+        else alert(x.data.detail || "Помилка");
+      })
+      .catch(function () { alert("Помилка мережі"); });
+  }
+
+  function adminBlockUser() {
+    var uid = document.getElementById("admin-block-user-id");
+    if (!uid) return;
+    var userId = parseInt(uid.value, 10);
+    if (isNaN(userId)) { alert("Введіть коректний ID"); return; }
+    fetch("/api/admin/block-user", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ user_id: userId })
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (x) {
+        if (x.ok) alert(x.data.message || "Готово");
+        else alert(x.data.detail || "Помилка");
+      })
+      .catch(function () { alert("Помилка мережі"); });
+  }
+
+  function adminDownloadProzorro() {
+    fetch("/api/admin/prozorro-config?download=1", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка " + r.status);
+        return r.blob();
+      })
+      .then(function (blob) {
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "ProZorro_clasification_codes.yaml";
+        a.click();
+        URL.revokeObjectURL(a.href);
+      })
+      .catch(function (err) { alert(err.message || "Помилка"); });
+  }
+
+  function adminUploadProzorro() {
+    var input = document.getElementById("admin-upload-prozorro");
+    if (!input || !input.files || !input.files[0]) { alert("Оберіть YAML файл"); return; }
+    var form = new FormData();
+    form.append("file", input.files[0]);
+    var h = {};
+    if (initData) h["X-Telegram-Init-Data"] = initData;
+    fetch("/api/admin/prozorro-config", {
+      method: "POST",
+      headers: h,
+      body: form
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (x) {
+        if (x.ok) alert(x.data.message || "Готово");
+        else alert(x.data.detail || "Помилка");
+        input.value = "";
+      })
+      .catch(function () { alert("Помилка мережі"); });
+  }
+
+  function bindEvents(me) {
+    loadChatSessions();
+    if (chatSessions.length > 0 && !currentChatId) {
+      currentChatId = chatSessions[0].id;
+    }
+    renderChatHistoryList();
+    initSidebarCollapse();
+    var sendBtn = document.getElementById("chat-send");
+    if (sendBtn) sendBtn.addEventListener("click", sendChatMessage);
+    var stopBtn = document.getElementById("chat-stop");
+    if (stopBtn) stopBtn.addEventListener("click", stopChatRequest);
+    var chatInput = document.getElementById("chat-input");
+    if (chatInput) chatInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChatMessage(); }
+    });
+    var newChatBtn = document.getElementById("sidebar-new-chat");
+    if (newChatBtn) newChatBtn.addEventListener("click", createNewChat);
+
+    initReportTemplates();
+
+    var addBtn = document.getElementById("admin-add-btn");
+    if (addBtn) addBtn.addEventListener("click", adminAddUser);
+    var blockBtn = document.getElementById("admin-block-btn");
+    if (blockBtn) blockBtn.addEventListener("click", adminBlockUser);
+    var dlProzorro = document.getElementById("admin-download-prozorro");
+    if (dlProzorro) dlProzorro.addEventListener("click", adminDownloadProzorro);
+    var uploadBtn = document.getElementById("admin-upload-prozorro-btn");
+    var uploadInput = document.getElementById("admin-upload-prozorro");
+    if (uploadBtn && uploadInput) uploadBtn.addEventListener("click", function () { uploadInput.click(); });
+    if (uploadInput) uploadInput.addEventListener("change", adminUploadProzorro);
+    if (me && me.is_admin) {
+      var btn1 = document.getElementById("admin-data-update-1");
+      var btn7 = document.getElementById("admin-data-update-7");
+      if (btn1) btn1.addEventListener("click", function () { startAdminDataUpdate(1); });
+      if (btn7) btn7.addEventListener("click", function () { startAdminDataUpdate(7); });
+      var rebuildAnalyticsBtn = document.getElementById("admin-rebuild-analytics");
+      if (rebuildAnalyticsBtn) rebuildAnalyticsBtn.addEventListener("click", adminRebuildAnalytics);
+      initAdminScheduler();
+    }
+  }
+
+  function initAdminScheduler() {
+    var toggle = document.getElementById("admin-scheduler-toggle");
+    var content = document.getElementById("admin-scheduler-content");
+    if (toggle && content) {
+      toggle.addEventListener("click", function () {
+        var collapsed = content.classList.toggle("collapsed");
+        toggle.textContent = collapsed ? "▼" : "▲";
+        toggle.setAttribute("aria-expanded", !collapsed);
+        if (!collapsed) loadSchedulerEvents();
+      });
+    }
+    var addBtn = document.getElementById("admin-scheduler-add");
+    if (addBtn) addBtn.addEventListener("click", adminSchedulerAdd);
+  }
+
+  function loadSchedulerEvents() {
+    var container = document.getElementById("admin-scheduler-events");
+    if (!container) return;
+    fetch("/api/admin/scheduler/events", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка завантаження");
+        return r.json();
+      })
+      .then(function (data) {
+        var events = data.events || [];
+        container.innerHTML = "";
+        if (events.length === 0) {
+          container.innerHTML = "<p class=\"admin-hint\">Немає запланованих оновлень. Додайте нижче.</p>";
+          return;
+        }
+        events.forEach(function (ev) {
+          var sourcesLabel = ev.sources === "all" ? "ProZorro+OLX" : ev.sources === "prozorro" ? "ProZorro" : "OLX";
+          var item = document.createElement("div");
+          item.className = "admin-scheduler-event";
+          item.innerHTML = "<div class=\"admin-scheduler-event-info\">Щодня о " + String(ev.hour).padStart(2, "0") + ":" + String(ev.minute).padStart(2, "0") + " — " + ev.days + " дн., " + sourcesLabel + "</div><div class=\"admin-scheduler-event-actions\"><button type=\"button\" class=\"btn btn-danger btn-small\" data-id=\"" + (ev.id || "") + "\">Видалити</button></div>";
+          var delBtn = item.querySelector("button[data-id]");
+          if (delBtn) delBtn.addEventListener("click", function () { adminSchedulerDelete(ev.id); });
+          container.appendChild(item);
+        });
+      })
+      .catch(function (err) {
+        container.innerHTML = "<p class=\"admin-hint\" style=\"color:var(--tg-theme-destructive-text-color)\">" + (err.message || "Помилка") + "</p>";
+      });
+  }
+
+  function adminSchedulerAdd() {
+    var hour = parseInt(document.getElementById("scheduler-hour").value, 10);
+    var minute = parseInt(document.getElementById("scheduler-minute").value, 10);
+    var days = parseInt(document.getElementById("scheduler-days").value, 10);
+    var sources = document.getElementById("scheduler-sources").value;
+    fetch("/api/admin/scheduler/events", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ hour: hour, minute: minute, days: days, sources: sources })
+    })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function (data) {
+        loadSchedulerEvents();
+        alert(data.message || "Додано.");
+      })
+      .catch(function (err) {
+        alert(err.message || "Не вдалося додати");
+      });
+  }
+
+  function adminSchedulerDelete(eventId) {
+    if (!eventId || !confirm("Вимкнути це планове оновлення?")) return;
+    fetch("/api/admin/scheduler/events/" + encodeURIComponent(eventId), {
+      method: "DELETE",
+      headers: apiHeaders()
+    })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function (data) {
+        loadSchedulerEvents();
+      })
+      .catch(function (err) {
+        alert(err.message || "Не вдалося видалити");
+      });
+  }
+
+  function adminRebuildAnalytics() {
+    var statusEl = document.getElementById("admin-analytics-status");
+    if (statusEl) statusEl.textContent = "Перерахунок...";
+    fetch("/api/analytics/rebuild", { method: "POST", headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function (data) {
+        if (statusEl) statusEl.textContent = "Готово. Індикатори: " + (data.counts && data.counts.indicators) + ", агрегатів: " + (data.counts && data.counts.aggregates);
+      })
+      .catch(function (err) {
+        if (statusEl) statusEl.textContent = "Помилка: " + (err.message || "Не вдалося");
+      });
+  }
+
+  function startAdminDataUpdate(days) {
+    var statusEl = document.getElementById("admin-data-update-status");
+    if (!statusEl) return;
+    statusEl.classList.remove("hidden");
+    statusEl.className = "admin-data-update-status running";
+    statusEl.textContent = "Запуск оновлення...";
+    fetch("/api/admin/data-update?days=" + days, { method: "POST", headers: apiHeaders() })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (x) {
+        if (!x.ok) {
+          statusEl.className = "admin-data-update-status error";
+          statusEl.textContent = x.data.detail || "Помилка запуску";
+          return;
+        }
+        var taskId = x.data.task_id;
+        function poll() {
+          fetch("/api/admin/data-update/status?task_id=" + encodeURIComponent(taskId), { headers: apiHeaders() })
+            .then(function (res) { return res.json(); })
+            .then(function (st) {
+              statusEl.textContent = st.message || st.status;
+              if (st.status === "done") {
+                statusEl.className = "admin-data-update-status done";
+                return;
+              }
+              if (st.status === "error") {
+                statusEl.className = "admin-data-update-status error";
+                return;
+              }
+              setTimeout(poll, 2000);
+            })
+            .catch(function (err) {
+              statusEl.className = "admin-data-update-status error";
+              statusEl.textContent = "Помилка: " + (err.message || "Не вдалося отримати статус");
+            });
+        }
+        poll();
+      })
+      .catch(function (err) {
+        statusEl.className = "admin-data-update-status error";
+        statusEl.textContent = "Помилка: " + (err.message || "Не вдалося запустити");
+      });
+  }
+
+  // Пошук: стан та функції (зведена таблиця unified_listings)
+  var searchState = {
+    filters: {
+      source: null,
+      dateFilter: null,
+      region: null,
+      city: null,
+      priceOp: null,
+      priceValue: null,
+      propertyType: null,
+      buildingAreaOp: null,
+      buildingAreaValue: null,
+      landAreaOp: null,
+      landAreaValue: null
+    },
+    sortField: "source_updated_at",
+    sortOrder: "desc",
+    currentPage: 0,
+    pageSize: 20,
+    filtersCollapsed: false,
+    lastDetailSource: null
+  };
+
+  var filterOptions = {
+    regions: [],
+    cities: []
+  };
+  
+  var filterLoadingState = {
+    regions: false,
+    cities: false
+  };
+  
+  // Ініціалізація пошуку (викликається при завантаженні сторінки)
+  function initSearch() {
+    console.log("Initializing search functionality");
+    // Переконаємося, що екран пошуку існує
+    var searchScreen = document.getElementById("screen-search");
+    if (!searchScreen) {
+      console.error("screen-search element not found in DOM");
+    } else {
+      console.log("screen-search element found");
+    }
+  }
+
+  function showSearch() {
+    console.log("showSearch called (unified)");
+    
+    // Скидаємо стан завантаження при відкритті пошуку
+    filterLoadingState.regions = false;
+    filterLoadingState.cities = false;
+    filterOptions.regions = [];
+    filterOptions.cities = [];
+    
+    // Спочатку показуємо екран
+    show("screen-search");
+    
+    // Переконаємося, що екран видимий
+    var searchScreen = document.getElementById("screen-search");
+    if (searchScreen) {
+      searchScreen.classList.remove("hidden");
+      searchScreen.style.display = "block";
+      console.log("Search screen should be visible now");
+    } else {
+      console.error("screen-search element not found!");
+      return;
+    }
+    
+    // Невелика затримка для того, щоб DOM оновився
+    setTimeout(function() {
+      loadFilterOptions();
+      performSearch();
+    }, 50);
+  }
+
+  function loadFilterOptions(regionForCities) {
+    var endpoint = "/api/search/unified";
+    var regionToUse = regionForCities || searchState.filters.region;
+    
+    // Завантажуємо області
+    if (!filterLoadingState.regions) {
+      filterLoadingState.regions = true;
+      fetch(endpoint + "/filters/regions", { headers: apiHeaders() })
+        .then(function (r) {
+          if (!r.ok) {
+            console.error("Failed to load regions:", r.status);
+            filterOptions.regions = [];
+            filterLoadingState.regions = false;
+            updateRegionDropdownIfVisible();
+            return null;
+          }
+          return r.json();
+        })
+        .then(function (data) {
+          filterLoadingState.regions = false;
+          if (data && data.regions && Array.isArray(data.regions)) {
+            filterOptions.regions = data.regions;
+            console.log("Loaded regions:", filterOptions.regions.length);
+          } else {
+            filterOptions.regions = [];
+            console.log("No regions data received");
+          }
+          updateRegionDropdownIfVisible();
+        })
+        .catch(function (err) {
+          console.error("Error loading regions:", err);
+          filterOptions.regions = [];
+          filterLoadingState.regions = false;
+          updateRegionDropdownIfVisible();
+        });
+    }
+    
+    // Завантажуємо міста (завжди: з областю або всі)
+    if (!filterLoadingState.cities) {
+      filterLoadingState.cities = true;
+      var citiesUrl = endpoint + "/filters/cities";
+      if (regionToUse) {
+        citiesUrl += "?region=" + encodeURIComponent(regionToUse);
+      }
+      fetch(citiesUrl, { headers: apiHeaders() })
+        .then(function (r) {
+          if (!r.ok) {
+            console.error("Failed to load cities:", r.status);
+            filterOptions.cities = [];
+            filterLoadingState.cities = false;
+            updateCityDropdownIfVisible();
+            return null;
+          }
+          return r.json();
+        })
+        .then(function (data) {
+          filterLoadingState.cities = false;
+          if (data && data.cities && Array.isArray(data.cities)) {
+            filterOptions.cities = data.cities;
+            console.log("Loaded cities:", filterOptions.cities.length);
+          } else {
+            filterOptions.cities = [];
+            console.log("No cities data received");
+          }
+          updateCityDropdownIfVisible();
+        })
+        .catch(function (err) {
+          console.error("Error loading cities:", err);
+          filterOptions.cities = [];
+          filterLoadingState.cities = false;
+          updateCityDropdownIfVisible();
+        });
+    }
+  }
+  
+  function updateRegionDropdownIfVisible() {
+    var regionInput = document.getElementById("filter-region");
+    var dropdown = document.getElementById("filter-region-dropdown");
+    if (regionInput && dropdown && !dropdown.classList.contains("hidden")) {
+      renderFilterDropdown("region", filterOptions.regions, regionInput.value);
+    }
+  }
+  
+  function updateCityDropdownIfVisible() {
+    var cityInput = document.getElementById("filter-city");
+    var dropdown = document.getElementById("filter-city-dropdown");
+    if (cityInput && dropdown && !dropdown.classList.contains("hidden")) {
+      renderFilterDropdown("city", filterOptions.cities, cityInput.value);
+    }
+  }
+
+  function renderConstructorDropdown(inputId, dropdownId, options, searchTerm) {
+    var dropdown = document.getElementById(dropdownId);
+    var input = document.getElementById(inputId);
+    if (!dropdown || !input) return;
+    var opts = options || [];
+    if (opts.length === 0) {
+      dropdown.innerHTML = "<div class='filter-dropdown-item'>Немає даних</div>";
+      dropdown.classList.remove("hidden");
+      return;
+    }
+    var filtered = opts.filter(function (o) {
+      return !searchTerm || String(o).toLowerCase().indexOf(searchTerm.toLowerCase()) !== -1;
+    });
+    dropdown.innerHTML = "";
+    filtered.forEach(function (opt) {
+      var item = document.createElement("div");
+      item.className = "filter-dropdown-item";
+      item.textContent = String(opt);
+      item.dataset.value = String(opt);
+      dropdown.appendChild(item);
+    });
+    dropdown.classList.remove("hidden");
+  }
+
+  function renderFilterDropdown(type, options, searchTerm) {
+    var dropdown = document.getElementById("filter-" + type + "-dropdown");
+    if (!dropdown) {
+      console.error("Dropdown not found for type:", type);
+      return;
+    }
+    
+    // Перевіряємо чи дані завантажені
+    var expectedOptions = type === "region" ? filterOptions.regions : filterOptions.cities;
+    
+    // Для міста без обраної області — завантажуємо всі міста (включно з Києвом, Севастополем)
+    if (type === "city" && !searchState.filters.region && (!filterOptions.cities || filterOptions.cities.length === 0) && !filterLoadingState.cities) {
+      loadFilterOptions(null);
+    }
+    
+    // Якщо options не передано або порожній
+    if ((!options || options.length === 0) && (!expectedOptions || expectedOptions.length === 0)) {
+      var isLoading = type === "region" ? filterLoadingState.regions : filterLoadingState.cities;
+      
+      if (isLoading) {
+        // Дані завантажуються
+        dropdown.innerHTML = "<div class='filter-dropdown-item'>Завантаження...</div>";
+        dropdown.classList.remove("hidden");
+        return;
+      } else {
+        // Дані завантажені, але порожні - показуємо "Немає даних"
+        dropdown.innerHTML = "<div class='filter-dropdown-item'>Немає даних</div>";
+        dropdown.classList.remove("hidden");
+        return;
+      }
+    }
+    
+    // Використовуємо передані options або дані з filterOptions
+    var optionsToUse = options && options.length > 0 ? options : expectedOptions;
+    
+    if (!optionsToUse || optionsToUse.length === 0) {
+      dropdown.innerHTML = "<div class='filter-dropdown-item'>Немає даних</div>";
+      dropdown.classList.remove("hidden");
+      return;
+    }
+    
+    var filtered = optionsToUse.filter(function (opt) {
+      if (!opt) return false;
+      return !searchTerm || String(opt).toLowerCase().indexOf(searchTerm.toLowerCase()) !== -1;
+    });
+    
+    dropdown.innerHTML = "";
+    if (filtered.length === 0) {
+      dropdown.innerHTML = "<div class='filter-dropdown-item'>Нічого не знайдено</div>";
+    } else {
+      filtered.forEach(function (opt) {
+        var item = document.createElement("div");
+        item.className = "filter-dropdown-item";
+        item.textContent = String(opt);
+        item.addEventListener("click", function (e) {
+          e.stopPropagation();
+          var input = document.getElementById("filter-" + type);
+          if (input) {
+            input.value = String(opt);
+            searchState.filters[type] = String(opt);
+          }
+          dropdown.classList.add("hidden");
+          if (type === "region") {
+            searchState.filters.city = null;
+            var cityInput = document.getElementById("filter-city");
+            if (cityInput) cityInput.value = "";
+            // Скидаємо стан завантаження міст і завантажуємо їх знову для нової області
+            filterLoadingState.cities = false;
+            filterOptions.cities = [];
+            loadFilterOptions();
+          }
+        });
+        dropdown.appendChild(item);
+      });
+    }
+    dropdown.classList.remove("hidden");
+  }
+
+  function performSearch() {
+    var loadingEl = document.getElementById("search-loading");
+    var itemsEl = document.getElementById("search-items");
+    var paginationEl = document.getElementById("search-pagination");
+    
+    if (!itemsEl) {
+      console.error("search-items element not found");
+      return;
+    }
+    
+    if (loadingEl) loadingEl.classList.remove("hidden");
+    if (itemsEl) itemsEl.innerHTML = "";
+    if (paginationEl) paginationEl.innerHTML = "";
+    var countEl = document.getElementById("search-results-count");
+    if (countEl) countEl.classList.add("hidden");
+    
+    var endpoint = "/api/search/unified";
+    var params = new URLSearchParams();
+    params.append("limit", searchState.pageSize);
+    params.append("skip", searchState.currentPage * searchState.pageSize);
+    
+    if (searchState.filters.source) params.append("source", searchState.filters.source);
+    if (searchState.filters.dateFilter) params.append("date_filter_days", searchState.filters.dateFilter);
+    if (searchState.filters.region) params.append("region", searchState.filters.region);
+    if (searchState.filters.city) params.append("city", searchState.filters.city);
+    
+    if (searchState.filters.priceOp && searchState.filters.priceValue !== null) {
+      var priceVal = parseFloat(searchState.filters.priceValue);
+      if (!isNaN(priceVal)) {
+        if (searchState.filters.priceOp === "eq") {
+          params.append("price_eq", priceVal);
+        } else if (searchState.filters.priceOp === "gte") {
+          params.append("price_min", priceVal);
+        } else if (searchState.filters.priceOp === "lte") {
+          params.append("price_max", priceVal);
+        }
+      }
+    }
+    
+    if (searchState.filters.propertyType) params.append("property_type", searchState.filters.propertyType);
+    
+    if (searchState.filters.buildingAreaOp && searchState.filters.buildingAreaValue !== null) {
+      var buildingVal = parseFloat(searchState.filters.buildingAreaValue);
+      if (!isNaN(buildingVal)) {
+        params.append("building_area_sqm_op", searchState.filters.buildingAreaOp);
+        params.append("building_area_sqm_value", buildingVal);
+      }
+    }
+    
+    if (searchState.filters.landAreaOp && searchState.filters.landAreaValue !== null) {
+      var landVal = parseFloat(searchState.filters.landAreaValue);
+      if (!isNaN(landVal)) {
+        params.append("land_area_ha_op", searchState.filters.landAreaOp);
+        params.append("land_area_ha_value", landVal);
+      }
+    }
+    
+    // Додаємо параметри сортування
+    params.append("sort_field", searchState.sortField);
+    params.append("sort_order", searchState.sortOrder);
+    
+    console.log("Fetching from:", endpoint + "?" + params.toString());
+    fetch(endpoint + "?" + params.toString(), { headers: apiHeaders() })
+      .then(function (r) {
+        console.log("Response status:", r.status);
+        if (!r.ok) {
+          return r.json().then(function(errData) {
+            throw new Error("Помилка " + r.status + ": " + (errData.detail || r.statusText));
+          }).catch(function() {
+            throw new Error("Помилка " + r.status);
+          });
+        }
+        return r.json();
+      })
+      .then(function (data) {
+        console.log("Received data:", data);
+        if (loadingEl) loadingEl.classList.add("hidden");
+        renderSearchResults(data.items || [], data.total || 0);
+      })
+      .catch(function (err) {
+        console.error("Search error:", err);
+        if (loadingEl) loadingEl.classList.add("hidden");
+        if (itemsEl) itemsEl.innerHTML = "<div class='error'>Помилка: " + (err.message || "Не вдалося завантажити") + "</div>";
+        var countEl = document.getElementById("search-results-count");
+        if (countEl) countEl.classList.add("hidden");
+      });
+  }
+
+  function formatDate(dateStr) {
+    if (!dateStr) return "";
+    try {
+      var date = new Date(dateStr);
+      if (isNaN(date.getTime())) return dateStr;
+      return date.toLocaleDateString("uk-UA", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit"
+      });
+    } catch (e) {
+      return dateStr;
+    }
+  }
+
+  function pluralizeListings(n) {
+    var mod10 = n % 10, mod100 = n % 100;
+    if (mod10 === 1 && mod100 !== 11) return "оголошення";
+    if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return "оголошення";
+    return "оголошень";
+  }
+
+  function renderSearchResults(items, total) {
+    var itemsEl = document.getElementById("search-items");
+    var paginationEl = document.getElementById("search-pagination");
+    var countEl = document.getElementById("search-results-count");
+    
+    if (!itemsEl) return;
+    
+    if (countEl) {
+      var countText = "Знайдено " + total + " " + pluralizeListings(total);
+      if (total > 0 && total > searchState.pageSize) {
+        var from = searchState.currentPage * searchState.pageSize + 1;
+        var to = Math.min((searchState.currentPage + 1) * searchState.pageSize, total);
+        countText += " (показано " + from + "–" + to + ")";
+      }
+      countEl.textContent = countText;
+      countEl.classList.remove("hidden");
+    }
+    
+    if (items.length === 0) {
+      itemsEl.innerHTML = "<div class='no-results'>Нічого не знайдено</div>";
+      if (paginationEl) paginationEl.innerHTML = "";
+      return;
+    }
+    
+    itemsEl.innerHTML = "";
+    items.forEach(function (item) {
+      var card = document.createElement("div");
+      card.className = "search-item-card";
+      
+      var headerRow = document.createElement("div");
+      headerRow.className = "search-item-header-row";
+      var title = document.createElement("div");
+      title.className = "search-item-title";
+      title.textContent = item.title || "Без назви";
+      headerRow.appendChild(title);
+      if (item.source) {
+        var sourceBadge = document.createElement("span");
+        sourceBadge.className = "search-item-source-badge search-item-source-" + item.source;
+        sourceBadge.textContent = item.source === "olx" ? "OLX" : "ProZorro";
+        headerRow.appendChild(sourceBadge);
+      }
+      card.appendChild(headerRow);
+      
+      var details = document.createElement("div");
+      details.className = "search-item-details";
+      
+      var indicator = SHOW_ANALYTICS_UI ? (item.price_indicator || null) : null;
+      var mainMetric = (item.price_per_m2_uah && item.price_per_m2_uah > 0) ? "m2" : (item.price_per_ha_uah && item.price_per_ha_uah > 0) ? "ha" : "price";
+      function addPriceRow(container, label, text, isMain) {
+        var wrap = document.createElement("div");
+        wrap.className = "search-item-price-row";
+        var priceEl = document.createElement("span");
+        priceEl.className = "search-item-price";
+        priceEl.textContent = label + text;
+        wrap.appendChild(priceEl);
+        if (indicator && isMain) {
+          var badge = document.createElement("span");
+          var indicatorClass = indicator.replace(/\s+/g, "-");
+          badge.className = "search-item-price-indicator search-item-price-" + indicatorClass;
+          badge.textContent = indicator === "вигідна" ? "✓ Вигідна" : indicator === "дорога" ? "↑ Дорога" : indicator === "аномально низька" ? "⚠ Аномально низька" : indicator === "аномально висока" ? "⚠ Аномально висока" : "— Середня";
+          wrap.appendChild(badge);
+        }
+        container.appendChild(wrap);
+      }
+
+      if (item.price !== null && item.price !== undefined) {
+        var baseText = item.price_text || formatPrice(item.price) + " ₴";
+        if (item.price_usd !== null && item.price_usd !== undefined) {
+          baseText += " (~" + formatPrice(item.price_usd) + " $)";
+        }
+        addPriceRow(details, "Ціна: ", baseText);
+      }
+
+      if (item.price_per_m2_uah !== null && item.price_per_m2_uah !== undefined) {
+        var textPpm2 = formatPrice(item.price_per_m2_uah) + " ₴/м²";
+        if (item.price_per_m2_usd !== null && item.price_per_m2_usd !== undefined) {
+          textPpm2 += " (" + formatPrice(item.price_per_m2_usd) + " $/м²)";
+        }
+        addPriceRow(details, "Ціна за м²: ", textPpm2, mainMetric === "m2");
+      }
+
+      if (item.price_per_ha_uah !== null && item.price_per_ha_uah !== undefined) {
+        var textPpha = formatPrice(item.price_per_ha_uah) + " ₴/га";
+        if (item.price_per_ha_usd !== null && item.price_per_ha_usd !== undefined) {
+          textPpha += " (" + formatPrice(item.price_per_ha_usd) + " $/га)";
+        }
+        addPriceRow(details, "Ціна за га: ", textPpha, mainMetric === "ha");
+      }
+      
+      var location = [];
+      if (item.city) location.push(item.city);
+      if (item.region) location.push(item.region);
+      if (location.length === 0 && item.location) location.push(item.location);
+      
+      if (location.length > 0) {
+        var loc = document.createElement("div");
+        loc.className = "search-item-location";
+        loc.textContent = "📍 " + location.join(", ");
+        details.appendChild(loc);
+      }
+      
+      var areaVal = item.area_m2 || item.building_area_sqm;
+      var landVal = item.land_area_ha;
+      if (areaVal) {
+        var area = document.createElement("div");
+        area.className = "search-item-area";
+        area.textContent = "Площа: " + areaVal + " м²";
+        details.appendChild(area);
+      }
+      if (landVal) {
+        var land = document.createElement("div");
+        land.className = "search-item-area";
+        land.textContent = "Земля: " + landVal + " га";
+        details.appendChild(land);
+      }
+      
+      if (item.status) {
+        var status = document.createElement("div");
+        status.className = "search-item-status";
+        status.textContent = "Статус: " + item.status;
+        details.appendChild(status);
+      }
+      
+      // Додаємо дату оновлення
+      var dateStr = item.updated_at || item.last_updated || item.date_modified || item.date_created;
+      if (dateStr) {
+        var dateEl = document.createElement("div");
+        dateEl.className = "search-item-date";
+        dateEl.textContent = "🕒 Оновлено: " + formatDate(dateStr);
+        details.appendChild(dateEl);
+      }
+      
+      card.appendChild(details);
+      
+      card.addEventListener("click", function () {
+        var detailSource = item.source || "olx";
+        var detailId = item.source_id || item.id || item.url || item.auction_id;
+        searchState.lastDetailSource = detailSource;
+        showDetail(detailSource, detailId);
+      });
+      
+      itemsEl.appendChild(card);
+    });
+    
+    // Пагінація (20 оголошень на сторінку)
+    if (paginationEl) paginationEl.innerHTML = "";
+    if (paginationEl && total > searchState.pageSize) {
+      var totalPages = Math.ceil(total / searchState.pageSize);
+      var pagination = document.createElement("div");
+      pagination.className = "pagination";
+      
+      if (searchState.currentPage > 0) {
+        var prev = document.createElement("button");
+        prev.className = "btn btn-secondary";
+        prev.textContent = "← Попередня";
+        prev.addEventListener("click", function () {
+          searchState.currentPage--;
+          performSearch();
+        });
+        pagination.appendChild(prev);
+      }
+      
+      var pageInfo = document.createElement("span");
+      pageInfo.textContent = "Сторінка " + (searchState.currentPage + 1) + " з " + totalPages + " (всього: " + total + ")";
+      pagination.appendChild(pageInfo);
+      
+      if (searchState.currentPage < totalPages - 1) {
+        var next = document.createElement("button");
+        next.className = "btn btn-secondary";
+        next.textContent = "Наступна →";
+        next.addEventListener("click", function () {
+          searchState.currentPage++;
+          performSearch();
+        });
+        pagination.appendChild(next);
+      }
+      
+      paginationEl.appendChild(pagination);
+    }
+  }
+
+  function formatPrice(price) {
+    if (typeof price !== "number") return String(price || "");
+    return new Intl.NumberFormat("uk-UA").format(price);
+  }
+
+  // Форматування предметів аукціону ProZorro для міні-апки
+  function formatProzorroItem(item, index) {
+    var parts = [];
+
+    // Опис / назва предмета
+    try {
+      var title = null;
+      if (item && typeof item === "object") {
+        // additionalClassifications[0].description.uk_UA / en_US
+        var addCls = item.additionalClassifications;
+        if (Array.isArray(addCls) && addCls.length > 0) {
+          var ac = addCls[0] || {};
+          var desc = ac.description || {};
+          if (typeof desc === "string") {
+            title = desc;
+          } else if (desc.uk_UA || desc.en_US) {
+            title = desc.uk_UA || desc.en_US;
+          }
+        }
+        // fallback: item.description.uk_UA / en_US / string
+        if (!title && item.description) {
+          if (typeof item.description === "string") {
+            title = item.description;
+          } else if (item.description.uk_UA || item.description.en_US) {
+            title = item.description.uk_UA || item.description.en_US;
+          }
+        }
+      }
+      if (title) {
+        parts.push(title);
+      }
+    } catch (e) {}
+
+    // Площа / кількість
+    try {
+      var area = null;
+      var areaLabel = null;
+
+      if (item && item.itemProps && typeof item.itemProps === "object") {
+        if (typeof item.itemProps.totalBuildingArea === "number") {
+          area = item.itemProps.totalBuildingArea;
+          areaLabel = "Площа будівлі";
+        } else if (typeof item.itemProps.totalObjectArea === "number") {
+          area = item.itemProps.totalObjectArea;
+          areaLabel = "Площа об'єкта";
+        }
+      }
+
+      if (area === null && item && item.quantity && typeof item.quantity.value === "number") {
+        area = item.quantity.value;
+        areaLabel = "Кількість / площа";
+      }
+
+      if (area !== null) {
+        var unit = null;
+        if (item && item.unit) {
+          if (typeof item.unit === "string") {
+            unit = item.unit;
+          } else if (item.unit.code || item.unit.name) {
+            unit = item.unit.code || item.unit.name;
+          }
+        } else if (item && item.quantity && item.quantity.unit) {
+          unit = item.quantity.unit;
+        }
+        var areaText = areaLabel + ": " + area;
+        if (unit) {
+          areaText += " " + unit;
+        }
+        parts.push(areaText);
+      }
+    } catch (e2) {}
+
+    // Адреса
+    try {
+      if (item && item.address && typeof item.address === "object") {
+        var addr = item.address;
+        var addrParts = [];
+        if (addr.region && addr.region.uk_UA) {
+          addrParts.push(addr.region.uk_UA);
+        }
+        if (addr.locality && addr.locality.uk_UA) {
+          addrParts.push(addr.locality.uk_UA);
+        }
+        if (addr.streetAddress) {
+          addrParts.push(addr.streetAddress);
+        }
+        if (addrParts.length > 0) {
+          parts.push("Адреса: " + addrParts.join(", "));
+        }
+      }
+    } catch (e3) {}
+
+    // Класифікатор
+    try {
+      if (item && item.classification && item.classification.id) {
+        parts.push("Код класифікатора: " + item.classification.id);
+      }
+    } catch (e4) {}
+
+    if (!parts.length) {
+      return "Предмет " + (typeof index === "number" ? "#" + (index + 1) : "");
+    }
+    return parts.join(" · ");
+  }
+
+  // Форматування заявок ProZorro
+  function formatProzorroBid(bid, index) {
+    if (!bid || typeof bid !== "object") {
+      return "Заявка " + (typeof index === "number" ? "#" + (index + 1) : "");
+    }
+    var parts = [];
+
+    var amount = bid.value && typeof bid.value.amount === "number" ? bid.value.amount : null;
+    if (amount !== null) {
+      parts.push("Сума: " + formatPrice(amount) + " ₴");
+    }
+
+    if (bid.status) {
+      parts.push("Статус: " + String(bid.status));
+    }
+
+    var biddersCount = Array.isArray(bid.bidders) ? bid.bidders.length : 0;
+    if (biddersCount) {
+      parts.push("Учасників у заявці: " + biddersCount);
+    }
+
+    var prefix = "Заявка " + (typeof index === "number" ? "#" + (index + 1) : "");
+    if (!parts.length) {
+      return prefix;
+    }
+    return prefix + " — " + parts.join(" · ");
+  }
+
+  function showDetail(type, itemId) {
+    var detailContent = document.getElementById("detail-content");
+    var loadingEl = document.createElement("div");
+    loadingEl.textContent = "Завантаження...";
+    if (detailContent) detailContent.innerHTML = "";
+    if (detailContent) detailContent.appendChild(loadingEl);
+    
+    show("screen-detail");
+    
+    // Для зведеної таблиці та окремих списків — однакові форми: olx/prozorro завжди через source-specific endpoint
+    var endpoint = "/api/search/" + type + "/" + encodeURIComponent(itemId);
+    
+    fetch(endpoint, { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка " + r.status);
+        return r.json();
+      })
+      .then(function (data) {
+        renderDetail(data, type);
+      })
+      .catch(function (err) {
+        if (detailContent) {
+          detailContent.innerHTML = "<div class='error'>Помилка: " + (err.message || "Не вдалося завантажити") + "</div>";
+        }
+      });
+  }
+
+  function renderUnifiedDetail(item) {
+    var detailContent = document.getElementById("detail-content");
+    if (!detailContent) return;
+    detailContent.innerHTML = "";
+    
+    var wrap = document.createElement("div");
+    wrap.className = "detail-unified";
+    
+    var title = document.createElement("h3");
+    title.className = "detail-unified-title";
+    title.textContent = item.title || "Без назви";
+    wrap.appendChild(title);
+    
+    var meta = document.createElement("div");
+    meta.className = "detail-unified-meta";
+    if (item.source) {
+      var badge = document.createElement("span");
+      badge.className = "search-item-source-badge search-item-source-" + item.source;
+      badge.textContent = item.source === "olx" ? "OLX" : "ProZorro";
+      meta.appendChild(badge);
+    }
+    if (SHOW_ANALYTICS_UI && item.price_indicator) {
+      var indBadge = document.createElement("span");
+      var indClass = (item.price_indicator || "").replace(/\s+/g, "-");
+      indBadge.className = "search-item-price-indicator search-item-price-" + indClass;
+      var indLabels = { "вигідна": "✓ Вигідна ціна", "дорога": "↑ Дорога", "середня": "— Середня", "аномально низька": "⚠ Аномально низька", "аномально висока": "⚠ Аномально висока" };
+      indBadge.textContent = indLabels[item.price_indicator] || item.price_indicator;
+      meta.appendChild(indBadge);
+    }
+    wrap.appendChild(meta);
+    
+    function addRow(label, text) {
+      if (text === undefined || text === null || text === "") return;
+      var row = document.createElement("div");
+      row.className = "detail-field";
+      var lbl = document.createElement("div");
+      lbl.className = "detail-field-label";
+      lbl.textContent = label + ":";
+      var val = document.createElement("div");
+      val.className = "detail-field-value";
+      val.textContent = typeof text === "number" ? formatPrice(text) : String(text);
+      row.appendChild(lbl);
+      row.appendChild(val);
+      wrap.appendChild(row);
+    }
+    
+    if (item.price != null) {
+      var priceText = formatPrice(item.price) + " ₴";
+      if (item.price_usd) priceText += " (~" + formatPrice(item.price_usd) + " $)";
+      addRow("Ціна", priceText);
+    }
+    if (item.price_per_m2_uah != null) addRow("Ціна за м²", formatPrice(item.price_per_m2_uah) + " ₴/м²");
+    if (item.price_per_ha_uah != null) addRow("Ціна за га", formatPrice(item.price_per_ha_uah) + " ₴/га");
+    if (item.region || item.city) addRow("Локація", [item.city, item.region].filter(Boolean).join(", "));
+    if (item.building_area_sqm) addRow("Площа", item.building_area_sqm + " м²");
+    if (item.land_area_ha) addRow("Земля", item.land_area_ha + " га");
+    if (item.status) addRow("Статус", item.status);
+    if (item.property_type) addRow("Тип", item.property_type);
+    if (item.page_url) {
+      var linkRow = document.createElement("div");
+      linkRow.className = "detail-field";
+      var linkLbl = document.createElement("div");
+      linkLbl.className = "detail-field-label";
+      linkLbl.textContent = "Посилання:";
+      var linkVal = document.createElement("div");
+      linkVal.className = "detail-field-value";
+      var link = document.createElement("a");
+      link.href = item.page_url;
+      link.target = "_blank";
+      link.className = "detail-link";
+      link.textContent = "Відкрити оголошення";
+      linkVal.appendChild(link);
+      linkRow.appendChild(linkLbl);
+      linkRow.appendChild(linkVal);
+      wrap.appendChild(linkRow);
+    }
+
+    var unifiedParts = [];
+    if (item.price != null) unifiedParts.push("ціна " + formatPrice(item.price) + " ₴");
+    if (item.region || item.city) unifiedParts.push([item.city, item.region].filter(Boolean).join(", "));
+    unifiedParts.push(item.source === "olx" ? "OLX" : "ProZorro");
+    var unifiedContext = {
+      page_url: item.page_url || "",
+      summary: unifiedParts.join(", "),
+      detail_source: item.source || "",
+      detail_id: item.source_id || item.id || item.url || "",
+    };
+    var aiBtnWrap = document.createElement("div");
+    aiBtnWrap.className = "detail-cta-wrap";
+    var aiBtn = document.createElement("button");
+    aiBtn.type = "button";
+    aiBtn.className = "btn detail-ai-btn";
+    aiBtn.textContent = "Спитати у AI-помічника";
+    aiBtn.title = "Відкрити чат з AI для аналізу цього оголошення";
+    aiBtn.addEventListener("click", function () {
+      openChatWithListingContext(unifiedContext);
+    });
+    aiBtnWrap.appendChild(aiBtn);
+    wrap.appendChild(aiBtnWrap);
+    
+    detailContent.appendChild(wrap);
+  }
+
+  // Тимчасово приховано: аналітика рахується, але не показується в UI (недостатньо даних)
+  var SHOW_ANALYTICS_UI = false;
+
+  // Конфігурація вкладок та полів для деталей (hero показує назву, ціну, статус, локацію)
+  var TAB_FIELD_CONFIG_BASE = {
+    prozorro: {
+      main: {
+        label: "Опис",
+        fields: [
+          { path: "auction_data.description.uk_UA", label: "Опис", formatter: null, block: true },
+          { path: "auction_data.description.en_US", label: "Опис (англ.)", fallback: true, block: true },
+          { path: "auction_id", label: "ID аукціону" },
+          { path: "auction_data.dateCreated", label: "Дата створення", formatter: function(v) { return formatDate(v); } },
+          { path: "auction_data.dateModified", label: "Дата оновлення", formatter: function(v) { return formatDate(v); } },
+          { path: "auction_data.enquiryPeriod.endDate", label: "Термін подачі документів", formatter: function(v) { return formatDate(v); }, fallback: true },
+          { path: "auction_data.procedureType", label: "Тип процедури" },
+          { path: "_detail_link", label: "Посилання", isLink: true, linkKey: "auction_id" }
+        ]
+      },
+      characteristics: {
+        label: "Характеристики",
+        fields: [
+          { path: "auction_data.price_metrics.price_per_m2_uah", label: "Ціна за м² (грн)", formatter: function(v) { return v ? formatPrice(v) + " ₴/м²" : ""; } },
+          { path: "auction_data.price_metrics.price_per_m2_usd", label: "Ціна за м² (USD)", formatter: function(v) { return v ? formatPrice(v) + " $/м²" : ""; } },
+          { path: "auction_data.price_metrics.price_per_ha_uah", label: "Ціна за га (грн)", formatter: function(v) { return v ? formatPrice(v) + " ₴/га" : ""; } },
+          { path: "auction_data.price_metrics.price_per_ha_usd", label: "Ціна за га (USD)", formatter: function(v) { return v ? formatPrice(v) + " $/га" : ""; } },
+          { path: "auction_data.value.currency", label: "Валюта" },
+          { path: "auction_data.value.valueAddedTaxIncluded", label: "ПДВ включено", formatter: function(v) { return v ? "Так" : "Ні"; } }
+        ]
+      },
+      participants: {
+        label: "Учасники",
+        fields: [
+          { path: "auction_data.minNumberOfQualifiedBids", label: "Мінімальна кількість учасників" },
+          { path: "auction_data.bids", label: "Заявки", isArray: true, arrayFormatter: formatProzorroBid }
+        ]
+      },
+      items: {
+        label: "Предмети аукціону",
+        fields: [
+          { path: "auction_data.items", label: "Предмети", isArray: true, arrayFormatter: formatProzorroItem }
+        ]
+      }
+    },
+    olx: {
+      main: {
+        label: "Опис",
+        fields: [
+          { path: "detail.description", label: "Опис", block: true },
+          { path: "detail.contact", label: "Контакти", formatter: function(v) {
+            if (!v || typeof v !== "object") return v ? String(v) : "";
+            var parts = [];
+            if (v.name) parts.push(v.name);
+            if (v.phone_preview) parts.push(v.phone_preview);
+            if (v.phones && Array.isArray(v.phones)) parts.push(v.phones.join(", "));
+            return parts.length ? parts.join(" · ") : JSON.stringify(v);
+          } },
+          { path: "url", label: "Посилання", isLink: true }
+        ]
+      },
+      characteristics: {
+        label: "Характеристики",
+        fields: [
+          { path: "search_data.area_m2", label: "Площа", formatter: function(v) { return v ? v + " м²" : ""; } },
+          { path: "detail.price_metrics.price_per_m2_uah", label: "Ціна за м² (грн)", formatter: function(v) { return v ? formatPrice(v) + " ₴/м²" : ""; } },
+          { path: "detail.price_metrics.price_per_m2_usd", label: "Ціна за м² (USD)", formatter: function(v) { return v ? formatPrice(v) + " $/м²" : ""; } },
+          { path: "detail.price_metrics.price_per_ha_uah", label: "Ціна за га (грн)", formatter: function(v) { return v ? formatPrice(v) + " ₴/га" : ""; } },
+          { path: "detail.price_metrics.price_per_ha_usd", label: "Ціна за га (USD)", formatter: function(v) { return v ? formatPrice(v) + " $/га" : ""; } },
+          { path: "detail.parameters", label: "Параметри", isArray: true, arrayFormatter: function(item) {
+            if (typeof item === "object" && item.label && item.value) return item.label + ": " + item.value;
+            return String(item);
+          }},
+          { path: "detail.location", label: "Детальна локація" },
+          { path: "search_data.currency", label: "Валюта" }
+        ]
+      }
+    }
+  };
+
+  var TAB_FIELD_CONFIG = (function() {
+    var cfg = {};
+    ["prozorro", "olx"].forEach(function(key) {
+      cfg[key] = {};
+      for (var k in TAB_FIELD_CONFIG_BASE[key]) {
+        cfg[key][k] = TAB_FIELD_CONFIG_BASE[key][k];
+      }
+    });
+    if (SHOW_ANALYTICS_UI) {
+      cfg.prozorro.analytics = { label: "Аналітика", special: true };
+      cfg.olx.analytics = { label: "Аналітика", special: true };
+    }
+    return cfg;
+  })();
+
+  // Конфігурація полів для відображення (legacy, для сумісності)
+  var FIELD_CONFIG = {
+    olx: {
+      // Службові поля, які не відображаються
+      hidden: ["_id", "created_at", "updated_at", "version_hash", "description_hash", "raw_snippet"],
+      // Конфігурація полів з пріоритетами (менше число = вище)
+      fields: [
+        { path: "search_data.title", label: "Назва", priority: 1, description: "Заголовок оголошення" },
+        { path: "search_data.price_value", label: "Ціна (грн)", priority: 2, description: "Ціна в гривнях", formatter: function(v) { return formatPrice(v) + " ₴"; } },
+        { path: "detail.price_metrics.total_price_usd", label: "Ціна (USD)", priority: 3, description: "Загальна ціна в доларах США", formatter: function(v) { return v ? formatPrice(v) + " $" : ""; } },
+        { path: "search_data.price_text", label: "Ціна (текст)", priority: 4, description: "Ціна як вказано в оголошенні" },
+        { path: "search_data.location", label: "Розташування", priority: 4, description: "Місто та область" },
+        { path: "search_data.area_m2", label: "Площа", priority: 5, description: "Площа в квадратних метрах", formatter: function(v) { return v + " м²"; } },
+        { path: "detail.price_metrics.price_per_m2_uah", label: "Ціна за м² (грн)", priority: 6, description: "Ціна за квадратний метр у гривнях", formatter: function(v) { return v ? formatPrice(v) + " ₴/м²" : ""; } },
+        { path: "detail.price_metrics.price_per_m2_usd", label: "Ціна за м² (USD)", priority: 7, description: "Ціна за квадратний метр у доларах США", formatter: function(v) { return v ? formatPrice(v) + " $/м²" : ""; } },
+        { path: "detail.price_metrics.price_per_ha_uah", label: "Ціна за га (грн)", priority: 8, description: "Ціна за гектар у гривнях", formatter: function(v) { return v ? formatPrice(v) + " ₴/га" : ""; } },
+        { path: "detail.price_metrics.price_per_ha_usd", label: "Ціна за га (USD)", priority: 9, description: "Ціна за гектар у доларах США", formatter: function(v) { return v ? formatPrice(v) + " $/га" : ""; } },
+        { path: "url", label: "Посилання на оголошення", priority: 10, description: "Пряме посилання на OLX", isLink: true },
+        { path: "detail.description", label: "Опис", priority: 11, description: "Детальний опис нерухомості" },
+        { path: "detail.parameters", label: "Параметри", priority: 12, description: "Додаткові характеристики", isArray: true, arrayFormatter: function(item) {
+          if (typeof item === "object" && item.label && item.value) {
+            return item.label + ": " + item.value;
+          }
+          return String(item);
+        }},
+        { path: "detail.location", label: "Детальна локація", priority: 13, description: "Повна адреса" },
+        { path: "detail.contact", label: "Контакти", priority: 14, description: "Інформація про продавця" },
+        { path: "search_data.date_text", label: "Дата публікації", priority: 15, description: "Коли опубліковано оголошення" },
+        { path: "search_data.currency", label: "Валюта", priority: 16, description: "Валюта ціни" },
+      ]
+    },
+    prozorro: {
+      hidden: ["_id", "created_at", "last_updated", "version_hash", "description_hash"],
+      fields: [
+        { path: "auction_data.title.uk_UA", label: "Назва", priority: 1, description: "Назва аукціону" },
+        { path: "auction_data.title.en_US", label: "Назва (англ.)", priority: 2, description: "Назва англійською", fallback: true },
+        { path: "auction_id", label: "ID аукціону", priority: 3, description: "Унікальний ідентифікатор" },
+        { path: "auction_data.value.amount", label: "Стартова ціна (грн)", priority: 4, description: "Початкова ціна аукціону", formatter: function(v) { return formatPrice(v) + " ₴"; } },
+        { path: "auction_data.price_metrics.total_price_usd", label: "Стартова ціна (USD)", priority: 5, description: "Початкова ціна в доларах США", formatter: function(v) { return v ? formatPrice(v) + " $" : ""; } },
+        { path: "auction_data.price_metrics.price_per_m2_uah", label: "Ціна за м² (грн)", priority: 6, description: "Ціна за квадратний метр у гривнях", formatter: function(v) { return v ? formatPrice(v) + " ₴/м²" : ""; } },
+        { path: "auction_data.price_metrics.price_per_m2_usd", label: "Ціна за м² (USD)", priority: 7, description: "Ціна за квадратний метр у доларах США", formatter: function(v) { return v ? formatPrice(v) + " $/м²" : ""; } },
+        { path: "auction_data.price_metrics.price_per_ha_uah", label: "Ціна за га (грн)", priority: 8, description: "Ціна за гектар у гривнях", formatter: function(v) { return v ? formatPrice(v) + " ₴/га" : ""; } },
+        { path: "auction_data.price_metrics.price_per_ha_usd", label: "Ціна за га (USD)", priority: 9, description: "Ціна за гектар у доларах США", formatter: function(v) { return v ? formatPrice(v) + " $/га" : ""; } },
+        { path: "auction_data.value.currency", label: "Валюта", priority: 10, description: "Валюта ціни" },
+        { path: "auction_data.value.valueAddedTaxIncluded", label: "ПДВ включено", priority: 6, description: "Чи включений податок", formatter: function(v) { return v ? "Так" : "Ні"; } },
+        { path: "auction_data.status", label: "Статус", priority: 11, description: "Поточний статус аукціону" },
+        { path: "auction_data.dateCreated", label: "Дата створення", priority: 12, description: "Коли створено аукціон", formatter: function(v) { return formatDate(v); } },
+        { path: "auction_data.dateModified", label: "Дата оновлення", priority: 13, description: "Останнє оновлення", formatter: function(v) { return formatDate(v); } },
+        { path: "auction_data.procedureType", label: "Тип процедури", priority: 14, description: "Тип аукціону" },
+        { path: "auction_data.procuringEntity.name", label: "Організатор", priority: 15, description: "Хто проводить аукціон" },
+        { path: "auction_data.description.uk_UA", label: "Опис", priority: 16, description: "Детальний опис", fallback: true },
+        { path: "auction_data.description.en_US", label: "Опис (англ.)", priority: 17, description: "Опис англійською", fallback: true },
+        { path: "auction_data.items", label: "Предмети аукціону", priority: 18, description: "Список предметів", isArray: true, arrayFormatter: formatProzorroItem },
+        { path: "auction_data.bids", label: "Заявки", priority: 19, description: "Подані заявки", isArray: true, arrayFormatter: formatProzorroBid },
+        { path: "auction_data.auctionPeriod.startDate", label: "Дата початку торгів", priority: 20, description: "Коли починаються торги", formatter: function(v) { return formatDate(v); }, fallback: true },
+        { path: "auction_data.auctionPeriod.endDate", label: "Дата закінчення торгів", priority: 21, description: "Коли закінчуються торги", formatter: function(v) { return formatDate(v); }, fallback: true },
+        { path: "auction_data.enquiryPeriod.endDate", label: "Термін подачі документів", priority: 22, description: "Дедлайн для документів", formatter: function(v) { return formatDate(v); }, fallback: true },
+      ]
+    }
+  };
+
+  // Функція для отримання значення за шляхом (dot notation)
+  function getNestedValue(obj, path) {
+    var parts = path.split(".");
+    var current = obj;
+    for (var i = 0; i < parts.length; i++) {
+      if (current === null || current === undefined) return null;
+      current = current[parts[i]];
+    }
+    return current;
+  }
+
+  // Функція для рекурсивного відображення вкладених об'єктів у вигляді структурованого HTML
+  function renderNestedObject(obj, container, level) {
+    if (level === undefined) level = 0;
+    if (level > 5) {
+      // Захист від занадто глибокої вкладеності
+      var pre = document.createElement("pre");
+      pre.className = "detail-json-text";
+      pre.textContent = JSON.stringify(obj, null, 2);
+      container.appendChild(pre);
+      return;
+    }
+
+    if (obj === null) {
+      container.appendChild(document.createTextNode("null"));
+      return;
+    }
+
+    if (Array.isArray(obj)) {
+      if (obj.length === 0) {
+        container.appendChild(document.createTextNode("[]"));
+        return;
+      }
+      
+      // Для великих масивів (більше 10 елементів) додаємо можливість згортання
+      var isCollapsible = obj.length > 10 && level === 0;
+      var list = document.createElement("ul");
+      list.className = "detail-nested-list";
+      
+      if (isCollapsible) {
+        var toggleBtn = document.createElement("button");
+        toggleBtn.className = "detail-toggle-btn";
+        toggleBtn.type = "button";
+        toggleBtn.textContent = "▼ Розгорнути (" + obj.length + " елементів)";
+        toggleBtn.onclick = function() {
+          var isExpanded = list.style.display !== "none";
+          list.style.display = isExpanded ? "none" : "block";
+          toggleBtn.textContent = isExpanded ? "▼ Розгорнути (" + obj.length + " елементів)" : "▲ Згорнути";
+        };
+        container.appendChild(toggleBtn);
+        list.style.display = "none";
+      }
+      
+      obj.forEach(function(item, index) {
+        var li = document.createElement("li");
+        li.className = "detail-nested-item";
+        if (typeof item === "object" && item !== null) {
+          var itemLabel = document.createElement("span");
+          itemLabel.className = "detail-nested-index";
+          itemLabel.textContent = "[" + index + "]: ";
+          li.appendChild(itemLabel);
+          var itemContainer = document.createElement("div");
+          itemContainer.className = "detail-nested-object";
+          renderNestedObject(item, itemContainer, level + 1);
+          li.appendChild(itemContainer);
+        } else {
+          li.textContent = String(item);
+        }
+        list.appendChild(li);
+      });
+      container.appendChild(list);
+      return;
+    }
+
+    if (typeof obj === "object") {
+      var keys = Object.keys(obj);
+      if (keys.length === 0) {
+        container.appendChild(document.createTextNode("{}"));
+        return;
+      }
+      
+      // Для великих об'єктів (більше 5 ключів) додаємо можливість згортання
+      var isCollapsible = keys.length > 5 && level === 0;
+      var objContainer = document.createElement("div");
+      objContainer.className = "detail-nested-object";
+      
+      if (isCollapsible) {
+        var toggleBtn = document.createElement("button");
+        toggleBtn.className = "detail-toggle-btn";
+        toggleBtn.type = "button";
+        toggleBtn.textContent = "▼ Розгорнути (" + keys.length + " полів)";
+        toggleBtn.onclick = function() {
+          var isExpanded = contentDiv.style.display !== "none";
+          contentDiv.style.display = isExpanded ? "none" : "block";
+          toggleBtn.textContent = isExpanded ? "▼ Розгорнути (" + keys.length + " полів)" : "▲ Згорнути";
+        };
+        container.appendChild(toggleBtn);
+        
+        var contentDiv = document.createElement("div");
+        contentDiv.className = "detail-nested-content";
+        contentDiv.style.display = "none";
+        
+        keys.forEach(function(key) {
+          var propDiv = document.createElement("div");
+          propDiv.className = "detail-nested-property";
+          var keySpan = document.createElement("span");
+          keySpan.className = "detail-nested-key";
+          keySpan.textContent = key + ": ";
+          propDiv.appendChild(keySpan);
+          var valueContainer = document.createElement("span");
+          valueContainer.className = "detail-nested-value";
+          var value = obj[key];
+          if (typeof value === "object" && value !== null) {
+            renderNestedObject(value, valueContainer, level + 1);
+          } else if (value === null) {
+            valueContainer.textContent = "null";
+            valueContainer.className += " detail-null";
+          } else if (typeof value === "string") {
+            valueContainer.textContent = '"' + value + '"';
+            valueContainer.className += " detail-string";
+          } else if (typeof value === "number") {
+            valueContainer.textContent = String(value);
+            valueContainer.className += " detail-number";
+          } else if (typeof value === "boolean") {
+            valueContainer.textContent = value ? "true" : "false";
+            valueContainer.className += " detail-boolean";
+          } else {
+            valueContainer.textContent = String(value);
+          }
+          propDiv.appendChild(valueContainer);
+          contentDiv.appendChild(propDiv);
+        });
+        
+        objContainer.appendChild(contentDiv);
+        container.appendChild(objContainer);
+      } else {
+        keys.forEach(function(key) {
+          var propDiv = document.createElement("div");
+          propDiv.className = "detail-nested-property";
+          var keySpan = document.createElement("span");
+          keySpan.className = "detail-nested-key";
+          keySpan.textContent = key + ": ";
+          propDiv.appendChild(keySpan);
+          var valueContainer = document.createElement("span");
+          valueContainer.className = "detail-nested-value";
+          var value = obj[key];
+          if (typeof value === "object" && value !== null) {
+            renderNestedObject(value, valueContainer, level + 1);
+          } else if (value === null) {
+            valueContainer.textContent = "null";
+            valueContainer.className += " detail-null";
+          } else if (typeof value === "string") {
+            valueContainer.textContent = '"' + value + '"';
+            valueContainer.className += " detail-string";
+          } else if (typeof value === "number") {
+            valueContainer.textContent = String(value);
+            valueContainer.className += " detail-number";
+          } else if (typeof value === "boolean") {
+            valueContainer.textContent = value ? "true" : "false";
+            valueContainer.className += " detail-boolean";
+          } else {
+            valueContainer.textContent = String(value);
+          }
+          propDiv.appendChild(valueContainer);
+          objContainer.appendChild(propDiv);
+        });
+        container.appendChild(objContainer);
+      }
+      return;
+    }
+
+    // Прості типи
+    container.appendChild(document.createTextNode(String(obj)));
+  }
+
+  // Функція для отримання головного фото з URL (для OLX)
+  function getMainImageUrl(url, detailData) {
+    if (!url || typeof url !== "string") return null;
+    
+    // Спочатку перевіряємо чи є фото в detail
+    if (detailData && detailData.main_image && typeof detailData.main_image === "string") {
+      return detailData.main_image;
+    }
+    if (detailData && detailData.images && Array.isArray(detailData.images) && detailData.images.length > 0) {
+      return detailData.images[0];
+    }
+    
+    // Можна додати ендпоінт для отримання фото через API
+    // Зараз повертаємо null, якщо фото немає в даних
+    return null;
+  }
+
+  // Функція для отримання фото з auction_data (для Prozorro)
+  function getProzorroImageUrl(auctionData) {
+    if (!auctionData || typeof auctionData !== "object") return null;
+    // Шукаємо фото в items або інших полях
+    var items = auctionData.items;
+    if (Array.isArray(items) && items.length > 0) {
+      for (var i = 0; i < items.length; i++) {
+        var item = items[i];
+        if (item.images && Array.isArray(item.images) && item.images.length > 0) {
+          return item.images[0];
+        }
+        if (item.photo && typeof item.photo === "string") {
+          return item.photo;
+        }
+      }
+    }
+    return null;
+  }
+
+  function renderDetailField(data, fieldConfig, container, type) {
+    var path = fieldConfig.path;
+    var value;
+    if (path === "_detail_link" && fieldConfig.linkKey === "auction_id") {
+      var aid = data.auction_id;
+      value = aid ? "https://prozorro.sale/auction/" + aid : null;
+    } else {
+      value = getNestedValue(data, path);
+    }
+    if ((value === null || value === undefined || value === "") && !fieldConfig.fallback) return;
+    if ((value === null || value === undefined || value === "") && fieldConfig.fallback) return;
+
+    var field = document.createElement("div");
+    field.className = "detail-field" + (fieldConfig.block ? " detail-field-block" : "");
+    var labelEl = document.createElement("div");
+    labelEl.className = "detail-field-label";
+    labelEl.textContent = fieldConfig.label + ":";
+    field.appendChild(labelEl);
+    var valueEl = document.createElement("div");
+    valueEl.className = "detail-field-value";
+
+    if (fieldConfig.isLink && (typeof value === "string" || value)) {
+      var link = document.createElement("a");
+      link.href = typeof value === "string" ? value : ("https://prozorro.sale/auction/" + (value || ""));
+      link.target = "_blank";
+      link.textContent = "Відкрити";
+      link.className = "detail-link";
+      valueEl.appendChild(link);
+    } else if (fieldConfig.isArray && Array.isArray(value)) {
+      if (value.length === 0) return;
+      var list = document.createElement("ul");
+      list.className = "detail-array-list";
+      value.forEach(function(item, index) {
+        var li = document.createElement("li");
+        li.className = "detail-array-item";
+        if (fieldConfig.arrayFormatter) {
+          li.textContent = fieldConfig.arrayFormatter(item, index);
+        } else {
+          li.textContent = typeof item === "object" ? JSON.stringify(item) : String(item);
+        }
+        list.appendChild(li);
+      });
+      valueEl.appendChild(list);
+    } else {
+      if (fieldConfig.formatter && typeof fieldConfig.formatter === "function") {
+        valueEl.textContent = fieldConfig.formatter(value);
+      } else if (typeof value === "object" && value !== null) {
+        renderNestedObject(value, valueEl, 0);
+      } else {
+        valueEl.textContent = String(value);
+      }
+    }
+    field.appendChild(valueEl);
+    container.appendChild(field);
+  }
+
+  function renderAnalyticsTab(panel, data, type) {
+    var city = "", region = "";
+    if (type === "prozorro") {
+      var refs = (data.auction_data && data.auction_data.address_refs) || [];
+      if (refs.length && refs[0]) {
+        city = (refs[0].city && refs[0].city.name) || "";
+        region = (refs[0].region && refs[0].region.name) || "";
+      }
+      if (!city && data.auction_data && data.auction_data.items && data.auction_data.items[0]) {
+        var addr = data.auction_data.items[0].address;
+        if (addr && addr.locality) city = (addr.locality.uk_UA || addr.locality.en_US || "") || "";
+        if (addr && addr.region) region = (addr.region.uk_UA || addr.region.en_US || "") || "";
+      }
+    } else if (type === "olx") {
+      var loc = (data.search_data && data.search_data.location) || (data.detail && data.detail.location) || "";
+      if (typeof loc === "string") {
+        var parts = loc.split(",").map(function(s) { return s.trim(); });
+        if (parts.length >= 1) city = parts[0];
+        if (parts.length >= 2) region = parts[1];
+      } else if (loc && loc.city) city = loc.city;
+    }
+    if (!city && !region) {
+      panel.innerHTML = "<p class='detail-tab-empty'>Для аналітики потрібна інформація про місто або область.</p>";
+      return;
+    }
+    panel.innerHTML = "<div class='detail-analytics-loading'>Завантаження аналітики...</div>";
+    var params = new URLSearchParams();
+    params.append("period_type", "month");
+    params.append("limit", "15");
+    if (region) params.append("region", region);
+    if (city) params.append("city", city);
+    fetch("/api/analytics/aggregates?" + params.toString(), { headers: apiHeaders() })
+      .then(function(r) { return r.ok ? r.json() : Promise.reject(new Error("Помилка")); })
+      .then(function(res) {
+        var items = (res.items || []).filter(function(x) {
+          if (!x || !x.metrics) return false;
+          var m = x.metrics;
+          return (m.price_per_m2_uah && m.price_per_m2_uah.avg) || (m.price_per_ha_uah && m.price_per_ha_uah.avg) || (m.price_uah && m.price_uah.avg);
+        });
+        panel.innerHTML = "";
+        if (items.length === 0) {
+          panel.innerHTML = "<p class='detail-tab-empty'>Немає даних аналітики для цієї локації.</p>";
+          return;
+        }
+        function pickMetricKey(items) {
+          var m2 = 0, ha = 0, uah = 0;
+          items.forEach(function(row) {
+            var m = row.metrics || {};
+            if (m.price_per_m2_uah && m.price_per_m2_uah.avg) m2++;
+            if (m.price_per_ha_uah && m.price_per_ha_uah.avg) ha++;
+            if (m.price_uah && m.price_uah.avg) uah++;
+          });
+          if (m2 >= ha && m2 >= uah) return "price_per_m2_uah";
+          if (ha >= uah) return "price_per_ha_uah";
+          return "price_uah";
+        }
+        var metricKey = pickMetricKey(items);
+        var unitMap = { price_per_m2_uah: "грн/м²", price_per_ha_uah: "грн/га", price_uah: "грн" };
+        var unit = unitMap[metricKey] || "";
+        function getMetric(row) {
+          var m = (row.metrics || {})[metricKey];
+          return m && m.avg ? { val: m.avg, count: m.count } : { val: 0, count: 0 };
+        }
+        var displayItems = items.filter(function(row) { return getMetric(row).val > 0; }).slice(0, 10);
+        if (displayItems.length === 0) {
+          panel.innerHTML = "<p class='detail-tab-empty'>Немає даних для обраної метрики.</p>";
+          return;
+        }
+        var labels = displayItems.map(function(row) {
+          var gb = row.group_by || {};
+          return gb.city || gb.region || row.period_key || "—";
+        });
+        var values = displayItems.map(function(row) { return getMetric(row).val; });
+        var counts = displayItems.map(function(row) { return getMetric(row).count; });
+
+        var isDark = document.documentElement.getAttribute("data-theme") === "dark";
+        var textColor = isDark ? "#e5e5ea" : "#000000";
+        var gridColor = isDark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.08)";
+        var barColor = isDark ? "rgba(10,132,255,0.85)" : "rgba(36,129,204,0.85)";
+
+        var title = document.createElement("h4");
+        title.className = "detail-analytics-title";
+        title.textContent = "Середня ціна по локаціях (останній місяць)";
+        if (unit) title.textContent += " · " + unit;
+        panel.appendChild(title);
+
+        if (displayItems.length === 1) {
+          var card = document.createElement("div");
+          card.className = "detail-analytics-single-card";
+          var val = values[0];
+          var cnt = counts[0] || 0;
+          var valDiv = document.createElement("div");
+          valDiv.className = "detail-analytics-single-card-value";
+          valDiv.appendChild(document.createTextNode(formatPrice(val) + " "));
+          var unitSpan = document.createElement("span");
+          unitSpan.className = "detail-analytics-single-card-unit";
+          unitSpan.textContent = unit;
+          valDiv.appendChild(unitSpan);
+          card.appendChild(valDiv);
+          var lblDiv = document.createElement("div");
+          lblDiv.className = "detail-analytics-single-card-label";
+          lblDiv.textContent = labels[0];
+          card.appendChild(lblDiv);
+          if (cnt) {
+            var cntDiv = document.createElement("div");
+            cntDiv.className = "detail-analytics-single-card-count";
+            cntDiv.textContent = cnt + " оголошень";
+            card.appendChild(cntDiv);
+          }
+          panel.appendChild(card);
+          return;
+        }
+
+        var chartWrap = document.createElement("div");
+        chartWrap.className = "detail-analytics-chart-wrap";
+        var canvas = document.createElement("canvas");
+        chartWrap.appendChild(canvas);
+        panel.appendChild(chartWrap);
+
+        if (typeof ChartDataLabels !== "undefined") {
+          Chart.register(ChartDataLabels);
+        }
+        var chart = new Chart(canvas, {
+          type: "bar",
+          data: {
+            labels: labels,
+            datasets: [{
+              label: unit || "Ціна",
+              data: values,
+              backgroundColor: values.map(function(_, i) {
+                var p = values.length > 1 ? (values[i] / Math.max.apply(null, values)) : 1;
+                return isDark ? "rgba(10,132,255," + (0.4 + 0.5 * p) + ")" : "rgba(36,129,204," + (0.5 + 0.4 * p) + ")";
+              }),
+              borderColor: barColor,
+              borderWidth: 1,
+              borderRadius: 6,
+              borderSkipped: false,
+            }],
+          },
+          options: {
+            indexAxis: "y",
+            responsive: true,
+            maintainAspectRatio: true,
+            aspectRatio: 1.2,
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  label: function(ctx) {
+                    var v = ctx.raw;
+                    var idx = ctx.dataIndex;
+                    var c = counts[idx] || 0;
+                    return formatPrice(v) + " " + unit + (c ? " · " + c + " оголошень" : "");
+                  },
+                },
+              },
+              datalabels: {
+                display: true,
+                anchor: "end",
+                align: "start",
+                offset: 4,
+                color: textColor,
+                font: { size: 12, weight: "600" },
+                formatter: function(v) { return formatPrice(v) + " " + unit; },
+              },
+            },
+            scales: {
+              x: {
+                grid: { color: gridColor },
+                ticks: {
+                  color: textColor,
+                  callback: function(v) { return formatPrice(v); },
+                },
+              },
+              y: {
+                grid: { display: false },
+                ticks: { color: textColor, font: { size: 12 } },
+              },
+            },
+          },
+          plugins: typeof ChartDataLabels !== "undefined" ? [ChartDataLabels] : [],
+        });
+        chartWrap._chart = chart;
+      })
+      .catch(function() {
+        panel.innerHTML = "<p class='detail-tab-empty'>Не вдалося завантажити аналітику.</p>";
+      });
+  }
+
+  function renderDetail(data, type) {
+    var detailContent = document.getElementById("detail-content");
+    if (!detailContent) return;
+    detailContent.querySelectorAll(".detail-analytics-chart-wrap").forEach(function(w) {
+      if (w._chart) w._chart.destroy();
+    });
+    detailContent.innerHTML = "";
+
+    var tabConfig = TAB_FIELD_CONFIG[type];
+    if (!tabConfig) {
+      detailContent.innerHTML = "<div class='error'>Невідомий тип: " + type + "</div>";
+      return;
+    }
+
+    var wrap = document.createElement("div");
+    wrap.className = "detail-page";
+
+    // Головне фото
+    var imageUrl = null;
+    if (type === "olx") {
+      imageUrl = getMainImageUrl(data.url, data.detail);
+    } else if (type === "prozorro") {
+      imageUrl = getProzorroImageUrl(data.auction_data);
+    }
+    if (imageUrl) {
+      var imgWrap = document.createElement("div");
+      imgWrap.className = "detail-hero-image";
+      var img = document.createElement("img");
+      img.src = imageUrl;
+      img.alt = "";
+      img.className = "detail-main-image";
+      img.onerror = function() { imgWrap.remove(); };
+      imgWrap.appendChild(img);
+      wrap.appendChild(imgWrap);
+    }
+
+    // Hero-блок: назва, ціна, статус, локація
+    var hero = document.createElement("div");
+    hero.className = "detail-hero";
+    var title = "";
+    var priceText = "";
+    var status = "";
+    var location = "";
+    var pageUrl = "";
+
+    if (type === "prozorro") {
+      title = getNestedValue(data, "auction_data.title.uk_UA") || getNestedValue(data, "auction_data.title.en_US") || "Аукціон";
+      var amt = getNestedValue(data, "auction_data.value.amount");
+      if (amt != null) {
+        priceText = formatPrice(amt) + " ₴";
+        var usd = getNestedValue(data, "auction_data.price_metrics.total_price_usd");
+        if (usd) priceText += " (~" + formatPrice(usd) + " $)";
+      }
+      status = getNestedValue(data, "auction_data.status") || "";
+      var refs = (data.auction_data && data.auction_data.address_refs) || [];
+      if (refs.length && refs[0]) {
+        var parts = [];
+        if (refs[0].city && refs[0].city.name) parts.push(refs[0].city.name);
+        if (refs[0].region && refs[0].region.name) parts.push(refs[0].region.name);
+        location = parts.join(", ");
+      }
+      if (!location && data.auction_data && data.auction_data.items && data.auction_data.items[0]) {
+        var addr = data.auction_data.items[0].address;
+        if (addr) {
+          var locParts = [];
+          if (addr.locality && (addr.locality.uk_UA || addr.locality.en_US)) locParts.push(addr.locality.uk_UA || addr.locality.en_US || "");
+          if (addr.region && (addr.region.uk_UA || addr.region.en_US)) locParts.push(addr.region.uk_UA || addr.region.en_US || "");
+          location = locParts.filter(Boolean).join(", ");
+        }
+      }
+      var aid = data.auction_id;
+      pageUrl = aid ? "https://prozorro.sale/auction/" + aid : "";
+    } else if (type === "olx") {
+      title = getNestedValue(data, "search_data.title") || "Оголошення";
+      var pv = getNestedValue(data, "search_data.price_value");
+      if (pv != null) {
+        priceText = formatPrice(pv) + " ₴";
+        var usd = getNestedValue(data, "detail.price_metrics.total_price_usd");
+        if (usd) priceText += " (~" + formatPrice(usd) + " $)";
+      } else {
+        var pt = getNestedValue(data, "search_data.price_text");
+        if (pt) priceText = pt;
+      }
+      var loc = getNestedValue(data, "search_data.location");
+      location = typeof loc === "string" ? loc : (loc && loc.city ? loc.city + (loc.region ? ", " + loc.region : "") : "");
+      pageUrl = data.url || "";
+    }
+
+    var titleEl = document.createElement("h1");
+    titleEl.className = "detail-hero-title";
+    titleEl.textContent = title;
+    hero.appendChild(titleEl);
+
+    if (priceText) {
+      var priceEl = document.createElement("div");
+      priceEl.className = "detail-hero-price";
+      priceEl.textContent = priceText;
+      hero.appendChild(priceEl);
+    }
+
+    if (status && type === "prozorro") {
+      var statusEl = document.createElement("span");
+      statusEl.className = "detail-hero-status detail-status-" + (status.toLowerCase().replace(/\s+/g, "-"));
+      statusEl.textContent = status;
+      hero.appendChild(statusEl);
+    }
+
+    if (location) {
+      var locEl = document.createElement("div");
+      locEl.className = "detail-hero-location";
+      locEl.textContent = location;
+      hero.appendChild(locEl);
+    }
+
+    wrap.appendChild(hero);
+
+    // Швидкі факти (key info cards)
+    var keyInfo = document.createElement("div");
+    keyInfo.className = "detail-key-info";
+    var keyItems = [];
+
+    if (type === "prozorro") {
+      var ppm2 = getNestedValue(data, "auction_data.price_metrics.price_per_m2_uah");
+      if (ppm2) keyItems.push({ icon: "㎡", label: "Ціна за м²", value: formatPrice(ppm2) + " ₴/м²" });
+      var ppha = getNestedValue(data, "auction_data.price_metrics.price_per_ha_uah");
+      if (ppha) keyItems.push({ icon: "⊡", label: "Ціна за га", value: formatPrice(ppha) + " ₴/га" });
+      var bids = getNestedValue(data, "auction_data.bids");
+      if (Array.isArray(bids) && bids.length > 0) {
+        keyItems.push({ icon: "📋", label: "Заявок", value: String(bids.length) });
+      }
+      var startDate = getNestedValue(data, "auction_data.auctionPeriod.startDate");
+      if (startDate) keyItems.push({ icon: "📅", label: "Початок торгів", value: formatDate(startDate) });
+      var endDate = getNestedValue(data, "auction_data.auctionPeriod.endDate");
+      if (endDate) keyItems.push({ icon: "⏱", label: "Кінець торгів", value: formatDate(endDate) });
+      var org = getNestedValue(data, "auction_data.procuringEntity.name");
+      if (org) keyItems.push({ icon: "🏛", label: "Організатор", value: org });
+    } else if (type === "olx") {
+      var area = getNestedValue(data, "search_data.area_m2");
+      if (area) keyItems.push({ icon: "㎡", label: "Площа", value: area + " м²" });
+      var ppm2 = getNestedValue(data, "detail.price_metrics.price_per_m2_uah");
+      if (ppm2) keyItems.push({ icon: "㎡", label: "Ціна за м²", value: formatPrice(ppm2) + " ₴/м²" });
+      var ppha = getNestedValue(data, "detail.price_metrics.price_per_ha_uah");
+      if (ppha) keyItems.push({ icon: "⊡", label: "Ціна за га", value: formatPrice(ppha) + " ₴/га" });
+      var dateText = getNestedValue(data, "search_data.date_text");
+      if (dateText) keyItems.push({ icon: "📅", label: "Опубліковано", value: dateText });
+    }
+
+    keyItems.slice(0, 6).forEach(function(item) {
+      var card = document.createElement("div");
+      card.className = "detail-key-card";
+      var iconSpan = document.createElement("span");
+      iconSpan.className = "detail-key-icon";
+      iconSpan.textContent = item.icon;
+      var labelSpan = document.createElement("span");
+      labelSpan.className = "detail-key-label";
+      labelSpan.textContent = item.label;
+      var valueSpan = document.createElement("span");
+      valueSpan.className = "detail-key-value";
+      valueSpan.textContent = item.value;
+      card.appendChild(iconSpan);
+      card.appendChild(labelSpan);
+      card.appendChild(valueSpan);
+      keyInfo.appendChild(card);
+    });
+    if (keyItems.length > 0) wrap.appendChild(keyInfo);
+
+    // CTA-кнопки
+    var ctaWrap = document.createElement("div");
+    ctaWrap.className = "detail-cta-wrap";
+    if (pageUrl) {
+      var cta = document.createElement("a");
+      cta.href = pageUrl;
+      cta.target = "_blank";
+      cta.rel = "noopener noreferrer";
+      cta.className = "detail-cta-btn";
+      cta.textContent = type === "prozorro" ? "Відкрити на ProZorro.Sale" : "Відкрити на OLX";
+      ctaWrap.appendChild(cta);
+    }
+    var aiBtn = document.createElement("button");
+    aiBtn.type = "button";
+    aiBtn.className = "btn detail-ai-btn";
+    aiBtn.textContent = "Спитати у AI-помічника";
+    aiBtn.title = "Відкрити чат з AI для аналізу цього оголошення";
+    currentDetailContext = buildDetailContext(data, type);
+    aiBtn.addEventListener("click", function () {
+      openChatWithListingContext(currentDetailContext);
+    });
+    ctaWrap.appendChild(aiBtn);
+    wrap.appendChild(ctaWrap);
+
+    // Вкладки
+    var tabBar = document.createElement("div");
+    tabBar.className = "detail-tabs";
+    var panelsWrap = document.createElement("div");
+    panelsWrap.className = "detail-tab-panels";
+
+    var tabIds = Object.keys(tabConfig);
+    tabIds.forEach(function(tabId, idx) {
+      var tabCfg = tabConfig[tabId];
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "detail-tab-btn" + (idx === 0 ? " active" : "");
+      btn.textContent = tabCfg.label;
+      btn.dataset.tab = tabId;
+      tabBar.appendChild(btn);
+
+      var panel = document.createElement("div");
+      panel.className = "detail-tab-panel" + (idx === 0 ? " active" : "");
+      panel.dataset.tab = tabId;
+
+      if (tabCfg.special && tabId === "analytics") {
+        renderAnalyticsTab(panel, data, type);
+      } else if (tabCfg.fields) {
+        tabCfg.fields.forEach(function(fc) {
+          renderDetailField(data, fc, panel, type);
+        });
+      }
+      panelsWrap.appendChild(panel);
+    });
+
+    tabBar.addEventListener("click", function(e) {
+      var btn = e.target;
+      if (btn.tagName !== "BUTTON" || !btn.dataset.tab) return;
+      tabBar.querySelectorAll(".detail-tab-btn").forEach(function(b) { b.classList.remove("active"); });
+      panelsWrap.querySelectorAll(".detail-tab-panel").forEach(function(p) { p.classList.remove("active"); });
+      btn.classList.add("active");
+      var pnl = panelsWrap.querySelector("[data-tab='" + btn.dataset.tab + "']");
+      if (pnl) pnl.classList.add("active");
+    });
+
+    wrap.appendChild(tabBar);
+    wrap.appendChild(panelsWrap);
+    detailContent.appendChild(wrap);
+  }
+
+  function bindSearchEvents() {
+    // Фільтри
+    var regionInput = document.getElementById("filter-region");
+    var cityInput = document.getElementById("filter-city");
+    var priceOpSelect = document.getElementById("filter-price-op");
+    var priceValueInput = document.getElementById("filter-price-value");
+    var sourceSelect = document.getElementById("filter-source");
+    
+    // Обробка випадаючого списку для області
+    if (regionInput) {
+      regionInput.addEventListener("click", function (e) {
+        e.stopPropagation();
+        // Завжди показуємо dropdown, навіть якщо дані ще завантажуються
+        renderFilterDropdown("region", filterOptions.regions, regionInput.value);
+        // Якщо дані ще не завантажені і не завантажуються, завантажуємо їх
+        if ((!filterOptions.regions || filterOptions.regions.length === 0) && !filterLoadingState.regions) {
+          loadFilterOptions();
+        }
+      });
+      regionInput.addEventListener("focus", function () {
+        renderFilterDropdown("region", filterOptions.regions, regionInput.value);
+        if ((!filterOptions.regions || filterOptions.regions.length === 0) && !filterLoadingState.regions) {
+          loadFilterOptions();
+        }
+      });
+      regionInput.addEventListener("input", function () {
+        renderFilterDropdown("region", filterOptions.regions, regionInput.value);
+      });
+    }
+    
+    // Обробка випадаючого списку для міста
+    if (cityInput) {
+      cityInput.addEventListener("click", function (e) {
+        e.stopPropagation();
+        // Завжди показуємо dropdown, навіть якщо дані ще завантажуються
+        renderFilterDropdown("city", filterOptions.cities, cityInput.value);
+        // Якщо дані ще не завантажені і не завантажуються, завантажуємо їх
+        if ((!filterOptions.cities || filterOptions.cities.length === 0) && !filterLoadingState.cities) {
+          loadFilterOptions();
+        }
+      });
+      cityInput.addEventListener("focus", function () {
+        renderFilterDropdown("city", filterOptions.cities, cityInput.value);
+        if ((!filterOptions.cities || filterOptions.cities.length === 0) && !filterLoadingState.cities) {
+          loadFilterOptions();
+        }
+      });
+      cityInput.addEventListener("input", function () {
+        renderFilterDropdown("city", filterOptions.cities, cityInput.value);
+      });
+    }
+    
+    // Згортання/розгортання фільтрів
+    var filtersToggle = document.getElementById("search-filters-toggle");
+    var filtersContainer = document.getElementById("search-filters");
+    if (filtersToggle && filtersContainer) {
+      filtersToggle.addEventListener("click", function () {
+        searchState.filtersCollapsed = !searchState.filtersCollapsed;
+        if (searchState.filtersCollapsed) {
+          filtersContainer.classList.add("collapsed");
+          filtersToggle.textContent = "▶";
+        } else {
+          filtersContainer.classList.remove("collapsed");
+          filtersToggle.textContent = "▼";
+        }
+      });
+    }
+    
+    // Сортування
+    var sortFieldSelect = document.getElementById("search-sort-field");
+    var sortOrderSelect = document.getElementById("search-sort-order");
+    if (sortFieldSelect) {
+      sortFieldSelect.value = searchState.sortField;
+      sortFieldSelect.addEventListener("change", function () {
+        searchState.sortField = sortFieldSelect.value;
+        searchState.currentPage = 0;
+        performSearch();
+      });
+    }
+    if (sortOrderSelect) {
+      sortOrderSelect.value = searchState.sortOrder;
+      sortOrderSelect.addEventListener("change", function () {
+        searchState.sortOrder = sortOrderSelect.value;
+        searchState.currentPage = 0;
+        performSearch();
+      });
+    }
+    
+    // Закриття dropdown при кліку поза ним
+    document.addEventListener("click", function (e) {
+      var clickedInside = e.target.closest(".filter-input-wrapper") || 
+                          e.target.closest(".filter-dropdown");
+      if (!clickedInside) {
+        document.querySelectorAll(".filter-dropdown").forEach(function (dd) {
+          dd.classList.add("hidden");
+        });
+      }
+    });
+    
+    // Застосування фільтрів
+    var propertyTypeSelect = document.getElementById("filter-property-type");
+    var buildingAreaOpSelect = document.getElementById("filter-building-area-op");
+    var buildingAreaValueInput = document.getElementById("filter-building-area-value");
+    var landAreaOpSelect = document.getElementById("filter-land-area-op");
+    var landAreaValueInput = document.getElementById("filter-land-area-value");
+    
+    var applyBtn = document.getElementById("search-apply-filters");
+    if (applyBtn) {
+      applyBtn.addEventListener("click", function () {
+        var dateFilterEl = document.getElementById("filter-date");
+        searchState.filters.source = sourceSelect ? (sourceSelect.value || null) : null;
+        searchState.filters.dateFilter = dateFilterEl && dateFilterEl.value ? parseInt(dateFilterEl.value, 10) : null;
+        searchState.filters.region = regionInput ? regionInput.value.trim() || null : null;
+        searchState.filters.city = cityInput ? cityInput.value.trim() || null : null;
+        searchState.filters.priceOp = priceOpSelect ? priceOpSelect.value || null : null;
+        searchState.filters.priceValue = priceValueInput ? (priceValueInput.value ? parseFloat(priceValueInput.value) : null) : null;
+        searchState.filters.propertyType = propertyTypeSelect ? (propertyTypeSelect.value || null) : null;
+        searchState.filters.buildingAreaOp = buildingAreaOpSelect ? (buildingAreaOpSelect.value || null) : null;
+        searchState.filters.buildingAreaValue = buildingAreaValueInput ? (buildingAreaValueInput.value ? parseFloat(buildingAreaValueInput.value) : null) : null;
+        searchState.filters.landAreaOp = landAreaOpSelect ? (landAreaOpSelect.value || null) : null;
+        searchState.filters.landAreaValue = landAreaValueInput ? (landAreaValueInput.value ? parseFloat(landAreaValueInput.value) : null) : null;
+        searchState.currentPage = 0;
+        performSearch();
+      });
+    }
+    
+    // Очищення фільтрів
+    var clearBtn = document.getElementById("search-clear-filters");
+    if (clearBtn) {
+      clearBtn.addEventListener("click", function () {
+        searchState.filters = {
+          source: null, dateFilter: null, region: null, city: null, priceOp: null, priceValue: null,
+          propertyType: null, buildingAreaOp: null, buildingAreaValue: null,
+          landAreaOp: null, landAreaValue: null
+        };
+        if (sourceSelect) sourceSelect.value = "";
+        var dateFilterEl = document.getElementById("filter-date");
+        if (dateFilterEl) dateFilterEl.value = "";
+        if (regionInput) regionInput.value = "";
+        if (cityInput) cityInput.value = "";
+        if (priceOpSelect) priceOpSelect.value = "";
+        if (priceValueInput) priceValueInput.value = "";
+        if (propertyTypeSelect) propertyTypeSelect.value = "";
+        if (buildingAreaOpSelect) buildingAreaOpSelect.value = "";
+        if (buildingAreaValueInput) buildingAreaValueInput.value = "";
+        if (landAreaOpSelect) landAreaOpSelect.value = "";
+        if (landAreaValueInput) landAreaValueInput.value = "";
+        searchState.currentPage = 0;
+        performSearch();
+      });
+    }
+    
+    // Назад з деталей
+    var backBtn = document.getElementById("detail-back");
+    if (backBtn) {
+      backBtn.addEventListener("click", function () {
+        showSearch();
+      });
+    }
+
+    // Зберегти у файл (надсилається через бота — для мобільних)
+    var saveToFileBtn = document.getElementById("search-save-to-file");
+    if (saveToFileBtn) {
+      saveToFileBtn.addEventListener("click", function () {
+        var body = buildSearchExportBody();
+        saveToFileBtn.disabled = true;
+        var origText = saveToFileBtn.textContent;
+        saveToFileBtn.textContent = "Надсилання...";
+        fetch("/api/search/send-export-via-bot", {
+          method: "POST",
+          headers: apiHeaders(),
+          body: JSON.stringify(body)
+        })
+          .then(function (r) {
+            if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || "Помилка експорту"); });
+            return r.json();
+          })
+          .then(function (data) {
+            alert(data.message || "Файл надіслано в чат бота");
+          })
+          .catch(function (err) { alert(err.message || "Помилка"); })
+          .finally(function () {
+            saveToFileBtn.disabled = false;
+            saveToFileBtn.textContent = origText;
+          });
+      });
+    }
+
+    // Зберегти як шаблон
+    var saveAsTemplateBtn = document.getElementById("search-save-as-template");
+    if (saveAsTemplateBtn) {
+      saveAsTemplateBtn.addEventListener("click", function () {
+        openReportConstructorFromSearch();
+      });
+    }
+  }
+
+  function buildSearchExportBody() {
+    var sourceSelect = document.getElementById("filter-source");
+    var dateFilterEl = document.getElementById("filter-date");
+    var regionInput = document.getElementById("filter-region");
+    var cityInput = document.getElementById("filter-city");
+    var priceOpSelect = document.getElementById("filter-price-op");
+    var priceValueInput = document.getElementById("filter-price-value");
+    var propertyTypeSelect = document.getElementById("filter-property-type");
+    var buildingAreaOpSelect = document.getElementById("filter-building-area-op");
+    var buildingAreaValueInput = document.getElementById("filter-building-area-value");
+    var landAreaOpSelect = document.getElementById("filter-land-area-op");
+    var landAreaValueInput = document.getElementById("filter-land-area-value");
+    var sortFieldSelect = document.getElementById("search-sort-field");
+    var sortOrderSelect = document.getElementById("search-sort-order");
+    var body = {
+      source: sourceSelect ? sourceSelect.value || null : null,
+      date_filter_days: dateFilterEl && dateFilterEl.value ? parseInt(dateFilterEl.value, 10) : null,
+      region: regionInput ? regionInput.value.trim() || null : null,
+      city: cityInput ? cityInput.value.trim() || null : null,
+      property_type: propertyTypeSelect ? propertyTypeSelect.value || null : null,
+      sort_field: sortFieldSelect ? sortFieldSelect.value : "source_updated_at",
+      sort_order: sortOrderSelect ? sortOrderSelect.value : "desc"
+    };
+    if (priceOpSelect && priceOpSelect.value && priceValueInput && priceValueInput.value) {
+      var pv = parseFloat(priceValueInput.value);
+      if (priceOpSelect.value === "eq") body.price_eq = pv;
+      else if (priceOpSelect.value === "gte") body.price_min = pv;
+      else if (priceOpSelect.value === "lte") body.price_max = pv;
+    }
+    if (buildingAreaOpSelect && buildingAreaOpSelect.value && buildingAreaValueInput && buildingAreaValueInput.value) {
+      body.building_area_sqm_op = buildingAreaOpSelect.value;
+      body.building_area_sqm_value = parseFloat(buildingAreaValueInput.value);
+    }
+    if (landAreaOpSelect && landAreaOpSelect.value && landAreaValueInput && landAreaValueInput.value) {
+      body.land_area_ha_op = landAreaOpSelect.value;
+      body.land_area_ha_value = parseFloat(landAreaValueInput.value);
+    }
+    return body;
+  }
+
+  function openReportConstructorFromSearch() {
+    var body = buildSearchExportBody();
+    var prefill = {
+      source: body.source,
+      date_filter: body.date_filter_days || 7,
+      region: body.region,
+      city: body.city,
+      property_type: body.property_type
+    };
+    show("screen-files");
+    var filesScreen = document.getElementById("screen-files");
+    if (filesScreen) filesScreen.classList.remove("hidden");
+    loadReportTemplates();
+    setTimeout(function () { openReportConstructor(prefill); }, 100);
+  }
+
+  // Ініціалізація Telegram WebApp (викликається один раз)
+  if (Tg) {
+    if (Tg.ready) Tg.ready();
+    if (Tg.expand) Tg.expand();
+  }
+
+  fetch("/api/me", { headers: apiHeaders() })
+    .then(function (r) {
+      if (!r.ok) {
+        if (r.status === 403 && !initData) {
+          throw new Error("Відкрийте застосунок з Telegram: кнопка меню бота або посилання t.me/YourBot?startapp");
+        }
+        throw new Error(r.status === 403 ? "Недійсні дані або не авторизовано" : "Помилка " + r.status);
+      }
+      return r.json();
+    })
+    .then(function (me) {
+      if (!me.authorized) {
+        showError("Ваш користувач не авторизований. Зверніться до адміністратора.");
+        // Все одно показуємо навігацію, щоб користувач міг бачити меню
+        renderNav({ authorized: false });
+        return;
+      }
+      renderNav(me);
+      bindEvents(me);
+      bindSearchEvents();
+      initSearch();
+      show("screen-home");
+      var homeScreen = document.getElementById("screen-home");
+      if (homeScreen) homeScreen.classList.remove("hidden");
+      renderChatMessages();
+    })
+    .catch(function (err) {
+      console.error("Error loading profile:", err);
+      // Показуємо навігацію навіть при помилці, щоб користувач міг бачити меню
+      renderNav({ authorized: false });
+      showError(err.message || "Не вдалося завантажити профіль.");
+    });
+})();

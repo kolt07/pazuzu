@@ -16,15 +16,22 @@ import time
 from config.settings import Settings
 from transport.dto.prozorro_dto import AuctionDTO, AuctionsResponseDTO
 from utils.date_utils import get_date_range, format_datetime_for_api, format_datetime_for_byDateModified, format_date_display, format_datetime_display
-from utils.file_utils import save_json_to_file, save_csv_to_file, save_excel_to_file, generate_json_filename, generate_auction_filename, ensure_directory_exists, merge_excel_files, generate_excel_in_memory
+from utils.file_utils import save_json_to_file, save_csv_to_file, save_excel_to_file, generate_json_filename, generate_auction_filename, ensure_directory_exists, merge_excel_files, generate_excel_in_memory, generate_excel_with_sheets
 from utils.hash_utils import calculate_object_version_hash, calculate_description_hash, extract_auction_id
+from utils.price_metrics import compute_price_metrics
 from business.services.llm_service import LLMService
 from business.services.llm_cache_service import LLMCacheService
 from business.services.logging_service import LoggingService
+from business.services.currency_rate_service import CurrencyRateService
 from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepository
 from data.repositories.app_data_repository import AppDataRepository
+from data.repositories.olx_listings_repository import OlxListingsRepository
+from data.repositories.unified_listings_repository import UnifiedListingsRepository
 from data.database.connection import MongoDBConnection
+import logging
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 class ProZorroService:
@@ -55,6 +62,12 @@ class ProZorroService:
         self.auctions_repository = ProZorroAuctionsRepository()
         self.app_data_repository = AppDataRepository()
         self.logging_service = LoggingService()
+        # Курс продажу USD (може бути None, тоді USD-метрики не обчислюються)
+        self._usd_rate = None
+        try:
+            self._usd_rate = CurrencyRateService(self.settings).get_today_usd_rate(allow_fetch=True)
+        except Exception:
+            self._usd_rate = None
         
         # Ініціалізація LLM сервісу (може викликати помилку, якщо API ключ не вказано)
         self.llm_service = None
@@ -66,10 +79,69 @@ class ProZorroService:
         
         # Ініціалізація кешу LLM
         self.llm_cache_service = LLMCacheService()
-        
+        # Репозиторій оголошень OLX (для експорту в той самий Excel)
+        self.olx_listings_repository = OlxListingsRepository()
+        # Репозиторій зведеної таблиці оголошень
+        self.unified_listings_repository = UnifiedListingsRepository()
+        self._unified_listings_service = None
+
         # Шлях до файлу конфігурації кодів класифікації
         config_dir = Path(__file__).parent.parent.parent / 'config'
         self.classification_codes_config_path = config_dir / 'ProZorro_clasification_codes.yaml'
+
+    # ------------------------------------------------------------------
+    # Внутрішні допоміжні методи
+    # ------------------------------------------------------------------
+
+    def _attach_price_metrics_to_auction_data(self, auction_data: Dict[str, Any]) -> None:
+        """
+        Додає до auction_data поле price_metrics з розрахованими метриками:
+        - total_price_uah / total_price_usd
+        - price_per_m2_uah / price_per_m2_usd
+        - price_per_ha_uah / price_per_ha_usd (якщо є площа ділянки в га)
+        """
+        try:
+            value = auction_data.get('value') or {}
+            total_price_uah = value.get('amount')
+
+            items = auction_data.get('items') or []
+            building_area_sqm = None
+            land_area_ha = None
+            if items and isinstance(items, list) and isinstance(items[0], dict):
+                first = items[0]
+                quantity = first.get('quantity')
+                unit = first.get('unit') or {}
+                unit_name = ''
+                if isinstance(unit, dict):
+                    unit_name = str(unit.get('name', '')).lower()
+                elif isinstance(unit, str):
+                    unit_name = unit.lower()
+
+                if 'га' in unit_name or 'hectar' in unit_name or 'hectare' in unit_name:
+                    land_area_ha = quantity
+                else:
+                    building_area_sqm = quantity
+
+            metrics = compute_price_metrics(
+                total_price_uah=total_price_uah,
+                building_area_sqm=building_area_sqm,
+                land_area_ha=land_area_ha,
+                uah_per_usd=self._usd_rate,
+            )
+            auction_data['price_metrics'] = metrics
+        except Exception:
+            # Не перериваємо основний процес збереження аукціону
+            pass
+
+    def _sync_auction_to_unified(self, auction_id: str) -> None:
+        """Синхронізує аукціон у зведену таблицю unified_listings."""
+        try:
+            if self._unified_listings_service is None:
+                from business.services.unified_listings_service import UnifiedListingsService
+                self._unified_listings_service = UnifiedListingsService(self.settings)
+            self._unified_listings_service.sync_prozorro_auction(auction_id)
+        except Exception as e:
+            logger.warning("Помилка синхронізації аукціону %s в unified_listings: %s", auction_id, e)
 
     def get_real_estate_auctions_by_date_range(self, date_from: datetime, date_to: datetime) -> List[AuctionDTO]:
         """
@@ -501,7 +573,9 @@ class ProZorroService:
                                     llm_progress.update(1)
                         unchanged_count += 1
                     else:
-                        # Версія змінилася - оновлюємо
+                        # Версія змінилася - перед оновленням додаємо цінові метрики
+                        self._attach_price_metrics_to_auction_data(auction_data)
+                        # Оновлюємо
                         self.auctions_repository.upsert_auction(
                             auction_id=auction_id,
                             auction_data=auction_data,
@@ -509,6 +583,7 @@ class ProZorroService:
                             description_hash=description_hash,
                             last_updated=datetime.now(timezone.utc)
                         )
+                        self._sync_auction_to_unified(auction_id)
                         updated_count += 1
                         # Обробляємо через LLM для оновлених аукціонів
                         # Перевіряємо кеш по description_hash перед викликом LLM
@@ -519,7 +594,8 @@ class ProZorroService:
                                 llm_requests_count += self._process_auction_with_llm(auction_data)
                                 llm_progress.update(1)
                 else:
-                    # Аукціону немає в базі - додаємо
+                    # Аукціону немає в базі - додаємо (попередньо рахуємо цінові метрики)
+                    self._attach_price_metrics_to_auction_data(auction_data)
                     self.auctions_repository.upsert_auction(
                         auction_id=auction_id,
                         auction_data=auction_data,
@@ -527,6 +603,7 @@ class ProZorroService:
                         description_hash=description_hash,
                         last_updated=datetime.now(timezone.utc)
                     )
+                    self._sync_auction_to_unified(auction_id)
                     created_count += 1
                     # Обробляємо через LLM для нових аукціонів
                     # Перевіряємо кеш по description_hash перед викликом LLM
@@ -1874,6 +1951,23 @@ class ProZorroService:
             # Оновлюємо parsed_info з фінальним масивом адрес
             parsed_info['addresses'] = addresses
             
+            # Створюємо посилання на топоніми через GeographyService
+            address_refs_list = []
+            try:
+                from business.services.geography_service import GeographyService
+                geography_service = GeographyService()
+                for addr in addresses:
+                    if isinstance(addr, dict):
+                        address_refs = geography_service.resolve_address(addr)
+                        if address_refs.get("region_id") or address_refs.get("city_id"):
+                            address_refs_list.append(address_refs["address_refs"])
+            except Exception:
+                # Якщо GeographyService недоступний, продовжуємо без посилань
+                pass
+            
+            if address_refs_list:
+                parsed_info['address_refs'] = address_refs_list
+            
             # Беремо першу адресу для полів область та місто
             first_address = addresses[0] if addresses else {}
             address_region = first_address.get('region', '')
@@ -2290,9 +2384,431 @@ class ProZorroService:
         _min_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
         excel_data.sort(key=lambda r: r.get('date_updated_ts') or _min_ts, reverse=True)
         
-        # Генеруємо Excel в пам'яті
-        return generate_excel_in_memory(excel_data, fieldnames, column_headers)
+        # Друга вкладка — OLX: оголошення з сайту OLX (структура аналогічна ProZorro)
+        olx_docs = self.olx_listings_repository.get_all_for_export()
+        olx_data = self._prepare_olx_data_for_excel(olx_docs) if olx_docs else []
+        olx_fieldnames = [
+            'date_updated', 'address_region', 'address_city', 'address', 'property_type',
+            'building_area_sqm', 'land_area_ha', 'base_price', 'description', 'listing_url', 'category'
+        ]
+        olx_headers = {
+            'date_updated': 'Дата оновлення',
+            'address_region': 'Область',
+            'address_city': 'Населений пункт',
+            'address': 'Адреса',
+            'property_type': 'Тип нерухомості',
+            'building_area_sqm': 'Площа нерухомості (кв. м.)',
+            'land_area_ha': 'Площа земельної ділянки (га)',
+            'base_price': 'Ціна',
+            'description': 'Опис',
+            'listing_url': 'Посилання',
+            'category': 'Категорія OLX',
+        }
+        sheets = [
+            ('ProZorro', excel_data, fieldnames, column_headers),
+            ('OLX', olx_data, olx_fieldnames, olx_headers),
+        ]
+        return generate_excel_with_sheets(sheets)
+
+    # Стандартні fieldnames та заголовки для експорту (як у «файл за день/тиждень»)
+    STANDARD_EXPORT_FIELDNAMES_PROZORRO = [
+        'date_updated', 'address_region', 'address_city', 'address', 'property_type',
+        'cadastral_number', 'building_area_sqm', 'land_area_ha', 'base_price', 'deposit_amount',
+        'auction_start_date', 'document_submission_deadline',
+        'min_participants_count', 'participants_count', 'arrests_info',
+        'description', 'auction_url', 'classification_code',
+        'is_repeat_auction', 'previous_auctions_links'
+    ]
+    STANDARD_EXPORT_HEADERS_PROZORRO = {
+        'date_updated': 'Дата оновлення', 'address_region': 'Область', 'address_city': 'Населений пункт',
+        'address': 'Адреса', 'property_type': 'Тип нерухомості', 'cadastral_number': 'Кадастровий номер',
+        'building_area_sqm': 'Площа нерухомості (кв. м.)', 'land_area_ha': 'Площа земельної ділянки (га)',
+        'base_price': 'Стартова ціна', 'deposit_amount': 'Розмір взносу', 'auction_start_date': 'Дата торгів',
+        'document_submission_deadline': 'Дата фінальної подачі документів',
+        'min_participants_count': 'Мінімальна кількість учасників', 'participants_count': 'Кількість зареєстрованих учасників',
+        'arrests_info': 'Арешти', 'description': 'Опис', 'auction_url': 'Посилання',
+        'classification_code': 'Код класифікатора', 'is_repeat_auction': 'Повторний аукціон',
+        'previous_auctions_links': 'Посилання на минулі аукціони'
+    }
+    STANDARD_EXPORT_FIELDNAMES_OLX = [
+        'date_updated',
+        'address_region',
+        'address_city',
+        'address',
+        'property_type',
+        'building_area_sqm',
+        'land_area_ha',
+        'base_price',
+        'total_price_uah',
+        'total_price_usd',
+        'price_per_m2_uah',
+        'price_per_m2_usd',
+        'price_per_ha_uah',
+        'price_per_ha_usd',
+        'description',
+        'listing_url',
+        'category',
+    ]
+    STANDARD_EXPORT_HEADERS_OLX = {
+        'date_updated': 'Дата оновлення',
+        'address_region': 'Область',
+        'address_city': 'Населений пункт',
+        'address': 'Адреса',
+        'property_type': 'Тип нерухомості',
+        'building_area_sqm': 'Площа нерухомості (кв. м.)',
+        'land_area_ha': 'Площа земельної ділянки (га)',
+        'base_price': 'Ціна (текст)',
+        'total_price_uah': 'Ціна (грн)',
+        'total_price_usd': 'Ціна (USD)',
+        'price_per_m2_uah': 'Ціна за м² (грн)',
+        'price_per_m2_usd': 'Ціна за м² (USD)',
+        'price_per_ha_uah': 'Ціна за га (грн)',
+        'price_per_ha_usd': 'Ціна за га (USD)',
+        'description': 'Опис',
+        'listing_url': 'Посилання',
+        'category': 'Категорія OLX',
+    }
+    STANDARD_EXPORT_FIELDNAMES_UNIFIED = [
+        'date_updated', 'source', 'source_id', 'status', 'property_type',
+        'building_area_sqm', 'land_area_ha',
+        'address_region', 'address_city', 'address', 'cadastral_numbers',
+        'price_uah', 'price_usd', 'price_per_m2_uah', 'price_per_ha_uah',
+        'title', 'description', 'page_url',
+    ]
+    STANDARD_EXPORT_HEADERS_UNIFIED = {
+        'date_updated': 'Дата оновлення', 'source': 'Джерело', 'source_id': 'ID в джерелі',
+        'status': 'Статус', 'property_type': 'Тип нерухомості',
+        'building_area_sqm': 'Площа (м²)', 'land_area_ha': 'Площа (га)',
+        'address_region': 'Область', 'address_city': 'Населений пункт', 'address': 'Адреса',
+        'cadastral_numbers': 'Кадастрові номери', 'price_uah': 'Ціна (грн)', 'price_usd': 'Ціна (USD)',
+        'price_per_m2_uah': 'Ціна за м² (грн)', 'price_per_ha_uah': 'Ціна за га (грн)',
+        'title': 'Заголовок', 'description': 'Опис', 'page_url': 'Посилання',
+    }
+
+    def get_standard_sheet_data_for_export(
+        self, ids: List[str], collection: str
+    ) -> Optional[tuple]:
+        """
+        Повертає дані для одного аркуша Excel у стандартному форматі (як «файл за день/тиждень»).
+        collection: 'prozorro_auctions' або 'olx_listings'.
+        Returns: (rows, fieldnames, column_headers) або None.
+        """
+        if not ids:
+            rows_prozorro = [{self.STANDARD_EXPORT_FIELDNAMES_PROZORRO[0]: 'Немає даних за вказаний період'}]
+            rows_olx = [{self.STANDARD_EXPORT_FIELDNAMES_OLX[0]: 'Немає даних за вказаний період'}]
+            rows_unified = [{self.STANDARD_EXPORT_FIELDNAMES_UNIFIED[0]: 'Немає даних за вказаний період'}]
+            if collection == 'prozorro_auctions':
+                return (rows_prozorro, self.STANDARD_EXPORT_FIELDNAMES_PROZORRO, self.STANDARD_EXPORT_HEADERS_PROZORRO)
+            if collection == 'olx_listings':
+                return (rows_olx, self.STANDARD_EXPORT_FIELDNAMES_OLX, self.STANDARD_EXPORT_HEADERS_OLX)
+            if collection == 'unified_listings':
+                return (rows_unified, self.STANDARD_EXPORT_FIELDNAMES_UNIFIED, self.STANDARD_EXPORT_HEADERS_UNIFIED)
+            return None
+        if collection == 'prozorro_auctions':
+            docs = self.auctions_repository.get_by_ids(ids)
+            if not docs:
+                return (
+                    [{self.STANDARD_EXPORT_FIELDNAMES_PROZORRO[0]: 'Немає даних за вказаний період'}],
+                    self.STANDARD_EXPORT_FIELDNAMES_PROZORRO,
+                    self.STANDARD_EXPORT_HEADERS_PROZORRO,
+                )
+            auctions = []
+            for d in docs:
+                ad = d.get('auction_data')
+                if ad:
+                    try:
+                        auctions.append(AuctionDTO.from_dict(ad))
+                    except Exception:
+                        continue
+            if not auctions:
+                return (
+                    [{self.STANDARD_EXPORT_FIELDNAMES_PROZORRO[0]: 'Немає даних'}],
+                    self.STANDARD_EXPORT_FIELDNAMES_PROZORRO,
+                    self.STANDARD_EXPORT_HEADERS_PROZORRO,
+                )
+            data = self._prepare_auctions_data_for_excel(auctions, skip_llm=False)
+            _min_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            data.sort(key=lambda r: r.get('date_updated_ts') or _min_ts, reverse=True)
+            rows = [{k: r.get(k, '') for k in self.STANDARD_EXPORT_FIELDNAMES_PROZORRO} for r in data]
+            return (rows, self.STANDARD_EXPORT_FIELDNAMES_PROZORRO, self.STANDARD_EXPORT_HEADERS_PROZORRO)
+        if collection == 'olx_listings':
+            docs = self.olx_listings_repository.get_by_ids(ids)
+            if not docs:
+                return (
+                    [{self.STANDARD_EXPORT_FIELDNAMES_OLX[0]: 'Немає даних за вказаний період'}],
+                    self.STANDARD_EXPORT_FIELDNAMES_OLX,
+                    self.STANDARD_EXPORT_HEADERS_OLX,
+                )
+            _min_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            docs.sort(key=lambda d: d.get('updated_at') or _min_dt, reverse=True)
+            data = self._prepare_olx_data_for_excel(docs)
+            rows = [{k: r.get(k, '') for k in self.STANDARD_EXPORT_FIELDNAMES_OLX} for r in data]
+            return (rows, self.STANDARD_EXPORT_FIELDNAMES_OLX, self.STANDARD_EXPORT_HEADERS_OLX)
+        if collection == 'unified_listings':
+            docs = self.unified_listings_repository.get_by_ids(ids)
+            if not docs:
+                return (
+                    [{self.STANDARD_EXPORT_FIELDNAMES_UNIFIED[0]: 'Немає даних за вказаний період'}],
+                    self.STANDARD_EXPORT_FIELDNAMES_UNIFIED,
+                    self.STANDARD_EXPORT_HEADERS_UNIFIED,
+                )
+            _min_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            docs.sort(key=lambda d: d.get('source_updated_at') or d.get('system_updated_at') or _min_dt, reverse=True)
+            data = self._prepare_unified_data_for_excel(docs)
+            rows = [{k: r.get(k, '') for k in self.STANDARD_EXPORT_FIELDNAMES_UNIFIED} for r in data]
+            return (rows, self.STANDARD_EXPORT_FIELDNAMES_UNIFIED, self.STANDARD_EXPORT_HEADERS_UNIFIED)
+        return None
+
+    def get_standard_sheet_data_for_export_from_docs(
+        self, docs: List[Dict[str, Any]], source_collection: str
+    ) -> Optional[tuple]:
+        """
+        Повертає дані для одного аркуша Excel у стандартному форматі з уже отриманих документів
+        (наприклад із тимчасової вибірки агента).
+        source_collection: 'prozorro_auctions', 'olx_listings' або 'unified_listings'.
+        Якщо порожній або невідомий — використовується unified_listings (зведена таблиця).
+        Returns: (rows, fieldnames, column_headers) або None.
+        """
+        coll = (source_collection or "").strip() or "unified_listings"
+        if not docs:
+            if coll == 'prozorro_auctions':
+                rows = [{self.STANDARD_EXPORT_FIELDNAMES_PROZORRO[0]: 'Немає даних за вказаний період'}]
+                return (rows, self.STANDARD_EXPORT_FIELDNAMES_PROZORRO, self.STANDARD_EXPORT_HEADERS_PROZORRO)
+            if coll == 'olx_listings':
+                rows = [{self.STANDARD_EXPORT_FIELDNAMES_OLX[0]: 'Немає даних за вказаний період'}]
+                return (rows, self.STANDARD_EXPORT_FIELDNAMES_OLX, self.STANDARD_EXPORT_HEADERS_OLX)
+            if coll == 'unified_listings':
+                rows = [{self.STANDARD_EXPORT_FIELDNAMES_UNIFIED[0]: 'Немає даних за вказаний період'}]
+                return (rows, self.STANDARD_EXPORT_FIELDNAMES_UNIFIED, self.STANDARD_EXPORT_HEADERS_UNIFIED)
+            return None
+        if coll == 'prozorro_auctions':
+            auctions = []
+            for d in docs:
+                ad = d.get('auction_data')
+                if ad:
+                    try:
+                        auctions.append(AuctionDTO.from_dict(ad))
+                    except Exception:
+                        continue
+            if not auctions:
+                return (
+                    [{self.STANDARD_EXPORT_FIELDNAMES_PROZORRO[0]: 'Немає даних'}],
+                    self.STANDARD_EXPORT_FIELDNAMES_PROZORRO,
+                    self.STANDARD_EXPORT_HEADERS_PROZORRO,
+                )
+            data = self._prepare_auctions_data_for_excel(auctions, skip_llm=False)
+            _min_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            data.sort(key=lambda r: r.get('date_updated_ts') or _min_ts, reverse=True)
+            rows = [{k: r.get(k, '') for k in self.STANDARD_EXPORT_FIELDNAMES_PROZORRO} for r in data]
+            return (rows, self.STANDARD_EXPORT_FIELDNAMES_PROZORRO, self.STANDARD_EXPORT_HEADERS_PROZORRO)
+        if coll == 'olx_listings':
+            _min_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            docs_sorted = sorted(docs, key=lambda d: d.get('updated_at') or _min_dt, reverse=True)
+            data = self._prepare_olx_data_for_excel(docs_sorted)
+            rows = [{k: r.get(k, '') for k in self.STANDARD_EXPORT_FIELDNAMES_OLX} for r in data]
+            return (rows, self.STANDARD_EXPORT_FIELDNAMES_OLX, self.STANDARD_EXPORT_HEADERS_OLX)
+        if coll == 'unified_listings':
+            _min_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            docs_sorted = sorted(
+                docs,
+                key=lambda d: d.get('source_updated_at') or d.get('system_updated_at') or _min_dt,
+                reverse=True,
+            )
+            data = self._prepare_unified_data_for_excel(docs_sorted)
+            rows = [{k: r.get(k, '') for k in self.STANDARD_EXPORT_FIELDNAMES_UNIFIED} for r in data]
+            return (rows, self.STANDARD_EXPORT_FIELDNAMES_UNIFIED, self.STANDARD_EXPORT_HEADERS_UNIFIED)
+        return None
+
+    def generate_excel_bytes_for_export(
+        self, ids: List[str], collection: str, filename_prefix: str = 'export'
+    ) -> Optional[BytesIO]:
+        """
+        Генерує Excel у стандартному форматі (як «файл за день/тиждень») для заданих ids та collection.
+        Повертає BytesIO або None.
+        """
+        sheet = self.get_standard_sheet_data_for_export(ids, collection)
+        if not sheet:
+            return None
+        rows, fieldnames, column_headers = sheet
+        return generate_excel_in_memory(rows, fieldnames, column_headers)
     
+    def _prepare_olx_data_for_excel(self, olx_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Підготовлює оголошення OLX для Excel у структурі, аналогічній ProZorro.
+        Адреса беруться з detail.resolved_locations (деталізовано: область, місто, вулиця).
+        """
+        def ensure_str(v: Any) -> str:
+            if v is None:
+                return ''
+            return str(v).strip()
+
+        rows = []
+        for doc in olx_docs:
+            url = doc.get('url') or ''
+            search_data = doc.get('search_data') or {}
+            detail = doc.get('detail') or {}
+            updated_at = doc.get('updated_at')
+
+            date_updated = ''
+            if updated_at:
+                try:
+                    if hasattr(updated_at, 'strftime'):
+                        date_updated = format_datetime_display(updated_at, '%d.%m.%Y %H:%M')
+                    else:
+                        date_updated = ensure_str(updated_at)
+                except Exception:
+                    date_updated = ensure_str(updated_at)
+
+            address_region = ''
+            address_city = ''
+            address = ''
+            resolved = detail.get('resolved_locations') or []
+            if resolved:
+                first = resolved[0]
+                results = first.get('results') or []
+                if results:
+                    r0 = results[0]
+                    addr_struct = r0.get('address_structured') or {}
+                    address_region = ensure_str(addr_struct.get('region', ''))
+                    address_city = ensure_str(addr_struct.get('city', ''))
+                    street = ensure_str(addr_struct.get('street', ''))
+                    street_number = ensure_str(addr_struct.get('street_number', ''))
+                    if address_region or address_city or street:
+                        address = ', '.join(p for p in [address_region, address_city, street, street_number] if p)
+                    if not address:
+                        address = ensure_str(r0.get('formatted_address', ''))
+
+            if not address:
+                address = ensure_str(search_data.get('location', ''))
+
+            llm = detail.get('llm') or {}
+            property_type = ensure_str(llm.get('property_type', ''))
+            if not property_type:
+                params = detail.get('parameters') or []
+                for p in params:
+                    if isinstance(p, dict):
+                        lb = (p.get('label') or '').lower()
+                        if 'тип' in lb or 'призначення' in lb:
+                            property_type = ensure_str(p.get('value', ''))
+                            break
+
+            building_area_sqm = ''
+            land_area_ha = ''
+            if llm.get('building_area_sqm') is not None:
+                try:
+                    building_area_sqm = str(float(str(llm.get('building_area_sqm', '')).replace(',', '.')))
+                except (ValueError, TypeError):
+                    pass
+            if llm.get('land_area_ha') is not None:
+                try:
+                    land_area_ha = str(float(str(llm.get('land_area_ha', '')).replace(',', '.')))
+                except (ValueError, TypeError):
+                    pass
+            if not building_area_sqm and not land_area_ha:
+                area_m2 = search_data.get('area_m2')
+                if area_m2 is not None:
+                    try:
+                        building_area_sqm = str(float(str(area_m2).replace(',', '.')))
+                    except (ValueError, TypeError):
+                        pass
+
+            price_text = ensure_str(search_data.get('price_text', ''))
+            price_value = search_data.get('price_value')
+            base_price = price_text or (str(price_value) if price_value is not None else '')
+
+            description = ensure_str(detail.get('description', ''))
+            if not description:
+                description = ensure_str(search_data.get('title', ''))
+
+            # Цінові метрики, розраховані при завантаженні OLX (detail.price_metrics)
+            price_metrics = detail.get('price_metrics') or {}
+
+            rows.append({
+                'date_updated': date_updated,
+                'address_region': address_region,
+                'address_city': address_city,
+                'address': address,
+                'property_type': property_type,
+                'building_area_sqm': building_area_sqm,
+                'land_area_ha': land_area_ha,
+                'base_price': base_price,
+                'total_price_uah': price_metrics.get('total_price_uah'),
+                'total_price_usd': price_metrics.get('total_price_usd'),
+                'price_per_m2_uah': price_metrics.get('price_per_m2_uah'),
+                'price_per_m2_usd': price_metrics.get('price_per_m2_usd'),
+                'price_per_ha_uah': price_metrics.get('price_per_ha_uah'),
+                'price_per_ha_usd': price_metrics.get('price_per_ha_usd'),
+                'description': description,
+                'listing_url': url,
+                'category': ensure_str(doc.get('category_label', '')),
+            })
+        return rows
+
+    def _prepare_unified_data_for_excel(self, unified_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Підготовлює зведені оголошення (unified_listings) для Excel.
+        """
+        def ensure_str(v: Any) -> str:
+            if v is None:
+                return ''
+            if isinstance(v, list):
+                return ', '.join(str(x) for x in v if x)
+            return str(v).strip()
+
+        rows = []
+        for doc in unified_docs:
+            updated_at = doc.get('source_updated_at') or doc.get('system_updated_at')
+            date_updated = ''
+            if updated_at:
+                try:
+                    if hasattr(updated_at, 'strftime'):
+                        date_updated = format_datetime_display(updated_at, '%d.%m.%Y %H:%M')
+                    else:
+                        date_updated = ensure_str(updated_at)
+                except Exception:
+                    date_updated = ensure_str(updated_at)
+
+            addresses = doc.get('addresses') or []
+            if isinstance(addresses, dict):
+                addresses = [addresses] if addresses else []
+            elif not isinstance(addresses, list):
+                addresses = []
+            addr_region = ''
+            addr_city = ''
+            addr = ''
+            if addresses and isinstance(addresses[0], dict):
+                first = addresses[0]
+                addr_region = ensure_str(first.get('region', ''))
+                addr_city = ensure_str(first.get('settlement', ''))
+                addr = ensure_str(first.get('formatted_address', ''))
+                if not addr and (addr_region or addr_city):
+                    addr = ', '.join(p for p in [addr_region, addr_city] if p)
+
+            cadastral = doc.get('cadastral_numbers') or []
+            cadastral_str = ', '.join(str(c) for c in cadastral) if isinstance(cadastral, list) else ''
+
+            rows.append({
+                'date_updated': date_updated,
+                'source': ensure_str(doc.get('source', '')),
+                'source_id': ensure_str(doc.get('source_id', '')),
+                'status': ensure_str(doc.get('status', '')),
+                'property_type': ensure_str(doc.get('property_type', '')),
+                'building_area_sqm': doc.get('building_area_sqm'),
+                'land_area_ha': doc.get('land_area_ha'),
+                'address_region': addr_region,
+                'address_city': addr_city,
+                'address': addr,
+                'cadastral_numbers': cadastral_str,
+                'price_uah': doc.get('price_uah'),
+                'price_usd': doc.get('price_usd'),
+                'price_per_m2_uah': doc.get('price_per_m2_uah'),
+                'price_per_ha_uah': doc.get('price_per_ha_uah'),
+                'title': ensure_str(doc.get('title', '')),
+                'description': ensure_str(doc.get('description', '')),
+                'page_url': ensure_str(doc.get('page_url', '')),
+            })
+        return rows
+
     def _prepare_auctions_data_for_excel_with_hashes(
         self,
         auctions_with_hashes: List[tuple]
@@ -3494,32 +4010,36 @@ class ProZorroService:
                 'error': str(e)
             }
 
-    def get_auction_details(self, auction_id: str) -> Dict[str, Any]:
+    def get_auction_details(self, auction_id: str, proc_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Отримує детальну інформацію по конкретному аукціону.
 
         Endpoint (ProZorro.Sale): GET {base}/procedures/{id}
-        Використовуємо procedure.prozorro.sale API для отримання деталей.
+        API procedure.prozorro.sale очікує _id (MongoDB ObjectId), а НЕ auctionId (LSE001-UA-...).
+        Якщо є proc_id з auction_data._id — використовуємо його.
 
         Args:
-            auction_id: Ідентифікатор аукціону
+            auction_id: Ідентифікатор аукціону (auctionId, для fallback)
+            proc_id: Ідентифікатор процедури в API (_id з auction_data), має пріоритет
 
         Returns:
             Dict[str, Any]: Повна відповідь API у вигляді JSON (dict)
         """
-        if not auction_id:
-            raise ValueError("auction_id is required")
+        # API очікує _id (24-символьний hex), не auctionId (LSE001-UA-...)
+        effective_id = proc_id if proc_id else auction_id
+        if not effective_id:
+            raise ValueError("auction_id or proc_id is required")
 
-        # Використовуємо procedure.prozorro.sale API для отримання деталей
-        # Це той самий базовий URL, що використовується для пошуку
-        url = f'{self.settings.prozorro_sale_search_api_base_url}/procedures/{auction_id}'
+        url = f'{self.settings.prozorro_sale_search_api_base_url}/procedures/{effective_id}'
         response = self.session.get(
             url,
             timeout=self.settings.prozorro_api_timeout
         )
-        # Перевіряємо статус вручну, щоб не виводити помилки для 404
+        # Перевіряємо статус вручну: 404 — процедура не знайдена; 422 — недоступна (архів тощо)
         if response.status_code == 404:
             raise requests.exceptions.HTTPError(f"404 Client Error: Not Found for url: {url}", response=response)
+        if response.status_code == 422:
+            raise requests.exceptions.HTTPError(f"422 Client Error: Unprocessable Entity for url: {url}", response=response)
         response.raise_for_status()
         return response.json()
     
@@ -3584,6 +4104,7 @@ class ProZorroService:
         skipped_count = 0
         errors_count = 0
         not_found_count = 0
+        unprocessable_count = 0  # 422 — процедура недоступна в API
         llm_requests_count = 0
         
         # Прогрес-бар для оновлення
@@ -3602,10 +4123,16 @@ class ProZorroService:
             if not auction_id:
                 update_progress.update(1)
                 continue
+            # API очікує _id (ObjectId), не auctionId
+            proc_id = None
+            ad = auction_doc.get('auction_data') or {}
+            if isinstance(ad.get('_id'), str):
+                proc_id = ad['_id']
+            elif ad.get('_id') is not None:
+                proc_id = str(ad['_id'])
             
             try:
-                # Отримуємо актуальні дані з API
-                auction_data = self.get_auction_details(auction_id)
+                auction_data = self.get_auction_details(auction_id, proc_id=proc_id)
                 
                 # Конвертуємо в AuctionDTO для зручності
                 auction_dto = AuctionDTO.from_dict(auction_data)
@@ -3651,7 +4178,8 @@ class ProZorroService:
                     description_hash=new_description_hash,
                     last_updated=datetime.now(timezone.utc)
                 )
-                
+                self._sync_auction_to_unified(auction_id)
+
                 # Якщо статус став неактивним - просто оновлюємо дані, подальшу обробку опускаємо
                 # ГАРАНТОВАНО не викликаємо LLM для неактивних аукціонів
                 if not is_still_active:
@@ -3673,11 +4201,13 @@ class ProZorroService:
                 
             except requests.exceptions.HTTPError as e:
                 if e.response and e.response.status_code == 404:
-                    # Аукціон більше не існує в API
                     not_found_count += 1
                     update_progress.update(1)
+                elif e.response and e.response.status_code == 422:
+                    # 422 Unprocessable Entity — процедура недоступна (архівована, змінена схема тощо)
+                    unprocessable_count += 1
+                    update_progress.update(1)
                 else:
-                    # Інші HTTP помилки
                     errors_count += 1
                     update_progress.update(1)
                     update_progress.write(f"Помилка при отриманні аукціону {auction_id}: {e}")
@@ -3693,6 +4223,7 @@ class ProZorroService:
         print(f"  Оновлено: {updated_count}")
         print(f"  Пропущено (без змін): {skipped_count}")
         print(f"  Не знайдено в API (404): {not_found_count}")
+        print(f"  Недоступні в API (422): {unprocessable_count}")
         print(f"  Помилок: {errors_count}")
         print(f"  Викликів LLM: {llm_requests_count}")
         
@@ -3701,6 +4232,7 @@ class ProZorroService:
             'skipped_count': skipped_count,
             'errors_count': errors_count,
             'not_found_count': not_found_count,
+            'unprocessable_count': unprocessable_count,
             'llm_requests_count': llm_requests_count,
             'total_count': total_count
         }
@@ -3732,6 +4264,7 @@ class ProZorroService:
         
         errors_count = 0
         not_found_count = 0
+        unprocessable_count = 0
         
         # Прогрес-бар для оновлення
         from tqdm import tqdm
@@ -3750,10 +4283,15 @@ class ProZorroService:
             if not auction_id:
                 update_progress.update(1)
                 continue
+            proc_id = None
+            ad = auction_doc.get('auction_data') or {}
+            if isinstance(ad.get('_id'), str):
+                proc_id = ad['_id']
+            elif ad.get('_id') is not None:
+                proc_id = str(ad['_id'])
             
             try:
-                # Отримуємо актуальні дані з API
-                auction_data = self.get_auction_details(auction_id)
+                auction_data = self.get_auction_details(auction_id, proc_id=proc_id)
                 
                 # Конвертуємо в AuctionDTO
                 auction_dto = AuctionDTO.from_dict(auction_data)
@@ -3764,20 +4302,18 @@ class ProZorroService:
                 
             except requests.exceptions.HTTPError as e:
                 if e.response and e.response.status_code == 404:
-                    # Аукціон більше не існує в API - це нормальна ситуація, не виводимо помилку
                     not_found_count += 1
                     update_progress.update(1)
-                    # Не виводимо помилку для 404 - це нормальна ситуація
+                elif e.response and e.response.status_code == 422:
+                    unprocessable_count += 1
+                    update_progress.update(1)
                 else:
-                    # Інші HTTP помилки
                     errors_count += 1
                     update_progress.update(1)
-                    # Виводимо помилку через tqdm.write, щоб не порушувати прогрес-бар
                     update_progress.write(f"Помилка при отриманні аукціону {auction_id}: {e}")
             except Exception as e:
                 errors_count += 1
                 update_progress.update(1)
-                # Виводимо помилку через tqdm.write, щоб не порушувати прогрес-бар
                 update_progress.write(f"Помилка при оновленні аукціону {auction_id}: {e}")
         
         update_progress.close()
@@ -3793,6 +4329,7 @@ class ProZorroService:
         print(f"  Всього перевірено: {total_count}")
         print(f"  Успішно оновлено: {len(updated_auctions)}")
         print(f"  Не знайдено в API (404): {not_found_count}")
+        print(f"  Недоступні в API (422): {unprocessable_count}")
         print(f"  Помилок: {errors_count}")
         
         return {
@@ -3863,9 +4400,13 @@ class ProZorroService:
 
             for idx, auction in enumerate(auctions, start=1):
                 auction_id = auction.id
+                proc_id = None
+                if auction.data:
+                    pid = auction.data.get('_id')
+                    proc_id = pid if isinstance(pid, str) else (str(pid) if pid is not None else None)
                 try:
                     _render_progress(idx)
-                    details = self.get_auction_details(auction_id)
+                    details = self.get_auction_details(auction_id, proc_id=proc_id)
                     detailed_auctions.append(details)
                 except requests.exceptions.RequestException as e:
                     errors.append({

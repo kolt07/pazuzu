@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Pazuzu</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="root">
+    <header class="header">
+      <div class="header-row">
+        <button type="button" id="sidebar-toggle" class="btn-sidebar-toggle hidden" title="Історія чатів">☰</button>
+        <h1 class="title">Pazuzu</h1>
+      </div>
+      <nav class="nav" id="nav"></nav>
+    </header>
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+    <div class="app-body">
+      <aside id="chat-sidebar" class="sidebar hidden">
+        <div class="sidebar-header">
+          <div class="sidebar-header-row">
+            <button type="button" id="sidebar-new-chat" class="btn btn-primary btn-small">+ Новий чат</button>
+            <button type="button" id="sidebar-collapse-btn" class="btn-sidebar-toggle" title="Згорнути">‹</button>
+          </div>
+        </div>
+        <div id="chat-history-list" class="chat-history-list"></div>
+      </aside>
+      <main class="main" id="main">
+        <div id="screen-loading">Завантаження...</div>
+        <div id="screen-error" class="hidden"></div>
+        <div id="screen-home" class="hidden">
+          <p class="intro">Напишіть повідомлення — відповість LLM-асистент.</p>
+          <section class="chat-section">
+            <div id="chat-listing-pinned" class="chat-listing-pinned hidden"></div>
+            <div id="chat-messages" class="chat-messages"></div>
+            <div class="chat-input-wrap">
+              <textarea id="chat-input" rows="2" placeholder="Ваш запит..."></textarea>
+              <div class="chat-send-row">
+                <button type="button" id="chat-send" class="btn btn-primary">Надіслати</button>
+                <button type="button" id="chat-stop" class="btn btn-danger hidden">Стоп</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      <div id="screen-admin" class="hidden">
+        <h2>Адміністрування</h2>
+        <div class="admin-block">
+          <h3>Додати користувача / адміністратора</h3>
+          <input type="number" id="admin-add-user-id" placeholder="Telegram ID" />
+          <input type="text" id="admin-add-nickname" placeholder="Псевдонім" />
+          <select id="admin-add-role">
+            <option value="user">Користувач</option>
+            <option value="admin">Адміністратор</option>
+          </select>
+          <button type="button" id="admin-add-btn" class="btn">Додати</button>
+        </div>
+        <div class="admin-block">
+          <h3>Заблокувати користувача</h3>
+          <input type="number" id="admin-block-user-id" placeholder="Telegram ID" />
+          <button type="button" id="admin-block-btn" class="btn btn-danger">Заблокувати</button>
+        </div>
+        <div class="admin-block">
+          <h3>Оновлення даних</h3>
+          <p class="admin-hint">Запустити оновлення з ProZorro та OLX. Прогрес відображається нижче.</p>
+          <div class="admin-data-update-actions">
+            <button type="button" id="admin-data-update-1" class="btn" data-days="1">Оновити за 1 день</button>
+            <button type="button" id="admin-data-update-7" class="btn" data-days="7">Оновити за 7 днів</button>
+          </div>
+          <div id="admin-data-update-status" class="admin-data-update-status hidden"></div>
+        </div>
+        <div class="admin-block">
+          <h3>Аналітика цін</h3>
+          <p class="admin-hint">Перерахувати зведену аналітику (квартилі, середні ціни по містах). Виконується автоматично після оновлення даних.</p>
+          <button type="button" id="admin-rebuild-analytics" class="btn">Перерахувати аналітику</button>
+          <span id="admin-analytics-status" class="admin-hint"></span>
+        </div>
+        <div class="admin-block admin-collapsible">
+          <h3 class="admin-collapsible-header">
+            <button type="button" class="btn-toggle admin-collapsible-toggle" id="admin-scheduler-toggle" aria-expanded="false">▼</button>
+            Планувальник
+          </h3>
+          <div id="admin-scheduler-content" class="admin-collapsible-content collapsed">
+            <p class="admin-hint">Планування автоматичного оновлення даних з ProZorro та OLX. Події виконуються ботом при його роботі. Зміни застосовуються після перезапуску бота.</p>
+            <div id="admin-scheduler-events" class="admin-scheduler-events"></div>
+            <div class="admin-scheduler-form">
+              <h4>Додати планове оновлення</h4>
+              <div class="admin-scheduler-fields">
+                <div class="filter-group">
+                  <label>Час (год:хв):</label>
+                  <select id="scheduler-hour" class="filter-select">
+                    <option value="0">00</option><option value="1">01</option><option value="2">02</option><option value="3">03</option><option value="4">04</option><option value="5">05</option><option value="6" selected>06</option><option value="7">07</option><option value="8">08</option><option value="9">09</option>
+                    <option value="10">10</option><option value="11">11</option><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option><option value="17">17</option><option value="18">18</option><option value="19">19</option>
+                    <option value="20">20</option><option value="21">21</option><option value="22">22</option><option value="23">23</option>
+                  </select>
+                  :
+                  <select id="scheduler-minute" class="filter-select">
+                    <option value="0" selected>00</option><option value="15">15</option><option value="30">30</option><option value="45">45</option>
+                  </select>
+                </div>
+                <div class="filter-group">
+                  <label>Період даних:</label>
+                  <select id="scheduler-days" class="filter-select">
+                    <option value="1">За 1 день</option>
+                    <option value="7" selected>За 7 днів</option>
+                  </select>
+                </div>
+                <div class="filter-group">
+                  <label>Джерела:</label>
+                  <select id="scheduler-sources" class="filter-select">
+                    <option value="all" selected>ProZorro + OLX</option>
+                    <option value="prozorro">Тільки ProZorro</option>
+                    <option value="olx">Тільки OLX</option>
+                  </select>
+                </div>
+                <button type="button" id="admin-scheduler-add" class="btn btn-primary">Додати</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="admin-block">
+          <h3>ProZorro: налаштування</h3>
+          <button type="button" id="admin-download-prozorro" class="btn">Отримати файл конфігурації</button>
+          <input type="file" id="admin-upload-prozorro" accept=".yaml,.yml" class="hidden" />
+          <button type="button" id="admin-upload-prozorro-btn" class="btn">Завантажити YAML</button>
+        </div>
+      </div>
+      <div id="screen-files" class="hidden">
+        <h2>Звіти</h2>
+        <p>Мої шаблони звітів:</p>
+        <div id="report-templates-list" class="report-templates-list"></div>
+        <button type="button" id="report-add-template" class="btn btn-primary">+ Новий шаблон</button>
+        <div id="files-report-link-wrap" class="hidden file-download-link-wrap"></div>
+        <div id="files-generate-status" class="hidden status-box"></div>
+      </div>
+      <div id="report-constructor-modal" class="modal hidden">
+        <div class="modal-content report-constructor">
+          <h3>Конструктор шаблону звіту</h3>
+          <div class="constructor-fields">
+            <div class="filter-group">
+              <label>Джерело даних <span class="required">*</span>:</label>
+              <select id="constructor-source" class="filter-select">
+                <option value="">OLX + ProZorro</option>
+                <option value="olx">OLX</option>
+                <option value="prozorro">ProZorro</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label>Період <span class="required">*</span>:</label>
+              <select id="constructor-date-filter" class="filter-select">
+                <option value="1">За добу</option>
+                <option value="7" selected>За тиждень</option>
+                <option value="30">За 30 днів</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label>Область:</label>
+              <div class="filter-input-wrapper">
+                <input type="text" id="constructor-region" class="filter-input" placeholder="Оберіть область..." />
+                <div id="constructor-region-dropdown" class="filter-dropdown hidden"></div>
+              </div>
+            </div>
+            <div class="filter-group">
+              <label>Місто:</label>
+              <div class="filter-input-wrapper">
+                <input type="text" id="constructor-city" class="filter-input" placeholder="Всі міста" />
+                <div id="constructor-city-dropdown" class="filter-dropdown hidden"></div>
+              </div>
+            </div>
+            <div class="filter-group">
+              <label>Тип:</label>
+              <select id="constructor-property-type" class="filter-select">
+                <option value="">Всі</option>
+                <option value="neruhomist">Нерухомість</option>
+                <option value="zemelna_dilyanka">ЗД</option>
+                <option value="zemelna_dilyanka_z_neruhomistyu">ЗД+Нерухомість</option>
+                <option value="inshe">Інше</option>
+              </select>
+            </div>
+            <div class="filter-group price-filter">
+              <label>Ціна:</label>
+              <select id="constructor-price-op" class="filter-select">
+                <option value="">--</option>
+                <option value="gte">≥</option>
+                <option value="lte">≤</option>
+              </select>
+              <input type="number" id="constructor-price-value" class="filter-input" placeholder="0" min="0" />
+              <select id="constructor-price-currency" class="filter-select">
+                <option value="uah" selected>грн</option>
+                <option value="usd">$</option>
+              </select>
+            </div>
+            <div class="filter-group price-filter">
+              <label>Ціна за м²:</label>
+              <select id="constructor-price-m2-op" class="filter-select">
+                <option value="">--</option>
+                <option value="gte">≥</option>
+                <option value="lte">≤</option>
+              </select>
+              <input type="number" id="constructor-price-m2-value" class="filter-input" placeholder="0" min="0" />
+              <select id="constructor-price-m2-currency" class="filter-select">
+                <option value="uah" selected>грн</option>
+                <option value="usd">$</option>
+              </select>
+            </div>
+            <div class="filter-group price-filter">
+              <label>Ціна за га:</label>
+              <select id="constructor-price-ha-op" class="filter-select">
+                <option value="">--</option>
+                <option value="gte">≥</option>
+                <option value="lte">≤</option>
+              </select>
+              <input type="number" id="constructor-price-ha-value" class="filter-input" placeholder="0" min="0" />
+              <select id="constructor-price-ha-currency" class="filter-select">
+                <option value="uah" selected>грн</option>
+                <option value="usd">$</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label>Сортування:</label>
+              <select id="constructor-sort-field" class="filter-select">
+                <option value="source_updated_at" selected>За оновленням</option>
+                <option value="price">За ціною</option>
+                <option value="title">За назвою</option>
+              </select>
+              <select id="constructor-sort-order" class="filter-select">
+                <option value="desc" selected>Спадання</option>
+                <option value="asc">Зростання</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label>Формат виводу:</label>
+              <select id="constructor-output-format" class="filter-select">
+                <option value="unified_table" selected>Зведена таблиця</option>
+                <option value="tabs_by_source">Вкладки по джерелах</option>
+              </select>
+            </div>
+            <div class="filter-group name-row">
+              <label>Назва шаблону:</label>
+              <input type="text" id="constructor-name" class="filter-input" placeholder="Назва шаблону" />
+              <button type="button" id="constructor-generate-name" class="btn btn-secondary">Згенерувати</button>
+            </div>
+          </div>
+          <div class="modal-actions">
+            <button type="button" id="constructor-save" class="btn btn-primary">Зберегти шаблон</button>
+            <button type="button" id="constructor-cancel" class="btn btn-secondary">Скасувати</button>
+          </div>
+        </div>
+      </div>
+      <div id="screen-search" class="hidden">
+        <p class="intro intro-search">Зведений пошук оголошень з OLX та ProZorro</p>
+        <div class="search-filters-header">
+          <h3>Фільтри</h3>
+          <button type="button" id="search-filters-toggle" class="btn-toggle">▼</button>
+        </div>
+        <div id="search-filters" class="search-filters search-filters-compact">
+          <div class="filter-group">
+            <label>Джерело:</label>
+            <select id="filter-source" class="filter-select">
+              <option value="">Всі (OLX + ProZorro)</option>
+              <option value="olx">OLX</option>
+              <option value="prozorro">ProZorro</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label>Період:</label>
+            <select id="filter-date" class="filter-select">
+              <option value="">Всі</option>
+              <option value="1">За добу</option>
+              <option value="7">За тиждень</option>
+              <option value="30">За 30 днів</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label>Регіон:</label>
+            <div class="filter-input-wrapper">
+              <input type="text" id="filter-region" class="filter-input" placeholder="Область або м. Київ..." />
+              <div id="filter-region-dropdown" class="filter-dropdown hidden"></div>
+            </div>
+          </div>
+          <div class="filter-group">
+            <label>Місто:</label>
+            <div class="filter-input-wrapper">
+              <input type="text" id="filter-city" class="filter-input" placeholder="Місто..." />
+              <div id="filter-city-dropdown" class="filter-dropdown hidden"></div>
+            </div>
+          </div>
+          <div class="filter-group">
+            <label>Тип:</label>
+            <select id="filter-property-type" class="filter-select">
+              <option value="">Всі</option>
+              <option value="neruhomist">Нерухомість</option>
+              <option value="zemelna_dilyanka">ЗД</option>
+              <option value="zemelna_dilyanka_z_neruhomistyu">ЗД+нерухомість</option>
+              <option value="inshe">інше</option>
+            </select>
+          </div>
+          <div class="filter-group filter-inline">
+            <label>Ціна:</label>
+            <div class="filter-inline-row">
+              <select id="filter-price-op" class="filter-select filter-select-narrow">
+                <option value="">--</option>
+                <option value="eq">=</option>
+                <option value="gte">≥</option>
+                <option value="lte">≤</option>
+              </select>
+              <input type="number" id="filter-price-value" class="filter-input filter-input-narrow" placeholder="0" min="0" step="0.01" />
+            </div>
+          </div>
+          <div class="filter-group filter-inline">
+            <label>Площа (м²):</label>
+            <div class="filter-inline-row">
+              <select id="filter-building-area-op" class="filter-select filter-select-narrow">
+                <option value="">--</option>
+                <option value="eq">=</option>
+                <option value="gte">≥</option>
+                <option value="lte">≤</option>
+              </select>
+              <input type="number" id="filter-building-area-value" class="filter-input filter-input-narrow" placeholder="0" min="0" step="0.01" />
+            </div>
+          </div>
+          <div class="filter-group filter-inline">
+            <label>Площа (га):</label>
+            <div class="filter-inline-row">
+              <select id="filter-land-area-op" class="filter-select filter-select-narrow">
+                <option value="">--</option>
+                <option value="eq">=</option>
+                <option value="gte">≥</option>
+                <option value="lte">≤</option>
+              </select>
+              <input type="number" id="filter-land-area-value" class="filter-input filter-input-narrow" placeholder="0" min="0" step="0.01" />
+            </div>
+          </div>
+          <div class="filter-group filter-actions">
+            <button type="button" id="search-apply-filters" class="btn btn-primary btn-small">Застосувати</button>
+            <button type="button" id="search-clear-filters" class="btn btn-secondary btn-small">Очистити</button>
+          </div>
+        </div>
+        <div class="search-controls-row">
+          <div class="search-sort-header">
+            <label>Сортування:</label>
+            <select id="search-sort-field" class="filter-select">
+              <option value="source_updated_at">За датою</option>
+              <option value="price">За ціною</option>
+              <option value="title">За назвою</option>
+            </select>
+            <select id="search-sort-order" class="filter-select">
+              <option value="desc">Новіші</option>
+              <option value="asc">Старіші</option>
+            </select>
+          </div>
+          <div class="search-actions-row">
+            <button type="button" id="search-save-to-file" class="btn btn-primary btn-small">У файл</button>
+            <button type="button" id="search-save-as-template" class="btn btn-secondary btn-small">Як шаблон</button>
+          </div>
+        </div>
+        <div id="search-results" class="search-results">
+          <div id="search-loading" class="hidden">Завантаження...</div>
+          <div id="search-results-count" class="search-results-count hidden"></div>
+          <div id="search-items" class="search-items"></div>
+          <div id="search-pagination" class="search-pagination"></div>
+        </div>
+      </div>
+      <div id="screen-detail" class="hidden">
+        <button type="button" id="detail-back" class="btn btn-secondary">← Назад</button>
+        <div id="detail-content" class="detail-content"></div>
+      </div>
+      </main>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

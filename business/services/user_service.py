@@ -51,6 +51,20 @@ class UserService:
         
         return user.get('role') == 'admin' and not user.get('is_blocked', False)
     
+    def get_admin_user_ids(self):
+        """
+        Повертає список Telegram user_id усіх адміністраторів (для сповіщень, напр. від агента безпеки).
+
+        Returns:
+            List[int]: Список user_id з role='admin' та не заблокованих
+        """
+        users = self.repository.get_all_users()
+        return [
+            int(u["user_id"])
+            for u in users
+            if u.get("role") == "admin" and not u.get("is_blocked", False)
+        ]
+
     def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
         """
         Отримує інформацію про користувача.

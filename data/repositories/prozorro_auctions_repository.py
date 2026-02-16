@@ -188,6 +188,53 @@ class ProZorroAuctionsRepository(BaseRepository):
         
         return filtered_auctions
     
+    def get_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        Повертає аукціони за списком ідентифікаторів.
+        Ідентифікатор може бути auction_id (рядок API) або _id (ObjectId у вигляді рядка).
+
+        Args:
+            ids: Список auction_id або _id
+
+        Returns:
+            Список документів (порядок може не збігатися з порядком ids)
+        """
+        if not ids:
+            return []
+        from bson import ObjectId
+        by_auction_id = []
+        by_object_id = []
+        for i in ids:
+            s = (i or "").strip()
+            if not s:
+                continue
+            by_auction_id.append(s)
+            if len(s) == 24:
+                try:
+                    by_object_id.append(ObjectId(s))
+                except Exception:
+                    pass
+        criteria = None
+        if by_auction_id and by_object_id:
+            criteria = {"$or": [{"auction_id": {"$in": by_auction_id}}, {"_id": {"$in": by_object_id}}]}
+        elif by_auction_id:
+            criteria = {"auction_id": {"$in": by_auction_id}}
+        elif by_object_id:
+            criteria = {"_id": {"$in": by_object_id}}
+        else:
+            return []
+        self._ensure_indexes()
+        docs = list(self.collection.find(criteria))
+        seen = set()
+        unique = []
+        for d in docs:
+            d["_id"] = str(d["_id"])
+            key = d.get("auction_id") or d.get("_id")
+            if key not in seen:
+                seen.add(key)
+                unique.append(d)
+        return unique
+
     def get_active_auctions(self) -> List[Dict[str, Any]]:
         """
         Отримує всі активні аукціони з бази даних.

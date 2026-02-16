@@ -1,0 +1,76 @@
+---
+description: Правила роботи LLM-агента з вкладеними структурами колекції prozorro_auctions (bids, bidders, address_refs, фінанси)
+alwaysApply: true
+---
+
+# ProZorro: вкладені сутності та правила для агента
+
+Ці правила застосовуються при будь-яких запитах до колекції **prozorro_auctions** (execute_query, execute_aggregation, execute_analytics). Агент має завжди дотримуватись їх, щоб коректно працювати з bids, bidders, address_refs та фінансовими полями.
+
+---
+
+## 1. Заявки та учасники (bids, bidders)
+
+### Що є в документі
+
+- **auction_data.bids** — масив заявок на участь у аукціоні. Кожен елемент — одна заявка (bid).
+- **auction_data.bids[].bidders** — масив учасників у межах однієї заявки. Один bid може містити кілька bidders.
+- **auction_data.bids[].bidders[].identifier.id** — унікальний ідентифікатор учасника (ІПН, ЄДРПОУ тощо).
+
+### Заборонено
+
+- Використовувати поле **auction_data.numberOfBids** — його немає в документах.
+
+### Дозволено / як робити
+
+- **Кількість заявок (bids):** обчислювати через `$addFields`: `bids_count = $size($ifNull("$auction_data.bids", []))`. Потім сортувати/фільтрувати по `bids_count`.
+- **Кількість унікальних учасників:** збирати всі `bids[].bidders[].identifier.id`, потім рахувати унікальні (наприклад через `$setUnion` після `$reduce` по bids та bidders). Не плутати з кількістю заявок: одна заявка може містити кілька bidders, один учасник може бути в кількох заявках — рахувати саме унікальні identifier.id.
+
+---
+
+## 2. Адреси (address_refs)
+
+### Що є в документі
+
+- **auction_data.address_refs** — масив нормалізованих посилань на топоніми (область, місто, вулиця, будинок). Кожен елемент містить об'єкти з полями `_id` та `name` (наприклад `region.name`, `city.name`).
+
+### Як фільтрувати
+
+- За регіоном або містом використовувати **тільки** `$elemMatch` по **auction_data.address_refs**:
+  - область: `{"auction_data.address_refs": {"$elemMatch": {"region.name": "Київська"}}}`
+  - місто: `{"auction_data.address_refs": {"$elemMatch": {"city.name": "Київ"}}}`
+- Якщо address_refs відсутні — fallback: `auction_data.items[].address.region.uk_UA`, `auction_data.items[].address.locality.uk_UA` (в агрегаціях — після $unwind по items).
+
+---
+
+## 3. Фінансові поля
+
+### Стартова ціна
+
+- **auction_data.value.amount** (number, UAH) — стартова ціна аукціону.
+- **auction_data.value.valueAddedTaxIncluded** (boolean) — чи включено ПДВ.
+- Для аналітики, сортування та фільтрації за ціною використовувати саме **auction_data.value.amount**.
+
+### Ціна в заявці (не плутати зі стартовою)
+
+- **auction_data.bids[].value.amount** — запропонована в заявці ціна. Не використовувати як «ціну аукціону».
+
+### Фінальна ціна
+
+- **auction_data.contracts[].value.amount** або **auction_data.awards[].value.amount** — фактична фінальна сума після завершення аукціону.
+
+---
+
+## 4. Предмети аукціону (items)
+
+- **auction_data.items[]** — масив лотів. **Площі** (ProZorro.Sale): пріоритетно **items[].itemProps** — totalObjectArea, totalBuildingArea, usableArea (нерухомість, м²), landArea (земля, га); fallback — **items[].quantity.value** з unit (м²/га). Адреса лоту: **items[].address** (region.uk_UA, locality.uk_UA). Класифікація: **items[].classification.id**.
+- При агрегаціях за регіоном через items: спочатку **$unwind** по **auction_data.items**, потім фільтрувати по **items.address** або використовувати address_refs.
+
+---
+
+## 5. Короткий чеклист для агента
+
+- Топ за кількістю учасників/заявок → $addFields з `bids_count` або унікальними `identifier.id`; ніколи — numberOfBids.
+- Фільтр за областю/містом → $elemMatch по **auction_data.address_refs** (region.name, city.name).
+- Ціна аукціону (стартова) → **auction_data.value.amount**; фінальна → contracts/awards.
+- Дати — **auction_data.dateModified** / **dateCreated** (рядки ISO 8601); порівняння через $gte/$lte рядків.

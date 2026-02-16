@@ -4,17 +4,21 @@
 """
 
 import asyncio
+import concurrent.futures
 import os
 import re
+import threading
+import uuid
 import zipfile
 import tempfile
 import yaml
 import time
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, BotCommand, MenuButtonWebApp, WebAppInfo
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,14 +32,16 @@ from telegram.ext import (
 from config.settings import Settings
 from business.services.prozorro_service import ProZorroService
 from business.services.user_service import UserService
+from scripts.olx_scraper.run_update import run_olx_update
 from business.services.logging_service import LoggingService
-from business.services.langchain_agent_service import LangChainAgentService
+from business.services.multi_agent_service import MultiAgentService
+from business.services.agent_test_runner_service import AgentTestRunnerService
 from utils.file_utils import create_zip_archive
 from utils.date_utils import format_datetime_display
 
 
-# Стани для ConversationHandler
-WAITING_USER_ID, WAITING_NICKNAME, WAITING_CONFIRM_USER, WAITING_BLOCK_USER_ID, WAITING_CONFIRM_BLOCK, WAITING_LLM_QUERY = range(6)
+# Стани для ConversationHandler (адмін-діалоги)
+WAITING_USER_ID, WAITING_NICKNAME, WAITING_CONFIRM_USER, WAITING_BLOCK_USER_ID, WAITING_CONFIRM_BLOCK = range(5)
 
 
 class TelegramBotService:
@@ -52,10 +58,11 @@ class TelegramBotService:
         self.user_service = UserService(settings.telegram_users_config_path)
         self.prozorro_service = ProZorroService(settings)
         self.logging_service = LoggingService()
-        self.llm_agent_service = None  # Ініціалізується при першому використанні
+        self.llm_agent_service = None  # Ініціалізується лише для адмін-тесту агента
         self.application = None
         self._running = False
-        
+        self._bot_loop = None  # event loop бота (для відправки з планувальника)
+
         if not settings.telegram_bot_token:
             raise ValueError("Telegram bot token не вказано в налаштуваннях")
     
@@ -68,67 +75,67 @@ class TelegramBotService:
             return
         
         await self.show_main_menu(update, context)
+
+    async def app_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Команда відкриття та авторизації в Telegram Mini App."""
+        user_id = update.effective_user.id
+        if not self.user_service.is_user_authorized(user_id):
+            await update.message.reply_text(
+                "Ваш користувач не авторизований. Зареєструйтесь у адміністратора — після цього ви зможете відкрити застосунок."
+            )
+            return
+        mini_app_url = (getattr(self.settings, "mini_app_base_url", None) or "").strip()
+        if not mini_app_url:
+            await update.message.reply_text(
+                "Mini App поки не налаштовано (не вказано base_url)."
+            )
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Відкрити застосунок", web_app=WebAppInfo(url=mini_app_url))]
+        ])
+        await update.message.reply_text(
+            "Ви авторизовані. Натисніть кнопку нижче, щоб відкрити застосунок у Telegram:",
+            reply_markup=keyboard,
+        )
     
     async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Показує головне меню."""
+        """Показує головне меню (кнопки швидких дій + адміністрування для адмінів)."""
         user_id = update.effective_user.id
         is_admin = self.user_service.is_admin(user_id)
-        
-        # Отримуємо дати оновлень з БД
-        from data.repositories.app_data_repository import AppDataRepository
-        app_data_repo = AppDataRepository()
-        update_dates = app_data_repo.get_all_update_dates()
-        
-        day_period = ""
-        if update_dates.get('1d'):
-            update_date = update_dates['1d']
-            day_period = f" (оновлено {format_datetime_display(update_date, '%d.%m, %H:%M')})"
-        
-        week_period = ""
-        if update_dates.get('7d'):
-            update_date = update_dates['7d']
-            week_period = f" (оновлено {format_datetime_display(update_date, '%d.%m, %H:%M')})"
-        
-        keyboard = [
-            [KeyboardButton(f"📥 Скачати файл за добу{day_period}")],
-            [KeyboardButton(f"📥 Скачати файл за тиждень{week_period}")],
-            [KeyboardButton("📊 Сформувати файл за добу")],
-            [KeyboardButton("📊 Сформувати файл за тиждень")]
-        ]
-        
+
+        keyboard = []
         if is_admin:
-            keyboard.append([KeyboardButton("🤖 Спитати LLM")])
             keyboard.append([KeyboardButton("⚙️ Адміністрування")])
-        
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        text = "Виберіть дію:"
+
+        text = "Оберіть швидку дію нижче або відкрийте застосунок. Адміністратори можуть використати кнопку нижче."
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True) if keyboard else ReplyKeyboardRemove()
+        inline_kbd = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📊 Звіт за день", callback_data="quick:report_last_day"),
+                InlineKeyboardButton("📈 Звіт за тиждень", callback_data="quick:report_last_week"),
+            ],
+            [InlineKeyboardButton("📥 Експорт даних", callback_data="quick:export_data")],
+        ])
+
         if update.callback_query:
-            msg = await update.callback_query.message.reply_text(text=text, reply_markup=reply_markup)
+            msg = await update.callback_query.message.reply_text(
+                text=text, reply_markup=reply_markup,
+            )
         else:
             msg = await update.message.reply_text(text=text, reply_markup=reply_markup)
+        await msg.reply_text("Швидкі дії:", reply_markup=inline_kbd)
         context.user_data['last_menu_message_id'] = msg.message_id
         context.user_data['last_menu_chat_id'] = msg.chat.id
     
     async def _send_main_menu_to_chat(self, chat_id: int, user_id: int) -> None:
-        """Надсилає головне меню в чат (після завершення фонового завдання)."""
+        """Надсилає головне меню в чат (лише адміністрування для адмінів)."""
         is_admin = self.user_service.is_admin(user_id)
-        from data.repositories.app_data_repository import AppDataRepository
-        app_data_repo = AppDataRepository()
-        update_dates = app_data_repo.get_all_update_dates()
-        day_period = f" (оновлено {format_datetime_display(update_dates['1d'], '%d.%m, %H:%M')})" if update_dates.get('1d') else ""
-        week_period = f" (оновлено {format_datetime_display(update_dates['7d'], '%d.%m, %H:%M')})" if update_dates.get('7d') else ""
-        keyboard = [
-            [KeyboardButton(f"📥 Скачати файл за добу{day_period}")],
-            [KeyboardButton(f"📥 Скачати файл за тиждень{week_period}")],
-            [KeyboardButton("📊 Сформувати файл за добу")],
-            [KeyboardButton("📊 Сформувати файл за тиждень")]
-        ]
+        keyboard = []
         if is_admin:
-            keyboard.append([KeyboardButton("🤖 Спитати LLM")])
             keyboard.append([KeyboardButton("⚙️ Адміністрування")])
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        sent = await self.application.bot.send_message(chat_id=chat_id, text="Виберіть дію:", reply_markup=reply_markup)
+        text = "Оберіть швидку дію або відкрийте застосунок."
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True) if keyboard else ReplyKeyboardRemove()
+        sent = await self.application.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
         if user_id not in self.application.user_data:
             self.application.user_data[user_id] = {}
         self.application.user_data[user_id]['last_menu_message_id'] = sent.message_id
@@ -154,15 +161,7 @@ class TelegramBotService:
 
         text = update.message.text
 
-        if text.startswith("📥 Скачати файл за добу"):
-            await self.handle_get_file(update, context, days=1)
-        elif text.startswith("📥 Скачати файл за тиждень"):
-            await self.handle_get_file(update, context, days=7)
-        elif text == "📊 Сформувати файл за добу":
-            await self.handle_generate_file(update, context, days=1)
-        elif text == "📊 Сформувати файл за тиждень":
-            await self.handle_generate_file_week_confirmation(update, context)
-        elif text == "⚙️ Адміністрування":
+        if text == "⚙️ Адміністрування":
             await self.show_admin_menu(update, context)
         elif text == "🔙 Повернутись":
             await self.show_main_menu(update, context)
@@ -176,12 +175,16 @@ class TelegramBotService:
             await self.handle_get_prozorro_config(update, context)
         elif text == "📤 Завантажити файл налаштувань ProZorro":
             await self.handle_upload_prozorro_config(update, context)
+        elif text == "🔄 Оновити дані за добу":
+            await self._run_data_update(update, context, days=1)
+        elif text == "🔄 Оновити дані за тиждень":
+            await self._run_data_update(update, context, days=7)
+        elif text == "🧪 Тестування агента":
+            await self._run_agent_test(update, context)
         elif text == "✅ Так":
-            # Підтвердження формування файлу за тиждень
             if context.user_data.get('pending_generate_week'):
                 context.user_data.pop('pending_generate_week')
                 await self.handle_generate_file(update, context, days=7)
-                # Повертаємо головне меню, щоб клавіатура змінилась з «Так/Відміна» на основні кнопки
                 await self.show_main_menu(update, context)
             else:
                 await update.message.reply_text("Немає активного запиту на підтвердження.")
@@ -189,7 +192,45 @@ class TelegramBotService:
             context.user_data.pop('pending_generate_week', None)
             await self.show_main_menu(update, context)
         else:
-            await update.message.reply_text("Невідома команда. Використовуйте кнопки меню.")
+            # Логуємо повідомлення, не відповідаємо (LLM-агент використовується лише в застосунку)
+            self.logging_service.log_user_action(
+                user_id=user_id,
+                action="bot_message_received",
+                message=f"Повідомлення в боті: {text[:200]}{'...' if len(text) > 200 else ''}",
+                metadata={"text_length": len(text)},
+            )
+
+    async def handle_quick_action_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обробка натискання кнопок швидких дій (Звіт за день/тиждень, Експорт)."""
+        if not update.callback_query:
+            return
+        user_id = update.effective_user.id
+        if not self.user_service.is_user_authorized(user_id):
+            await update.callback_query.answer("Не авторизовано.")
+            return
+        data = (update.callback_query.data or "").strip()
+        if not data.startswith("quick:"):
+            await update.callback_query.answer()
+            return
+        intent = data.replace("quick:", "")
+        if intent not in ("report_last_day", "report_last_week", "export_data"):
+            await update.callback_query.answer()
+            return
+        await update.callback_query.answer()
+        if intent == "report_last_day":
+            await self.handle_get_file(update, context, days=1)
+        elif intent == "report_last_week":
+            await self.handle_get_file(update, context, days=7)
+        elif intent == "export_data":
+            mini_app_url = (getattr(self.settings, "mini_app_base_url", None) or "").strip()
+            msg = "Експорт даних доступний у застосунку. "
+            if mini_app_url:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Відкрити застосунок", web_app=WebAppInfo(url=mini_app_url))]
+                ])
+                await update.callback_query.message.reply_text(msg + "Натисніть кнопку нижче:", reply_markup=keyboard)
+            else:
+                await update.callback_query.message.reply_text(msg + "Відкрийте застосунок через команду /app.")
     
     async def start_add_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Початок діалогу додавання користувача."""
@@ -439,6 +480,25 @@ class TelegramBotService:
                     }
                 )
                 
+                # Оновлення OLX: нежитлова нерухомість + земельні ділянки
+                try:
+                    await self._send_progress_message(chat_id, "Оновлення оголошень OLX...")
+                    olx_result = await loop.run_in_executor(
+                        None,
+                        lambda: run_olx_update(settings=self.settings, days=days)
+                    )
+                    if olx_result.get("success"):
+                        await self._send_progress_message(
+                            chat_id,
+                            f"OLX: оброблено {olx_result.get('total_listings', 0)} оголошень, "
+                            f"завантажено деталей: {olx_result.get('total_detail_fetches', 0)}."
+                        )
+                except Exception as olx_err:
+                    await self._send_progress_message(
+                        chat_id,
+                        f"OLX: помилка оновлення — {olx_err!s}"
+                    )
+                
                 # Генеруємо та відправляємо файл користувачу
                 try:
                     excel_bytes = self.prozorro_service.generate_excel_from_db(days)
@@ -517,6 +577,8 @@ class TelegramBotService:
             [KeyboardButton("➕ Додати користувача")],
             [KeyboardButton("➕ Додати адміністратора")],
             [KeyboardButton("🚫 Заблокувати користувача")],
+            [KeyboardButton("🔄 Оновити дані за добу"), KeyboardButton("🔄 Оновити дані за тиждень")],
+            [KeyboardButton("🧪 Тестування агента")],
             [KeyboardButton("📥 Отримати файл налаштувань ProZorro")],
             [KeyboardButton("📤 Завантажити файл налаштувань ProZorro")],
             [KeyboardButton("🔙 Повернутись")]
@@ -639,22 +701,85 @@ class TelegramBotService:
         context.user_data.clear()
         return ConversationHandler.END
     
-    def setup_handlers(self) -> None:
-        """Налаштовує обробники команд та повідомлень."""
-        # ConversationHandler для LLM запитів
-        llm_conv_handler = ConversationHandler(
-            entry_points=[
-                MessageHandler(filters.Regex("^🤖 Спитати LLM$"), self.start_llm_query)
-            ],
-            states={
-                WAITING_LLM_QUERY: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^🔙 Повернутись$"), self.handle_llm_query),
-                    MessageHandler(filters.Regex("^🔙 Повернутись$"), self._back_to_main_menu)
-                ]
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel)]
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обробник помилок для всіх винятків у боті."""
+        import logging
+        from telegram.error import NetworkError, TimedOut, RetryAfter
+        
+        logger = logging.getLogger(__name__)
+        
+        error = context.error
+        if error is None:
+            return
+        
+        error_type = type(error).__name__
+        error_msg = str(error)
+        error_str_lower = error_msg.lower()
+        
+        # Мережеві помилки — лише одне коротке попередження, без повного traceback
+        is_network_error = (
+            isinstance(error, NetworkError) or
+            isinstance(error, TimedOut) or
+            "NetworkError" in error_type or
+            "RemoteProtocolError" in error_type or
+            "ReadError" in error_type or
+            "httpx" in error_type or
+            "connection" in error_str_lower or
+            "disconnected" in error_str_lower or
+            "timeout" in error_str_lower
         )
         
+        if is_network_error:
+            logger.warning(
+                "Мережева помилка Telegram (retry автоматично): %s — %s",
+                error_type,
+                error_msg,
+            )
+            return
+        
+        # Обробляємо RetryAfter окремо
+        if isinstance(error, RetryAfter):
+            logger.warning(
+                f"Rate limit досягнуто, очікування {error.retry_after} секунд: {error_msg}"
+            )
+            return
+        
+        # Для інших помилок — повний traceback і сповіщення користувача
+        logger.error(
+            "Помилка в Telegram боті: %s: %s",
+            error_type,
+            error_msg,
+            exc_info=error,
+        )
+        try:
+            if update and isinstance(update, Update):
+                user_id = update.effective_user.id if update.effective_user else None
+                chat_id = update.effective_chat.id if update.effective_chat else None
+                
+                self.logging_service.log_user_action(
+                    user_id=user_id,
+                    action='bot_error',
+                    message=f"Помилка бота: {error_type}",
+                    error=error_msg,
+                    metadata={'chat_id': chat_id, 'error_type': error_type}
+                )
+                
+                # Спробуємо відправити повідомлення користувачу про помилку (якщо це можливо)
+                if chat_id and user_id:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="⚠️ Виникла помилка при обробці запиту. Спробуйте ще раз або зверніться до адміністратора."
+                        )
+                    except Exception:
+                        # Якщо не вдалося відправити повідомлення, просто логуємо
+                        pass
+        except Exception as e:
+            # Якщо виникла помилка при обробці помилки, просто логуємо
+            logger.error(f"Помилка при обробці error handler: {e}", exc_info=e)
+
+    def setup_handlers(self) -> None:
+        """Налаштовує обробники команд та повідомлень."""
         # ConversationHandler для адміністраторських діалогів
         admin_conv_handler = ConversationHandler(
             entry_points=[
@@ -690,10 +815,16 @@ class TelegramBotService:
         
         # Додаємо обробники (спочатку ConversationHandler, потім обробник документів, потім загальний MessageHandler)
         self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(llm_conv_handler)
+        self.application.add_handler(CommandHandler("app", self.app_command))
+        self.application.add_handler(CallbackQueryHandler(self.handle_quick_action_callback))
         self.application.add_handler(admin_conv_handler)
         self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        
+        # Error handler вже зареєстровано в методі run() перед setup_handlers()
+        # Додаємо тут тільки якщо він ще не зареєстрований (для безпеки)
+        if not hasattr(self.application, '_error_handlers') or not self.application._error_handlers:
+            self.application.add_error_handler(self.error_handler)
     
     async def _back_to_admin_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Повертає до меню адміністратора."""
@@ -797,7 +928,109 @@ class TelegramBotService:
             "..."
         )
         context.user_data['waiting_for_prozorro_config'] = True
-    
+
+    def _run_data_update_sync(self, days: int) -> Dict[str, Any]:
+        """Синхронне оновлення даних ProZorro та OLX за вказану кількість днів. Для виклику з фонового потоку."""
+        result_prozorro = self.prozorro_service.fetch_and_save_real_estate_auctions(days=days)
+        result_olx = run_olx_update(settings=self.settings, days=days)
+        try:
+            from business.services.collection_knowledge_service import refresh_knowledge_after_sources
+            refresh_knowledge_after_sources(["prozorro", "olx"])
+        except Exception:
+            pass
+        return {"prozorro": result_prozorro, "olx": result_olx}
+
+    async def _run_data_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE, days: int) -> None:
+        """Запускає оновлення даних за добу (days=1) або за тиждень (days=7) у фоновому потоці та надсилає підсумок після завершення."""
+        period_text = "за добу" if days == 1 else "за тиждень"
+        chat_id = update.effective_chat.id
+        loop = asyncio.get_event_loop()
+        bot = context.bot
+
+        await update.message.reply_text(f"Запущено оновлення даних {period_text}. Повідомлення прийде після завершення.")
+
+        def work() -> None:
+            try:
+                res = self._run_data_update_sync(days)
+                p = res["prozorro"]
+                o = res["olx"]
+                p_ok = "✓ " + (p.get("message", "OK") if p.get("success") else "✗ " + p.get("message", "помилка"))
+                o_ok = "✓ OK" if o.get("success") else "✗ помилка"
+                if o.get("success") and o.get("total_listings") is not None:
+                    o_ok += f" (оголошень: {o.get('total_listings', 0)}, деталей: {o.get('total_detail_fetches', 0)})"
+                summary = f"Оновлення даних {period_text} завершено.\nProZorro: {p_ok}\nOLX: {o_ok}"
+            except Exception as e:
+                summary = f"Оновлення даних {period_text}: помилка — {e!s}"
+            fut = asyncio.run_coroutine_threadsafe(bot.send_message(chat_id=chat_id, text=summary), loop)
+            try:
+                fut.result(timeout=10)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True, name="DataUpdate").start()
+
+    async def _run_agent_test(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Запускає тестування LLM-помічника тест-агентом (генерація кейсів, прогон, перевірка по БД) та надсилає звіт."""
+        message = update.message or (update.callback_query.message if update.callback_query else None)
+        if not message:
+            return
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+
+        if self.llm_agent_service is None:
+            try:
+                loop = asyncio.get_running_loop()
+                def notify_admins(nmsg: str, uid: Optional[str], det: Optional[str]) -> None:
+                    asyncio.run_coroutine_threadsafe(
+                        self._notify_admins_async(nmsg, uid, det),
+                        loop,
+                    )
+                self.llm_agent_service = MultiAgentService(
+                    self.settings,
+                    user_service=self.user_service,
+                    notify_admins_fn=notify_admins,
+                )
+            except Exception as e:
+                await message.reply_text(f"❌ Помилка ініціалізації LLM агента: {e}")
+                await self.show_admin_menu(update, context)
+                return
+
+        await message.reply_text("🧪 Запускаю тестування агента (генерація кейсів, прогон, перевірка по БД). Це може зайняти кілька хвилин…")
+
+        def run_test_sync() -> Dict[str, Any]:
+            runner = AgentTestRunnerService(self.settings)
+            return runner.run_all(self.llm_agent_service, generate_with_llm=True)
+
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                report = await loop.run_in_executor(executor, run_test_sync)
+        except Exception as e:
+            await message.reply_text(f"❌ Помилка тестування: {e}")
+            await self.show_admin_menu(update, context)
+            return
+
+        full_text = report.get("full_report_text", "")
+        total_passed = report.get("total_passed", 0)
+        total_failed = report.get("total_failed", 0)
+        chunk_size = 4000
+        for i in range(0, len(full_text), chunk_size):
+            chunk = full_text[i : i + chunk_size]
+            try:
+                await message.reply_text(chunk)
+            except Exception as e:
+                await message.reply_text(f"Не вдалося надіслати частину звіту: {e}")
+                break
+        await message.reply_text(f"Підсумок: пройдено {total_passed}, не пройдено {total_failed}.")
+        self.logging_service.log_user_action(
+            user_id=user_id,
+            action="admin_action",
+            message="Запуск тестування агента",
+            metadata={"total_passed": total_passed, "total_failed": total_failed},
+        )
+        await self.show_admin_menu(update, context)
+
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Обробляє завантажені документи."""
         if not context.user_data.get('waiting_for_prozorro_config'):
@@ -887,211 +1120,28 @@ class TelegramBotService:
             context.user_data.pop('waiting_for_prozorro_config', None)
             await self.show_admin_menu(update, context)
     
-    async def start_llm_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Починає діалог з LLM."""
-        user_id = update.effective_user.id
-        
-        if not self.user_service.is_admin(user_id):
-            await update.message.reply_text("Ця функція доступна тільки для адміністраторів.")
-            return ConversationHandler.END
-        
-        await update.message.reply_text(
-            "🤖 Задайте питання LLM аналітику.\n\n"
-            "Аналітик може:\n"
-            "• Дослідити структуру бази даних\n"
-            "• Виконати аналітичні запити\n"
-            "• Згенерувати звіти\n"
-            "• Відповісти на питання про дані\n\n"
-            "Напишіть ваше питання або натисніть '🔙 Повернутись' для виходу.",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🔙 Повернутись")]], resize_keyboard=True)
-        )
-        
-        return WAITING_LLM_QUERY
-    
-    async def handle_llm_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Обробляє запит до LLM."""
-        user_id = update.effective_user.id
-        user_query = update.message.text
-        
-        if not self.user_service.is_admin(user_id):
-            await update.message.reply_text("Ця функція доступна тільки для адміністраторів.")
-            return ConversationHandler.END
-        
-        # Ініціалізуємо LLM агента, якщо ще не ініціалізовано
-        if self.llm_agent_service is None:
+    async def _notify_admins_async(
+        self,
+        message: str,
+        offending_user_id: Optional[str],
+        details: Optional[str],
+    ) -> None:
+        """Надсилає повідомлення усім адміністраторам (наприклад про спрацьовування агента безпеки)."""
+        if not self.application or not self.application.bot:
+            return
+        admin_ids = self.user_service.get_admin_user_ids()
+        body = f"⚠️ Агент безпеки: {message}"
+        if offending_user_id:
+            body += f"\nКористувач (TG id): {offending_user_id}"
+        if details:
+            body += f"\nДеталі: {details[:500]}"
+        for chat_id in admin_ids:
             try:
-                self.llm_agent_service = LangChainAgentService(self.settings)
+                await self.application.bot.send_message(chat_id=chat_id, text=body)
             except Exception as e:
-                await update.message.reply_text(
-                    f"❌ Помилка ініціалізації LLM агента: {str(e)}\n"
-                    "Перевірте налаштування LLM в конфігурації."
-                )
-                return ConversationHandler.END
-        
-        # Відправляємо повідомлення про початок обробки
-        status_message = await update.message.reply_text("🤔 Обробляю запит...")
-        
-        # Функція для трансляції проміжних результатів
-        async def stream_callback(text: str):
-            """Транслює проміжні результати користувачу."""
-            try:
-                # Оновлюємо повідомлення з новим текстом
-                current_text = status_message.text or ""
-                new_text = current_text + text
-                # Обмежуємо довжину повідомлення (Telegram має ліміт 4096 символів)
-                if len(new_text) > 4000:
-                    new_text = new_text[-4000:] + "\n\n... (текст обрізано)"
-                await status_message.edit_text(new_text)
-            except Exception:
-                pass  # Ігноруємо помилки оновлення повідомлення
-        
-        try:
-            # Створюємо список для зберігання проміжних повідомлень
-            intermediate_messages = []
-            last_update_time = [time.time()]  # Використовуємо список для nonlocal
-            
-            # Функція для збору проміжних повідомлень
-            # Використовуємо threading.Event для синхронізації
-            import threading
-            import queue
-            update_event = threading.Event()
-            update_queue = queue.Queue()
-            
-            def collect_messages(text: str):
-                intermediate_messages.append(text)
-                current_time = time.time()
-                # Оновлюємо повідомлення кожні 0.5 секунди або кожні 3 повідомлення
-                if (current_time - last_update_time[0] > 0.5) or (len(intermediate_messages) % 3 == 0):
-                    combined_text = "".join(intermediate_messages)
-                    try:
-                        update_queue.put_nowait(combined_text[-500:])
-                        update_event.set()
-                    except queue.Full:
-                        pass  # Ігноруємо, якщо черга переповнена
-                    last_update_time[0] = current_time
-            
-            # Створюємо завдання для оновлення повідомлень
-            stop_updates = asyncio.Event()
-            
-            async def update_messages_task():
-                """Завдання для оновлення повідомлень з черги."""
-                while not stop_updates.is_set():
-                    try:
-                        # Перевіряємо чергу
-                        try:
-                            text = update_queue.get_nowait()
-                            await stream_callback(text)
-                        except queue.Empty:
-                            pass
-                        await asyncio.sleep(0.1)
-                    except Exception:
-                        break
-            
-            # Запускаємо завдання оновлення повідомлень
-            update_task = asyncio.create_task(update_messages_task())
-            
-            # Обробляємо запит в окремому потоці, щоб не блокувати event loop
-            import concurrent.futures
-            
-            def process_in_thread():
-                try:
-                    return self.llm_agent_service.process_query(
-                        user_query,
-                        stream_callback=collect_messages
-                    )
-                finally:
-                    # Сигналізуємо про завершення обробки
-                    stop_updates.set()
-                    update_event.set()
-            
-            # Виконуємо в thread pool
-            try:
-                loop = asyncio.get_event_loop()
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    response = await loop.run_in_executor(executor, process_in_thread)
-            finally:
-                # Зупиняємо завдання оновлення
-                stop_updates.set()
-                update_task.cancel()
-                try:
-                    await update_task
-                except asyncio.CancelledError:
-                    pass
-            
-            # Оновлюємо повідомлення з усіма проміжними результатами
-            all_messages = "".join(intermediate_messages)
-            if all_messages:
-                await status_message.edit_text(all_messages[-4000:])
-            
-            # Перевіряємо, чи є Excel файли в результатах tools
-            excel_files = []
-            if hasattr(self.llm_agent_service, '_extract_excel_files_from_history'):
-                excel_files = self.llm_agent_service._extract_excel_files_from_history()
-            
-            # Відправляємо Excel файли, якщо є
-            if excel_files:
-                import base64
-                from io import BytesIO
-                
-                for excel_file in excel_files:
-                    try:
-                        # Декодуємо base64
-                        file_bytes = base64.b64decode(excel_file['file_base64'])
-                        file_io = BytesIO(file_bytes)
-                        file_io.seek(0)
-                        
-                        # Відправляємо файл
-                        await context.bot.send_document(
-                            chat_id=update.message.chat_id,
-                            document=file_io,
-                            filename=excel_file['filename'],
-                            caption=f"📊 Excel файл з результатами запиту\nРядків: {excel_file.get('rows_count', 0)}, Колонок: {excel_file.get('columns_count', 0)}"
-                        )
-                    except Exception as e:
-                        await update.message.reply_text(f"Помилка відправки Excel файлу: {e}")
-            
-            # Відправляємо фінальну відповідь
-            if len(response) > 4096:
-                # Якщо відповідь занадто довга, розбиваємо на частини
-                parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
-                for i, part in enumerate(parts):
-                    if i == 0 and not all_messages:
-                        await status_message.edit_text(part)
-                    else:
-                        await update.message.reply_text(part)
-            else:
-                if not all_messages:
-                    await status_message.edit_text(response)
-                else:
-                    await update.message.reply_text(response)
-            
-            # Логуємо дію
-            self.logging_service.log_user_action(
-                user_id=user_id,
-                action='llm_query',
-                message=f"Запит до LLM: {user_query[:100]}...",
-                metadata={'query_length': len(user_query), 'response_length': len(response)}
-            )
-        
-        except Exception as e:
-            error_msg = f"❌ Помилка обробки запиту: {str(e)}"
-            await status_message.edit_text(error_msg)
-            
-            self.logging_service.log_user_action(
-                user_id=user_id,
-                action='llm_query',
-                message=f"Помилка запиту до LLM: {user_query[:100]}...",
-                error=str(e)
-            )
-        
-        # Повертаємо до стану очікування наступного запиту
-        await update.message.reply_text(
-            "Задайте наступне питання або натисніть '🔙 Повернутись' для виходу.",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🔙 Повернутись")]], resize_keyboard=True)
-        )
-        
-        return WAITING_LLM_QUERY
-    
+                # Логуємо, але не падаємо
+                pass
+
     async def _back_to_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Повертає до головного меню."""
         context.user_data.clear()
@@ -1100,22 +1150,129 @@ class TelegramBotService:
     
     async def post_init(self, application: Application) -> None:
         """Викликається після ініціалізації бота."""
+        self._bot_loop = asyncio.get_running_loop()
         await application.bot.set_my_commands([
-            BotCommand("start", "Запустити бота")
+            BotCommand("start", "Запустити бота"),
+            BotCommand("app", "Відкрити застосунок"),
         ])
+        mini_app_url = (getattr(self.settings, "mini_app_base_url", None) or "").strip()
+        if mini_app_url and mini_app_url.lower().startswith("https://"):
+            try:
+                await application.bot.set_chat_menu_button(
+                    menu_button=MenuButtonWebApp(
+                        text="Відкрити застосунок",
+                        web_app=WebAppInfo(url=mini_app_url),
+                    )
+                )
+            except Exception as e:
+                print(f"Попередження: не вдалося встановити кнопку Mini App: {e}")
+        elif mini_app_url:
+            print("Попередження: Mini App base_url має бути HTTPS (наприклад ngrok або ваш домен). Кнопка меню не встановлена.")
     
     def run(self) -> None:
         """Запускає бота."""
         if self._running:
             return
         
-        self.application = Application.builder().token(self.settings.telegram_bot_token).post_init(self.post_init).build()
+        # Налаштовуємо Application з покращеною обробкою помилок
+        builder = Application.builder().token(self.settings.telegram_bot_token).post_init(self.post_init)
+        
+        # Налаштовуємо HTTPXRequest для кращої обробки мережевих помилок
+        # (API python-telegram-bot v20+ не приймає готовий http_client, лише параметри/kwargs)
+        try:
+            import httpx
+            from telegram.request import HTTPXRequest
+            
+            # Передаємо налаштування через параметри HTTPXRequest / httpx_kwargs
+            request = HTTPXRequest(
+                read_timeout=30.0,
+                connect_timeout=10.0,
+                http_version="2",
+                httpx_kwargs={
+                    "limits": httpx.Limits(
+                        max_keepalive_connections=5,
+                        max_connections=10,
+                    ),
+                    "http2": True,
+                },
+            )
+            builder = builder.request(request)
+        except (ImportError, AttributeError) as e:
+            # Якщо HTTPXRequest недоступний (старі версії бібліотеки), використовуємо стандартні налаштування
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Не вдалося налаштувати HTTPXRequest, використовуємо стандартні налаштування: {e}")
+        
+        self.application = builder.build()
+        
+        # Реєструємо error handler ПЕРЕД setup_handlers, щоб він точно був зареєстрований
+        self.application.add_error_handler(self.error_handler)
+        
         self.setup_handlers()
         
         self._running = True
         print("Telegram бот запущено")
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+        # Запускаємо polling з покращеною обробкою помилок
+        try:
+            self.application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,  # Не скидаємо очікуючі оновлення
+                close_loop=False,  # Не закриваємо event loop при помилках
+            )
+        except KeyboardInterrupt:
+            print("\nОтримано сигнал переривання, зупиняємо бота...")
+            self.stop()
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Критична помилка при роботі бота: {e}", exc_info=e)
+            raise
     
+    def send_message_to_chat_sync(self, chat_id: int, text: str, timeout: float = 15) -> None:
+        """
+        Відправляє текстове повідомлення в чат з контексту іншого потоку (наприклад планувальника).
+        Викликає send_message у потоку бота через run_coroutine_threadsafe.
+        """
+        if not self.application or not self.application.bot or not self._bot_loop:
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self.application.bot.send_message(chat_id=chat_id, text=text),
+                self._bot_loop,
+            )
+            fut.result(timeout=timeout)
+        except Exception as e:
+            print(f"Помилка відправки повідомлення планувальника: {e}")
+
+    def send_document_to_chat_sync(
+        self,
+        chat_id: int,
+        file_path: str,
+        filename: str,
+        caption: Optional[str] = None,
+        timeout: float = 30,
+    ) -> None:
+        """
+        Відправляє файл у чат з контексту іншого потоку (наприклад планувальника).
+        """
+        if not self.application or not self.application.bot or not self._bot_loop:
+            return
+        try:
+            file_bytes = Path(file_path).read_bytes()
+            fut = asyncio.run_coroutine_threadsafe(
+                self.application.bot.send_document(
+                    chat_id=chat_id,
+                    document=BytesIO(file_bytes),
+                    filename=filename,
+                    caption=caption,
+                ),
+                self._bot_loop,
+            )
+            fut.result(timeout=timeout)
+        except Exception as e:
+            print(f"Помилка відправки файлу планувальника: {e}")
+
     def stop(self) -> None:
         """Зупиняє бота."""
         if not self._running:

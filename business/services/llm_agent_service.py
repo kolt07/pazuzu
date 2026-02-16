@@ -220,11 +220,8 @@ IMPORTANT - Counting Participants:
   - If you get "Extra data" error, check that the JSON string ends exactly at the closing brace
 - CRITICAL: Always include "auction_id" in projection when user asks for "ідентифікатори аукціонів"
 - The participants_count field counts UNIQUE participants by their identifier.id across all bids
-- Format response as a list of auction IDs, e.g.:
-  "Знайдено 10 аукціонів у Львівській області з найбільшою кількістю учасників:
-  1. 693fdef2142590472c473e5a (3 учасники)
-  2. 69412175f441378eb8b39128 (3 учасники)
-  ..."
+- Format response as a list with VALID links. auction_id for prozorro.sale MUST be format like LSE001-UA-20260112-18611 (NOT 24-char hex _id).
+  Example: "1. [Аукціон](https://prozorro.sale/auction/LSE001-UA-20260112-18611) — 150 учасників"
 - NOTE: If you get MALFORMED_FUNCTION_CALL error, try simplifying the addFields expression or use a simpler calculation
 
 Always explain what you're doing and why.
@@ -234,8 +231,8 @@ When generating reports, explain what data will be included.
 IMPORTANT - Returning Results with Links:
 - When user asks for auction links (like "виведи посилання на 10 аукціонів"), you MUST:
   1. Use query-builder-mcp with join to llm_cache
-  2. Include "auction_id" or "auction_data._id" in the projection - this is REQUIRED for generating links
-     * CRITICAL: auction_data.id does NOT exist - use "auction_id" (top level field) instead
+  2. Include "auction_id" in the projection - REQUIRED for links. Use top-level auction_id (format LSE001-UA-...), NOT _id (MongoDB ObjectId)
+     * CRITICAL: _id (24 hex chars) is INVALID for prozorro.sale URLs — use auction_id only
   3. Calculate price_per_m2 using addFields (use $convert for type safety)
   4. Sort by price_per_m2 (ascending for lowest price)
   5. Filter by region/city using llm_result fields (AFTER join, not before)
@@ -874,10 +871,12 @@ Respond in Ukrainian language."""
         tool = types.Tool(function_declarations=function_declarations)
         
         # Конфігурація
+        temperature = getattr(self.settings, 'llm_agent_temperature', 0.7)
+        max_output_tokens = getattr(self.settings, 'llm_agent_max_output_tokens', 8192)
         config = types.GenerateContentConfig(
             tools=[tool],
-            temperature=0.7,
-            max_output_tokens=8192
+            temperature=temperature,
+            max_output_tokens=max_output_tokens
         )
         
         try:
@@ -1046,7 +1045,7 @@ Respond in Ukrainian language."""
                 ]
                 
                 # Цикл для обробки кількох викликів функцій
-                max_iterations = 5  # Максимальна кількість ітерацій
+                max_iterations = getattr(self.settings, 'llm_agent_max_iterations', 5)
                 iteration = 0
                 
                 while iteration < max_iterations:
@@ -1183,8 +1182,8 @@ Respond in Ukrainian language."""
                         contents=conversation_parts,
                         config=types.GenerateContentConfig(
                             tools=[tool],  # Передаємо tools для можливості додаткових викликів
-                            temperature=0.7,
-                            max_output_tokens=8192
+                            temperature=temperature,
+                            max_output_tokens=max_output_tokens
                         )
                     )
                     

@@ -1,13 +1,42 @@
 # -*- coding: utf-8 -*-
 """
 Модуль для побудови aggregation pipeline для аналітичних запитів.
+Підтримує prozorro_auctions та olx_listings (ціна за м² за регіоном/датою).
 """
 
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 from datetime import datetime
 from data.database.connection import MongoDBConnection
 from utils.analytics_metrics import AnalyticsMetrics, MetricDefinition
+from utils.analytics_formula import (
+    formula_to_mongo_expr,
+    formula_references_llm,
+    FormulaParseError,
+)
 from utils.query_builder import QueryBuilder
+
+
+def _is_custom_metric(metric: Any) -> bool:
+    """Чи є метрика кастомною (словник з формулою)."""
+    return isinstance(metric, dict) and isinstance(metric.get('formula'), str)
+
+
+def _normalize_metric_spec(query: Dict[str, Any]) -> Tuple[Union[str, Dict], Optional[MetricDefinition], bool, str]:
+    """
+    Повертає (metric_spec, builtin_metric, is_custom, aggregation).
+    metric_spec: для вбудованих — канонічна назва (str), для кастомних — dict.
+    aggregation: 'avg' | 'sum' | 'min' | 'max' (для $group).
+    """
+    raw = query.get('metric')
+    if _is_custom_metric(raw):
+        agg = (raw.get('aggregation') or 'avg').lower()
+        if agg not in ('avg', 'sum', 'min', 'max'):
+            agg = 'avg'
+        return raw, None, True, agg
+    name = AnalyticsMetrics._resolve_metric_name(raw)
+    return name, AnalyticsMetrics.get_metric(name), False, (
+        'avg' if name == 'average_price_per_m2' else 'sum'
+    )
 
 
 class AnalyticsBuilder:
@@ -38,12 +67,38 @@ class AnalyticsBuilder:
         if 'metric' not in query:
             return False, "Поле 'metric' є обов'язковим"
         
-        metric_name = query['metric']
+        collection = query.get('collection', 'prozorro_auctions')
+        if collection == 'olx_listings':
+            # OLX: лише метрика ціна за м² та groupBy date; фільтри region/city та дата
+            raw_metric = query['metric']
+            if _is_custom_metric(raw_metric):
+                formula = (raw_metric.get('formula') or '').strip()
+                if not formula or 'building_area_sqm' not in formula or 'price' not in formula.lower():
+                    return False, "Для olx_listings використовуй метрику ціни за м²: metric: { name: 'price_per_sqm', formula: 'search_data.price / detail.llm.building_area_sqm', aggregation: 'avg' } або metric: 'average_price_per_m2'."
+            elif not AnalyticsMetrics.is_valid_metric(raw_metric) and AnalyticsMetrics._resolve_metric_name(raw_metric) != 'average_price_per_m2':
+                return False, "Для olx_listings підтримується лише метрика average_price_per_m2 (ціна за м²)."
+            group_by = query.get('groupBy') or []
+            if group_by and set(group_by) != {'date'}:
+                return False, "Для olx_listings зараз дозволено лише groupBy: ['date']."
+            if query.get('filters'):
+                is_valid, error = self.query_builder._validate_filters(query['filters'], depth=0)
+                if not is_valid:
+                    return False, error
+            return True, None
         
-        # Перевірка метрики
-        if not AnalyticsMetrics.is_valid_metric(metric_name):
-            available_metrics = [m['name'] for m in AnalyticsMetrics.list_metrics()]
-            return False, f"Метрика '{metric_name}' не існує. Доступні метрики: {', '.join(available_metrics)}"
+        raw_metric = query['metric']
+        if _is_custom_metric(raw_metric):
+            formula = raw_metric.get('formula', '').strip()
+            if not formula:
+                return False, "Кастомна метрика має містити поле 'formula' (вираз над полями auction_data.*, llm_result.result.*)"
+            try:
+                formula_to_mongo_expr(formula)
+            except FormulaParseError as e:
+                return False, f"Невірна формула метрики: {e}"
+        else:
+            if not AnalyticsMetrics.is_valid_metric(raw_metric):
+                available = [m['name'] for m in AnalyticsMetrics.list_metrics()]
+                return False, f"Метрика '{raw_metric}' не існує. Доступні: {', '.join(available)}. Або задайте кастомну: metric={{ name, formula, aggregation? }}."
         
         # Перевірка groupBy
         if 'groupBy' in query:
@@ -86,18 +141,20 @@ class AnalyticsBuilder:
             Aggregation pipeline
         """
         pipeline = []
-        metric_name = query['metric']
-        metric = AnalyticsMetrics.get_metric(metric_name)
+        metric_spec, builtin_metric, is_custom, aggregation = _normalize_metric_spec(query)
+        metric_name = metric_spec.get('name', 'custom') if is_custom else metric_spec
+        metric = builtin_metric
         group_by = query.get('groupBy', [])
         filters = query.get('filters', {})
         
         # Перевіряємо, чи потрібен lookup для llm_cache
-        needs_llm_lookup = False
+        if is_custom:
+            needs_llm_lookup = formula_references_llm(metric_spec['formula'])
+        else:
+            needs_llm_lookup = False
+            metrics_needing_llm = ['average_price_per_m2', 'area', 'building_area', 'land_area']
         
-        # Метрики, що потребують llm_cache
-        metrics_needing_llm = ['average_price_per_m2', 'area', 'building_area', 'land_area']
-        
-        if metric:
+        if not is_custom and metric:
             # Перевіряємо required_fields та назву метрики
             needs_llm_lookup = (
                 any(field in ['building_area', 'land_area', 'region', 'city', 'property_type'] 
@@ -160,7 +217,9 @@ class AnalyticsBuilder:
         add_fields = {}
         
         # Додаємо обчислення метрики
-        if metric_name == 'average_price_per_m2':
+        if is_custom:
+            add_fields['_metric_value'] = formula_to_mongo_expr(metric_spec['formula'])
+        elif metric_name == 'average_price_per_m2':
             # Використовуємо priceFinal (з contracts/awards) або value.amount як fallback
             # Обчислюємо все в одному виразі
             add_fields['_metric_value'] = {
@@ -395,16 +454,24 @@ class AnalyticsBuilder:
                         ]
                     }
                 }
+            elif field == 'date':
+                # День у форматі YYYY-MM-DD (auction_data.dateModified — рядок ISO)
+                add_fields[f'_group_{field}'] = {
+                    '$substr': [
+                        {'$ifNull': ['$auction_data.dateModified', '']},
+                        0,
+                        10
+                    ]
+                }
         
         if add_fields:
             pipeline.append({'$addFields': add_fields})
         
-        # 4. Match для фільтрації null значень метрики
-        pipeline.append({
-            '$match': {
-                '_metric_value': {'$ne': None}
-            }
-        })
+        # 4. Match для фільтрації null значень метрики та порожніх дат при groupBy date
+        match_metric = {'_metric_value': {'$ne': None}}
+        if 'date' in group_by:
+            match_metric['_group_date'] = {'$nin': [None, '']}
+        pipeline.append({'$match': match_metric})
         
         # 5. Group stage
         group_id = {}
@@ -415,7 +482,9 @@ class AnalyticsBuilder:
             group_id = None
         
         # Визначаємо функцію агрегації
-        if metric_name == 'average_price_per_m2':
+        if is_custom:
+            agg_func = f'${aggregation}'
+        elif metric_name == 'average_price_per_m2':
             agg_func = '$avg'
         elif metric_name in ['total_price', 'base_price', 'area', 'building_area', 'land_area', 'count']:
             agg_func = '$sum'
@@ -454,6 +523,181 @@ class AnalyticsBuilder:
             pipeline.append({'$sort': {'value': -1}})
         
         return pipeline
+    
+    def _parse_iso_to_datetime(self, value: Any):
+        """Повертає datetime з ISO-рядка (з підтримкою суфікса Z)."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        s = str(value).strip().replace('Z', '+00:00')
+        try:
+            return datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+    
+    def _build_olx_region_city_match(self, filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """З фільтрів (region, city або $or) будує $match для OLX: resolved_locations або search_data.location."""
+        or_conditions = []
+        if filters.get('$or') and isinstance(filters['$or'], list):
+            for item in filters['$or']:
+                if not isinstance(item, dict):
+                    continue
+                region = item.get('region')
+                city = item.get('city')
+                if region:
+                    or_conditions.append({
+                        'detail.resolved_locations': {
+                            '$elemMatch': {'address_structured.region': {'$regex': str(region).strip(), '$options': 'i'}}
+                        }
+                    })
+                    or_conditions.append({'search_data.location': {'$regex': str(region).strip(), '$options': 'i'}})
+                if city:
+                    or_conditions.append({
+                        'detail.resolved_locations': {
+                            '$elemMatch': {'address_structured.city': {'$regex': str(city).strip(), '$options': 'i'}}
+                        }
+                    })
+                    or_conditions.append({'search_data.location': {'$regex': str(city).strip(), '$options': 'i'}})
+        if not or_conditions:
+            return None
+        return {'$or': or_conditions}
+    
+    def _build_olx_price_per_sqm_pipeline(self, query: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Будує aggregation pipeline для OLX: середня ціна за м² за днями, з фільтрами за датою та регіоном/містом."""
+        filters = query.get('filters') or {}
+        pipeline = []
+        
+        # 1. Match: діапазон дат (updated_at)
+        date_range = filters.get('auction_data.dateModified') or filters.get('updated_at')
+        if isinstance(date_range, dict) and '$gte' in date_range and '$lte' in date_range:
+            gte = self._parse_iso_to_datetime(date_range['$gte'])
+            lte = self._parse_iso_to_datetime(date_range['$lte'])
+            if gte and lte:
+                pipeline.append({'$match': {'updated_at': {'$gte': gte, '$lte': lte}}})
+        
+        # 2. Match: регіон/місто (Київ, Київська тощо)
+        region_city = self._build_olx_region_city_match(filters)
+        if region_city:
+            pipeline.append({'$match': region_city})
+        
+        # 3. AddFields: ціна, площа, ціна за м² ($convert з onError: null щоб порожні рядки '' не ламали агрегацію)
+        _safe_double = lambda field: {
+            '$convert': {'input': field, 'to': 'double', 'onError': None, 'onNull': None}
+        }
+        pipeline.append({
+            '$addFields': {
+                '_price': {'$cond': [
+                    {'$and': [
+                        {'$ne': ['$search_data.price', None]},
+                        {'$ne': ['$search_data.price', '']},
+                        {'$gt': [_safe_double('$search_data.price'), 0]}
+                    ]},
+                    _safe_double('$search_data.price'),
+                    {'$cond': [
+                        {'$and': [
+                            {'$ne': ['$search_data.price_value', None]},
+                            {'$ne': ['$search_data.price_value', '']},
+                            {'$gt': [_safe_double('$search_data.price_value'), 0]}
+                        ]},
+                        _safe_double('$search_data.price_value'),
+                        None
+                    ]}
+                ]},
+                '_area': {'$cond': [
+                    {'$and': [
+                        {'$ne': ['$detail.llm.building_area_sqm', None]},
+                        {'$ne': ['$detail.llm.building_area_sqm', '']},
+                        {'$gt': [_safe_double('$detail.llm.building_area_sqm'), 0]}
+                    ]},
+                    _safe_double('$detail.llm.building_area_sqm'),
+                    None
+                ]},
+            }
+        })
+        pipeline.append({
+            '$addFields': {
+                '_price_per_sqm': {
+                    '$cond': {
+                        'if': {'$and': [
+                            {'$ne': ['$_price', None]},
+                            {'$ne': ['$_area', None]},
+                            {'$gt': ['$_area', 0]}
+                        ]},
+                        'then': {'$divide': ['$_price', '$_area']},
+                        'else': None
+                    }
+                }
+            }
+        })
+        pipeline.append({'$match': {'_price_per_sqm': {'$ne': None, '$gt': 0}}})
+        
+        # 4. Групування за днем
+        pipeline.append({
+            '$addFields': {
+                '_group_date': {
+                    '$dateToString': {'format': '%Y-%m-%d', 'date': '$updated_at'}
+                }
+            }
+        })
+        pipeline.append({
+            '$group': {
+                '_id': {'date': '$_group_date'},
+                'value': {'$avg': '$_price_per_sqm'},
+                'date': {'$first': '$_group_date'}
+            }
+        })
+        pipeline.append({'$project': {'_id': 0, 'date': 1, 'value': 1}})
+        pipeline.append({'$sort': {'date': 1}})
+        return pipeline
+    
+    def _execute_olx_analytics(self, query: Dict[str, Any]) -> Dict[str, Any]:
+        """Виконує аналітику ціни за м² по OLX (olx_listings). Повертає той самий формат, що й execute_analytics для ProZorro."""
+        try:
+            filters = query.get('filters') or {}
+            date_range = filters.get('auction_data.dateModified') or filters.get('updated_at')
+            if not isinstance(date_range, dict) or not date_range.get('$gte') or not date_range.get('$lte'):
+                return {
+                    'success': False,
+                    'error': 'Для OLX потрібен діапазон дат у фільтрах: auction_data.dateModified або updated_at з $gte та $lte (ISO).'
+                }
+            pipeline = self._build_olx_price_per_sqm_pipeline(query)
+            if not pipeline:
+                return {
+                    'success': False,
+                    'error': 'Потрібні фільтри: діапазон дат (auction_data.dateModified або updated_at з $gte/$lte) та опційно регіон/місто ($or: [{region, city}]).'
+                }
+            coll = self._get_database()['olx_listings']
+            results = list(coll.aggregate(pipeline))
+            formatted = []
+            for r in results:
+                formatted.append({
+                    'date': r.get('date', 'Unknown'),
+                    'value': round(float(r.get('value', 0)), 2),
+                    'unit': 'UAH/m²'
+                })
+            out = {
+                'success': True,
+                'metric': query.get('metric') or 'average_price_per_m2',
+                'metric_description': 'Середня ціна за м² (OLX)',
+                'unit': 'UAH/m²',
+                'group_by': query.get('groupBy', ['date']),
+                'results': formatted,
+                'count': len(formatted),
+                'data_source': 'olx_listings',
+            }
+            if len(formatted) == 0:
+                out['message'] = (
+                    'За обраними критеріями (регіон/дата) в OLX результатів не знайдено. '
+                    'Можливі причини: немає оголошень з ціною та площею (detail.llm.building_area_sqm), '
+                    'або фільтр регіону/міста не збігається з даними (resolved_locations, search_data.location).'
+                )
+            return out
+        except Exception as e:
+            return {
+                'success': False,
+                'error': f'Помилка аналітики OLX: {str(e)}'
+            }
     
     def _build_match_filters(self, filters: Dict[str, Any], skip_llm_fields: bool = False, only_llm_fields: bool = False) -> Dict[str, Any]:
         """
@@ -556,9 +800,15 @@ class AnalyticsBuilder:
                             # Якщо просте значення, використовуємо $eq
                             field_name = 'building_area_sqm' if key in ['building_area_sqm', 'building_area'] else 'land_area_ha'
                             mongo_filters[f'llm_result.result.{field_name}'] = value
+                elif key in ('auction_data.dateModified', 'auction_data.dateCreated'):
+                    if not only_llm_fields and isinstance(value, dict):
+                        mongo_filters[key] = value
                 else:
                     if not only_llm_fields:
-                        mongo_filters[f'auction_data.{key}'] = value
+                        if key.startswith('auction_data.'):
+                            mongo_filters[key] = value
+                        else:
+                            mongo_filters[f'auction_data.{key}'] = value
         
         return mongo_filters
     
@@ -580,41 +830,48 @@ class AnalyticsBuilder:
                 'error': error
             }
         
+        collection = query.get('collection', 'prozorro_auctions')
+        if collection == 'olx_listings':
+            return self._execute_olx_analytics(query)
+        
         # Побудова pipeline
         pipeline = self.build_pipeline(query)
         
         # Виконання запиту
         try:
+            is_custom = _is_custom_metric(query['metric'])
+            if is_custom:
+                resolved_metric = None
+                metric_desc = query['metric'].get('description', '')
+                metric_unit = query['metric'].get('unit', '')
+                metric_display = query['metric'].get('name', 'custom')
+            else:
+                resolved_metric = AnalyticsMetrics._resolve_metric_name(query['metric'])
+                metric = AnalyticsMetrics.get_metric(query['metric'])
+                metric_desc = metric.description if metric else ''
+                metric_unit = metric.unit if metric else ''
+                metric_display = query['metric']
             collection = self._get_database()['prozorro_auctions']
             results = list(collection.aggregate(pipeline))
             
-            # Форматування результатів
-            metric = AnalyticsMetrics.get_metric(query['metric'])
             formatted_results = []
-            
             for result in results:
                 value = result.get('value')
-                # Фільтруємо null значення для метрик, що потребують даних
-                if value is None and query['metric'] in ['average_price_per_m2', 'total_price', 'area', 'building_area', 'land_area']:
+                if value is None and resolved_metric in ('average_price_per_m2', 'total_price', 'area', 'building_area', 'land_area'):
                     continue
-                
                 formatted_result = {
                     'value': round(value, 2) if value is not None else 0,
-                    'unit': metric.unit if metric else ''
+                    'unit': metric_unit
                 }
-                
-                # Додаємо поля групування
                 for field in query.get('groupBy', []):
                     formatted_result[field] = result.get(field, 'Unknown')
-                
                 formatted_results.append(formatted_result)
             
-            # Якщо немає результатів, додаємо інформацію про це
             response = {
                 'success': True,
-                'metric': query['metric'],
-                'metric_description': metric.description if metric else '',
-                'unit': metric.unit if metric else '',
+                'metric': metric_display,
+                'metric_description': metric_desc,
+                'unit': metric_unit,
                 'group_by': query.get('groupBy', []),
                 'results': formatted_results,
                 'count': len(formatted_results)

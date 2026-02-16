@@ -1,0 +1,64 @@
+# -*- coding: utf-8 -*-
+# Профілі видів діяльності для гео-аналізу придатності приміщення.
+# Використовується AssessorAgent при оцінці «чи підходить для аптеки/кафе тощо».
+
+pharmacy:
+  name: "Аптека"
+  listing_criteria:
+    min_area_sqm: 30
+    max_area_sqm: 150
+    preferred_floor: [1]
+    property_types: ["Комерційна нерухомість"]
+  poi_criteria:
+    - type: pharmacy
+      radius_m: 500
+      role: competitor
+      max_count: 5
+      description: "Конкуренція — небажано дуже багато аптек поруч"
+    - type: hospital
+      radius_m: 1000
+      role: positive
+      description: "Лікарня поруч — потенційні клієнти"
+    - type: bus_station
+      radius_m: 300
+      role: positive
+      description: "Зупинка транспорту — потік людей"
+    - type: apartment_building
+      radius_m: 500
+      role: positive
+      description: "Житлові будинки — потік людей"
+
+cafe:
+  name: "Кафе"
+  listing_criteria:
+    min_area_sqm: 50
+    max_area_sqm: 200
+    preferred_floor: [1]
+  poi_criteria:
+    - type: transit_station
+      radius_m: 200
+      role: positive
+    - type: university
+      radius_m: 500
+      role: positive
+    - type: local_government_office
+      radius_m: 300
+      role: positive
+      description: "Офіси поруч — потенційні клієнти"
+
+clinic:
+  name: "Клініка / медичний центр"
+  listing_criteria:
+    min_area_sqm: 80
+    max_area_sqm: 300
+    preferred_floor: [1, 2]
+  poi_criteria:
+    - type: hospital
+      radius_m: 500
+      role: positive
+    - type: pharmacy
+      radius_m: 300
+      role: positive
+    - type: bus_station
+      radius_m: 300
+      role: positive

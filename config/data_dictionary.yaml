@@ -5,6 +5,169 @@
 # - Генерації документації
 
 collections:
+  regions:
+    description: "Колекція областей України"
+    mongo_collection: "regions"
+    indexes:
+      - field: "name"
+        unique: true
+        description: "Унікальна назва області"
+      - field: "name_normalized"
+        unique: false
+        description: "Нормалізована назва для пошуку"
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+        description: "MongoDB ObjectId"
+        mongo_generated: true
+      name:
+        type: "string"
+        required: true
+        description: "Назва області"
+        example: "Київська"
+      name_normalized:
+        type: "string"
+        required: true
+        description: "Нормалізована назва (без 'область', 'обл.')"
+        example: "київська"
+      created_at:
+        type: "datetime"
+        required: true
+        description: "Дата створення"
+      updated_at:
+        type: "datetime"
+        required: true
+        description: "Дата оновлення"
+  
+  cities:
+    description: "Колекція міст та населених пунктів України"
+    mongo_collection: "cities"
+    indexes:
+      - field: ["region_id", "name_normalized"]
+        unique: true
+        description: "Унікальна комбінація області та міста"
+      - field: "region_id"
+        unique: false
+        description: "Посилання на область"
+      - field: "name_normalized"
+        unique: false
+        description: "Нормалізована назва для пошуку"
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+        description: "MongoDB ObjectId"
+        mongo_generated: true
+      name:
+        type: "string"
+        required: true
+        description: "Назва міста/населеного пункту"
+        example: "Київ"
+      name_normalized:
+        type: "string"
+        required: true
+        description: "Нормалізована назва (без префіксів 'м.', 'с.')"
+        example: "київ"
+      region_id:
+        type: "string"
+        required: true
+        description: "ID області (посилання на regions._id)"
+      created_at:
+        type: "datetime"
+        required: true
+        description: "Дата створення"
+      updated_at:
+        type: "datetime"
+        required: true
+        description: "Дата оновлення"
+  
+  streets:
+    description: "Колекція вулиць"
+    mongo_collection: "streets"
+    indexes:
+      - field: ["city_id", "name_normalized"]
+        unique: true
+        description: "Унікальна комбінація міста та вулиці"
+      - field: "city_id"
+        unique: false
+        description: "Посилання на місто"
+      - field: "name_normalized"
+        unique: false
+        description: "Нормалізована назва для пошуку"
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+        description: "MongoDB ObjectId"
+        mongo_generated: true
+      name:
+        type: "string"
+        required: true
+        description: "Назва вулиці"
+        example: "Хрещатик"
+      name_normalized:
+        type: "string"
+        required: true
+        description: "Нормалізована назва (з типом вулиці)"
+        example: "вул хрещатик"
+      street_type:
+        type: "string"
+        required: false
+        description: "Тип вулиці (вул., просп., пл. тощо)"
+        example: "вул."
+      city_id:
+        type: "string"
+        required: true
+        description: "ID міста (посилання на cities._id)"
+      created_at:
+        type: "datetime"
+        required: true
+        description: "Дата створення"
+      updated_at:
+        type: "datetime"
+        required: true
+        description: "Дата оновлення"
+  
+  buildings:
+    description: "Колекція будинків"
+    mongo_collection: "buildings"
+    indexes:
+      - field: ["street_id", "number"]
+        unique: true
+        description: "Унікальна комбінація вулиці та номера будинку"
+      - field: "street_id"
+        unique: false
+        description: "Посилання на вулицю"
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+        description: "MongoDB ObjectId"
+        mongo_generated: true
+      number:
+        type: "string"
+        required: true
+        description: "Номер будинку"
+        example: "1"
+      building_part:
+        type: "string"
+        required: false
+        description: "Частина будинку (літера, корпус тощо)"
+        example: "А"
+      street_id:
+        type: "string"
+        required: true
+        description: "ID вулиці (посилання на streets._id)"
+      created_at:
+        type: "datetime"
+        required: true
+        description: "Дата створення"
+      updated_at:
+        type: "datetime"
+        required: true
+        description: "Дата оновлення"
+  
   prozorro_auctions:
     description: "Колекція з даними про аукціони ProZorro.Sale"
     mongo_collection: "prozorro_auctions"
@@ -108,6 +271,57 @@ collections:
           description:
             type: "string"
             description: "Опис аукціону"
+          address_refs:
+            type: "array"
+            description: "Посилання на топоніми з колекцій regions, cities, streets, buildings. Кожен елемент містить об'єкт з полями region, city, street, building (якщо є), де кожне поле містить _id та name."
+            item_type: "object"
+            nested_fields:
+              region:
+                type: "object"
+                description: "Посилання на область"
+                nested_fields:
+                  _id:
+                    type: "string"
+                    description: "ID області з колекції regions"
+                  name:
+                    type: "string"
+                    description: "Назва області"
+              city:
+                type: "object"
+                description: "Посилання на місто"
+                nested_fields:
+                  _id:
+                    type: "string"
+                    description: "ID міста з колекції cities"
+                  name:
+                    type: "string"
+                    description: "Назва міста"
+              street:
+                type: "object"
+                description: "Посилання на вулицю (опціонально)"
+                nested_fields:
+                  _id:
+                    type: "string"
+                    description: "ID вулиці з колекції streets"
+                  name:
+                    type: "string"
+                    description: "Назва вулиці"
+                  street_type:
+                    type: "string"
+                    description: "Тип вулиці"
+              building:
+                type: "object"
+                description: "Посилання на будинок (опціонально)"
+                nested_fields:
+                  _id:
+                    type: "string"
+                    description: "ID будинку з колекції buildings"
+                  number:
+                    type: "string"
+                    description: "Номер будинку"
+                  building_part:
+                    type: "string"
+                    description: "Частина будинку"
       
       version_hash:
         type: "string"
@@ -368,6 +582,445 @@ collections:
         target_field: "description_hash"
         description: "Зв'язок з аукціонами, які мають такий самий хеш опису"
         cardinality: "one-to-many"
+
+  olx_listings:
+    description: "Колекція оголошень OLX (нежитлова нерухомість, земельні ділянки). Джерело — скрапінг пошуку OLX; ідентифікатор — url. Для фільтрації за періодом використовуй поле updated_at (BSON Date); для execute_query/save_query_to_temp_collection — filters з полями url, search_data.*, detail.*, updated_at."
+    mongo_collection: "olx_listings"
+    indexes:
+      - field: "url"
+        unique: true
+        description: "Унікальний URL оголошення OLX"
+      - field: "updated_at"
+        unique: false
+        description: "Для сортування та фільтрації за датою оновлення"
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+        description: "MongoDB ObjectId"
+        mongo_generated: true
+      url:
+        type: "string"
+        required: true
+        description: "Унікальний URL оголошення на OLX; використовуй як ідентифікатор при експорті (export_listings_to_file з collection=olx_listings)"
+        indexed: true
+        example: "https://www.olx.ua/d/obyavlenie/..."
+      search_data:
+        type: "object"
+        description: "Дані зі сторінки пошуку OLX (картка в списку)"
+        nested_fields:
+          title:
+            type: "string"
+            description: "Заголовок оголошення"
+          price:
+            type: "number"
+            description: "Ціна в гривнях (число)"
+          price_text:
+            type: "string"
+            description: "Ціна як текст (наприклад з одиницями)"
+          price_value:
+            type: "number"
+            description: "Числове значення ціни"
+          location:
+            type: "string"
+            description: "Локація з оголошення (рядок)"
+          date_text:
+            type: "string"
+            description: "Текст дати публікації з сторінки"
+          listed_at_iso:
+            type: "string"
+            description: "Дата публікації в ISO форматі (UTC)"
+          area_m2:
+            type: "number"
+            description: "Площа в м² з картки пошуку (якщо є)"
+      detail:
+        type: "object"
+        description: "Дані зі сторінки оголошення (деталі, опис, LLM-екстракція, геокодування)"
+        nested_fields:
+          description:
+            type: "string"
+            description: "Повний текст опису оголошення"
+          llm:
+            type: "object"
+            description: "Структуровані дані з LLM-парсингу опису (тип нерухомості, площі)"
+            nested_fields:
+              property_type:
+                type: "string"
+                description: "Тип нерухомості (з опису)"
+              building_area_sqm:
+                type: "number"
+                unit: "m²"
+                description: "Площа будівлі/приміщень у м²"
+              land_area_ha:
+                type: "number"
+                unit: "ha"
+                description: "Площа земельної ділянки в гектарах"
+          resolved_locations:
+            type: "array"
+            description: "Результати геокодування адрес (масив об'єктів з results[].address_structured: region, city, street, street_number, formatted_address)"
+            item_type: "object"
+          address_refs:
+            type: "array"
+            description: "Посилання на топоніми з колекцій regions, cities, streets, buildings. Кожен елемент містить об'єкт з полями region, city, street, building (якщо є), де кожне поле містить _id та name."
+            item_type: "object"
+            nested_fields:
+              region:
+                type: "object"
+                description: "Посилання на область"
+                nested_fields:
+                  _id:
+                    type: "string"
+                    description: "ID області з колекції regions"
+                  name:
+                    type: "string"
+                    description: "Назва області"
+              city:
+                type: "object"
+                description: "Посилання на місто"
+                nested_fields:
+                  _id:
+                    type: "string"
+                    description: "ID міста з колекції cities"
+                  name:
+                    type: "string"
+                    description: "Назва міста"
+              street:
+                type: "object"
+                description: "Посилання на вулицю (опціонально)"
+                nested_fields:
+                  _id:
+                    type: "string"
+                    description: "ID вулиці з колекції streets"
+                  name:
+                    type: "string"
+                    description: "Назва вулиці"
+                  street_type:
+                    type: "string"
+                    description: "Тип вулиці"
+              building:
+                type: "object"
+                description: "Посилання на будинок (опціонально)"
+                nested_fields:
+                  _id:
+                    type: "string"
+                    description: "ID будинку з колекції buildings"
+                  number:
+                    type: "string"
+                    description: "Номер будинку"
+                  building_part:
+                    type: "string"
+                    description: "Частина будинку"
+          parameters:
+            type: "array"
+            description: "Параметри оголошення з сторінки (масив {label, value}); для типу нерухомості — label містить 'тип' або 'призначення'"
+            item_type: "object"
+      created_at:
+        type: "datetime"
+        description: "Дата створення запису в БД (BSON Date)"
+      updated_at:
+        type: "datetime"
+        description: "Дата останнього оновлення запису в БД. Для фільтра за періодом використовуй updated_at з операторами $gte, $lte; значення — BSON Date або ISO-рядок (залежно від збереження). При execute_query для olx_listings можна фільтрувати за 'updated_at': {$gte: ISODate(...), $lte: ISODate(...)} або порівняння рядків ISO."
+    
+    # Поля для запитів та експорту (агент використовує ці шляхи)
+    flattened_fields:
+      url:
+        type: "string"
+        description: "Ідентифікатор оголошення; для експорту передавай список url у export_listings_to_file(ids=..., collection=olx_listings)"
+        usage: "Фільтр за url; ідентифікатор для експорту"
+      updated_at:
+        type: "datetime"
+        description: "Дата оновлення запису. Фільтр за періодом: updated_at з $gte/$lte (BSON Date або ISO рядок)"
+        usage: "Фільтрація за періодом (звіт за добу, за тиждень)"
+      search_data_title:
+        type: "string"
+        source: "search_data.title"
+        description: "Заголовок оголошення"
+      search_data_price:
+        type: "number"
+        source: "search_data.price"
+        description: "Ціна (UAH)"
+      search_data_location:
+        type: "string"
+        source: "search_data.location"
+        description: "Локація з картки"
+      detail_llm_property_type:
+        type: "string"
+        source: "detail.llm.property_type"
+        description: "Тип нерухомості з LLM-парсингу"
+      detail_llm_building_area_sqm:
+        type: "number"
+        source: "detail.llm.building_area_sqm"
+        description: "Площа будівлі (м²)"
+      detail_llm_land_area_ha:
+        type: "number"
+        source: "detail.llm.land_area_ha"
+        description: "Площа ділянки (га)"
+      detail_llm_tags:
+        type: "array"
+        source: "detail.llm.tags"
+        description: "Масив тегів для фільтрації: призначення (крамниця, аптека, офіс, склад, кафе тощо) та комунікації (газ, вода, електрика, каналізація, опалення тощо). Формується агентом-інтерпретатором при парсингу опису. Фільтр: detail.llm.tags з $in. Унікальні значення — get_distinct_values(collection, detail.llm.tags, unwrap_array=true)."
+
+  unified_listings:
+    description: "Зведена таблиця оголошень, що об'єднує дані з OLX та ProZorro в єдину структуру. Використовується як основне джерело даних для агентів та інструментів."
+    mongo_collection: "unified_listings"
+    indexes:
+      - field: ["source", "source_id"]
+        unique: true
+        description: "Унікальна комбінація джерела та ID в джерелі"
+      - field: "source"
+        unique: false
+        description: "Джерело даних (olx або prozorro)"
+      - field: "status"
+        unique: false
+        description: "Статус оголошення (активне/неактивне)"
+      - field: "property_type"
+        unique: false
+        description: "Тип оголошення"
+      - field: "source_updated_at"
+        unique: false
+        description: "Дата оновлення в джерелі"
+      - field: "system_updated_at"
+        unique: false
+        description: "Дата останнього оновлення в системі"
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+        description: "MongoDB ObjectId"
+        mongo_generated: true
+      source:
+        type: "string"
+        required: true
+        description: "Джерело даних: 'olx' або 'prozorro'"
+        enum: ["olx", "prozorro"]
+        indexed: true
+      source_id:
+        type: "string"
+        required: true
+        description: "ID в джерелі (URL для OLX, auction_id для ProZorro)"
+        indexed: true
+      source_updated_at:
+        type: "datetime"
+        required: true
+        description: "Дата оновлення в джерелі (BSON Date)"
+      status:
+        type: "string"
+        required: true
+        description: "Статус оголошення: 'активне' або 'неактивне'"
+        enum: ["активне", "неактивне"]
+        indexed: true
+      system_updated_at:
+        type: "datetime"
+        required: true
+        description: "Дата останнього оновлення в системі (BSON Date)"
+        indexed: true
+      created_at:
+        type: "datetime"
+        required: true
+        description: "Дата створення запису в системі (BSON Date)"
+      page_url:
+        type: "string"
+        required: true
+        description: "Посилання на сторінку оголошення/аукціону"
+      identifier:
+        type: "string"
+        required: true
+        description: "Ідентифікатор оголошення (URL для OLX, auction_id для ProZorro)"
+      property_type:
+        type: "string"
+        required: false
+        description: "Тип оголошення: 'Земельна ділянка', 'Комерційна нерухомість', 'Земельна ділянка з нерухомістю', 'інше'"
+        enum: ["Земельна ділянка", "Комерційна нерухомість", "Земельна ділянка з нерухомістю", "інше"]
+        indexed: true
+      title:
+        type: "string"
+        required: false
+        description: "Заголовок оголошення"
+      description:
+        type: "string"
+        required: false
+        description: "Повний опис оголошення"
+      addresses:
+        type: "array"
+        required: false
+        description: "Масив нормалізованих адрес (результат обробки Google Maps)"
+        item_type: "object"
+        nested_fields:
+          region:
+            type: "string"
+            description: "Область"
+          settlement:
+            type: "string"
+            description: "Населений пункт"
+          district:
+            type: "string"
+            description: "Район"
+          street:
+            type: "string"
+            description: "Вулиця"
+          building:
+            type: "string"
+            description: "Номер будинку"
+          apartment:
+            type: "string"
+            description: "Номер квартири/приміщення"
+          coordinates:
+            type: "object"
+            description: "Координати (latitude, longitude)"
+            nested_fields:
+              latitude:
+                type: "number"
+              longitude:
+                type: "number"
+          is_complete:
+            type: "boolean"
+            description: "Чи є адреса повною (до будинку) чи це приблизна локація"
+          formatted_address:
+            type: "string"
+            description: "Відформатована адреса"
+      cadastral_numbers:
+        type: "array"
+        required: false
+        description: "Масив кадастрових номерів"
+        item_type: "string"
+      building_area_sqm:
+        type: "number"
+        required: false
+        unit: "m²"
+        description: "Площа нерухомості (будівель, приміщень) в квадратних метрах. Джерело: detail.llm.building_area_sqm (OLX); auction_data.items[].itemProps (totalObjectArea, totalBuildingArea, usableArea) або quantity.value за unit м² (ProZorro)."
+      land_area_ha:
+        type: "number"
+        required: false
+        unit: "ha"
+        description: "Площа земельної ділянки в гектарах. Джерело: detail.llm.land_area_ha (OLX); auction_data.items[].itemProps.landArea або quantity.value за unit га (ProZorro)."
+      price_uah:
+        type: "number"
+        required: false
+        description: "Ціна в гривнях"
+      price_usd:
+        type: "number"
+        required: false
+        description: "Ціна в доларах США"
+      price_per_m2_uah:
+        type: "number"
+        required: false
+        description: "Ціна за кв. м. в гривнях. NULL для земельної ділянки без нерухомості; заповнена для нерухомості або землі з нерухомістю (при наявності building_area_sqm)."
+      price_per_m2_usd:
+        type: "number"
+        required: false
+        description: "Ціна за кв. м. в доларах. NULL для земельної ділянки без нерухомості."
+      price_per_ha_uah:
+        type: "number"
+        required: false
+        description: "Ціна за га в гривнях. NULL для чистої нерухомості без землі; заповнена для землі або землі з нерухомістю (при наявності land_area_ha)."
+      price_per_ha_usd:
+        type: "number"
+        required: false
+        description: "Ціна за га в доларах. NULL для чистої нерухомості без землі."
+      currency_rate:
+        type: "number"
+        required: false
+        description: "Курс валюти, який використано для встановлення ціни в доларах"
+    
+    # Поля для запитів та експорту
+    flattened_fields:
+      source:
+        type: "string"
+        description: "Джерело даних (olx або prozorro)"
+        usage: "Фільтр за джерелом"
+      source_id:
+        type: "string"
+        description: "ID в джерелі"
+        usage: "Ідентифікатор для пошуку"
+      status:
+        type: "string"
+        description: "Статус оголошення"
+        usage: "Фільтр за статусом"
+      property_type:
+        type: "string"
+        description: "Тип оголошення"
+        usage: "Фільтр за типом нерухомості"
+      building_area_sqm:
+        type: "number"
+        description: "Площа нерухомості (м²)"
+        usage: "Фільтрація, сортування, аналітика"
+      land_area_ha:
+        type: "number"
+        description: "Площа земельної ділянки (га)"
+        usage: "Фільтрація, сортування, аналітика"
+      price_uah:
+        type: "number"
+        description: "Ціна в гривнях"
+        usage: "Сортування та фільтрація за ціною"
+      price_usd:
+        type: "number"
+        description: "Ціна в доларах"
+        usage: "Сортування та фільтрація за ціною"
+      addresses_region:
+        type: "string"
+        source: "addresses.region"
+        description: "Область з адрес"
+        usage: "Фільтр за областю (використовуй $elemMatch)"
+      addresses_settlement:
+        type: "string"
+        source: "addresses.settlement"
+        description: "Населений пункт з адрес"
+        usage: "Фільтр за містом (використовуй $elemMatch)"
+      source_updated_at:
+        type: "datetime"
+        description: "Дата оновлення в джерелі"
+        usage: "Фільтрація за періодом"
+
+  price_analytics:
+    description: "Зведена аналітика цін: агреговані метрики та індикатори (квартилі по містах)"
+    mongo_collection: "price_analytics"
+    purpose: "Зберігання агрегованих метрик (avg, std, q1–q4) за періодами (day/week/month) та індикаторів ціни (квартилі по місту за 30 днів)"
+    fields:
+      period_type:
+        type: "string"
+        description: "Тип періоду: day, week, month, indicator"
+      period_key:
+        type: "string"
+        description: "Ключ періоду (YYYY-MM-DD, YYYY-Www, YYYY-MM, last_30_days)"
+      group_source:
+        type: "string"
+        description: "Джерело (olx/prozorro)"
+      group_property_type:
+        type: "string"
+        description: "Тип оголошення"
+      group_region:
+        type: "string"
+        description: "Область"
+      group_city:
+        type: "string"
+        description: "Місто"
+      city:
+        type: "string"
+        description: "Місто (для period_type=indicator)"
+      region:
+        type: "string"
+        description: "Область (для period_type=indicator)"
+      metric:
+        type: "string"
+        description: "Метрика (price_uah, price_per_m2_uah, price_per_ha_uah)"
+      q1:
+        type: "number"
+        description: "1-й квартиль"
+      q2:
+        type: "number"
+        description: "Медіана (2-й квартиль)"
+      q3:
+        type: "number"
+        description: "3-й квартиль"
+      q4:
+        type: "number"
+        description: "4-й квартиль"
+      metrics:
+        type: "object"
+        description: "Об'єкт метрик з avg, std, q1–q4 для кожної"
+      computed_at:
+        type: "datetime"
+        description: "Час обчислення"
 
 # Допоміжні типи та константи
 field_types:

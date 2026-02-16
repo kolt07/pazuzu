@@ -276,6 +276,11 @@ class AnalyticsMetrics:
         ),
     }
     
+    # Аліаси назв метрик (наприклад sqm → m2 для сумісності з формулюваннями користувача)
+    METRIC_ALIASES = {
+        'average_price_per_sqm': 'average_price_per_m2',
+    }
+
     # Дозволені поля для групування
     ALLOWED_GROUP_BY_FIELDS = [
         'region',
@@ -284,8 +289,14 @@ class AnalyticsMetrics:
         'status',
         'year',
         'month',
-        'quarter'
+        'quarter',
+        'date'  # день (YYYY-MM-DD) для звітів «по днях»
     ]
+
+    @classmethod
+    def _resolve_metric_name(cls, metric_name: str) -> str:
+        """Повертає канонічну назву метрики (з урахуванням аліасів)."""
+        return cls.METRIC_ALIASES.get(metric_name, metric_name)
     
     @classmethod
     def get_metric(cls, metric_name: str) -> Optional[MetricDefinition]:
@@ -298,7 +309,7 @@ class AnalyticsMetrics:
         Returns:
             Визначення метрики або None
         """
-        return cls.METRICS.get(metric_name)
+        return cls.METRICS.get(cls._resolve_metric_name(metric_name))
     
     @classmethod
     def list_metrics(cls) -> List[Dict[str, Any]]:
@@ -321,7 +332,7 @@ class AnalyticsMetrics:
     @classmethod
     def is_valid_metric(cls, metric_name: str) -> bool:
         """
-        Перевіряє, чи існує метрика.
+        Перевіряє, чи існує метрика (з урахуванням аліасів, напр. average_price_per_sqm).
         
         Args:
             metric_name: Назва метрики
@@ -329,7 +340,7 @@ class AnalyticsMetrics:
         Returns:
             True, якщо метрика існує
         """
-        return metric_name in cls.METRICS
+        return cls._resolve_metric_name(metric_name) in cls.METRICS
     
     @classmethod
     def is_valid_group_by(cls, field: str) -> bool:

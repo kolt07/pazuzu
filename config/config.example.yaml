@@ -1,6 +1,24 @@
 # Приклад конфігураційного файлу для Pazuzu
 # Скопіюйте цей файл як config.yaml та заповніть API ключі
 
+# Маршрутизація запитів (intent confidence)
+# routing:
+#   confidence_threshold: 0.7   # при confidence < порогу: уточнення або fallback у LangChain
+#   ask_on_low_confidence: false # true = повернути уточнююче питання; false = fallback у вільний агент
+
+# Security layer: rate limit та max complexity
+# security_layer:
+#   rate_limit_requests_per_minute: 30
+#   max_query_complexity_length: 8000
+
+# Ліміти експорту та артефактів
+# limits:
+#   export_max_rows: 50000
+#   export_max_file_size_mb: 50
+#   exports_per_user_per_day: 20
+#   artifact_ttl_seconds: 3600
+#   export_confirm_rows_threshold: 50000  # при більшій кількості рядків — запит підтвердження
+
 # Налаштування LLM провайдерів
 llm:
   # Провайдер за замовчуванням: gemini, openai, anthropic
@@ -15,6 +33,13 @@ llm:
   rate_limit:
     calls_per_minute: 4
   
+  # Параметри циклу агента (опційно)
+  # agent:
+  #   max_iterations: 10      # макс. ітерацій tool-calling за один запит
+  #   max_output_tokens: 8192
+  #   temperature: 0.7
+  #   time_budget_seconds: 120  # макс. секунд на один process_query; порожньо = без обмеження
+  
   # API ключі для різних провайдерів
   api_keys:
     # Google Gemini API ключ
@@ -26,6 +51,11 @@ llm:
     # Anthropic (Claude) API ключ
     anthropic: ""
 
+# Регламентне фонове оновлення даних (ProZorro + OLX за минулу добу)
+# Працює лише при запуску Telegram бота. Інтервал у хвилинах; 0 = вимкнено
+# background_update:
+#   interval_minutes: 10
+
 # Налаштування Telegram бота
 telegram:
   # Токен бота від @BotFather
@@ -33,6 +63,27 @@ telegram:
   
   # Шлях до файлу з користувачами (опціонально, за замовчуванням config/users.yaml)
   # users_config_path: "config/users.yaml"
+
+# Telegram Mini App (веб-застосунок у Telegram)
+# base_url — обов'язково HTTPS. Без нього команда /app покаже "Mini App поки не налаштовано".
+# Локальна розробка: використайте ngrok (ngrok http 8000) і вставте виданий https://... URL нижче.
+#
+# Кнопка "Open" у результатах пошуку (як у BotFather):
+#   Налаштовується тільки через @BotFather, не через код:
+#   1. Відкрити @BotFather
+#   2. /mybots → обрати Pazuzu → Bot Settings → Configure Mini App → Enable Mini App
+#   3. Вказати URL (той самий base_url) та опційно завантажити превью
+#
+# Кнопка меню (☰) в чаті: встановлюється автоматично при запуску бота за наявності base_url.
+mini_app:
+  # Порт локального сервера Mini App (0 = вимкнено)
+  port: 8000
+  # Публічний HTTPS URL застосунку — для кнопки меню та команди /app (напр. https://your-domain.com або https://xxxx.ngrok.io)
+  base_url: ""
+
+# Google Maps API (геокодування: адреси, топоніми, назви ЖК/ТРЦ тощо)
+google_maps:
+  api_key: ""
 
 # Налаштування MongoDB
 mongodb:

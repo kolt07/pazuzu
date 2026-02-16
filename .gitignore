@@ -71,3 +71,6 @@ config/config.yaml
 
 # LLM cache
 data/cache/llm_cache.json
+
+# OLX scraper output (тестові вибірки)
+scripts/olx_scraper/output/
