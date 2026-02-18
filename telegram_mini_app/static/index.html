@@ -138,6 +138,20 @@
           <input type="file" id="admin-upload-prozorro" accept=".yaml,.yml" class="hidden" />
           <button type="button" id="admin-upload-prozorro-btn" class="btn">Завантажити YAML</button>
         </div>
+        <div class="admin-block">
+          <h3>Конфігурація та дані</h3>
+          <p class="admin-hint">Експорт/імпорт конфігу (промпти, налаштування, схема) та даних. Конфіг застосується після перезапуску.</p>
+          <div class="admin-export-actions">
+            <button type="button" id="admin-export-config" class="btn">Експорт конфігу</button>
+            <button type="button" id="admin-export-data" class="btn">Експорт даних</button>
+            <button type="button" id="admin-export-full" class="btn">Експорт усе</button>
+          </div>
+          <div class="admin-import-actions" style="margin-top: 0.5rem;">
+            <input type="file" id="admin-import-config" accept=".zip" class="hidden" />
+            <button type="button" id="admin-import-config-btn" class="btn">Імпорт конфігу (ZIP)</button>
+          </div>
+          <div id="admin-integrity-status" class="admin-hint" style="margin-top: 0.5rem;"></div>
+        </div>
       </div>
       <div id="screen-files" class="hidden">
         <h2>Звіти</h2>
@@ -383,8 +397,6 @@
     </div>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -36,6 +36,7 @@ class SourceFieldMapper:
             "price": "search_data.price",
             "date": "updated_at",
             "area": "detail.llm.building_area_sqm",
+            "floor": "detail.llm.floor",
             # Fallback поля для адрес
             "city_fallback": "detail.resolved_locations.address_structured.city",
             "region_fallback": "search_data.location",
@@ -50,6 +51,7 @@ class SourceFieldMapper:
             "area": "building_area_sqm",
             "building_area_sqm": "building_area_sqm",
             "land_area_ha": "land_area_ha",
+            "floor": "floor",
             "price_per_m2": "price_per_m2_uah",
             "price_per_m2_uah": "price_per_m2_uah",
             "average_price_per_sqm": "price_per_m2_uah",

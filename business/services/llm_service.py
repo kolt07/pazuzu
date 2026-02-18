@@ -87,6 +87,15 @@ class BaseLLMProvider(ABC):
         Returns:
             Текст промпту
         """
+        try:
+            from config.config_loader import get_config_loader
+            loader = get_config_loader()
+            template = loader.get_parsing_template()
+            if template:
+                return template.format(description=description)
+        except Exception:
+            pass
+        # Fallback — захардкодений промпт (legacy)
         return f"""Проаналізуй наступний опис аукціону нерухомості та витягни структуровану інформацію.
 Якщо інформація відсутня або невизначена, поверни порожнє значення або null.
 

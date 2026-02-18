@@ -758,6 +758,13 @@ class UnifiedListingsService:
         # Площі
         area_info = self._extract_area_info(olx_doc, "olx")
         
+        # Поверх та теги з LLM
+        llm = detail.get("llm", {}) if isinstance(detail, dict) else {}
+        floor = llm.get("floor") or ""
+        tags = llm.get("tags")
+        if not isinstance(tags, list):
+            tags = []
+        
         # Розраховуємо цінові метрики
         price_metrics = compute_price_metrics(
             total_price_uah=price_info["price_uah"],
@@ -780,6 +787,8 @@ class UnifiedListingsService:
             "cadastral_numbers": cadastral_numbers,
             "building_area_sqm": area_info["building_area_sqm"],
             "land_area_ha": area_info["land_area_ha"],
+            "floor": floor,
+            "tags": tags,
             "price_uah": price_info["price_uah"],
             "price_usd": price_info["price_usd"],
             "price_per_m2_uah": price_metrics.get("price_per_m2_uah"),
@@ -854,6 +863,12 @@ class UnifiedListingsService:
         # Площі
         area_info = self._extract_area_info(prozorro_doc, "prozorro")
         
+        # Поверх та теги (ProZorro: з auction_data якщо є)
+        floor = auction_data.get("floor") or ""
+        tags = auction_data.get("tags")
+        if not isinstance(tags, list):
+            tags = []
+        
         # Розраховуємо цінові метрики
         price_metrics = compute_price_metrics(
             total_price_uah=price_info["price_uah"],
@@ -876,6 +891,8 @@ class UnifiedListingsService:
             "cadastral_numbers": cadastral_numbers,
             "building_area_sqm": area_info["building_area_sqm"],
             "land_area_ha": area_info["land_area_ha"],
+            "floor": floor,
+            "tags": tags,
             "price_uah": price_info["price_uah"],
             "price_usd": price_info["price_usd"],
             "price_per_m2_uah": price_metrics.get("price_per_m2_uah"),

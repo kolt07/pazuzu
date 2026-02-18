@@ -104,7 +104,25 @@ class QueryStructureAgent:
     ) -> str:
         """Формує промпт для аналізу структури запиту."""
         metadata_summary = self.metadata_service.get_metadata_for_llm(max_length=2000)
-        
+        intent_info_str = json.dumps(intent_info, ensure_ascii=False, indent=2)
+        context_block = ("\n\n## Додатковий контекст:\n" + context) if context else ""
+        listing_context_block = ""
+        if listing_context and isinstance(listing_context, dict):
+            listing_context_block = "\n\n## ВАЖЛИВО — аналіз конкретного оголошення:\nКористувач запитує про КОНКРЕТНЕ оголошення (є посилання в контексті).\nНЕ додавай filter_metrics.property_type — оголошення може мати тип 'інше' або інший.\nВикористовуй лише region/city з контексту для порівняння з іншими оголошеннями в цьому регіоні."
+        try:
+            from config.config_loader import get_config_loader
+            template = get_config_loader().get_prompt("query_structure")
+            if template:
+                return template.format(
+                    metadata_summary=metadata_summary,
+                    user_query=user_query,
+                    intent_info=intent_info_str,
+                    context_block=context_block,
+                    listing_context_block=listing_context_block,
+                )
+        except Exception:
+            pass
+        # Fallback — збираємо з частин (legacy)
         prompt_parts = [
             "Проаналізуй запит користувача та визнач структурні елементи для вибірки даних.",
             "",
@@ -115,9 +133,8 @@ class QueryStructureAgent:
             user_query,
             "",
             "## Визначений намір:",
-            json.dumps(intent_info, ensure_ascii=False, indent=2),
+            intent_info_str,
         ]
-        
         if context:
             prompt_parts.extend([
                 "",
@@ -132,7 +149,6 @@ class QueryStructureAgent:
                 "НЕ додавай filter_metrics.property_type — оголошення може мати тип 'інше' або інший.",
                 "Використовуй лише region/city з контексту для порівняння з іншими оголошеннями в цьому регіоні.",
             ])
-        
         prompt_parts.extend([
             "",
             "## Завдання:",

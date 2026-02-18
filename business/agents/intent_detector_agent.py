@@ -95,7 +95,21 @@ class IntentDetectorAgent:
     def _build_intent_detection_prompt(self, user_query: str, context: Optional[str] = None) -> str:
         """Формує промпт для визначення наміру."""
         metadata_summary = self.metadata_service.get_metadata_for_llm(max_length=1500)
-        
+        context_block = ""
+        if context:
+            context_block = "\n\n## Додатковий контекст (для розуміння контексту розмови):\nВАЖЛИВО: Якщо в контексті є відповіді асистента типу 'неможливо визначити', 'даних недостатньо' — це НЕ підстава для out_of_scope. Такі запити стосуються даних системи.\n" + context
+        try:
+            from config.config_loader import get_config_loader
+            template = get_config_loader().get_prompt("intent_detection")
+            if template:
+                return template.format(
+                    metadata_summary=metadata_summary,
+                    user_query=user_query,
+                    context_block=context_block,
+                )
+        except Exception:
+            pass
+        # Fallback — збираємо з частин (legacy)
         prompt_parts = [
             "Проаналізуй запит користувача та визнач його намір та очікуваний формат відповіді.",
             "",
@@ -105,7 +119,6 @@ class IntentDetectorAgent:
             "## Запит користувача:",
             user_query,
         ]
-        
         if context:
             prompt_parts.extend([
                 "",
@@ -113,7 +126,6 @@ class IntentDetectorAgent:
                 "ВАЖЛИВО: Якщо в контексті є відповіді асистента типу 'неможливо визначити', 'даних недостатньо' — це НЕ підстава для out_of_scope. Такі запити стосуються даних системи.",
                 context
             ])
-        
         prompt_parts.extend([
             "",
             "## Завдання:",
@@ -142,7 +154,6 @@ class IntentDetectorAgent:
             '  "reasoning": "коротке пояснення вибору (опціонально)"',
             "}"
         ])
-        
         return "\n".join(prompt_parts)
     
     def _parse_llm_response(self, response_text: str) -> Dict[str, Any]:

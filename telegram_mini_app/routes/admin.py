@@ -319,6 +319,74 @@ def get_feedback_dislikes(
     return {"items": items, "count": len(items)}
 
 
+@router.get("/integrity/check")
+def integrity_check(request: Request):
+    """Перевірка цілісності даних (схема, колекції)."""
+    _get_admin_user(request)
+    from business.services.data_integrity_service import DataIntegrityService
+    service = DataIntegrityService()
+    return service.check()
+
+
+@router.get("/export/config")
+def export_config(request: Request):
+    """Експорт конфігураційного bundle (ZIP)."""
+    _get_admin_user(request)
+    from config.config_export_service import build_config_zip
+    zip_bytes, filename = build_config_zip()
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/export/data")
+def export_data(request: Request, limit: int = Query(10000, ge=1, le=50000)):
+    """Експорт даних з основних колекцій (ZIP з JSON)."""
+    _get_admin_user(request)
+    from config.config_export_service import build_data_zip
+    zip_bytes, filename = build_data_zip(limit_per_collection=limit)
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/export/full")
+def export_full(request: Request, limit: int = Query(5000, ge=1, le=20000)):
+    """Експорт конфігу + даних в одному архіві."""
+    _get_admin_user(request)
+    from config.config_export_service import build_full_zip
+    zip_bytes, filename = build_full_zip(limit_per_collection=limit)
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/import/config")
+async def import_config(request: Request, file: UploadFile = File(...)):
+    """Імпорт конфігурації з ZIP."""
+    admin_id, _, _, logging_service = _get_admin_user(request)
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Файл має бути .zip")
+    content = await file.read()
+    from config.config_export_service import import_config_from_zip
+    success, message = import_config_from_zip(content)
+    if success:
+        logging_service.log_user_action(
+            user_id=admin_id,
+            action="admin_action",
+            message=f"Імпортовано конфігурацію: {message}",
+            metadata={"action": "import_config"},
+        )
+        return {"success": True, "message": message}
+    raise HTTPException(status_code=400, detail=message)
+
+
 @router.post("/prozorro-config")
 async def upload_prozorro_config(request: Request, file: UploadFile = File(...)):
     """Завантажує файл конфігурації ProZorro (YAML)."""

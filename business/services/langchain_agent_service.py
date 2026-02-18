@@ -372,15 +372,10 @@ class LangChainAgentService:
                 logger.warning("chat session save: %s", e)
 
     def _load_glossary(self) -> str:
-        """Завантажує глосарій розробника."""
+        """Завантажує глосарій розробника з config або docs/."""
         try:
-            project_root = Path(__file__).parent.parent.parent
-            glossary_path = project_root / 'docs' / 'developer_glossary.md'
-            
-            if glossary_path.exists():
-                with open(glossary_path, 'r', encoding='utf-8') as f:
-                    return f.read()
-            return ""
+            from config.config_loader import get_config_loader
+            return get_config_loader().get_glossary()
         except Exception:
             return ""
     
@@ -389,8 +384,15 @@ class LangChainAgentService:
         # Додаємо метаданні застосунку
         metadata_text = self.metadata_service.get_metadata_for_llm(max_length=3000)
         
-        # Використовуємо звичайний рядок замість f-string, щоб уникнути проблем з вкладеністю
-        base_prompt = metadata_text + """
+        # Завантажуємо base промпт з prompts.yaml (fallback на дефолт з коду)
+        from config.config_loader import get_config_loader
+        loader = get_config_loader()
+        base_from_config = loader.get_prompt("langchain_system")
+        if base_from_config:
+            base_prompt = metadata_text + "\n\n" + base_from_config.strip()
+        else:
+            # Fallback — захардкодений промпт (legacy)
+            base_prompt = metadata_text + """
 
 ---
 
@@ -471,7 +473,14 @@ class LangChainAgentService:
 ## ЗАГАЛЬНІ ПРАВИЛА
 
 - У JSON використовуй "null", не None. Дозволені aggregation stages: $match, $project, $group, $unwind, $sort, $limit, $lookup, $addFields; заборонені: $out, $merge.
-- Не вигадуй поля чи колекції; якщо потрібних даних немає — явно повідом. Відповідай українською."""
+- Не вигадуй поля чи колекції; якщо потрібних даних немає — явно повідом. Відповідай українською.
+
+**Посилання та переліки:**
+- Коли користувач просить посилання — надай лише ті, що є в даних. Не обіцяй «N оголошень», якщо їх менше.
+- Кожне посилання — це повний URL (https://...). Не пиши плейсхолдери типу «[Посилання на друге оголошення...]» — або надай URL, або пропусти пункт.
+- НЕ використовуй markdown для посилань: заборонено формат [текст](url). Пиши просто URL після опису: «1. Назва, адреса: https://...». Система сама зробить клікабельне посилання.
+- Не дублюй один і той самий URL у відповіді — кожне оголошення має одне посилання.
+- Формат: номер, короткий опис (адреса/назва), посилання. Без мета-пояснень про відсутність даних."""
         
         glossary = self._load_glossary()
         if glossary:
@@ -1614,7 +1623,10 @@ Important: Use terms from the glossary correctly."""
         logger.info(f"🔍 [Geocoding MCP] Виклик geocode_address: {address_or_place!r}, region={region}")
         try:
             result = self.geocoding_service.geocode(query=address_or_place, region=region)
-            logger.info(f"✓ [Geocoding MCP] Результат: {len(result.get('results', []))} місць, from_cache={result.get('from_cache')}")
+            results_list = result.get("results", [])
+            logger.info(f"✓ [Geocoding MCP] Результат: {len(results_list)} місць, from_cache={result.get('from_cache')}")
+            result = dict(result)
+            result["success"] = len(results_list) > 0
             return result
         except Exception as e:
             logger.exception(f"✗ [Geocoding MCP] Помилка: {e}")
@@ -2019,11 +2031,12 @@ Important: Use terms from the glossary correctly."""
             )
             self.conversation_history.append(reply_hint)
 
-        # Предзапит: контекст оголошення — сильний фокус на конкретному об'єкті
+        # Предзапит: контекст оголошення — сильний фокус на конкретному об'єкті + попередній аналіз використання
         if listing_context and isinstance(listing_context, dict):
             page_url = listing_context.get("page_url") or ""
             summary = listing_context.get("summary") or ""
-            if page_url or summary:
+            usage_analysis = listing_context.get("_usage_analysis")
+            if page_url or summary or usage_analysis:
                 parts = [
                     "УВАГА: Розмова ведеться про КОНКРЕТНЕ оголошення. Усі відповіді, аналітика та рекомендації мають стосуватися САМЕ цього об'єкта.",
                     "Не змінюй фокус на інші оголошення. Якщо користувач питає «а яка ціна?», «що з оточенням?» — май на увазі це оголошення.",
@@ -2032,6 +2045,9 @@ Important: Use terms from the glossary correctly."""
                     parts.append(f"Посилання на оголошення: {page_url}")
                 if summary:
                     parts.append(f"Короткий контекст: {summary}")
+                if usage_analysis:
+                    from business.services.property_usage_analysis_service import PropertyUsageAnalysisService
+                    parts.append(PropertyUsageAnalysisService().format_analysis_for_llm(usage_analysis))
                 listing_hint = SystemMessage(content="\n".join(parts))
                 self.conversation_history.append(listing_hint)
         
@@ -2107,9 +2123,14 @@ Important: Use terms from the glossary correctly."""
                     if hasattr(response, 'content'):
                         response_content = response.content
                         if isinstance(response_content, list):
-                            # Якщо content - список, шукаємо текст
-                            text_parts = [str(item) for item in response_content if isinstance(item, str)]
-                            response_content = ' '.join(text_parts) if text_parts else None
+                            # Якщо content - список (наприклад блоки Gemini: {type:'text', text:'...'})
+                            text_parts = []
+                            for item in response_content:
+                                if isinstance(item, str):
+                                    text_parts.append(item)
+                                elif isinstance(item, dict) and item.get("type") == "text" and "text" in item:
+                                    text_parts.append(str(item["text"]))
+                            response_content = "\n".join(text_parts) if text_parts else None
                         elif not isinstance(response_content, str):
                             response_content = str(response_content) if response_content else None
                     
@@ -2201,12 +2222,18 @@ Important: Use terms from the glossary correctly."""
                                 limit_val = min(limit_val, 100)
                             else:
                                 limit_val = 100
+                            proj_raw = tool_args.get('project') or tool_args.get('projection') or inner.get('project') or inner.get('projection')
+                            if isinstance(proj_raw, dict):
+                                proj_raw = [k for k, v in proj_raw.items() if v and k != '_id']
+                            elif proj_raw is not None and not isinstance(proj_raw, list):
+                                proj_raw = [proj_raw]
                             query_for_builder = {
                                 'collection': coll or '',
                                 'filters': filters if isinstance(filters, dict) else {},
-                                'projection': tool_args.get('project') or tool_args.get('projection') or inner.get('project') or inner.get('projection'),
                                 'limit': limit_val,
                             }
+                            if proj_raw is not None:
+                                query_for_builder['projection'] = proj_raw if isinstance(proj_raw, list) else [proj_raw]
                             if not query_for_builder['collection']:
                                 tool_result = {'success': False, 'error': "Поле 'collection' є обов'язковим. Передай collection або collection_name: prozorro_auctions, olx_listings, llm_cache."}
                             else:
@@ -2421,13 +2448,16 @@ Important: Use terms from the glossary correctly."""
         # Якщо досягнуто максимум ітерацій
         logger.warning("%sДосягнуто максимум ітерацій (%s)", log_ctx, max_iterations)
         
-        # Спробуємо отримати фінальну відповідь (з retry при тимчасових помилках)
+        # Спробуємо отримати фінальну відповідь БЕЗ tools (щоб LLM не міг викликати інструменти, лише текст)
         try:
-            llm_with_tools = self.llm.bind_tools(tools_for_request)
+            fallback_messages = list(self.conversation_history)
+            fallback_messages.append(HumanMessage(
+                content="[СИСТЕМА] Досягнуто ліміт ітерацій. На основі наявних даних у цій бесіді дай фінальну відповідь користувачу текстом: перелік з посиланнями (URL), короткий опис кожного. НЕ викликай інструменти."
+            ))
             last_err = None
             for attempt in range(AGENT_LLM_RETRY_ATTEMPTS + 1):
                 try:
-                    final_response = llm_with_tools.invoke(self.conversation_history)
+                    final_response = self.llm.invoke(fallback_messages)
                     break
                 except Exception as e:
                     last_err = e
@@ -2444,7 +2474,18 @@ Important: Use terms from the glossary correctly."""
             
             if final_response and hasattr(final_response, 'content') and final_response.content:
                 fc = final_response.content
-                final_str = fc if isinstance(fc, str) else (" ".join(str(x) for x in fc) if isinstance(fc, list) else str(fc))
+                if isinstance(fc, str):
+                    final_str = fc
+                elif isinstance(fc, list):
+                    parts = []
+                    for x in fc:
+                        if isinstance(x, str):
+                            parts.append(x)
+                        elif isinstance(x, dict) and x.get("type") == "text" and "text" in x:
+                            parts.append(str(x["text"]))
+                    final_str = "\n".join(parts) if parts else ""
+                else:
+                    final_str = str(fc)
                 if final_str.strip():
                     self._save_response_to_memory(user_id, user_query, final_str, chat_id)
                 self._last_request_metrics = {"iterations": iteration, "duration_seconds": time.perf_counter() - start_time}

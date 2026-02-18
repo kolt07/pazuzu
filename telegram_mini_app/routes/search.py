@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from telegram_mini_app.auth import validate_telegram_init_data
 from data.repositories.unified_listings_repository import UnifiedListingsRepository
-from data.repositories.olx_listings_repository import OlxListingsRepository
+from data.repositories.olx_listings_repository import OlxListingsRepository, _olx_url_variants
 from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepository
 
 
@@ -386,6 +386,8 @@ def _normalize_unified_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "property_type": doc.get("property_type", ""),
         "building_area_sqm": doc.get("building_area_sqm"),
         "land_area_ha": doc.get("land_area_ha"),
+        "floor": doc.get("floor"),
+        "tags": doc.get("tags") or [],
         "page_url": doc.get("page_url"),
         "updated_at": date_str,
     }
@@ -440,6 +442,10 @@ def _normalize_olx_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(detail, dict):
         price_metrics = detail.get("price_metrics") or {}
 
+    llm = detail.get("llm", {}) if isinstance(detail, dict) else {}
+    floor = llm.get("floor") if llm else None
+    tags = llm.get("tags") if llm and isinstance(llm.get("tags"), list) else []
+
     return {
         "id": doc.get("_id"),
         "url": doc.get("url"),
@@ -455,6 +461,8 @@ def _normalize_olx_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "region": region,
         "city": city,
         "area_m2": search_data.get("area_m2"),
+        "floor": floor if floor else None,
+        "tags": tags or [],
         "date_text": search_data.get("date_text", ""),
         "updated_at": doc.get("updated_at").isoformat() if doc.get("updated_at") and hasattr(doc.get("updated_at"), "isoformat") else str(doc.get("updated_at")) if doc.get("updated_at") else None,
     }
@@ -515,6 +523,11 @@ def _normalize_prozorro_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     if not title_ua:
         title_ua = auction_data.get("id", "")
     
+    floor = auction_data.get("floor")
+    tags = auction_data.get("tags")
+    if not isinstance(tags, list):
+        tags = []
+
     return {
         "id": doc.get("_id"),
         "auction_id": doc.get("auction_id"),
@@ -527,6 +540,8 @@ def _normalize_prozorro_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "price_per_ha_usd": price_metrics.get("price_per_ha_usd"),
         "region": region,
         "city": city,
+        "floor": floor,
+        "tags": tags,
         "status": auction_data.get("status", ""),
         "date_created": auction_data.get("dateCreated"),
         "date_modified": auction_data.get("dateModified"),
@@ -1229,29 +1244,190 @@ def get_unified_detail(
     return item
 
 
-@router.get("/olx/{item_id:path}")
-def get_olx_item(request: Request, item_id: str):
-    """Отримує детальну інформацію про оголошення OLX."""
+@router.get("/usage-analysis")
+def get_usage_analysis(
+    request: Request,
+    source: str = Query(..., description="Джерело: olx або prozorro"),
+    source_id: str = Query(..., description="ID в джерелі (URL для OLX, auction_id для ProZorro)"),
+):
+    """Отримує попередній аналіз використання об'єкта."""
     user_id, user_service = _get_validated_user(request)
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
-    
-    repo = OlxListingsRepository()
-    
-    # Спробуємо знайти за URL або _id
+    if source.lower() not in ("olx", "prozorro"):
+        raise HTTPException(status_code=400, detail="source must be olx or prozorro")
+
+    try:
+        from business.services.property_usage_analysis_service import PropertyUsageAnalysisService
+        svc = PropertyUsageAnalysisService()
+        analysis = svc.get_or_create_analysis(source.lower(), source_id)
+        if analysis.get("error"):
+            return {"existing_usage": [], "usage_suggestions": [], "geo_analysis": {}}
+        return {
+            "existing_usage": analysis.get("existing_usage", []),
+            "usage_suggestions": analysis.get("usage_suggestions", []),
+            "geo_analysis": analysis.get("geo_analysis", {}),
+        }
+    except Exception as e:
+        return {"existing_usage": [], "usage_suggestions": [], "geo_analysis": {}, "error": str(e)}
+
+
+def _unified_olx_to_olx_like(unified_doc: Dict[str, Any], url: str) -> Dict[str, Any]:
+    """Конвертує документ unified_listings (source=olx) у формат olx_listings для renderDetail."""
+    addresses = unified_doc.get("addresses", [])
+    location_parts = []
+    if addresses and isinstance(addresses, list):
+        for addr in addresses:
+            if isinstance(addr, dict):
+                settlement = addr.get("settlement")
+                region = addr.get("region")
+                if settlement:
+                    location_parts.append(settlement)
+                if region and region not in location_parts:
+                    location_parts.append(region)
+                if location_parts:
+                    break
+    location_str = " - ".join(location_parts) if location_parts else ""
+
+    price_uah = unified_doc.get("price_uah")
+    price_text = f"{int(price_uah):,} грн".replace(",", " ") if price_uah is not None else ""
+
+    price_metrics = {}
+    if unified_doc.get("price_usd") is not None:
+        price_metrics["total_price_usd"] = unified_doc["price_usd"]
+    if unified_doc.get("price_per_m2_uah") is not None:
+        price_metrics["price_per_m2_uah"] = unified_doc["price_per_m2_uah"]
+    if unified_doc.get("price_per_m2_usd") is not None:
+        price_metrics["price_per_m2_usd"] = unified_doc["price_per_m2_usd"]
+    if unified_doc.get("price_per_ha_uah") is not None:
+        price_metrics["price_per_ha_uah"] = unified_doc["price_per_ha_uah"]
+    if unified_doc.get("price_per_ha_usd") is not None:
+        price_metrics["price_per_ha_usd"] = unified_doc["price_per_ha_usd"]
+
+    floor = unified_doc.get("floor") or ""
+    tags = unified_doc.get("tags")
+    if not isinstance(tags, list):
+        tags = []
+    llm = {"floor": floor, "tags": tags} if (floor or tags) else {}
+
+    return {
+        "url": url,
+        "search_data": {
+            "title": unified_doc.get("title", ""),
+            "location": location_str,
+            "price_value": price_uah,
+            "price_text": price_text,
+            "area_m2": unified_doc.get("building_area_sqm"),
+        },
+        "detail": {
+            "location": location_str,
+            "description": unified_doc.get("description", ""),
+            "price_metrics": price_metrics if price_metrics else None,
+            "llm": llm if llm else None,
+        },
+    }
+
+
+def _build_item_for_price_indicator(doc: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
+    """Будує item для get_price_indicators_for_items з doc olx або prozorro."""
+    if source == "olx":
+        search_data = doc.get("search_data", {})
+        detail = doc.get("detail", {})
+        price_metrics = detail.get("price_metrics") or {}
+        city, region = None, None
+        loc = search_data.get("location", "")
+        if isinstance(loc, str):
+            parts = [p.strip() for p in loc.replace(" - ", ",").split(",")]
+            if parts:
+                city = parts[0]
+            if len(parts) > 1:
+                region = parts[1]
+        return {
+            "source": "olx",
+            "source_id": doc.get("url", ""),
+            "city": city,
+            "region": region,
+            "price_uah": search_data.get("price_value"),
+            "price_per_m2_uah": price_metrics.get("price_per_m2_uah"),
+            "price_per_ha_uah": price_metrics.get("price_per_ha_uah"),
+        }
+    if source == "prozorro":
+        auction_data = doc.get("auction_data", {})
+        city, region = None, None
+        refs = auction_data.get("address_refs", [])
+        if refs and isinstance(refs[0], dict):
+            r = refs[0]
+            if isinstance(r.get("city"), dict):
+                city = r["city"].get("name")
+            if isinstance(r.get("region"), dict):
+                region = r["region"].get("name")
+        if not city and not region:
+            items = auction_data.get("items", [])
+            if items and isinstance(items[0], dict):
+                addr = items[0].get("address", {})
+                if isinstance(addr, dict):
+                    loc = addr.get("locality", {})
+                    reg = addr.get("region", {})
+                    if isinstance(loc, dict):
+                        city = loc.get("uk_UA", "")
+                    if isinstance(reg, dict):
+                        region = (reg.get("uk_UA", "") or "").replace(" область", "").replace(" обл.", "").strip()
+        value = auction_data.get("value", {})
+        price = value.get("amount") if isinstance(value, dict) else None
+        pm = auction_data.get("price_metrics") or {}
+        return {
+            "source": "prozorro",
+            "source_id": doc.get("auction_id", ""),
+            "city": city,
+            "region": region,
+            "price_uah": price,
+            "price_per_m2_uah": pm.get("price_per_m2_uah"),
+            "price_per_ha_uah": pm.get("price_per_ha_uah"),
+        }
+    return None
+
+
+@router.get("/olx/{item_id:path}")
+def get_olx_item(request: Request, item_id: str):
+    """Отримує детальну інформацію про оголошення OLX. Якщо в olx_listings немає — fallback на unified_listings."""
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+
+    olx_repo = OlxListingsRepository()
     doc = None
-    
+
     if item_id.startswith("http://") or item_id.startswith("https://"):
-        doc = repo.find_by_url(item_id)
+        doc = olx_repo.find_by_url(item_id)
     else:
         try:
-            doc = repo.find_by_id(item_id)
+            doc = olx_repo.find_by_id(item_id)
         except Exception:
             pass
-    
+
+    if not doc and (item_id.startswith("http://") or item_id.startswith("https://")):
+        unified_repo = UnifiedListingsRepository()
+        for variant in _olx_url_variants(item_id):
+            unified_doc = unified_repo.find_by_source_id("olx", variant)
+            if unified_doc:
+                url = unified_doc.get("source_id") or unified_doc.get("page_url") or item_id
+                doc = _unified_olx_to_olx_like(unified_doc, url)
+                break
+
     if not doc:
         raise HTTPException(status_code=404, detail="Item not found")
-    
+
+    try:
+        item = _build_item_for_price_indicator(doc, "olx")
+        if item:
+            from business.services.price_analytics_service import PriceAnalyticsService
+            analytics = PriceAnalyticsService()
+            indicators = analytics.get_price_indicators_for_items([item])
+            cid = f"olx:{item.get('source_id', '')}"
+            if cid in indicators:
+                doc["price_indicator"] = indicators[cid]
+    except Exception:
+        pass
     return doc
 
 
@@ -1276,7 +1452,18 @@ def get_prozorro_item(request: Request, item_id: str):
     
     if not doc:
         raise HTTPException(status_code=404, detail="Item not found")
-    
+
+    try:
+        item = _build_item_for_price_indicator(doc, "prozorro")
+        if item:
+            from business.services.price_analytics_service import PriceAnalyticsService
+            analytics = PriceAnalyticsService()
+            indicators = analytics.get_price_indicators_for_items([item])
+            cid = f"prozorro:{item.get('source_id', '')}"
+            if cid in indicators:
+                doc["price_indicator"] = indicators[cid]
+    except Exception:
+        pass
     return doc
 
 

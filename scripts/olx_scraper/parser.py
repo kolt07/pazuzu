@@ -328,6 +328,20 @@ def parse_detail_page(html: str) -> Dict[str, Any]:
         result["description"] = desc_el.get_text(separator="\n", strip=True) or None
 
     # Параметри: пари лейбл/значення (наприклад Площа, Поверх)
+    def _parse_param_item(text: str) -> Optional[Dict[str, str]]:
+        """Парсить рядок у форматі 'Лейбл: значення' або повертає None."""
+        if not text or len(text) > 1000:
+            return None
+        parts = re.split(r"\s*:\s*", text, 1)
+        if len(parts) == 2:
+            return {"label": parts[0].strip(), "value": parts[1].strip()}
+        if text.strip():
+            return {"label": text[:100].strip(), "value": ""}
+        return None
+
+    params_by_label: Dict[str, str] = {}  # label -> value (зберігаємо найповніше значення)
+
+    # 1) Класичний блок параметрів: data-cy="ad_parameters"
     params_container = (
         soup.select_one('[data-cy="ad_parameters"]')
         or soup.find("ul", class_=re.compile(r"param|detail|list", re.I))
@@ -336,16 +350,27 @@ def parse_detail_page(html: str) -> Dict[str, Any]:
     if params_container:
         items = params_container.select("li") or params_container.find_all(["div", "p"], class_=re.compile(r"item|row", re.I))
         for item in items:
-            text = item.get_text(strip=True)
-            if not text or len(text) > 500:
-                continue
-            # Формат "Лейбл: значення" або два дочірні елементи
-            parts = re.split(r"\s*:\s*", text, 1)
-            if len(parts) == 2:
-                result["parameters"].append({"label": parts[0].strip(), "value": parts[1].strip()})
-            else:
-                # Один рядок — зберігаємо як лейбл з порожнім значенням або як значення
-                result["parameters"].append({"label": text[:100], "value": ""})
+            parsed = _parse_param_item(item.get_text(strip=True))
+            if parsed and parsed["label"]:
+                # Якщо вже є — оновлюємо лише якщо нове значення довше (більш повне)
+                existing = params_by_label.get(parsed["label"])
+                if existing is None or len(parsed.get("value", "")) > len(existing):
+                    params_by_label[parsed["label"]] = parsed.get("value", "")
+
+    # 2) Розширений блок характеристик: data-testid="ad-parameters-container"
+    # Містить: відстань до міста, тип нерухомості, кадастровий номер, площа ділянки,
+    # комунікації, інфраструктура тощо
+    ad_params_container = soup.select_one('[data-testid="ad-parameters-container"]')
+    if ad_params_container:
+        for p_el in ad_params_container.find_all("p"):
+            parsed = _parse_param_item(p_el.get_text(strip=True))
+            if parsed and parsed["label"]:
+                existing = params_by_label.get(parsed["label"])
+                if existing is None or len(parsed.get("value", "")) > len(existing):
+                    params_by_label[parsed["label"]] = parsed.get("value", "")
+
+    if params_by_label:
+        result["parameters"] = [{"label": k, "value": v} for k, v in params_by_label.items()]
 
     # Локація (місто/область) – блок «Місцезнаходження»
     try:

@@ -3,16 +3,54 @@
 Скрипт для запуску всіх міграцій.
 
 Цей скрипт автоматично знаходить та виконує всі міграції в порядку їх номерів.
+Відстежує виконані міграції в колекції _migration_history (після міграції 029).
 """
 
 import sys
 import importlib.util
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 # Додаємо корінь проекту до шляху для імпортів
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+
+
+def _get_migration_history_collection():
+    """Повертає колекцію _migration_history або None якщо БД не ініціалізована."""
+    try:
+        from config.settings import Settings
+        from data.database.connection import MongoDBConnection
+        MongoDBConnection.initialize(Settings())
+        return MongoDBConnection.get_database()["_migration_history"]
+    except Exception:
+        return None
+
+
+def _is_migration_applied(coll, migration_name: str) -> bool:
+    """Перевіряє, чи міграція вже виконана."""
+    if coll is None:
+        return False
+    return coll.find_one({"_id": migration_name}) is not None
+
+
+def _record_migration_applied(coll, migration_name: str) -> None:
+    """Записує міграцію як виконану."""
+    if coll is None:
+        return
+    try:
+        coll.replace_one(
+            {"_id": migration_name},
+            {
+                "_id": migration_name,
+                "applied_at": datetime.now(timezone.utc).isoformat(),
+                "config_version_at_apply": "1.0",
+            },
+            upsert=True,
+        )
+    except Exception:
+        pass
 
 
 def find_migrations() -> List[Tuple[int, str, Path]]:
@@ -63,32 +101,40 @@ def run_all_migrations():
         print(f"  {number:03d}: {name}")
     
     print("\n" + "=" * 60)
-    
+
     all_success = True
-    
+
     for number, name, file_path in migrations:
+        history_coll = _get_migration_history_collection()
+        if _is_migration_applied(history_coll, name):
+            print(f"\nПропуск міграції {number:03d}: {name} (вже виконано)")
+            continue
+
         print(f"\nВиконання міграції {number:03d}: {name}...")
         print("-" * 60)
-        
+
         try:
             # Імпортуємо модуль міграції
             module_name = f"scripts.migrations.{name}"
             spec = importlib.util.spec_from_file_location(module_name, file_path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            
-            # Виконуємо міграцію
-            if hasattr(module, 'run_migration'):
-                success = module.run_migration()
+
+            # Виконуємо міграцію (run_migration, run або up)
+            run_fn = getattr(module, 'run_migration', None) or getattr(module, 'run', None) or getattr(module, 'up', None)
+            if run_fn is not None:
+                result = run_fn()
+                success = result is not False
                 if not success:
                     print(f"\n✗ Міграція {number:03d} завершилася з помилкою")
                     all_success = False
                     break
+                _record_migration_applied(_get_migration_history_collection(), name)
             else:
-                print(f"✗ Міграція {number:03d} не містить функцію run_migration()")
+                print(f"✗ Міграція {number:03d} не містить функцію run_migration(), run() або up()")
                 all_success = False
                 break
-                
+
         except Exception as e:
             print(f"\n✗ Помилка під час виконання міграції {number:03d}: {e}")
             import traceback

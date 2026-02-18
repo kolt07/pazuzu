@@ -12,7 +12,24 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from telegram_mini_app.auth import validate_telegram_init_data
+import re
+from typing import Any, Dict, List
 from utils.link_formatter import format_message_links_for_mini_app
+
+
+def _infer_quick_actions_from_response(response: str, user_query: str) -> List[Dict[str, Any]]:
+    """
+    Визначає кнопки швидких дій, якщо відповідь містить уточнення або пропозицію варіантів.
+    """
+    if not response or not isinstance(response, str):
+        return []
+    r_lower = response.lower()
+    actions = []
+    if re.search(r"(показати|вивести)\s+(тут|в\s+чату|текстом)", r_lower) or "показати тут" in r_lower:
+        actions.append({"label": "Показати тут", "prompt": (user_query or "").strip() + " Покажи результати в чаті."})
+    if re.search(r"(вивантажити|експорт|завантажити|зберегти)\s+(в\s+)?(файл|excel)", r_lower) or "у файл" in r_lower:
+        actions.append({"label": "Вивантажити в Excel", "prompt": (user_query or "").strip() + " Вивантаж результати в Excel."})
+    return actions[:8]
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
 
@@ -235,11 +252,13 @@ def chat_stream(request: Request, body: ChatRequest):
                     })
                 except Exception:
                     continue
+            quick_actions = _infer_quick_actions_from_response(response, text)
             events_queue.put({
                 "type": "done",
                 "response": formatted_response,
                 "request_id": request_id,
                 "excel_files": out_excel_files,
+                "quick_actions": quick_actions,
             })
         except Exception as e:
             events_queue.put({"type": "error", "message": str(e)})

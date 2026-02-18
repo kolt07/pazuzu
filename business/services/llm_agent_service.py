@@ -74,6 +74,31 @@ class LLMAgentService:
         Returns:
             Системний промпт з глосарієм
         """
+        try:
+            from config.config_loader import get_config_loader
+            loader = get_config_loader()
+            base_from_config = loader.get_prompt("llm_agent_system")
+            if base_from_config:
+                glossary = loader.get_glossary()
+                if glossary:
+                    base_from_config += f"""
+
+## Термінологія проекту (Developer Glossary)
+
+Використовуй цю термінологію при відповідях та роботі з даними:
+
+{glossary}
+
+Важливо: Використовуй терміни з глосарію правильно. Наприклад:
+- "тендер" = процедура закупівлі через ProZorro API
+- "аукціон" = процедура продажу майна через ProZorro.Sale API
+- "оголошення" = тендер або аукціон
+- "status" = статус тендера/аукціону (active, active.tendering, active.auction, complete, cancelled, unsuccessful)
+"""
+                return base_from_config
+        except Exception:
+            pass
+        # Fallback — захардкодений промпт (legacy)
         base_prompt = """You are a data analyst assistant for a real estate auction database.
 
 You do NOT know the database structure in advance.

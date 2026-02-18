@@ -301,7 +301,8 @@ body {
   margin-bottom: 0.75rem;
 }
 
-.admin-data-update-actions {
+.admin-data-update-actions,
+.admin-export-actions {
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
@@ -462,6 +463,24 @@ body {
 
 .chat-msg.bot a.chat-link:hover {
   text-decoration: underline;
+}
+
+.chat-msg.bot a.chat-link-internal {
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.6rem;
+}
+
+.chat-quick-action-btn {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.6rem;
+  white-space: nowrap;
 }
 
 .chat-feedback {
@@ -1214,6 +1233,8 @@ a.file-download-link:active {
 
 .search-item-location,
 .search-item-area,
+.search-item-floor,
+.search-item-tags,
 .search-item-status,
 .search-item-date {
   color: var(--tg-theme-hint-color);
@@ -1280,6 +1301,17 @@ a.file-download-link:active {
   text-align: center;
   padding: 2rem;
   color: var(--tg-theme-hint-color);
+}
+
+.detail-404-fallback .detail-404-link {
+  display: inline-block;
+  margin-top: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--tg-theme-button-color);
+  color: var(--tg-theme-button-text-color);
+  text-decoration: none;
+  border-radius: 8px;
+  font-weight: 500;
 }
 
 /* Detail */
@@ -1716,12 +1748,33 @@ a.file-download-link:active {
   margin-top: 0.25rem;
 }
 
-.detail-analytics-chart-wrap {
-  position: relative;
-  min-height: 220px;
-  margin: 1rem 0;
+.detail-analytics-text {
+  padding: 0.5rem 0;
 }
 
-.detail-analytics-chart-wrap canvas {
-  max-height: 320px;
+.detail-analytics-desc {
+  margin: 0 0 1rem 0;
+  line-height: 1.6;
+  color: var(--tg-theme-text-color);
+  font-size: 0.95rem;
+}
+
+.detail-analytics-tag-section {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.detail-analytics-tag-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 0.5rem 0;
+  color: var(--tg-theme-text-color);
+}
+
+.detail-analytics-tag-desc {
+  margin: 0;
+  line-height: 1.55;
+  color: var(--tg-theme-hint-color);
+  font-size: 0.9rem;
 }

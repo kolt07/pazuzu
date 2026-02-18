@@ -18,3 +18,10 @@ def run():
     repo = OlxListingsRepository()
     repo.ensure_index()
     print("Міграція 003: колекція olx_listings та індекс по url створено/перевірено.")
+    return True
+
+
+def run_migration() -> bool:
+    """Точка входу для run_migrations.py."""
+    run()
+    return True

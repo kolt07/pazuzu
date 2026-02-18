@@ -61,7 +61,7 @@
     return h;
   }
 
-  var currentScreen = "screen-home";
+  var currentScreen = "screen-search";
 
   var CHAT_STORAGE_KEY = "pazuzu_chat_sessions";
   var THEME_STORAGE_KEY = "pazuzu_theme";
@@ -353,7 +353,7 @@
     return chatSessions.find(function (c) { return c.id === currentChatId; });
   }
 
-  function addMessageToCurrentChat(role, text, requestId, excelFiles) {
+  function addMessageToCurrentChat(role, text, requestId, excelFiles, quickActions) {
     var chat = getCurrentChat();
     if (!chat) {
       createNewChat();
@@ -364,6 +364,9 @@
     var msg = { role: role, text: text, requestId: requestId || null, timestamp: timestamp };
     if (excelFiles && excelFiles.length) {
       msg.excelFiles = excelFiles;
+    }
+    if (quickActions && quickActions.length) {
+      msg.quickActions = quickActions;
     }
     chat.messages.push(msg);
     if (role === "user" && chat.title === "Новий чат") {
@@ -502,12 +505,12 @@
     var chat = getCurrentChat();
     if (!chat || !chat.messages.length) return;
     chat.messages.forEach(function (m) {
-      appendChatMessageDOM(container, m.role, m.text, m.requestId, m.timestamp, m.excelFiles);
+      appendChatMessageDOM(container, m.role, m.text, m.requestId, m.timestamp, m.excelFiles, m.quickActions);
     });
     container.scrollTop = container.scrollHeight;
   }
 
-  function appendChatMessageDOM(container, role, text, requestId, timestamp, excelFiles) {
+  function appendChatMessageDOM(container, role, text, requestId, timestamp, excelFiles, quickActions) {
     if (!container) return;
     var div = document.createElement("div");
     div.className = "chat-msg " + role;
@@ -516,6 +519,27 @@
     if (role === "bot") {
       contentWrap.innerHTML = text || "";
       div.appendChild(contentWrap);
+      if (quickActions && quickActions.length) {
+        var qaWrap = document.createElement("div");
+        qaWrap.className = "chat-quick-actions";
+        quickActions.forEach(function (qa) {
+          var btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "btn btn-small btn-secondary chat-quick-action-btn";
+          btn.textContent = qa.label || qa.prompt;
+          btn.dataset.prompt = qa.prompt || "";
+          btn.onclick = function () {
+            var p = (qa.prompt || btn.dataset.prompt || "").trim();
+            if (p) sendChatMessageWithText(p);
+            else {
+              var inp = document.getElementById("chat-input");
+              if (inp) inp.focus();
+            }
+          };
+          qaWrap.appendChild(btn);
+        });
+        div.appendChild(qaWrap);
+      }
       if (excelFiles && excelFiles.length) {
         excelFiles.forEach(function (f) {
           var aid = f.artifact_id || f.artifactId;
@@ -624,6 +648,17 @@
     nav.innerHTML = "";
 
     if (me && me.authorized) {
+      var aSearch = document.createElement("a");
+      aSearch.href = "#";
+      aSearch.textContent = "Пошук";
+      aSearch.classList.add("secondary");
+      aSearch.setAttribute("data-screen", "screen-search");
+      aSearch.addEventListener("click", function (e) { 
+        e.preventDefault(); 
+        showSearch(); 
+      });
+      nav.appendChild(aSearch);
+      
       var a1 = document.createElement("a");
       a1.href = "#";
       a1.textContent = "AI-асистент";
@@ -636,17 +671,6 @@
         if (homeScreen) homeScreen.classList.remove("hidden");
       });
       nav.appendChild(a1);
-      
-      var aSearch = document.createElement("a");
-      aSearch.href = "#";
-      aSearch.textContent = "Пошук";
-      aSearch.classList.add("secondary");
-      aSearch.setAttribute("data-screen", "screen-search");
-      aSearch.addEventListener("click", function (e) { 
-        e.preventDefault(); 
-        showSearch(); 
-      });
-      nav.appendChild(aSearch);
       
       var a2 = document.createElement("a");
       a2.href = "#";
@@ -670,6 +694,7 @@
           show("screen-admin"); 
           var adminScreen = document.getElementById("screen-admin");
           if (adminScreen) adminScreen.classList.remove("hidden");
+          loadAdminIntegrityStatus();
         });
         nav.appendChild(a3);
       }
@@ -700,13 +725,13 @@
     setNavActive(currentScreen);
   }
 
-  function appendChatMessage(role, text, requestId, excelFiles) {
-    addMessageToCurrentChat(role, text, requestId, excelFiles);
+  function appendChatMessage(role, text, requestId, excelFiles, quickActions) {
+    addMessageToCurrentChat(role, text, requestId, excelFiles, quickActions);
     var container = document.getElementById("chat-messages");
     var chat = getCurrentChat();
     var lastMsg = chat && chat.messages.length ? chat.messages[chat.messages.length - 1] : null;
     var ts = lastMsg ? lastMsg.timestamp : null;
-    appendChatMessageDOM(container, role, text, requestId, ts, excelFiles);
+    appendChatMessageDOM(container, role, text, requestId, ts, excelFiles, quickActions);
   }
   
   function submitFeedback(requestId, feedbackType, responseText) {
@@ -783,6 +808,122 @@
 
   var currentChatAbortController = null;
 
+  var CAPABILITIES_PHRASES = [
+    "що ти вмієш", "що ти можеш", "твої можливості", "розкажи про себе",
+    "які у тебе функції", "допоможи з", "як ти можеш допомогти", "що вмієш"
+  ];
+  var CAPABILITIES_RESPONSE = "Я — AI-помічник для роботи з оголошеннями нерухомості (OLX та ProZorro).\n\n" +
+    "Можу:\n" +
+    "• Шукати оголошення за параметрами (регіон, місто, ціна, площа, тип)\n" +
+    "• Порівнювати ціни, аналізувати ринок\n" +
+    "• Експортувати звіти в Excel (за період, геообмеженням)\n" +
+    "• Аналізувати конкретне оголошення (якщо воно відкрите в застосунку)\n\n" +
+    "Спробуйте один із прикладів нижче:";
+  var CAPABILITIES_QUICK_ACTIONS = [
+    { label: "Пошук приміщення в Києві", prompt: "Знайди приміщення для аптеки в Києві до 100 м², 1 поверх" },
+    { label: "Звіт за тиждень у файл", prompt: "Вивантаж звіт по оголошеннях за останній тиждень у Excel" },
+    { label: "Ціни за м² по областях", prompt: "Порівняй середню ціну за м² по областях України" },
+    { label: "Оголошення OLX у Львові", prompt: "Покажи оголошення OLX у Львові за останній тиждень" }
+  ];
+
+  function isCapabilitiesQuery(text) {
+    if (!text || typeof text !== "string") return false;
+    var t = text.toLowerCase().trim();
+    return CAPABILITIES_PHRASES.some(function (p) { return t.indexOf(p) >= 0; });
+  }
+
+  function sendChatMessageWithText(text) {
+    if (!text || !text.trim()) return;
+    if (!getCurrentChat()) createNewChat();
+    appendChatMessage("user", text.trim());
+    var statusEl = appendStatusBelowUser("Підключення...");
+    setInputState(true);
+    var abortController = new AbortController();
+    currentChatAbortController = abortController;
+    var messagesContainer = document.getElementById("chat-messages");
+    var chat = getCurrentChat();
+    var chatId = chat ? chat.id : null;
+    var listingContext = chat && chat.listingContext ? chat.listingContext : null;
+    fetch("/api/llm/chat-stream", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ text: text.trim(), chat_id: chatId, listing_context: listingContext, reply_to_text: null }),
+      signal: abortController.signal,
+    })
+      .then(function (r) {
+        if (!r.ok) {
+          return r.json().then(function (body) {
+            var msg = (body && body.detail) || (r.status === 403 ? "Немає доступу" : "Помилка " + r.status);
+            throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+          }, function () {
+            throw new Error(r.status === 403 ? "Немає доступу" : "Помилка " + r.status);
+          });
+        }
+        if (!r.body || !r.body.getReader) throw new Error("Стрімінг не підтримується");
+        return r.body.getReader();
+      })
+      .then(function (reader) {
+        var decoder = new TextDecoder();
+        var buffer = "";
+        function processEvent(eventData) {
+          try {
+            var data = JSON.parse(eventData);
+            if (data.type === "status" && statusEl) {
+              statusEl.textContent = data.message || "Обробка...";
+              if (messagesContainer) messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            } else if (data.type === "done") {
+              currentChatAbortController = null;
+              setInputState(false);
+              if (statusEl && statusEl.parentNode) statusEl.remove();
+              var reqId = data.request_id || null;
+              var excelFiles = (data.excel_files || []).filter(function (f) { return f.artifact_id && f.download_token; });
+              var qa = data.quick_actions || [];
+              appendChatMessage("bot", data.response || "", reqId, excelFiles, qa.length ? qa : undefined);
+              return true;
+            } else if (data.type === "error") {
+              currentChatAbortController = null;
+              setInputState(false);
+              if (statusEl && statusEl.parentNode) statusEl.remove();
+              appendChatMessage("bot", "Помилка: " + (data.message || "Помилка"));
+              return true;
+            }
+          } catch (e) {}
+          return false;
+        }
+        return reader.read().then(function processChunk(result) {
+          if (result.done) {
+            currentChatAbortController = null;
+            setInputState(false);
+            if (statusEl && statusEl.parentNode) statusEl.remove();
+            appendChatMessage("bot", "Потік завершено без відповіді");
+            return;
+          }
+          buffer += decoder.decode(result.value, { stream: true });
+          var events = buffer.split("\n\n");
+          buffer = events.pop() || "";
+          for (var i = 0; i < events.length; i++) {
+            var lines = events[i].split("\n");
+            for (var j = 0; j < lines.length; j++) {
+              if (lines[j].indexOf("data: ") === 0) {
+                var jsonStr = lines[j].slice(6).trim();
+                if (jsonStr && jsonStr !== "[DONE]") {
+                  if (processEvent(jsonStr)) return;
+                }
+                break;
+              }
+            }
+          }
+          return reader.read().then(processChunk);
+        });
+      })
+      .catch(function (err) {
+        currentChatAbortController = null;
+        setInputState(false);
+        if (statusEl && statusEl.parentNode) statusEl.remove();
+        appendChatMessage("bot", "Помилка: " + (err.message || err));
+      });
+  }
+
   function appendStatusBelowUser(message) {
     var container = document.getElementById("chat-messages");
     if (!container) return null;
@@ -810,6 +951,10 @@
     if (!getCurrentChat()) createNewChat();
     appendChatMessage("user", text);
     input.value = "";
+    if (isCapabilitiesQuery(text)) {
+      appendChatMessage("bot", CAPABILITIES_RESPONSE, null, null, CAPABILITIES_QUICK_ACTIONS);
+      return;
+    }
     var statusEl = appendStatusBelowUser("Підключення...");
     setInputState(true);
 
@@ -829,7 +974,8 @@
         var excelFiles = (data.excel_files || []).filter(function (f) {
           return f.artifact_id && f.download_token;
         });
-        appendChatMessage("bot", data.response || "", requestId, excelFiles);
+        var qa = data.quick_actions || [];
+        appendChatMessage("bot", data.response || "", requestId, excelFiles, qa.length ? qa : undefined);
       }
     }
 
@@ -1368,6 +1514,108 @@
       .catch(function () { alert("Помилка мережі"); });
   }
 
+  function adminExportConfig() {
+    fetch("/api/admin/export/config", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка " + r.status);
+        var cd = r.headers.get("Content-Disposition") || "";
+        var m = cd.match(/filename="?([^";\n]+)"?/);
+        var name = (m && m[1]) ? m[1] : "pazuzu_config.zip";
+        return r.blob().then(function (blob) { return { blob: blob, name: name }; });
+      })
+      .then(function (x) {
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(x.blob);
+        a.download = x.name;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      })
+      .catch(function (err) { alert(err.message || "Помилка"); });
+  }
+
+  function adminExportData() {
+    fetch("/api/admin/export/data?limit=10000", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка " + r.status);
+        var cd = r.headers.get("Content-Disposition") || "";
+        var m = cd.match(/filename="?([^";\n]+)"?/);
+        var name = (m && m[1]) ? m[1] : "pazuzu_data.zip";
+        return r.blob().then(function (blob) { return { blob: blob, name: name }; });
+      })
+      .then(function (x) {
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(x.blob);
+        a.download = x.name;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      })
+      .catch(function (err) { alert(err.message || "Помилка"); });
+  }
+
+  function adminExportFull() {
+    fetch("/api/admin/export/full?limit=5000", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка " + r.status);
+        var cd = r.headers.get("Content-Disposition") || "";
+        var m = cd.match(/filename="?([^";\n]+)"?/);
+        var name = (m && m[1]) ? m[1] : "pazuzu_full.zip";
+        return r.blob().then(function (blob) { return { blob: blob, name: name }; });
+      })
+      .then(function (x) {
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(x.blob);
+        a.download = x.name;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      })
+      .catch(function (err) { alert(err.message || "Помилка"); });
+  }
+
+  function adminImportConfig() {
+    var input = document.getElementById("admin-import-config");
+    if (!input || !input.files || !input.files[0]) { alert("Оберіть ZIP файл"); return; }
+    var form = new FormData();
+    form.append("file", input.files[0]);
+    var h = {};
+    if (initData) h["X-Telegram-Init-Data"] = initData;
+    fetch("/api/admin/import/config", {
+      method: "POST",
+      headers: h,
+      body: form
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (x) {
+        if (x.ok) alert(x.data.message || "Готово. Перезапустіть застосунок для застосування.");
+        else alert(x.data.detail || "Помилка");
+        input.value = "";
+      })
+      .catch(function () { alert("Помилка мережі"); });
+  }
+
+  function loadAdminIntegrityStatus() {
+    var el = document.getElementById("admin-integrity-status");
+    if (!el) return;
+    el.textContent = "Завантаження...";
+    fetch("/api/admin/integrity/check", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка " + r.status);
+        return r.json();
+      })
+      .then(function (d) {
+        var cv = d.config_version || "—";
+        var pv = d.platform_version || "—";
+        var st = d.status || "ok";
+        var stLabel = st === "ok" ? "OK" : (st === "warnings" ? "Попередження" : "Помилки");
+        var parts = ["Конфіг: v" + cv + ", платформа: v" + pv + ", цілісність: " + stLabel];
+        if (d.errors && d.errors.length) parts.push(" Помилки: " + d.errors.join("; "));
+        if (d.warnings && d.warnings.length) parts.push(" Попередження: " + d.warnings.join("; "));
+        el.textContent = parts.join("");
+      })
+      .catch(function (err) {
+        el.textContent = "Помилка: " + (err.message || "невідома");
+      });
+  }
+
   function bindEvents(me) {
     loadChatSessions();
     if (chatSessions.length > 0 && !currentChatId) {
@@ -1386,6 +1634,17 @@
     var newChatBtn = document.getElementById("sidebar-new-chat");
     if (newChatBtn) newChatBtn.addEventListener("click", createNewChat);
 
+    var chatMessagesEl = document.getElementById("chat-messages");
+    if (chatMessagesEl) {
+      chatMessagesEl.addEventListener("click", function (e) {
+        var link = e.target.closest("a.chat-link-internal");
+        if (link && link.dataset.source && link.dataset.sourceId) {
+          e.preventDefault();
+          openListingInApp(link.dataset.source, link.dataset.sourceId);
+        }
+      });
+    }
+
     initReportTemplates();
 
     var addBtn = document.getElementById("admin-add-btn");
@@ -1398,6 +1657,18 @@
     var uploadInput = document.getElementById("admin-upload-prozorro");
     if (uploadBtn && uploadInput) uploadBtn.addEventListener("click", function () { uploadInput.click(); });
     if (uploadInput) uploadInput.addEventListener("change", adminUploadProzorro);
+    var exportConfigBtn = document.getElementById("admin-export-config");
+    if (exportConfigBtn) exportConfigBtn.addEventListener("click", adminExportConfig);
+    var exportDataBtn = document.getElementById("admin-export-data");
+    if (exportDataBtn) exportDataBtn.addEventListener("click", adminExportData);
+    var exportFullBtn = document.getElementById("admin-export-full");
+    if (exportFullBtn) exportFullBtn.addEventListener("click", adminExportFull);
+    var importConfigBtn = document.getElementById("admin-import-config-btn");
+    var importConfigInput = document.getElementById("admin-import-config");
+    if (importConfigBtn && importConfigInput) {
+      importConfigBtn.addEventListener("click", function () { importConfigInput.click(); });
+      importConfigInput.addEventListener("change", adminImportConfig);
+    }
     if (me && me.is_admin) {
       var btn1 = document.getElementById("admin-data-update-1");
       var btn7 = document.getElementById("admin-data-update-7");
@@ -2131,7 +2402,19 @@
         land.textContent = "Земля: " + landVal + " га";
         details.appendChild(land);
       }
-      
+      if (item.floor !== null && item.floor !== undefined && item.floor !== "") {
+        var floorEl = document.createElement("div");
+        floorEl.className = "search-item-floor";
+        floorEl.textContent = "Поверх: " + item.floor;
+        details.appendChild(floorEl);
+      }
+      if (item.tags && item.tags.length > 0) {
+        var tagsWrap = document.createElement("div");
+        tagsWrap.className = "search-item-tags";
+        var tagsText = item.tags.join(", ");
+        tagsWrap.textContent = "Теги: " + tagsText;
+        details.appendChild(tagsWrap);
+      }
       if (item.status) {
         var status = document.createElement("div");
         status.className = "search-item-status";
@@ -2335,31 +2618,77 @@
     return prefix + " — " + parts.join(" · ");
   }
 
-  function showDetail(type, itemId) {
+  function getListingExternalUrl(source, sourceId) {
+    if (!sourceId) return null;
+    var id = sourceId;
+    try {
+      if (typeof sourceId === "string" && sourceId.indexOf("%") >= 0) {
+        id = decodeURIComponent(sourceId);
+      }
+    } catch (e) {}
+    if (source === "olx") return (id + "").indexOf("http") === 0 ? id : "https://www.olx.ua/d/uk/obyavlenie/" + id;
+    if (source === "prozorro") return "https://prozorro.sale/auction/" + id;
+    return null;
+  }
+
+  function openExternalUrl(url) {
+    if (!url) return;
+    if (Tg && typeof Tg.openLink === "function") {
+      Tg.openLink(url);
+    } else if (typeof window.open === "function") {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+  }
+
+  function openListingInApp(source, sourceId) {
     var detailContent = document.getElementById("detail-content");
     var loadingEl = document.createElement("div");
     loadingEl.textContent = "Завантаження...";
     if (detailContent) detailContent.innerHTML = "";
     if (detailContent) detailContent.appendChild(loadingEl);
-    
     show("screen-detail");
-    
-    // Для зведеної таблиці та окремих списків — однакові форми: olx/prozorro завжди через source-specific endpoint
-    var endpoint = "/api/search/" + type + "/" + encodeURIComponent(itemId);
-    
+    var endpoint = "/api/search/" + source + "/" + encodeURIComponent(sourceId);
     fetch(endpoint, { headers: apiHeaders() })
       .then(function (r) {
+        if (r.status === 404) {
+          var extUrl = getListingExternalUrl(source, sourceId);
+          openExternalUrl(extUrl);
+          if (detailContent) {
+            var wrap = document.createElement("div");
+            wrap.className = "error detail-404-fallback";
+            wrap.appendChild(document.createTextNode("Оголошення не знайдено в базі. "));
+            if (extUrl) {
+              var a = document.createElement("a");
+              a.href = extUrl;
+              a.target = "_blank";
+              a.rel = "noopener noreferrer";
+              a.className = "detail-404-link";
+              a.textContent = "Відкрити на " + (source === "olx" ? "OLX" : "ProZorro");
+              a.onclick = function (e) { e.preventDefault(); openExternalUrl(extUrl); };
+              wrap.appendChild(a);
+            } else {
+              wrap.appendChild(document.createTextNode("Посилання недоступне."));
+            }
+            detailContent.innerHTML = "";
+            detailContent.appendChild(wrap);
+          }
+          return null;
+        }
         if (!r.ok) throw new Error("Помилка " + r.status);
         return r.json();
       })
       .then(function (data) {
-        renderDetail(data, type);
+        if (data) renderDetail(data, source);
       })
       .catch(function (err) {
         if (detailContent) {
           detailContent.innerHTML = "<div class='error'>Помилка: " + (err.message || "Не вдалося завантажити") + "</div>";
         }
       });
+  }
+
+  function showDetail(type, itemId) {
+    openListingInApp(type, itemId);
   }
 
   function renderUnifiedDetail(item) {
@@ -2487,6 +2816,8 @@
       characteristics: {
         label: "Характеристики",
         fields: [
+          { path: "auction_data.floor", label: "Поверх", formatter: function(v) { return v ? String(v) : ""; } },
+          { path: "auction_data.tags", label: "Теги", formatter: function(v) { return Array.isArray(v) && v.length ? v.join(", ") : ""; } },
           { path: "auction_data.price_metrics.price_per_m2_uah", label: "Ціна за м² (грн)", formatter: function(v) { return v ? formatPrice(v) + " ₴/м²" : ""; } },
           { path: "auction_data.price_metrics.price_per_m2_usd", label: "Ціна за м² (USD)", formatter: function(v) { return v ? formatPrice(v) + " $/м²" : ""; } },
           { path: "auction_data.price_metrics.price_per_ha_uah", label: "Ціна за га (грн)", formatter: function(v) { return v ? formatPrice(v) + " ₴/га" : ""; } },
@@ -2528,14 +2859,15 @@
       characteristics: {
         label: "Характеристики",
         fields: [
+          { path: "detail.llm.floor", label: "Поверх", formatter: function(v) { return v ? String(v) : ""; } },
           { path: "search_data.area_m2", label: "Площа", formatter: function(v) { return v ? v + " м²" : ""; } },
+          { path: "detail.llm.tags", label: "Теги", formatter: function(v) { return Array.isArray(v) && v.length ? v.join(", ") : ""; }, isArray: false },
           { path: "detail.price_metrics.price_per_m2_uah", label: "Ціна за м² (грн)", formatter: function(v) { return v ? formatPrice(v) + " ₴/м²" : ""; } },
           { path: "detail.price_metrics.price_per_m2_usd", label: "Ціна за м² (USD)", formatter: function(v) { return v ? formatPrice(v) + " $/м²" : ""; } },
           { path: "detail.price_metrics.price_per_ha_uah", label: "Ціна за га (грн)", formatter: function(v) { return v ? formatPrice(v) + " ₴/га" : ""; } },
           { path: "detail.price_metrics.price_per_ha_usd", label: "Ціна за га (USD)", formatter: function(v) { return v ? formatPrice(v) + " $/га" : ""; } },
           { path: "detail.parameters", label: "Параметри", isArray: true, arrayFormatter: function(item) {
-            if (typeof item === "object" && item.label && item.value) return item.label + ": " + item.value;
-            return String(item);
+            return formatParameterItem(item);
           }},
           { path: "detail.location", label: "Детальна локація" },
           { path: "search_data.currency", label: "Валюта" }
@@ -2579,10 +2911,7 @@
         { path: "url", label: "Посилання на оголошення", priority: 10, description: "Пряме посилання на OLX", isLink: true },
         { path: "detail.description", label: "Опис", priority: 11, description: "Детальний опис нерухомості" },
         { path: "detail.parameters", label: "Параметри", priority: 12, description: "Додаткові характеристики", isArray: true, arrayFormatter: function(item) {
-          if (typeof item === "object" && item.label && item.value) {
-            return item.label + ": " + item.value;
-          }
-          return String(item);
+          return formatParameterItem(item);
         }},
         { path: "detail.location", label: "Детальна локація", priority: 13, description: "Повна адреса" },
         { path: "detail.contact", label: "Контакти", priority: 14, description: "Інформація про продавця" },
@@ -2619,6 +2948,25 @@
       ]
     }
   };
+
+  function formatParameterItem(item) {
+    if (item === null || item === undefined) return "";
+    if (typeof item === "string" || typeof item === "number") return String(item);
+    if (typeof item !== "object") return "";
+    function toDisplayString(x) {
+      if (x === null || x === undefined) return "";
+      if (typeof x === "string" || typeof x === "number") return String(x);
+      if (typeof x === "object" && x !== null) {
+        var v = x.uk_UA || x.en_US || x.name || x.raw;
+        if (v != null && typeof v === "string") return v;
+      }
+      return "";
+    }
+    var label = toDisplayString(item.label);
+    var val = toDisplayString(item.value);
+    if (!label && !val) return "";
+    return label ? (label + ": " + (val || "—")) : val;
+  }
 
   // Функція для отримання значення за шляхом (dot notation)
   function getNestedValue(obj, path) {
@@ -2864,15 +3212,20 @@
       var list = document.createElement("ul");
       list.className = "detail-array-list";
       value.forEach(function(item, index) {
+        var text;
+        if (fieldConfig.arrayFormatter) {
+          text = fieldConfig.arrayFormatter(item, index);
+        } else {
+          text = typeof item === "object" && item !== null ? JSON.stringify(item) : String(item);
+        }
+        if (text === null || text === undefined || (typeof text === "string" && text.indexOf("[object Object]") !== -1)) return;
+        if (text === "") return;
         var li = document.createElement("li");
         li.className = "detail-array-item";
-        if (fieldConfig.arrayFormatter) {
-          li.textContent = fieldConfig.arrayFormatter(item, index);
-        } else {
-          li.textContent = typeof item === "object" ? JSON.stringify(item) : String(item);
-        }
+        li.textContent = text;
         list.appendChild(li);
       });
+      if (list.children.length === 0) return;
       valueEl.appendChild(list);
     } else {
       if (fieldConfig.formatter && typeof fieldConfig.formatter === "function") {
@@ -2915,7 +3268,7 @@
     panel.innerHTML = "<div class='detail-analytics-loading'>Завантаження аналітики...</div>";
     var params = new URLSearchParams();
     params.append("period_type", "month");
-    params.append("limit", "15");
+    params.append("limit", "20");
     if (region) params.append("region", region);
     if (city) params.append("city", city);
     fetch("/api/analytics/aggregates?" + params.toString(), { headers: apiHeaders() })
@@ -2927,13 +3280,12 @@
           return (m.price_per_m2_uah && m.price_per_m2_uah.avg) || (m.price_per_ha_uah && m.price_per_ha_uah.avg) || (m.price_uah && m.price_uah.avg);
         });
         panel.innerHTML = "";
-        if (items.length === 0) {
-          panel.innerHTML = "<p class='detail-tab-empty'>Немає даних аналітики для цієї локації.</p>";
-          return;
-        }
-        function pickMetricKey(items) {
+        var indicator = data.price_indicator || null;
+        var localityName = [city, region].filter(Boolean).join(", ") || region || city || "локації";
+
+        function pickMetricKey(rows) {
           var m2 = 0, ha = 0, uah = 0;
-          items.forEach(function(row) {
+          rows.forEach(function(row) {
             var m = row.metrics || {};
             if (m.price_per_m2_uah && m.price_per_m2_uah.avg) m2++;
             if (m.price_per_ha_uah && m.price_per_ha_uah.avg) ha++;
@@ -2950,126 +3302,64 @@
           var m = (row.metrics || {})[metricKey];
           return m && m.avg ? { val: m.avg, count: m.count } : { val: 0, count: 0 };
         }
-        var displayItems = items.filter(function(row) { return getMetric(row).val > 0; }).slice(0, 10);
-        if (displayItems.length === 0) {
-          panel.innerHTML = "<p class='detail-tab-empty'>Немає даних для обраної метрики.</p>";
-          return;
-        }
-        var labels = displayItems.map(function(row) {
-          var gb = row.group_by || {};
-          return gb.city || gb.region || row.period_key || "—";
-        });
-        var values = displayItems.map(function(row) { return getMetric(row).val; });
-        var counts = displayItems.map(function(row) { return getMetric(row).count; });
+        var relevantItems = items.filter(function(row) { return getMetric(row).val > 0; });
+        var totalCount = relevantItems.reduce(function(sum, row) { return sum + (getMetric(row).count || 0); }, 0);
+        var avgVal = relevantItems.length ? relevantItems.reduce(function(s, r) { return s + getMetric(r).val; }, 0) / relevantItems.length : 0;
 
-        var isDark = document.documentElement.getAttribute("data-theme") === "dark";
-        var textColor = isDark ? "#e5e5ea" : "#000000";
-        var gridColor = isDark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.08)";
-        var barColor = isDark ? "rgba(10,132,255,0.85)" : "rgba(36,129,204,0.85)";
+        var block = document.createElement("div");
+        block.className = "detail-analytics-text";
 
-        var title = document.createElement("h4");
-        title.className = "detail-analytics-title";
-        title.textContent = "Середня ціна по локаціях (останній місяць)";
-        if (unit) title.textContent += " · " + unit;
-        panel.appendChild(title);
-
-        if (displayItems.length === 1) {
-          var card = document.createElement("div");
-          card.className = "detail-analytics-single-card";
-          var val = values[0];
-          var cnt = counts[0] || 0;
-          var valDiv = document.createElement("div");
-          valDiv.className = "detail-analytics-single-card-value";
-          valDiv.appendChild(document.createTextNode(formatPrice(val) + " "));
-          var unitSpan = document.createElement("span");
-          unitSpan.className = "detail-analytics-single-card-unit";
-          unitSpan.textContent = unit;
-          valDiv.appendChild(unitSpan);
-          card.appendChild(valDiv);
-          var lblDiv = document.createElement("div");
-          lblDiv.className = "detail-analytics-single-card-label";
-          lblDiv.textContent = labels[0];
-          card.appendChild(lblDiv);
-          if (cnt) {
-            var cntDiv = document.createElement("div");
-            cntDiv.className = "detail-analytics-single-card-count";
-            cntDiv.textContent = cnt + " оголошень";
-            card.appendChild(cntDiv);
+        var descP = document.createElement("p");
+        descP.className = "detail-analytics-desc";
+        if (items.length === 0) {
+          descP.textContent = "Немає достатніх даних для порівняння цін у цій місцевості.";
+        } else {
+          var descParts = [];
+          descParts.push("У " + localityName + " за останній місяць зареєстровано " + totalCount + " схожих оголошень.");
+          if (avgVal > 0) {
+            descParts.push("Середня ціна " + (metricKey === "price_per_m2_uah" ? "за м²" : metricKey === "price_per_ha_uah" ? "за га" : "") + " становить близько " + formatPrice(Math.round(avgVal)) + " " + unit + ".");
           }
-          panel.appendChild(card);
-          return;
+          if (indicator) {
+            if (indicator === "вигідна") {
+              descParts.push("Ціна цього об'єкта відносно низька серед аналогів — нижча за 25% оголошень у цій місцевості.");
+            } else if (indicator === "середня") {
+              descParts.push("Ціна знаходиться в середині діапазону — типове значення для подібних об'єктів.");
+            } else if (indicator === "дорога") {
+              descParts.push("Ціна вища за більшість аналогів — вище за 75% оголошень у цій місцевості.");
+            } else if (indicator === "аномально низька") {
+              descParts.push("Ціна значно нижча за типовий діапазон. Можливі причини: потребує ремонту, обмеження у використанні, терміновість продажу або помилка в оголошенні. Рекомендуємо перевірити деталі.");
+            } else if (indicator === "аномально висока") {
+              descParts.push("Ціна значно вища за типовий діапазон. Можливі причини: преміум-локація, особливі характеристики, помилка в оголошенні. Рекомендуємо порівняти з іншими пропозиціями.");
+            }
+          } else {
+            descParts.push("Для оцінки відносності ціни потрібно більше даних по цій місцевості.");
+          }
+          descP.textContent = descParts.join(" ");
+        }
+        block.appendChild(descP);
+
+        if (indicator) {
+          var tagSection = document.createElement("div");
+          tagSection.className = "detail-analytics-tag-section";
+          var tagTitle = document.createElement("h4");
+          tagTitle.className = "detail-analytics-tag-title";
+          tagTitle.textContent = "Що означає тег «" + (indicator === "вигідна" ? "Вигідна ціна" : indicator === "дорога" ? "Дорога" : indicator === "середня" ? "Середня" : indicator === "аномально низька" ? "Аномально низька" : indicator === "аномально висока" ? "Аномально висока" : indicator) + "»?";
+          tagSection.appendChild(tagTitle);
+          var tagP = document.createElement("p");
+          tagP.className = "detail-analytics-tag-desc";
+          var tagTexts = {
+            "вигідна": "Ціна нижча за 25% схожих оголошень у цій місцевості. Можливо, вигідний варіант.",
+            "середня": "Ціна в межах типового діапазону — не вигідна, але й не завищена.",
+            "дорога": "Ціна вища за 75% аналогів. Можливо, є особливості, що виправдовують вартість.",
+            "аномально низька": "Ціна значно виходить за межі типових значень (нижча за статистичну «нижню межу»). Варто перевірити стан об'єкта, обмеження та умови угоди.",
+            "аномально висока": "Ціна значно перевищує типовий діапазон. Можливо, об'єкт має унікальні переваги або є помилка в оголошенні."
+          };
+          tagP.textContent = tagTexts[indicator] || "Оцінка відносності ціни серед схожих об'єктів у цій місцевості.";
+          tagSection.appendChild(tagP);
+          block.appendChild(tagSection);
         }
 
-        var chartWrap = document.createElement("div");
-        chartWrap.className = "detail-analytics-chart-wrap";
-        var canvas = document.createElement("canvas");
-        chartWrap.appendChild(canvas);
-        panel.appendChild(chartWrap);
-
-        if (typeof ChartDataLabels !== "undefined") {
-          Chart.register(ChartDataLabels);
-        }
-        var chart = new Chart(canvas, {
-          type: "bar",
-          data: {
-            labels: labels,
-            datasets: [{
-              label: unit || "Ціна",
-              data: values,
-              backgroundColor: values.map(function(_, i) {
-                var p = values.length > 1 ? (values[i] / Math.max.apply(null, values)) : 1;
-                return isDark ? "rgba(10,132,255," + (0.4 + 0.5 * p) + ")" : "rgba(36,129,204," + (0.5 + 0.4 * p) + ")";
-              }),
-              borderColor: barColor,
-              borderWidth: 1,
-              borderRadius: 6,
-              borderSkipped: false,
-            }],
-          },
-          options: {
-            indexAxis: "y",
-            responsive: true,
-            maintainAspectRatio: true,
-            aspectRatio: 1.2,
-            plugins: {
-              legend: { display: false },
-              tooltip: {
-                callbacks: {
-                  label: function(ctx) {
-                    var v = ctx.raw;
-                    var idx = ctx.dataIndex;
-                    var c = counts[idx] || 0;
-                    return formatPrice(v) + " " + unit + (c ? " · " + c + " оголошень" : "");
-                  },
-                },
-              },
-              datalabels: {
-                display: true,
-                anchor: "end",
-                align: "start",
-                offset: 4,
-                color: textColor,
-                font: { size: 12, weight: "600" },
-                formatter: function(v) { return formatPrice(v) + " " + unit; },
-              },
-            },
-            scales: {
-              x: {
-                grid: { color: gridColor },
-                ticks: {
-                  color: textColor,
-                  callback: function(v) { return formatPrice(v); },
-                },
-              },
-              y: {
-                grid: { display: false },
-                ticks: { color: textColor, font: { size: 12 } },
-              },
-            },
-          },
-          plugins: typeof ChartDataLabels !== "undefined" ? [ChartDataLabels] : [],
-        });
-        chartWrap._chart = chart;
+        panel.appendChild(block);
       })
       .catch(function() {
         panel.innerHTML = "<p class='detail-tab-empty'>Не вдалося завантажити аналітику.</p>";
@@ -3079,9 +3369,6 @@
   function renderDetail(data, type) {
     var detailContent = document.getElementById("detail-content");
     if (!detailContent) return;
-    detailContent.querySelectorAll(".detail-analytics-chart-wrap").forEach(function(w) {
-      if (w._chart) w._chart.destroy();
-    });
     detailContent.innerHTML = "";
 
     var tabConfig = TAB_FIELD_CONFIG[type];
@@ -3198,6 +3485,8 @@
     var keyItems = [];
 
     if (type === "prozorro") {
+      var floorVal = getNestedValue(data, "auction_data.floor");
+      if (floorVal) keyItems.push({ icon: "🏢", label: "Поверх", value: String(floorVal) });
       var ppm2 = getNestedValue(data, "auction_data.price_metrics.price_per_m2_uah");
       if (ppm2) keyItems.push({ icon: "㎡", label: "Ціна за м²", value: formatPrice(ppm2) + " ₴/м²" });
       var ppha = getNestedValue(data, "auction_data.price_metrics.price_per_ha_uah");
@@ -3213,6 +3502,8 @@
       var org = getNestedValue(data, "auction_data.procuringEntity.name");
       if (org) keyItems.push({ icon: "🏛", label: "Організатор", value: org });
     } else if (type === "olx") {
+      var floorVal = getNestedValue(data, "detail.llm.floor");
+      if (floorVal) keyItems.push({ icon: "🏢", label: "Поверх", value: String(floorVal) });
       var area = getNestedValue(data, "search_data.area_m2");
       if (area) keyItems.push({ icon: "㎡", label: "Площа", value: area + " м²" });
       var ppm2 = getNestedValue(data, "detail.price_metrics.price_per_m2_uah");
@@ -3591,9 +3882,7 @@
       bindEvents(me);
       bindSearchEvents();
       initSearch();
-      show("screen-home");
-      var homeScreen = document.getElementById("screen-home");
-      if (homeScreen) homeScreen.classList.remove("hidden");
+      showSearch();
       renderChatMessages();
     })
     .catch(function (err) {

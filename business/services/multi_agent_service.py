@@ -682,6 +682,7 @@ class MultiAgentService:
         _status("Визначення наміру...")
         # 1. Визначення наміру та формату відповіді
         effective_context = context_summary or ""
+        listing_analysis_text = ""
         if listing_context and isinstance(listing_context, dict):
             parts = ["Контекст оголошення (предзапит):"]
             if listing_context.get("page_url"):
@@ -689,6 +690,29 @@ class MultiAgentService:
             if listing_context.get("summary"):
                 parts.append(f"Короткий опис: {listing_context['summary']}")
             effective_context = "\n".join(parts) + ("\n\n" + effective_context if effective_context else "")
+            # Попередній аналіз використання (існуюче використання, геоаналіз, можливі використання зі скорингом)
+            detail_source = listing_context.get("detail_source")
+            detail_id = listing_context.get("detail_id")
+            if not detail_source and not detail_id and listing_context.get("page_url"):
+                page_url = listing_context["page_url"]
+                if "prozorro.sale" in page_url:
+                    detail_source = "prozorro"
+                    detail_id = page_url.rstrip("/").split("/")[-1] or ""
+                elif "olx" in page_url:
+                    detail_source = "olx"
+                    detail_id = page_url
+            if detail_source and detail_id:
+                try:
+                    from business.services.property_usage_analysis_service import PropertyUsageAnalysisService
+                    analysis_svc = PropertyUsageAnalysisService()
+                    analysis = analysis_svc.get_or_create_analysis(detail_source, detail_id)
+                    if not analysis.get("error"):
+                        listing_analysis_text = analysis_svc.format_analysis_for_llm(analysis)
+                        effective_context += "\n\n" + listing_analysis_text
+                        listing_context = dict(listing_context)
+                        listing_context["_usage_analysis"] = analysis
+                except Exception as e:
+                    logger.debug("Попередній аналіз використання об'єкта: %s", e)
         logger.info("%s Крок 1: IntentDetectorAgent - визначення наміру та формату", log_ctx)
         intent_detector = IntentDetectorAgent(self.settings)
         intent_info = intent_detector.detect_intent_and_format(user_query, effective_context)

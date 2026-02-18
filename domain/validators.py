@@ -21,6 +21,7 @@ ALLOWED_LOGICAL_FILTER_KEYS: FrozenSet[str] = frozenset({
     "land_area_ha",
     "bids_count",
     "bidders_count",
+    "floor",
 })
 
 

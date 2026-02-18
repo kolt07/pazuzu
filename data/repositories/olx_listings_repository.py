@@ -21,6 +21,27 @@ def _normalize_doc(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return doc
 
 
+def _olx_url_variants(url: str) -> list:
+    """Повертає варіанти URL для пошуку (різні домени, протоколи, без query)."""
+    variants = [url]
+    u = url.strip()
+    if "?" in u:
+        variants.append(u.split("?")[0])
+    if u.startswith("https://"):
+        variants.append("http://" + u[8:])
+    elif u.startswith("http://"):
+        variants.append("https://" + u[7:])
+    if "www.olx.ua" in u:
+        variants.append(u.replace("www.olx.ua", "olx.ua"))
+    elif "olx.ua" in u and "www." not in u:
+        variants.append(u.replace("olx.ua", "www.olx.ua"))
+    if u.endswith("/"):
+        variants.append(u.rstrip("/"))
+    elif not u.endswith("/"):
+        variants.append(u + "/")
+    return list(dict.fromkeys(variants))
+
+
 class OlxListingsRepository(BaseRepository):
     """Робота з колекцією оголошень OLX (пошук + деталі)."""
 
@@ -28,11 +49,20 @@ class OlxListingsRepository(BaseRepository):
         super().__init__(COLLECTION_NAME)
 
     def find_by_url(self, url: str) -> Optional[Dict[str, Any]]:
-        """Знаходить оголошення за URL (url зберігається в полі url або як _id)."""
+        """Знаходить оголошення за URL (url зберігається в полі url). Пробує варіанти нормалізації."""
         if not url or not url.strip():
             return None
-        doc = self.collection.find_one({"url": url.strip()})
-        return _normalize_doc(doc)
+        url = url.strip()
+        doc = self.collection.find_one({"url": url})
+        if doc:
+            return _normalize_doc(doc)
+        variants = _olx_url_variants(url)
+        for v in variants:
+            if v != url:
+                doc = self.collection.find_one({"url": v})
+                if doc:
+                    return _normalize_doc(doc)
+        return None
 
     def upsert_listing(
         self,
@@ -91,21 +121,22 @@ class OlxListingsRepository(BaseRepository):
         if not ids:
             return []
         from bson import ObjectId
-        by_url = []
+        url_set: set = set()
         by_object_id = []
         for i in ids:
             s = (i or "").strip()
             if not s:
                 continue
             if s.startswith("http://") or s.startswith("https://"):
-                by_url.append(s)
+                url_set.update(_olx_url_variants(s))
             elif len(s) == 24:
                 try:
                     by_object_id.append(ObjectId(s))
                 except Exception:
                     pass
             else:
-                by_url.append(s)
+                url_set.add(s)
+        by_url = list(url_set)
         criteria = None
         if by_url and by_object_id:
             criteria = {"$or": [{"url": {"$in": by_url}}, {"_id": {"$in": by_object_id}}]}

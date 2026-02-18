@@ -1,5 +1,126 @@
 # Історія розробки
 
+## 2026-02-17 — Модульна архітектура: платформа, конфігурація та дані
+
+- **Запит**: Зробити конфігурацію зовнішньою (промпти, налаштування в bundle), експорт/імпорт конфігу та даних, версіонування, відстеження міграцій, перевірка цілісності.
+
+- **Дії**:
+  - **Фаза 1**: `config/prompts.yaml`, `config/bundle_metadata.yaml`, `config/config_loader.py` — ConfigLoader з `get_prompt()`, `get_parsing_template()`, `get_glossary()`, `get_bundle_metadata()`. Сервіси (langchain_agent_service, llm_service, intent_detector, query_structure, llm_agent_service) читають промпти з YAML з fallback.
+  - **Фаза 2**: Колекція `_migration_history`, міграція 029 (створення + backfill 001–028). `run_migrations.py` — перевірка виконаних міграцій перед запуском, запис після успіху.
+  - **Фаза 3**: `config/config_export_service.py` — `build_config_zip()`, `build_data_zip()`, `build_full_zip()`, `import_config_from_zip()`. API: `GET /api/admin/export/config`, `export/data`, `export/full`, `POST /api/admin/import/config`.
+  - **Фаза 4**: `DataIntegrityService` — перевірка колекцій vs data_dictionary. `config/config_migration_runner.py` — міграції конфігу. `scripts/check_data_integrity.py` — CLI. Інтеграція в `main.py`.
+  - **Фаза 5**: Розділ «Конфігурація та дані» в адмінці Mini App — кнопки експорту (конфіг, дані, усе), форма імпорту конфігу (ZIP), відображення версії конфігу, платформи та результату перевірки цілісності.
+
+## 2026-02-17 — Аналітика текстом замість графіків
+
+- **Запит**: Зробити викладки на вкладці аналітики текстом. Загальний опис положення ціни серед схожих об'єктів у місцевості, пояснення тегу відносності ціни (особливо аномальної). Прибрати графіки.
+
+- **Дії**:
+  - **search.py**: _build_item_for_price_indicator() — побудова item з olx/prozorro doc для get_price_indicators_for_items. Додано price_indicator до відповідей get_olx_item та get_prozorro_item.
+  - **app.js**: renderAnalyticsTab переписано — текстовий опис (кількість оголошень, середня ціна, положення ціни за індикатором), окрема секція з поясненням тегу (вигідна, середня, дорога, аномально низька/висока). Видалено Chart.js та графіки.
+  - **index.html**: видалено підключення chart.js та chartjs-plugin-datalabels.
+  - **styles.css**: додано .detail-analytics-text, .detail-analytics-desc, .detail-analytics-tag-section, .detail-analytics-tag-title, .detail-analytics-tag-desc.
+
+## 2026-02-17 — Усунення [object Object] у блоці «Параметри»
+
+- **Проблема**: У секції «Параметри» на сторінці деталей оголошення відображався текст [object Object] замість читабельних значень.
+
+- **Причина**: label або value в елементах detail.parameters могли бути об'єктами (наприклад, з полями uk_UA, en_US), при конкатенації з рядком давали [object Object].
+
+- **Дії**: app.js — додано formatParameterItem() для безпечного перетворення label/value у рядок (підтримка примітивів та об'єктів з uk_UA, en_US, name, raw). У renderDetailField — фільтрація елементів масиву, що дають порожній або [object Object] результат; не додаємо порожні li.
+
+## 2026-02-17 — Пошук як стартова вкладка застосунку
+
+- **Запит**: Зробити вкладку «Пошук» стартовою замість AI-помічника.
+
+- **Дії**: app.js — при авторизації викликається showSearch() замість show("screen-home"); початкове значення currentScreen змінено на "screen-search".
+
+## 2026-02-17 — Прибрано аналітику використання з пошуку та сторінок оголошень
+
+- **Запит**: Прибрати з пошуку і сторінок інформацію про аналітику використання.
+
+- **Дії**: Видалено відображення usage_analysis з карток пошуку, сторінки деталей (renderDetail) та renderUnifiedDetail. Видалено batch lookup та додавання usage_analysis до API-відповідей get_olx_item, get_prozorro_item, get_unified_detail, пошуку. Залишено ендпоінт `/api/search/usage-analysis` для інших потреб.
+
+## 2026-02-17 — Попередній аналіз використання об'єкта в обробнику LLM
+
+- **Запит**: Додати етап попереднього аналізу використання об'єкта: існуюче використання, геоаналіз, можливі використання зі скорингом. Кешувати геоаналіз. Batch-скрипт для всіх оголошень.
+
+- **Дії**:
+  - **PropertyUsageAnalysisService**: виявлення існуючого використання (магазин, склад, виробництво, аптека тощо) з опису/тегів; геоаналіз (pharmacy, supermarket, bus_station, mall поруч); скоринг можливих використань за площею та POI.
+  - **PropertyUsageAnalysisRepository** + колекція **property_usage_analysis**: збереження аналізу за source+source_id.
+  - **MultiAgentService**: при listing_context з detail_source+detail_id — виклик get_or_create_analysis(), додавання до effective_context та listing_context._usage_analysis.
+  - **LangChainAgentService**: при listing_context — додавання format_analysis_for_llm() до listing_hint.
+  - **Міграція 028**: колекція property_usage_analysis.
+  - **scripts/run_property_usage_analysis_batch.py**: batch-аналіз для unified_listings (--limit, --source olx|prozorro|all, --force).
+
+## 2026-02-17 — Помічник не видав відповідь (geo_assessment, max iterations)
+
+- **Проблема**: Запит «5 посилань на приміщення в Луцьку під аптеку» — помічник досяг 10 ітерацій без відповіді.
+
+- **Причини**: 1) geocode_address повертав результат без поля success — LLM вважав виклик невдалим; 2) при max iterations фінальний виклик з bind_tools давав tool_calls замість тексту; 3) execute_query з projection як dict замість list — помилка валідації.
+
+- **Дії**:
+  - **langchain_agent_service.py**: `_geocode_address` — додано success=True коли results не порожні. При max iterations — виклик `self.llm.invoke()` БЕЗ tools + HumanMessage-підказка «дай фінальну відповідь текстом». Нормалізація projection: dict → list полів (ключі з value=1).
+
+## 2026-02-17 — Фідбек: посилання не працюють, задубльовані (user_id=390636278)
+
+- **Фідбек**: Частина посилань у відповіді не працює. Посилання задубльовані.
+
+- **Аналіз**: LLM повертав markdown `[Відкрити в застосунку](https://...)`. link_formatter замінював лише URL, залишаючи `[текст](<a>...</a>)` — з’являлися два посилання. URL з query-параметрами (`?search_reason=...`) могли не знаходитися в БД.
+
+- **Дії**:
+  - **link_formatter.py**: `_collapse_markdown_links()` — заміна `[текст](url)` на сам URL перед форматуванням; `_MARKDOWN_LINK_PATTERN` для розпізнавання. Застосовано в `format_message_links_for_mini_app` та `format_message_links_for_telegram`.
+  - **langchain_agent_service.py**: правила в system prompt — не використовувати markdown для посилань; не дублювати URL.
+  - **olx_listings_repository.py**: `_olx_url_variants` — додано варіант без query-параметрів (`?`).
+  - **scripts/check_feedback.py**: підтримка пошуку за часом (date_str з пробілом).
+
+## 2026-02-17 — Усунути 404 при пошуку в нашій базі (OLX)
+
+- **Запит**: Якщо шукаємо серед своєї бази — оголошення не повинно бути відсутнім навіть теоретично.
+
+- **Дії**:
+  - **olx_listings_repository.py**: `find_by_url` — пошук за варіантами URL (http/https, www.olx.ua/olx.ua, trailing slash) через `_olx_url_variants`. `get_by_ids` — для URL-ів додано варіанти до пошуку.
+  - **search.py**: `get_olx_item` — fallback на `unified_listings` при відсутності в `olx_listings`; `_unified_olx_to_olx_like` — конвертація unified doc у olx-подібний формат для renderDetail.
+
+## 2026-02-17 — AI-помічник: команда «що ти вмієш», кнопки швидких дій, внутрішні посилання
+
+- **Запит**: Обробка «Розкажи, що ти вмієш» з кнопками тест-кейсів; кнопки при уточненні/варіантах; покращення вигляду відповідей з оголошеннями (внутрішні посилання, охайне оформлення).
+
+- **Дії**:
+  - **app.js**: Команда «що ти вмієш» — локальна відповідь з описом можливостей та кнопками (пошук приміщення, звіт у файл, ціни по областях, оголошення OLX). `sendChatMessageWithText()` — відправка запиту з коду. Підтримка `quick_actions` у повідомленнях — кнопки під відповіддю.
+  - **llm.py**: `_infer_quick_actions_from_response()` — визначення кнопок за текстом відповіді (показати тут, вивантажити в Excel). У події `done` додано `quick_actions`.
+  - **link_formatter.py**: ProZorro/OLX URL → внутрішні посилання з `data-source`, `data-source-id`; клік відкриває оголошення в застосунку (`showDetail`).
+  - **styles.css**: Стилі для `.chat-quick-actions`, `.chat-quick-action-btn`, `.chat-link-internal`.
+
+## 2026-02-17 — Відображення тегів та поверху на сторінках пошуку та деталей
+
+- **Запит**: Вивести на сторінку пошуку та сторінки оголошень теги, що отримуються при парсингу. В першу чергу — поверх.
+
+- **Дії**:
+  - **search.py**: `_normalize_unified_doc` — додано `floor`, `tags` у відповідь з unified_listings. `_normalize_olx_doc` — додано `floor`, `tags` з `detail.llm`. `_normalize_prozorro_doc` — додано `floor`, `tags` з `auction_data`.
+  - **UnifiedListingsService**: при конвертації OLX → unified додано `floor`, `tags` з `detail.llm`; при конвертації ProZorro → unified додано `floor`, `tags` з `auction_data`.
+  - **app.js**: на сторінці пошуку — відображення «Поверх» та «Теги» після площі/землі. На сторінці деталей — поверх у «швидких фактах» (key info) першим; у вкладці «Характеристики» — додано поля «Поверх» та «Теги» для OLX і ProZorro.
+  - **styles.css**: додано класи `.search-item-floor`, `.search-item-tags` до стилів карток пошуку.
+
+## 2026-02-16 — Парсинг блоку ad-parameters-container (OLX)
+
+- **Запит**: В парсері даних OLX необхідно отримувати також блок характеристик з `data-testid="ad-parameters-container"` — там багато корисних даних (відстань до міста, тип нерухомості, кадастровий номер, площа ділянки, комунікації, інфраструктура).
+- **Дії**: У `scripts/olx_scraper/parser.py` в `parse_detail_page` додано парсинг контейнера `[data-testid="ad-parameters-container"]`. Текст з дочірніх `<p>` елементів розбирається як пари «лейбл: значення» та об'єднується з існуючими параметрами з `data-cy="ad_parameters"`. При дублікаті лейбла зберігається значення з більшою довжиною (більш повне).
+
+## 2026-02-15 — Покращення якості відповідей (посилання, переліки)
+
+- **Фідбек**: user_id=171554829, 20:24 — відповідь «2 оголошення» з одним посиланням; друге — плейсхолдер замість URL.
+- **Дії**: Додано в system prompt правила для посилань та переліків: надавати лише те, що є в даних; не обіцяти N, якщо їх менше; не писати плейсхолдери типу «[Посилання на друге...]»; формат: номер, опис, URL.
+
+## 2026-02-15 — Виправлення формату відповіді LLM та LogicalLayerViolation для floor
+
+- **Проблема 1**: Помічник повертав відповідь у сирому форматі `{'type': 'text', 'text': "...", 'extras': {...}}` замість тексту.
+- **Проблема 2**: LogicalLayerViolation — Unknown logical field: 'floor' при запитах на приміщення для аптеки.
+- **Дії**:
+  - **LangChainAgentService**: при content у вигляді списку блоків (Gemini) — витягування тексту з елементів `{type:'text', text:'...'}` замість str(item).
+  - **domain/validators.py**: додано `floor` до ALLOWED_LOGICAL_FILTER_KEYS.
+  - **SourceFieldMapper**: маппінг floor → detail.llm.floor (olx_listings), floor (unified_listings).
+
 ## 2026-02-15 — Логування бесіди при дизлайку та перегляд в адмін-панелі
 
 - **Запит**: При «пальці вниз» на відповідь LLM — логувати бесіду повністю та дати можливість продивитися її в панелі адміністратора.

@@ -58,6 +58,12 @@ class Application:
     def __init__(self):
         """Ініціалізація застосунку."""
         self._running = False
+        # Перевірка та міграція конфігу перед завантаженням налаштувань
+        try:
+            from config.config_migration_runner import run_if_needed
+            run_if_needed()
+        except Exception as e:
+            print(f"Попередження: перевірка конфігу — {e}")
         self.settings = Settings()
         self.prozorro_service = None
         self.telegram_bot_service = None
