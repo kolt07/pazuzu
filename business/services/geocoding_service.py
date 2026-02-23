@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 from config.settings import Settings
 from data.repositories.geocode_cache_repository import GeocodeCacheRepository
 from utils.hash_utils import calculate_geocode_query_hash
+from business.services.logging_service import LoggingService
 
 GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 DEFAULT_REGION = "ua"
@@ -21,6 +22,7 @@ DEFAULT_LANGUAGE = "uk"  # Відповідь українською (кирил
 DEFAULT_TIMEOUT = 15
 
 # Типи address_components Google API -> ключі в address_structured
+# street_number: premise — fallback для номеру будинку (іноді Google повертає premise замість street_number)
 ADDRESS_COMPONENT_MAP = [
     ("country", ["country"]),
     ("region", ["administrative_area_level_1"]),
@@ -28,7 +30,7 @@ ADDRESS_COMPONENT_MAP = [
     ("city", ["locality", "administrative_area_level_2"]),
     ("sublocality", ["sublocality", "sublocality_level_1"]),
     ("street", ["route"]),
-    ("street_number", ["street_number"]),
+    ("street_number", ["street_number", "premise"]),
     ("postal_code", ["postal_code"]),
 ]
 
@@ -123,11 +125,13 @@ class GeocodingService:
     def __init__(self, settings: Optional[Settings] = None):
         self._settings = settings or Settings()
         self._cache = GeocodeCacheRepository()
+        self._logging = LoggingService()
 
     def geocode(
         self,
         query: str,
         region: str = DEFAULT_REGION,
+        caller: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Повертає координати та метадані для текстового запиту (адреса, назва ЖК, тощо).
@@ -143,7 +147,20 @@ class GeocodingService:
             }
         query_hash = calculate_geocode_query_hash(query_text)
         cached = self._cache.find_by_query_hash(query_hash)
+        source = caller or "geocoding_service"
         if cached is not None:
+            try:
+                self._logging.log_api_usage(
+                    service="geocoding",
+                    source=source,
+                    from_cache=True,
+                    metadata={
+                        "query_preview": query_text[:80] + ("..." if len(query_text) > 80 else ""),
+                        "results_count": len(cached.get("result") or []),
+                    },
+                )
+            except Exception as e:
+                logger.debug("log_api_usage (geocode cache): %s", e)
             return {
                 "query_hash": query_hash,
                 "query_text": cached.get("query_text") or query_text,
@@ -158,6 +175,15 @@ class GeocodingService:
                 "results": [],
                 "from_cache": False,
             }
+        try:
+            self._logging.log_api_usage(
+                service="geocoding",
+                source=source,
+                from_cache=False,
+                metadata={"query_preview": query_text[:80] + ("..." if len(query_text) > 80 else "")},
+            )
+        except Exception as e:
+            logger.debug("log_api_usage (geocode API): %s", e)
         results, should_cache = _call_google_geocode(query_text, api_key, region=region)
         if should_cache:
             self._cache.save_result(query_hash, query_text, results)

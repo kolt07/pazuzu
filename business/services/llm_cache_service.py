@@ -54,8 +54,11 @@ class LLMCacheService:
     
     def clear_cache(self) -> None:
         """Очищає весь кеш."""
-        # Видаляємо всі записи з колекції
         self.repository.delete_many({})
+
+    def clear_real_estate_objects_cache(self) -> int:
+        """Очищає кеш результатів парсингу об'єктів нерухомого майна (ключі reo_*)."""
+        return self.repository.delete_by_prefix("reo_")
     
     def get_cache_stats(self) -> Dict[str, Any]:
         """

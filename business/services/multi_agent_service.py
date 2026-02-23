@@ -166,6 +166,240 @@ class MultiAgentService:
             q.append(now)
         return None
 
+    def _try_analytics_aggregation_by_city(
+        self,
+        user_query: str,
+        intent_info: Dict[str, Any],
+        request_id: str,
+        status_callback: Optional[Callable[[str], None]],
+    ) -> Optional[str]:
+        """
+        Для analytical_text з запитом на порівняння цін по містах (Київ vs Львів тощо) —
+        викликає execute_analytics з groupBy: ["city"]. ProZorro, потім OLX як fallback.
+        """
+        if intent_info.get("response_format") not in ("analytical_text", "text_answer"):
+            return None
+        q = (user_query or "").strip().lower()
+        # Шаблони: "порівняй ціни в Києві та Львові", "середня ціна за м² у Києві і Львові"
+        city_keywords = ["києві", "київ", "львові", "львів", "харкові", "харків", "одесі", "одеса", "дніпрі", "дніпро"]
+        has_city_comparison = (
+            any(p in q for p in ["порівняй", "порівняння", "порівняти"])
+            or any(p in q for p in ["середня ціна", "ціна за м", "ціна за кв", "ціна за м²"])
+        ) and sum(1 for c in city_keywords if c in q) >= 2
+        if not has_city_comparison:
+            return None
+        # Визначаємо міста з запиту (спрощено — по ключовим словам)
+        cities = []
+        city_map = [
+            ("києві", "Київ"), ("київ", "Київ"),
+            ("львові", "Львів"), ("львів", "Львів"),
+            ("харкові", "Харків"), ("харків", "Харків"),
+            ("одесі", "Одеса"), ("одеса", "Одеса"),
+            ("дніпрі", "Дніпро"), ("дніпро", "Дніпро"),
+        ]
+        for kw, city in city_map:
+            if kw in q and city not in cities:
+                cities.append(city)
+        if len(cities) < 2:
+            return None
+        # Розширюємо міста варіантами (Київ, м. Київ тощо) для збігу з addresses.settlement / llm_result
+        settlement_values = set(cities)
+        for c in cities:
+            if not (c.startswith("м.") or c.startswith("м ")):
+                settlement_values.add("м. " + c)
+        settlement_list = list(settlement_values)
+        # Фільтр за типом: комерційна нерухомість
+        want_commercial = "комерційн" in q or "комерційна" in q
+        if status_callback:
+            try:
+                status_callback("Аналітика по містах...")
+            except Exception:
+                pass
+        try:
+            from business.services.relative_date_resolver import RelativeDateResolver
+            resolved = RelativeDateResolver().resolve({"period": "last_30_days"})
+            # Використовуємо $in для settlement — збігає і "Дніпро", і "м. Дніпро"
+            filters = {"city": {"$in": settlement_list}}
+            if resolved and isinstance(resolved, dict) and "gte" in resolved and "lte" in resolved:
+                filters["auction_data.dateModified"] = {"$gte": resolved["gte"], "$lte": resolved["lte"]}
+            if want_commercial:
+                filters["property_type"] = "Комерційна нерухомість"
+            # 1. ProZorro з groupBy: ["city"]
+            analytics_query = {
+                "collection": "prozorro_auctions",
+                "metric": "average_price_per_m2",
+                "groupBy": ["city"],
+                "filters": filters,
+            }
+            result = self.langchain_service.run_tool("execute_analytics", analytics_query)
+            if result.get("success"):
+                data = result.get("data") or result.get("results") or []
+                if data:
+                    composer = AnswerComposerService()
+                    contract = composer.compose({
+                        "data": data,
+                        "query_type": "analytical",
+                        "row_count": len(data),
+                        "has_attachment": False,
+                        "response_format": "analytical_text",
+                    })
+                    summary = contract.get("summary", "")
+                    if summary:
+                        refined = FinalAnswerRefinementService(self.settings).refine(summary, user_query)
+                        return refined if refined else summary
+            # 2. Fallback: OLX з groupBy: ["city"]
+            filters_olx = {"city": {"$in": settlement_list}}
+            if resolved and isinstance(resolved, dict) and "gte" in resolved and "lte" in resolved:
+                filters_olx["updated_at"] = {"$gte": resolved["gte"], "$lte": resolved["lte"]}
+            if want_commercial:
+                filters_olx["property_type"] = "Комерційна нерухомість"
+            analytics_query_olx = {
+                "collection": "olx_listings",
+                "metric": "average_price_per_m2",
+                "groupBy": ["city"],
+                "filters": filters_olx,
+            }
+            result_olx = self.langchain_service.run_tool("execute_analytics", analytics_query_olx)
+            if result_olx.get("success"):
+                data = result_olx.get("data") or result_olx.get("results") or []
+                if data:
+                    composer = AnswerComposerService()
+                    contract = composer.compose({
+                        "data": data,
+                        "query_type": "analytical",
+                        "row_count": len(data),
+                        "has_attachment": False,
+                        "response_format": "analytical_text",
+                    })
+                    summary = contract.get("summary", "")
+                    if summary:
+                        refined = FinalAnswerRefinementService(self.settings).refine(summary, user_query)
+                        return refined if refined else summary
+            # 3. Fallback: price_analytics (передобчислені агрегати з unified_listings)
+            try:
+                from datetime import datetime, timezone
+                from business.services.price_analytics_service import PriceAnalyticsService
+                month_key = datetime.now(timezone.utc).strftime("%Y-%m")
+                analytics_svc = PriceAnalyticsService()
+                data_from_aggregates = []
+                cities_lower = {c.strip().lower() for c in cities}
+                # Отримуємо агрегати за місяць (без фільтра по місту), потім фільтруємо по cities
+                all_rows = analytics_svc.get_aggregated_analytics(
+                    period_type="month",
+                    period_key=month_key,
+                    property_type="Комерційна нерухомість" if want_commercial else None,
+                )
+                by_city: Dict[str, Dict[str, Any]] = {}
+                for r in (all_rows or []):
+                    gc = (r.get("group_city") or (r.get("group_by") or {}).get("city", "") or "").strip()
+                    gc_norm = gc.replace("м.", "").replace("м ", "").strip().lower()
+                    matched = next((c for c in cities if c.lower() in gc_norm or gc_norm in c.lower()), None)
+                    if not matched:
+                        continue
+                    m = r.get("metrics", {}) or {}
+                    pm2 = m.get("price_per_m2_uah") or {}
+                    avg_val = pm2.get("avg") if isinstance(pm2, dict) else None
+                    cnt = r.get("count", 0)
+                    if avg_val is not None and avg_val > 0:
+                        prev = by_city.get(matched)
+                        if prev is None or cnt > prev.get("count", 0):
+                            by_city[matched] = {
+                                "city": gc or matched,
+                                "value": round(float(avg_val), 2),
+                                "average_price_per_m2": round(float(avg_val), 2),
+                                "count": cnt,
+                                "unit": "UAH/m²",
+                            }
+                data_from_aggregates = list(by_city.values())
+                if data_from_aggregates:
+                    composer = AnswerComposerService()
+                    contract = composer.compose({
+                        "data": data_from_aggregates,
+                        "query_type": "analytical",
+                        "row_count": len(data_from_aggregates),
+                        "has_attachment": False,
+                        "response_format": "analytical_text",
+                    })
+                    summary = contract.get("summary", "")
+                    if summary:
+                        refined = FinalAnswerRefinementService(self.settings).refine(summary, user_query)
+                        return refined if refined else summary
+            except Exception as e:
+                logger.debug("_try_analytics_aggregation_by_city price_analytics fallback: %s", e)
+            # 4. Fallback: execute_aggregation на unified_listings (адреси з addresses.settlement)
+            try:
+                from business.services.relative_date_resolver import RelativeDateResolver
+                from datetime import datetime
+                resolved = RelativeDateResolver().resolve({"period": "last_30_days"})
+                cutoff_dt = None
+                if resolved and isinstance(resolved, dict) and "gte" in resolved:
+                    try:
+                        cutoff_dt = datetime.fromisoformat(
+                            str(resolved["gte"]).replace("Z", "+00:00")
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                # Розширюємо cities варіантами (Київ, м. Київ тощо) для збігу з addresses.settlement
+                settlement_values = set(cities)
+                for c in cities:
+                    if not (c.startswith("м.") or c.startswith("м ")):
+                        settlement_values.add("м. " + c)
+                settlement_list = list(settlement_values)
+                base_match = {"addresses": {"$exists": True, "$ne": []}, "status": "активне"}
+                if cutoff_dt:
+                    base_match["source_updated_at"] = {"$gte": cutoff_dt}
+                if want_commercial:
+                    base_match["property_type"] = "Комерційна нерухомість"
+                pipeline = [
+                    {"$match": base_match},
+                    {"$unwind": "$addresses"},
+                    {"$match": {"addresses.settlement": {"$in": settlement_list}}},
+                ]
+                pipeline.extend([
+                    {"$match": {"price_per_m2_uah": {"$exists": True, "$gt": 0}}},
+                    {"$group": {
+                        "_id": "$addresses.settlement",
+                        "value": {"$avg": "$price_per_m2_uah"},
+                        "count": {"$sum": 1},
+                    }},
+                    {"$project": {"_id": 0, "city": "$_id", "value": 1, "count": 1}},
+                ])
+                agg_result = self.langchain_service.run_tool(
+                    "execute_aggregation",
+                    {"collection_name": "unified_listings", "pipeline": pipeline, "limit": 20},
+                )
+                if agg_result.get("success"):
+                    data_agg = agg_result.get("results") or agg_result.get("data") or []
+                    if data_agg:
+                        formatted = [
+                            {
+                                "city": r.get("city", "н/д"),
+                                "value": round(float(r.get("value", 0)), 2),
+                                "average_price_per_m2": round(float(r.get("value", 0)), 2),
+                                "count": r.get("count", 0),
+                                "unit": "UAH/m²",
+                            }
+                            for r in data_agg
+                        ]
+                        composer = AnswerComposerService()
+                        contract = composer.compose({
+                            "data": formatted,
+                            "query_type": "analytical",
+                            "row_count": len(formatted),
+                            "has_attachment": False,
+                            "response_format": "analytical_text",
+                        })
+                        summary = contract.get("summary", "")
+                        if summary:
+                            refined = FinalAnswerRefinementService(self.settings).refine(summary, user_query)
+                            return refined if refined else summary
+            except Exception as e:
+                logger.debug("_try_analytics_aggregation_by_city unified_listings fallback: %s", e)
+            return None
+        except Exception as e:
+            logger.debug("_try_analytics_aggregation_by_city: %s", e)
+            return None
+
     def _try_analytics_aggregation_by_region(
         self,
         user_query: str,
@@ -309,6 +543,7 @@ class MultiAgentService:
         listing_context: Optional[Dict[str, Any]] = None,
         stream_callback: Optional[Callable[[str], None]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
+        thinking_callback: Optional[Callable[[str], None]] = None,
         reply_to_text: Optional[str] = None,
         request_id: Optional[str] = None,
         explicit_intent: Optional[str] = None,
@@ -423,6 +658,7 @@ class MultiAgentService:
                     explicit_params=params_for_interpret,
                     status_callback=status_callback,
                     stream_callback=stream_callback,
+                    thinking_callback=thinking_callback,
                 )
             except Exception as e:
                 logger.exception("Помилка нового потоку обробки, fallback на старий: %s", e)
@@ -560,6 +796,7 @@ class MultiAgentService:
             chat_id=chat_id,
             listing_context=effective_listing_context,
             stream_callback=stream_callback,
+            thinking_callback=thinking_callback,
             reply_to_text=reply_to_text,
             request_id=request_id,
         )
@@ -658,6 +895,7 @@ class MultiAgentService:
         explicit_params: Optional[Dict[str, Any]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
         stream_callback: Optional[Callable[[str], None]] = None,
+        thinking_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
         """
         Новий потік обробки запиту:
@@ -744,6 +982,7 @@ class MultiAgentService:
                     chat_id=chat_id,
                     listing_context=listing_context,
                     stream_callback=stream_callback,
+                    thinking_callback=thinking_callback,
                     reply_to_text=None,
                     request_id=request_id,
                     route="geo_assessment",
@@ -753,7 +992,12 @@ class MultiAgentService:
                 self.langchain_service._current_user_id = None
                 self.langchain_service._current_chat_id = None
 
-        # Для analytical_text: спроба execute_analytics для агрегації "середня ціна по областям/регіонах"
+        # Для analytical_text: спроба execute_analytics для агрегації
+        analytics_result = self._try_analytics_aggregation_by_city(
+            user_query, intent_info, request_id, status_callback
+        )
+        if analytics_result is not None:
+            return analytics_result
         analytics_result = self._try_analytics_aggregation_by_region(
             user_query, intent_info, request_id, status_callback
         )

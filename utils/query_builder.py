@@ -14,7 +14,10 @@ class QueryBuilder:
     """Клас для побудови безпечних MongoDB запитів з абстрактних запитів."""
     
     # Дозволені колекції для запитів
-    ALLOWED_COLLECTIONS = {'prozorro_auctions', 'llm_cache', 'olx_listings', 'unified_listings'}
+    ALLOWED_COLLECTIONS = {
+        'prozorro_auctions', 'llm_cache', 'olx_listings', 'unified_listings',
+        'listing_analytics', 'real_estate_objects', 'price_analytics',
+    }
     
     # Дозволені оператори для фільтрів
     ALLOWED_OPERATORS = {

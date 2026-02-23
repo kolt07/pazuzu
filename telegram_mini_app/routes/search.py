@@ -48,7 +48,7 @@ def _build_olx_filters(
     price_eq: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Будує MongoDB фільтри для OLX."""
-    filters = {}
+    filters: Dict[str, Any] = {}
     
     # Фільтри за регіоном та містом
     if region or city:
@@ -100,14 +100,14 @@ def _build_olx_filters(
         if region:
             or_conditions.append({
                 "detail.resolved_locations": {
-                    "$elemMatch": {"address_structured.region": {"$regex": str(region).strip(), "$options": "i"}}
+                    "$elemMatch": {"results.address_structured.region": {"$regex": str(region).strip(), "$options": "i"}}
                 }
             })
             or_conditions.append({"search_data.location": {"$regex": str(region).strip(), "$options": "i"}})
         if city:
             or_conditions.append({
                 "detail.resolved_locations": {
-                    "$elemMatch": {"address_structured.city": {"$regex": str(city).strip(), "$options": "i"}}
+                    "$elemMatch": {"$or": [{"results.address_structured.city": {"$regex": str(city).strip(), "$options": "i"}}, {"results.address_structured.settlement": {"$regex": str(city).strip(), "$options": "i"}}]}
                 }
             })
             or_conditions.append({"search_data.location": {"$regex": str(city).strip(), "$options": "i"}})
@@ -224,6 +224,12 @@ def _build_prozorro_filters(
 
 # Маппінг UI-значень типу оголошення на значення в БД (unified_listings.property_type)
 _PROPERTY_TYPE_MAP = {
+    "kommercheska_ta_zd": [
+        "Нерухомість",
+        "Комерційна нерухомість",
+        "Земельна ділянка",
+        "Земельна ділянка з нерухомістю",
+    ],
     "neruhomist": ["Нерухомість", "Комерційна нерухомість"],
     "zemelna_dilyanka": ["Земельна ділянка"],
     "zemelna_dilyanka_z_neruhomistyu": ["Земельна ділянка з нерухомістю"],
@@ -369,6 +375,9 @@ def _normalize_unified_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         else:
             date_str = str(source_updated)
 
+    refs = doc.get("real_estate_object_refs") or []
+    related_objects_count = len(refs) if isinstance(refs, list) else 0
+
     return {
         "id": doc.get("_id"),
         "source": source,
@@ -382,6 +391,7 @@ def _normalize_unified_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "price_per_ha_usd": doc.get("price_per_ha_usd"),
         "region": region,
         "city": city,
+        "addresses": doc.get("addresses", []),
         "status": doc.get("status", ""),
         "property_type": doc.get("property_type", ""),
         "building_area_sqm": doc.get("building_area_sqm"),
@@ -390,6 +400,8 @@ def _normalize_unified_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "tags": doc.get("tags") or [],
         "page_url": doc.get("page_url"),
         "updated_at": date_str,
+        "price_notes": doc.get("price_notes") or "",
+        "related_objects_count": related_objects_count,
     }
 
 
@@ -883,6 +895,7 @@ def search_unified(
     )
 
     # Маппінг sort_field на MongoDB поле
+    # Сортування за датою = дата оновлення в джерелі (source_updated_at); при однаковій — за датою в нашій БД (system_updated_at)
     sort_field_map = {
         "source_updated_at": "source_updated_at",
         "updated_at": "source_updated_at",
@@ -891,10 +904,13 @@ def search_unified(
     }
     actual_sort = sort_field_map.get(sort_field, "source_updated_at")
     sort_direction = -1 if sort_order == "desc" else 1
+    sort_list = [(actual_sort, sort_direction)]
+    if actual_sort == "source_updated_at":
+        sort_list.append(("system_updated_at", sort_direction))
 
     docs = repo.find_many(
         filter=filters,
-        sort=[(actual_sort, sort_direction)],
+        sort=sort_list,
         skip=skip,
         limit=limit,
     )
@@ -915,7 +931,8 @@ def search_unified(
         for item in items:
             cid = f"{item.get('source', '')}:{item.get('source_id', '')}"
             if cid in indicators:
-                item["price_indicator"] = indicators[cid]
+                item["price_indicator"] = indicators[cid]["indicator"]
+                item["price_indicator_source"] = indicators[cid].get("source", "region")
     except Exception:
         pass
 
@@ -985,10 +1002,13 @@ def export_search_results(request: Request, body: ExportSearchRequest):
     sort_field_map = {"source_updated_at": "source_updated_at", "price": "price_uah", "title": "title"}
     actual_sort = sort_field_map.get(body.sort_field, "source_updated_at")
     sort_direction = -1 if body.sort_order == "desc" else 1
+    sort_list = [(actual_sort, sort_direction)]
+    if actual_sort == "source_updated_at":
+        sort_list.append(("system_updated_at", sort_direction))
 
     docs = repo.find_many(
         filter=filters,
-        sort=[(actual_sort, sort_direction)],
+        sort=sort_list,
         limit=10000,
         skip=0,
     )
@@ -1063,10 +1083,13 @@ def send_export_via_bot(request: Request, body: ExportSearchRequest):
     sort_field_map = {"source_updated_at": "source_updated_at", "price": "price_uah", "title": "title"}
     actual_sort = sort_field_map.get(body.sort_field, "source_updated_at")
     sort_direction = -1 if body.sort_order == "desc" else 1
+    sort_list = [(actual_sort, sort_direction)]
+    if actual_sort == "source_updated_at":
+        sort_list.append(("system_updated_at", sort_direction))
 
     docs = repo.find_many(
         filter=filters,
-        sort=[(actual_sort, sort_direction)],
+        sort=sort_list,
         limit=10000,
         skip=0,
     )
@@ -1237,11 +1260,76 @@ def get_unified_detail(
         indicators = analytics.get_price_indicators_for_items([item])
         cid = f"{item.get('source', '')}:{item.get('source_id', '')}"
         if cid in indicators:
-            item["price_indicator"] = indicators[cid]
+            item["price_indicator"] = indicators[cid]["indicator"]
+            item["price_indicator_source"] = indicators[cid].get("source", "region")
     except Exception:
         pass
     item["_detail_type"] = "unified"
     return item
+
+
+@router.get("/real-estate-objects")
+def get_real_estate_objects(
+    request: Request,
+    source: str = Query(..., description="Джерело: olx або prozorro"),
+    source_id: str = Query(..., description="ID в джерелі (URL для OLX, auction_id для ProZorro)"),
+):
+    """Отримує список об'єктів нерухомого майна (ОНМ), пов'язаних з оголошенням."""
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+    if source.lower() not in ("olx", "prozorro"):
+        raise HTTPException(status_code=400, detail="source must be olx or prozorro")
+
+    from data.repositories.real_estate_objects_repository import RealEstateObjectsRepository
+    from data.repositories.unified_listings_repository import UnifiedListingsRepository
+
+    unified_repo = UnifiedListingsRepository()
+    doc = unified_repo.find_by_source_id(source.lower(), source_id)
+    if not doc and source.lower() == "olx" and source_id:
+        for variant in _olx_url_variants(source_id.strip()):
+            if variant != source_id:
+                doc = unified_repo.find_by_source_id("olx", variant)
+                if doc:
+                    break
+    if not doc:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    refs = doc.get("real_estate_object_refs") or []
+    if not refs:
+        return {"count": 0, "items": []}
+
+    ids = [r.get("object_id") for r in refs if isinstance(r, dict) and r.get("object_id")]
+    if not ids:
+        return {"count": 0, "items": []}
+
+    reo_repo = RealEstateObjectsRepository()
+    items = reo_repo.find_by_ids(ids)
+    # Розкриваємо зв'язки: land_plots для будівель, premises для будівель, building для приміщень
+    all_ids = set(ids)
+    for item in items:
+        if item.get("type") == "building":
+            lp_ids = item.get("land_plot_ids") or []
+            prem_ids = item.get("premises_ids") or []
+            if lp_ids:
+                land_plots = reo_repo.find_by_ids([x for x in lp_ids if isinstance(x, str)])
+                item["land_plots"] = land_plots
+            else:
+                item["land_plots"] = []
+            if prem_ids:
+                premises = reo_repo.find_by_ids([x for x in prem_ids if isinstance(x, str)])
+                item["premises"] = premises
+            else:
+                item["premises"] = []
+        elif item.get("type") == "premises":
+            bid = item.get("building_id")
+            if bid:
+                bid_str = bid if isinstance(bid, str) else str(bid)
+                building = reo_repo.find_by_id(bid_str)
+                item["building"] = building
+            else:
+                item["building"] = None
+    return {"count": len(items), "items": items}
 
 
 @router.get("/usage-analysis")
@@ -1342,6 +1430,8 @@ def _build_item_for_price_indicator(doc: Dict[str, Any], source: str) -> Optiona
                 city = parts[0]
             if len(parts) > 1:
                 region = parts[1]
+        b_sqm = detail.get("llm", {}).get("building_area_sqm") or price_metrics.get("building_area_sqm")
+        l_ha = detail.get("llm", {}).get("land_area_ha") or price_metrics.get("land_area_ha")
         return {
             "source": "olx",
             "source_id": doc.get("url", ""),
@@ -1350,6 +1440,8 @@ def _build_item_for_price_indicator(doc: Dict[str, Any], source: str) -> Optiona
             "price_uah": search_data.get("price_value"),
             "price_per_m2_uah": price_metrics.get("price_per_m2_uah"),
             "price_per_ha_uah": price_metrics.get("price_per_ha_uah"),
+            "building_area_sqm": b_sqm,
+            "land_area_ha": l_ha,
         }
     if source == "prozorro":
         auction_data = doc.get("auction_data", {})
@@ -1375,6 +1467,12 @@ def _build_item_for_price_indicator(doc: Dict[str, Any], source: str) -> Optiona
         value = auction_data.get("value", {})
         price = value.get("amount") if isinstance(value, dict) else None
         pm = auction_data.get("price_metrics") or {}
+        items = auction_data.get("items") or []
+        b_sqm, l_ha = None, None
+        if items and isinstance(items[0], dict):
+            ip = items[0].get("itemProps") or {}
+            b_sqm = ip.get("totalBuildingArea") or ip.get("totalObjectArea") or ip.get("usableArea")
+            l_ha = ip.get("landArea")
         return {
             "source": "prozorro",
             "source_id": doc.get("auction_id", ""),
@@ -1383,6 +1481,8 @@ def _build_item_for_price_indicator(doc: Dict[str, Any], source: str) -> Optiona
             "price_uah": price,
             "price_per_m2_uah": pm.get("price_per_m2_uah"),
             "price_per_ha_uah": pm.get("price_per_ha_uah"),
+            "building_area_sqm": b_sqm,
+            "land_area_ha": l_ha,
         }
     return None
 
@@ -1425,9 +1525,18 @@ def get_olx_item(request: Request, item_id: str):
             indicators = analytics.get_price_indicators_for_items([item])
             cid = f"olx:{item.get('source_id', '')}"
             if cid in indicators:
-                doc["price_indicator"] = indicators[cid]
+                doc["price_indicator"] = indicators[cid]["indicator"]
+                doc["price_indicator_source"] = indicators[cid].get("source", "region")
     except Exception:
         pass
+    url = doc.get("url") or item_id
+    if url:
+        unified_repo = UnifiedListingsRepository()
+        for variant in [url] + [v for v in _olx_url_variants(url) if v != url]:
+            unified_doc = unified_repo.find_by_source_id("olx", variant)
+            if unified_doc and unified_doc.get("price_notes"):
+                doc["price_notes"] = unified_doc["price_notes"]
+                break
     return doc
 
 
@@ -1461,9 +1570,14 @@ def get_prozorro_item(request: Request, item_id: str):
             indicators = analytics.get_price_indicators_for_items([item])
             cid = f"prozorro:{item.get('source_id', '')}"
             if cid in indicators:
-                doc["price_indicator"] = indicators[cid]
+                doc["price_indicator"] = indicators[cid]["indicator"]
+                doc["price_indicator_source"] = indicators[cid].get("source", "region")
     except Exception:
         pass
+    unified_repo = UnifiedListingsRepository()
+    unified_doc = unified_repo.find_by_source_id("prozorro", doc.get("auction_id") or item_id)
+    if unified_doc and unified_doc.get("price_notes"):
+        doc["price_notes"] = unified_doc["price_notes"]
     return doc
 
 

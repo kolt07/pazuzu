@@ -149,7 +149,7 @@ def _resolve_geo_filter_olx(city_values: List[str], region_values: List[str]) ->
         or_conditions.append({"search_data.location": {"$regex": region, "$options": "i"}})
         or_conditions.append({
             "detail.resolved_locations": {
-                "$elemMatch": {"address_structured.region": {"$regex": region, "$options": "i"}}
+                "$elemMatch": {"results.address_structured.region": {"$regex": region, "$options": "i"}}
             }
         })
 
@@ -163,7 +163,7 @@ def _resolve_geo_filter_olx(city_values: List[str], region_values: List[str]) ->
         or_conditions.append({"search_data.location": {"$regex": c, "$options": "i"}})
         or_conditions.append({
             "detail.resolved_locations": {
-                "$elemMatch": {"address_structured.city": {"$regex": c, "$options": "i"}}
+                "$elemMatch": {"$or": [{"results.address_structured.city": {"$regex": c, "$options": "i"}}, {"results.address_structured.settlement": {"$regex": c, "$options": "i"}}]}
             }
         })
 

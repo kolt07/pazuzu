@@ -12,6 +12,8 @@ from config.settings import Settings
 from domain.managers.collection_manager import (
     BaseCollectionManager,
     UnifiedListingsCollectionManager,
+    ListingAnalyticsCollectionManager,
+    RealEstateObjectsCollectionManager,
 )
 
 logger = logging.getLogger(__name__)
@@ -19,12 +21,22 @@ logger = logging.getLogger(__name__)
 # Джерела даних: зведена таблиця — основна, джерела — лише за потреби
 UNIFIED_COLLECTION = "unified_listings"
 SOURCE_COLLECTIONS = ["prozorro_auctions", "olx_listings"]
+# Колекції, що підтримуються пайплайном (domain-шар)
+PIPELINE_COLLECTIONS = [
+    UNIFIED_COLLECTION,
+    "listing_analytics",
+    "real_estate_objects",
+] + SOURCE_COLLECTIONS
 
 
 def get_collection_manager(collection: str) -> Optional[BaseCollectionManager]:
     """Повертає CollectionManager для колекції."""
     if collection == UNIFIED_COLLECTION:
         return UnifiedListingsCollectionManager()
+    if collection == "listing_analytics":
+        return ListingAnalyticsCollectionManager()
+    if collection == "real_estate_objects":
+        return RealEstateObjectsCollectionManager()
     return None
 
 
@@ -127,6 +139,14 @@ class PipelineService:
             "olx_listings": {
                 "description": "Джерело даних OLX. Використовувати лише якщо потрібні поля, що не містяться в зведеній таблиці.",
                 "methods": ["find", "get_available_field_values"],
+            },
+            "listing_analytics": {
+                "description": "LLM-аналітика оголошень (ціна за одиницю, місцезнаходження, оточення). Зв'язок через source+source_id.",
+                "methods": ["find", "get_available_field_values", "get_field_structure"],
+            },
+            "real_estate_objects": {
+                "description": "Об'єкти нерухомого майна (ОНМ): land_plot, building, premises. Зв'язок з unified_listings через real_estate_refs.",
+                "methods": ["find", "get_available_field_values", "get_field_structure"],
             },
         }
         

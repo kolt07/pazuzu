@@ -138,6 +138,7 @@ class AppMetadataService:
         
         metadata = {
             "app": base.get("app", {}),
+            "data_flow_architecture": base.get("data_flow_architecture", {}),
             "data_sources": base.get("data_sources", {}),
             "collections": base.get("collections", {}),
             "available_operations": base.get("available_operations", []),
@@ -164,6 +165,18 @@ class AppMetadataService:
         app_info = metadata.get("app", {})
         if app_info.get("purpose"):
             parts.append(f"# Ціль застосунку\n\n{app_info['name']}: {app_info['purpose']}")
+
+        # Архітектура потоку даних — КРИТИЧНО для вибору маршруту
+        data_flow = metadata.get("data_flow_architecture", {})
+        if data_flow:
+            parts.append("\n# Архітектура потоку даних (вибір маршруту)\n")
+            parts.append("Шари даних: primary (olx_listings, prozorro_auctions) → unified (unified_listings) → aggregated (price_analytics).")
+            parts.append("Деривовані: listing_analytics, real_estate_objects.")
+            rules = data_flow.get("routing_rules", [])
+            if rules:
+                parts.append("Правила маршрутизації:")
+                for r in rules:
+                    parts.append(f"  - {r}")
         
         # Джерела даних
         parts.append("\n# Джерела даних\n")

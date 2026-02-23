@@ -536,6 +536,35 @@ body {
   max-width: 90%;
 }
 
+.chat-msg-thinking {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px dashed var(--border-color);
+  font-size: 0.85rem;
+}
+
+.chat-msg-thinking-summary {
+  cursor: pointer;
+  color: var(--tg-theme-hint-color);
+  font-weight: 500;
+  user-select: none;
+}
+
+.chat-msg-thinking-summary:hover {
+  color: var(--tg-theme-text-color);
+}
+
+.chat-msg-thinking-content {
+  margin-top: 0.4rem;
+  padding: 0.5rem;
+  background: var(--tg-theme-bg-color);
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 12rem;
+  overflow-y: auto;
+}
+
 .chat-send-row {
   display: flex;
   gap: 0.5rem;
@@ -657,6 +686,34 @@ a.file-download-link:active {
 .admin-block .btn {
   margin-top: 0.25rem;
   margin-right: 0.5rem;
+}
+
+.admin-usage-summary {
+  margin-bottom: 1rem;
+  font-size: 0.95rem;
+}
+
+.admin-usage-charts {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.admin-chart-wrap {
+  background: var(--tg-theme-bg-color);
+  border-radius: 8px;
+  padding: 0.75rem;
+  border: 1px solid var(--border-color);
+}
+
+.admin-chart-wrap h4 {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.admin-chart-wrap canvas {
+  max-height: 200px;
 }
 
 .admin-collapsible .admin-collapsible-header {
@@ -1191,9 +1248,19 @@ a.file-download-link:active {
   color: #16a34a;
 }
 
+.search-item-price-нижче-середньої {
+  background: rgba(34, 197, 94, 0.15);
+  color: #15803d;
+}
+
 .search-item-price-середня {
   background: rgba(148, 163, 184, 0.2);
   color: #64748b;
+}
+
+.search-item-price-вище-середньої {
+  background: rgba(245, 158, 11, 0.2);
+  color: #d97706;
 }
 
 .search-item-price-дорога {
@@ -1211,9 +1278,29 @@ a.file-download-link:active {
   color: #ea580c;
 }
 
+.search-item-price-anomalous {
+  background: rgba(59, 130, 246, 0.2);
+  color: #2563eb;
+}
+
+[data-theme="dark"] .search-item-price-anomalous {
+  background: rgba(59, 130, 246, 0.25);
+  color: #60a5fa;
+}
+
 [data-theme="dark"] .search-item-price-вигідна {
   background: rgba(34, 197, 94, 0.25);
   color: #4ade80;
+}
+
+[data-theme="dark"] .search-item-price-нижче-середньої {
+  background: rgba(34, 197, 94, 0.2);
+  color: #4ade80;
+}
+
+[data-theme="dark"] .search-item-price-вище-середньої {
+  background: rgba(245, 158, 11, 0.25);
+  color: #fbbf24;
 }
 
 [data-theme="dark"] .search-item-price-дорога {
@@ -1461,6 +1548,21 @@ a.file-download-link:active {
 .detail-ai-btn:hover,
 .detail-ai-btn:focus {
   opacity: 0.9;
+}
+
+.detail-reformat-btn {
+  padding: 0.7rem 1rem;
+  font-size: 0.9rem;
+  background: var(--tg-theme-secondary-bg-color, #f0f0f0);
+  color: var(--tg-theme-text-color);
+  border: 1px solid var(--tg-theme-hint-color, #999);
+}
+.detail-reformat-btn:hover:not(:disabled) {
+  opacity: 0.9;
+}
+.detail-reformat-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .detail-cta-btn {
@@ -1777,4 +1879,95 @@ a.file-download-link:active {
   line-height: 1.55;
   color: var(--tg-theme-hint-color);
   font-size: 0.9rem;
+}
+
+.detail-analytics-llm {
+  margin-top: 1.25rem;
+  padding: 1rem;
+  background: var(--tg-theme-secondary-bg-color);
+  border-radius: 12px;
+  border-left: 4px solid var(--accent-color, #3b82f6);
+}
+
+.detail-analytics-llm-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 0.5rem 0;
+  color: var(--tg-theme-text-color);
+}
+
+.detail-analytics-llm-text {
+  margin: 0;
+  line-height: 1.6;
+  color: var(--tg-theme-text-color);
+  font-size: 0.9rem;
+  white-space: pre-wrap;
+}
+
+.detail-analytics-btn-wrap {
+  margin-top: 1rem;
+}
+
+.detail-analytics-generate-btn {
+  font-size: 0.9rem;
+  padding: 0.5rem 1rem;
+}
+
+.search-item-related {
+  font-size: 0.85rem;
+  color: var(--tg-theme-hint-color);
+  margin-top: 0.25rem;
+}
+
+.detail-reo-card {
+  background: var(--tg-theme-secondary-bg-color);
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 0.75rem;
+}
+
+.detail-reo-card-title {
+  font-weight: 600;
+  font-size: 1rem;
+  margin-bottom: 0.5rem;
+  color: var(--tg-theme-text-color);
+}
+
+.detail-reo-card-area,
+.detail-reo-card-cadastral,
+.detail-reo-card-address,
+.detail-reo-card-floor,
+.detail-reo-card-premises-type,
+.detail-reo-card-building-type {
+  font-size: 0.9rem;
+  color: var(--tg-theme-hint-color);
+  margin-top: 0.25rem;
+}
+
+/* Підсвітка різниці площі оголошення та кадастру */
+.detail-reo-card-area-cadastre-diff {
+  background: rgba(255, 193, 7, 0.15);
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  border-left: 3px solid rgba(255, 193, 7, 0.6);
+}
+
+.detail-reo-cadastre-diff {
+  background: rgba(255, 193, 7, 0.1);
+  padding: 0.15rem 0.35rem;
+  border-radius: 4px;
+  margin: 0.1rem 0;
+}
+
+.detail-reo-card-related {
+  margin-top: 0.75rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--tg-theme-hint-color, rgba(128, 128, 128, 0.2));
+  font-size: 0.9rem;
+  color: var(--tg-theme-hint-color);
+}
+
+.detail-reo-related-list {
+  margin: 0.25rem 0 0 1rem;
+  padding-left: 0.5rem;
 }

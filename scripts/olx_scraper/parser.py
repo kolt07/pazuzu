@@ -41,20 +41,38 @@ def _normalize_url(href: Optional[str]) -> Optional[str]:
 
 
 def _extract_price_value(text: str) -> Optional[float]:
-    """Витягує числове значення ціни з рядка на кшталт '1 855 521.17 грн.' або 'Договірна'."""
+    """
+    Витягує числове значення ціни з рядка на кшталт '1 855 521.17 грн.' або 'Договірна'.
+    Нормалізує роздільники тисяч (·, nbsp, narrow nbsp), щоб '2·000·000' не парсилось як 2.
+    Якщо є кілька чисел (наприклад 4.68 га та 2 000 000 $) — повертає найбільше (ціна зазвичай більша за площу).
+    """
     if not text:
         return None
-    text = text.replace("\u00a0", " ").replace(",", ".")
-    # Прибираємо все, крім цифр і крапки
+    # Нормалізація: роздільники тисяч та кома як десяткова -> пробіл/крапка
+    text = (
+        text.replace("\u00a0", " ")   # non-breaking space
+        .replace("\u202f", " ")       # narrow no-break space
+        .replace("\u00b7", " ")       # middle dot (·) — OLX може використовувати
+        .replace(",", ".")
+    )
     numbers = re.findall(r"[\d\s.]+", text)
+    candidates: List[float] = []
     for n in numbers:
         n_clean = n.replace(" ", "").strip()
         if n_clean and n_clean.replace(".", "").isdigit():
             try:
-                return float(n_clean)
+                v = float(n_clean)
+                if v > 0:
+                    candidates.append(v)
             except ValueError:
                 continue
-    return None
+    if not candidates:
+        return None
+    # Якщо є число >= 100 — це ймовірно ціна (площі/га зазвичай < 100)
+    prices = [c for c in candidates if c >= 100]
+    if prices:
+        return max(prices)
+    return max(candidates)
 
 
 def _extract_area_m2(text: str) -> Optional[float]:
@@ -305,17 +323,50 @@ def parse_listings_page(html: str, use_llm: bool = False) -> List[Dict[str, Any]
 
 def parse_detail_page(html: str) -> Dict[str, Any]:
     """
-    Парсить HTML сторінки оголошення (деталі): опис, параметри.
-    Повертає словник: description (str), parameters (list of {label, value}), fetched_at (ISO).
+    Парсить HTML сторінки оголошення (деталі): ціна, опис, параметри.
+    Повертає словник: price_text, price_value, currency, description, parameters, location, contact, fetched_at.
     """
     soup = BeautifulSoup(html, "lxml")
     result: Dict[str, Any] = {
+        "price_text": None,
+        "price_value": None,
+        "currency": None,
         "description": None,
         "parameters": [],
         "location": None,
         "contact": None,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
+
+    # Ціна: data-cy="ad-price" або схожий елемент (на сторінці деталей ціна відображається окремо)
+    price_el = soup.select_one('[data-cy="ad-price"], [data-aut-id="itemPrice"]')
+    if not price_el:
+        # Шукаємо h2/h3 з коротким текстом ціни (наприклад "2 000 000 $") — не в title
+        for tag in soup.find_all(["h2", "h3", "h4"]):
+            txt = tag.get_text(strip=True) if hasattr(tag, "get_text") else ""
+            if txt and len(txt) < 50 and re.search(r"[\d\s.,·]+\s*[$€]|[\d\s.,·]+\s*грн", txt, re.I):
+                price_el = tag
+                break
+    if not price_el:
+        price_str = soup.find(string=re.compile(r"грн|Договірна|\$|€", re.I))
+        if price_str:
+            parent = price_str.find_parent()
+            if parent and parent.name not in ("title", "head"):
+                price_el = parent
+    if price_el:
+        if hasattr(price_el, "get_text"):
+            price_text = price_el.get_text(strip=True)
+        else:
+            price_text = str(price_el).strip() if price_el else ""
+        if price_text:
+            result["price_text"] = price_text
+            result["price_value"] = _extract_price_value(price_text)
+            if "грн" in price_text.lower():
+                result["currency"] = "UAH"
+            elif "$" in price_text:
+                result["currency"] = "USD"
+            elif "€" in price_text:
+                result["currency"] = "EUR"
 
     # Опис оголошення: data-cy="ad_description" або схожий блок
     desc_el = (

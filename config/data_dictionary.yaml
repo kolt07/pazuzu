@@ -720,6 +720,9 @@ collections:
       updated_at:
         type: "datetime"
         description: "Дата останнього оновлення запису в БД. Для фільтра за періодом використовуй updated_at з операторами $gte, $lte; значення — BSON Date або ISO-рядок (залежно від збереження). При execute_query для olx_listings можна фільтрувати за 'updated_at': {$gte: ISODate(...), $lte: ISODate(...)} або порівняння рядків ISO."
+      is_active:
+        type: "boolean"
+        description: "Чи оголошення активне (не зняте з публікації). False — зняте з пошуку OLX за період. За замовчуванням True."
     
     # Поля для запитів та експорту (агент використовує ці шляхи)
     flattened_fields:
@@ -761,7 +764,7 @@ collections:
         description: "Масив тегів для фільтрації: призначення (крамниця, аптека, офіс, склад, кафе тощо) та комунікації (газ, вода, електрика, каналізація, опалення тощо). Формується агентом-інтерпретатором при парсингу опису. Фільтр: detail.llm.tags з $in. Унікальні значення — get_distinct_values(collection, detail.llm.tags, unwrap_array=true)."
 
   unified_listings:
-    description: "Зведена таблиця оголошень, що об'єднує дані з OLX та ProZorro в єдину структуру. Використовується як основне джерело даних для агентів та інструментів."
+    description: "Зведена таблиця оголошень, що об'єднує дані з OLX та ProZorro в єдину структуру. Використовується як основне джерело даних для агентів та інструментів. Сортування за датою: primary — source_updated_at (дата в джерелі), secondary — system_updated_at (дата в БД при однаковій даті в джерелі)."
     mongo_collection: "unified_listings"
     indexes:
       - field: ["source", "source_id"]
@@ -921,6 +924,22 @@ collections:
         type: "number"
         required: false
         description: "Курс валюти, який використано для встановлення ціни в доларах"
+      price_notes:
+        type: "string"
+        required: false
+        description: "Примітка до ціни (напр. «Ціна потребує перевірки») при виявленні аномалій або неоднозначності (ціна за одиницю, оренда, договірна)"
+      real_estate_object_refs:
+        type: "array"
+        required: false
+        description: "Посилання на об'єкти нерухомого майна (ОНМ). Масив {object_id: ObjectId, role: primary|secondary}"
+        item_type: "object"
+        nested_fields:
+          object_id:
+            type: "ObjectId"
+            description: "ID об'єкта в колекції real_estate_objects"
+          role:
+            type: "string"
+            description: "Роль: primary (основний об'єкт), secondary (додатковий)"
     
     # Поля для запитів та експорту
     flattened_fields:
@@ -970,6 +989,424 @@ collections:
         type: "datetime"
         description: "Дата оновлення в джерелі"
         usage: "Фільтрація за періодом"
+
+  listing_analytics:
+    description: "LLM-згенерована детальна аналітика оголошення (ціна за одиницю площі, місцезнаходження, оточення). Зв'язок з оголошенням через source+source_id."
+    mongo_collection: "listing_analytics"
+    indexes:
+      - field: ["source", "source_id"]
+        unique: true
+        description: "Унікальна пара джерело+ID оголошення"
+      - field: "analysis_at"
+        unique: false
+        description: "Дата аналізу"
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+        description: "MongoDB ObjectId"
+        mongo_generated: true
+      source:
+        type: "string"
+        required: true
+        description: "Джерело: olx або prozorro"
+        enum: ["olx", "prozorro"]
+      source_id:
+        type: "string"
+        required: true
+        description: "ID оголошення в джерелі (url для OLX, auction_id для ProZorro)"
+      analysis_text:
+        type: "string"
+        required: true
+        description: "Текст LLM-аналітики (3 блоки: ціна за одиницю, місцезнаходження, оточення)"
+      metadata:
+        type: "object"
+        required: false
+        description: "Додаткові метадані"
+      analysis_at:
+        type: "datetime"
+        required: true
+        description: "Дата та час генерації аналітики"
+      updated_at:
+        type: "datetime"
+        required: true
+        description: "Дата оновлення"
+    relationships:
+      - type: "reference"
+        fields: ["source", "source_id"]
+        target_collection: "unified_listings"
+        target_fields: ["source", "source_id"]
+        description: "Зв'язок з оголошенням через source+source_id"
+        cardinality: "one-to-one"
+
+  cadastral_parcels:
+    description: "Земельні ділянки з кадастру (kadastrova-karta.com)"
+    mongo_collection: "cadastral_parcels"
+    indexes:
+      - field: "cadastral_number"
+        unique: true
+        description: "Унікальний кадастровий номер"
+      - field: ["bounds", "2dsphere"]
+        unique: false
+        description: "Геопошук за кордонами"
+      - field: "source_cell_id"
+        unique: false
+        description: "Зв'язок з коміркою сітки"
+    fields:
+      cadastral_number:
+        type: "string"
+        required: true
+        description: "Номер в кадастрі"
+      bounds:
+        type: "object"
+        required: true
+        description: "GeoJSON Polygon — кордони ділянки"
+      address:
+        type: "string"
+        required: false
+        description: "Адреса ділянки (якщо вказана в кадастрі)"
+      purpose:
+        type: "string"
+        required: false
+        description: "Код призначення (01.01, 02.02 тощо)"
+      purpose_label:
+        type: "string"
+        required: false
+        description: "Текстова назва призначення"
+      category:
+        type: "string"
+        required: false
+        description: "Категорія земель"
+      area_sqm:
+        type: "number"
+        required: false
+        description: "Площа, м²"
+      ownership_form:
+        type: "string"
+        required: false
+        description: "Форма власності"
+      source:
+        type: "string"
+        required: true
+        description: "Джерело (kadastrova-karta)"
+      source_cell_id:
+        type: "string"
+        required: false
+        description: "ID комірки сітки"
+      fetched_at:
+        type: "datetime"
+        required: true
+        description: "Час збору"
+
+  cadastral_scraper_cells:
+    description: "Прогрес скрапера кадастру — комірки сітки"
+    mongo_collection: "cadastral_scraper_cells"
+    indexes:
+      - field: "cell_id"
+        unique: true
+        description: "Унікальний ключ комірки"
+      - field: "status"
+        unique: false
+        description: "Статус обробки"
+    fields:
+      cell_id:
+        type: "string"
+        required: true
+        description: "Ключ комірки (zoom_lat_lon)"
+      zoom:
+        type: "number"
+        required: true
+        description: "Рівень zoom"
+      bbox:
+        type: "object"
+        required: true
+        description: "Межі комірки (min_lat, max_lat, min_lon, max_lon)"
+      status:
+        type: "string"
+        required: true
+        description: "pending, processing, done, error"
+      processed_at:
+        type: "datetime"
+        required: false
+        description: "Час обробки"
+      parcels_count:
+        type: "number"
+        required: false
+        description: "Кількість зібраних ділянок"
+      error_message:
+        type: "string"
+        required: false
+        description: "Помилка (якщо status=error)"
+
+  cadastral_parcel_location_index:
+    description: "Індекс місцезнаходження з кадастрового номера (область, район, КОАТУУ)"
+    mongo_collection: "cadastral_parcel_location_index"
+    indexes:
+      - field: "cadastral_number"
+        unique: true
+        description: "Унікальний кадастровий номер"
+      - field: "oblast_code"
+        unique: false
+        description: "Пошук за областю"
+      - field: "oblast_name"
+        unique: false
+        description: "Пошук за назвою області"
+      - field: "koatuu_prefix"
+        unique: false
+        description: "Пошук за префіксом КОАТУУ"
+    fields:
+      cadastral_number:
+        type: "string"
+        required: true
+        description: "Кадастровий номер"
+      oblast_code:
+        type: "string"
+        required: false
+        description: "Код області (перші 2 цифри КОАТУУ)"
+      oblast_name:
+        type: "string"
+        required: false
+        description: "Назва області"
+      koatuu_prefix:
+        type: "string"
+        required: false
+        description: "Префікс КОАТУУ (10 цифр)"
+      district_code:
+        type: "string"
+        required: false
+        description: "Код району (3-5 цифр)"
+      city_code:
+        type: "string"
+        required: false
+        description: "Код міста (6-8 цифр)"
+      zone:
+        type: "string"
+        required: false
+        description: "Кадастрова зона"
+      quarter:
+        type: "string"
+        required: false
+        description: "Кадастровий квартал"
+      parcel:
+        type: "string"
+        required: false
+        description: "Номер ділянки"
+
+  cadastral_parcel_clusters:
+    description: "Кластери ділянок (спільні кордони, однакове призначення та форма власності)"
+    mongo_collection: "cadastral_parcel_clusters"
+    indexes:
+      - field: "cluster_id"
+        unique: true
+        description: "Унікальний ID кластера"
+      - field: "cadastral_numbers"
+        unique: false
+        description: "Пошук за ділянкою"
+      - field: ["purpose", "ownership_form"]
+        unique: false
+        description: "Пошук за призначенням та власністю"
+      - field: "parcel_count"
+        unique: false
+        description: "Кількість ділянок"
+    fields:
+      cluster_id:
+        type: "string"
+        required: true
+        description: "Унікальний ідентифікатор кластера"
+      cadastral_numbers:
+        type: "array"
+        required: true
+        description: "Список кадастрових номерів"
+      purpose:
+        type: "string"
+        required: false
+        description: "Код призначення"
+      purpose_label:
+        type: "string"
+        required: false
+        description: "Назва призначення"
+      ownership_form:
+        type: "string"
+        required: false
+        description: "Форма власності"
+      parcel_count:
+        type: "number"
+        required: true
+        description: "Кількість ділянок"
+      centroid:
+        type: "object"
+        required: false
+        description: "GeoJSON Point — центр кластера"
+      bounds:
+        type: "object"
+        required: false
+        description: "GeoJSON Polygon — межі"
+      total_area_sqm:
+        type: "number"
+        required: false
+        description: "Сумарна площа, м²"
+
+  real_estate_objects:
+    description: "Об'єкти нерухомого майна (ОНМ): земельні ділянки, будівлі, приміщення. Єдина колекція з полем type."
+    mongo_collection: "real_estate_objects"
+    indexes:
+      - field: "type"
+        unique: false
+        description: "Тип об'єкта (land_plot, building, premises)"
+      - field: ["type", "cadastral_info.cadastral_number"]
+        unique: true
+        description: "Унікальність land_plot за кадастровим номером (partial)"
+      - field: "address.formatted_address"
+        unique: false
+        description: "Пошук будівель за адресою"
+      - field: "building_id"
+        unique: false
+        description: "Пошук приміщень за будівлею"
+      - field: "source_listing_ids.source"
+        unique: false
+        description: "Пошук за джерелом оголошення"
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+        description: "MongoDB ObjectId"
+        mongo_generated: true
+      type:
+        type: "string"
+        required: true
+        description: "Тип: land_plot, building, premises"
+        enum: ["land_plot", "building", "premises"]
+      description:
+        type: "string"
+        required: false
+        description: "Короткий опис (напр. ТРЦ Гулівер, Комерційне приміщення)"
+      area_sqm:
+        type: "number"
+        required: false
+        description: "Площа в м²"
+      area_by_cadastre_sqm:
+        type: "number"
+        required: false
+        description: "Площа за кадастром (м²). Заповнюється для land_plot, якщо площа в оголошенні суттєво відрізняється (±50 м²)"
+      created_at:
+        type: "datetime"
+        required: true
+        description: "Дата створення"
+      updated_at:
+        type: "datetime"
+        required: true
+        description: "Дата оновлення"
+      source_listing_ids:
+        type: "array"
+        required: false
+        description: "Масив {source, source_id} — оголошення, з яких витягнуто об'єкт"
+        item_type: "object"
+      cadastral_info:
+        type: "object"
+        required: false
+        description: "Для land_plot: cadastral_number, purpose, purpose_label, category, area_sqm, ownership_form, bounds, address"
+        nested_fields:
+          cadastral_number:
+            type: "string"
+          purpose:
+            type: "string"
+          purpose_label:
+            type: "string"
+          category:
+            type: "string"
+          area_sqm:
+            type: "number"
+          ownership_form:
+            type: "string"
+      building_info:
+        type: "object"
+        required: false
+        description: "Для building: floors_above_ground, floors_below_ground, communications, total_area_sqm, known_*"
+        nested_fields:
+          floors_above_ground:
+            type: "number"
+          floors_below_ground:
+            type: "number"
+          communications:
+            type: "array"
+          total_area_sqm:
+            type: "number"
+          residential_area_sqm:
+            type: "number"
+          technical_area_sqm:
+            type: "number"
+          commercial_area_sqm:
+            type: "number"
+          known_total_sqm:
+            type: "number"
+          known_residential_sqm:
+            type: "number"
+          known_technical_sqm:
+            type: "number"
+          known_commercial_sqm:
+            type: "number"
+      building_type:
+        type: "string"
+        required: false
+        description: "Для building: житловий будинок, торгівельний комплекс, МАФ, промислове, складське, не визначено"
+      address:
+        type: "object"
+        required: false
+        description: "Для building: region, settlement, street, building, formatted_address, coordinates"
+        nested_fields:
+          region:
+            type: "string"
+          settlement:
+            type: "string"
+          street:
+            type: "string"
+          building:
+            type: "string"
+          formatted_address:
+            type: "string"
+          coordinates:
+            type: "object"
+            nested_fields:
+              latitude:
+                type: "number"
+              longitude:
+                type: "number"
+      premises_ids:
+        type: "array"
+        required: false
+        description: "Для building: масив ObjectId приміщень"
+        item_type: "ObjectId"
+      land_plot_ids:
+        type: "array"
+        required: false
+        description: "Для building: масив ObjectId земельних ділянок"
+        item_type: "ObjectId"
+      related_building_ids:
+        type: "array"
+        required: false
+        description: "Для building: масив ObjectId пов'язаних будівель"
+        item_type: "ObjectId"
+      building_id:
+        type: "ObjectId"
+        required: false
+        description: "Для premises: ID будівлі"
+      floor:
+        type: "number"
+        required: false
+        description: "Для premises: поверх"
+      premises_type:
+        type: "string"
+        required: false
+        description: "Для premises: житлове, комерційне, технічне"
+      communications:
+        type: "array"
+        required: false
+        description: "Для premises: масив комунікацій"
+        item_type: "string"
+      description_text:
+        type: "string"
+        required: false
+        description: "Для premises: стан ремонту, техніка, бізнес тощо"
 
   price_analytics:
     description: "Зведена аналітика цін: агреговані метрики та індикатори (квартилі по містах)"

@@ -14,6 +14,7 @@ from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepos
 from business.services.geocoding_service import GeocodingService
 from business.services.currency_rate_service import CurrencyRateService
 from utils.price_metrics import compute_price_metrics
+from utils.address_parser import parse_prozorro_item_address
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,12 @@ class UnifiedListingsService:
         self.geocoding_service = GeocodingService(settings)
         self.currency_service = CurrencyRateService(settings)
         self._usd_rate: Optional[float] = None
+        self._ensure_usd_rate()
+
+    def _ensure_usd_rate(self) -> None:
+        """Оновлює курс USD, якщо ще не встановлено."""
+        if self._usd_rate is not None and self._usd_rate > 0:
+            return
         try:
             self._usd_rate = self.currency_service.get_today_usd_rate(allow_fetch=True)
         except Exception:
@@ -141,7 +148,9 @@ class UnifiedListingsService:
             location = search_data.get("location")
             if location:
                 try:
-                    geocode_result = self.geocoding_service.geocode(query=location, region="ua")
+                    geocode_result = self.geocoding_service.geocode(
+                        query=location, region="ua", caller="unified_listings_olx"
+                    )
                     addr = self._normalize_address_from_geocode(geocode_result)
                     if addr:
                         addresses.append(addr)
@@ -214,7 +223,7 @@ class UnifiedListingsService:
                     seen_address_strs.add(address_str)
                     try:
                         geocode_result = self.geocoding_service.geocode(
-                            query=address_str, region="ua"
+                            query=address_str, region="ua", caller="unified_listings_prozorro"
                         )
                         addr = self._normalize_address_from_geocode(geocode_result)
                         if addr:
@@ -250,58 +259,31 @@ class UnifiedListingsService:
                 item_address = item.get("address")
                 if not item_address or not isinstance(item_address, dict):
                     continue
-                
-                address_parts = []
-                region_obj = item_address.get("region")
-                locality_obj = item_address.get("locality")
-                street_address_obj = item_address.get("streetAddress")
-                
-                region_ua = None
-                if isinstance(region_obj, dict):
-                    region_ua = region_obj.get("uk_UA")
-                elif isinstance(region_obj, str):
-                    region_ua = region_obj
-                
-                locality_ua = None
-                if isinstance(locality_obj, dict):
-                    locality_ua = locality_obj.get("uk_UA")
-                elif isinstance(locality_obj, str):
-                    locality_ua = locality_obj
-                
-                street_ua = None
-                if isinstance(street_address_obj, dict):
-                    street_ua = street_address_obj.get("uk_UA")
-                elif isinstance(street_address_obj, str):
-                    street_ua = street_address_obj
-                
-                if region_ua:
-                    region_ua = str(region_ua).replace(" область", "").replace(" обл.", "").strip()
-                    address_parts.append(region_ua)
-                if locality_ua:
-                    address_parts.append(str(locality_ua))
-                if street_ua:
-                    address_parts.append(str(street_ua))
-                
-                if address_parts:
-                    address_str = ", ".join(address_parts)
-                    if address_str in seen_address_strs:
-                        continue
-                    seen_address_strs.add(address_str)
-                    try:
-                        geocode_result = self.geocoding_service.geocode(
-                            query=address_str, region="ua"
-                        )
-                        addr = self._normalize_address_from_geocode(geocode_result)
-                        if addr:
-                            addr["region"] = region_ua
-                            addr["settlement"] = locality_ua
-                            addr["street"] = street_ua if street_ua else None
-                            addr["apartment"] = None
-                            addresses.append(addr)
-                    except Exception as e:
-                        logger.warning(
-                            f"Помилка геокодування ProZorro item address {address_str}: {e}"
-                        )
+                parsed = parse_prozorro_item_address(item_address)
+                if not parsed.get("region") and not parsed.get("settlement") and not parsed.get("street"):
+                    continue
+                address_str = parsed.get("formatted_address") or ""
+                if not address_str or address_str in seen_address_strs:
+                    continue
+                seen_address_strs.add(address_str)
+                try:
+                    geocode_result = self.geocoding_service.geocode(
+                        query=address_str, region="ua", caller="unified_listings_prozorro_items"
+                    )
+                    addr = self._normalize_address_from_geocode(geocode_result)
+                    if addr:
+                        addr["region"] = parsed.get("region")
+                        addr["settlement"] = parsed.get("settlement")
+                        addr["street"] = parsed.get("street")
+                        if parsed.get("building"):
+                            addr["building"] = parsed["building"]
+                        addr["apartment"] = None
+                        addresses.append(addr)
+                except Exception as e:
+                    logger.warning(
+                        "Помилка геокодування ProZorro item address %s: %s",
+                        address_str[:80], e,
+                    )
         
         return addresses
 
@@ -342,9 +324,8 @@ class UnifiedListingsService:
         if source == "olx":
             detail = doc.get("detail", {})
             llm = detail.get("llm", {})
-            prop_type = llm.get("property_type", "")
+            prop_type = (llm.get("property_type") or "").strip()
             if prop_type:
-                # Нормалізуємо тип
                 prop_type_lower = prop_type.lower()
                 if "земля" in prop_type_lower or "ділянка" in prop_type_lower:
                     if "нерухомість" in prop_type_lower or "будівл" in prop_type_lower:
@@ -352,6 +333,16 @@ class UnifiedListingsService:
                     return "Земельна ділянка"
                 elif "нерухомість" in prop_type_lower or "будівл" in prop_type_lower:
                     return "Комерційна нерухомість"
+
+            # Fallback: якщо LLM не повернув тип — інферуємо з заголовка/опису
+            search_data = doc.get("search_data", {})
+            title = ((search_data.get("title") or "") + " " + (detail.get("description") or "")).lower()
+            if any(kw in title for kw in ("земельн", "земля", "ділянк", "соток", "га ", " гектар")):
+                if any(kw in title for kw in ("будинк", "будівл", "приміщен", "офіс", "склад", "магазин")):
+                    return "Земельна ділянка з нерухомістю"
+                return "Земельна ділянка"
+            if any(kw in title for kw in ("нерухомість", "приміщен", "офіс", "склад", "магазин", "комерц", "нежитлов")):
+                return "Комерційна нерухомість"
             return "інше"
         
         elif source == "prozorro":
@@ -670,16 +661,21 @@ class UnifiedListingsService:
         
         return area_info
 
-    def sync_olx_listing(self, olx_url: str) -> bool:
+    def sync_olx_listing(self, olx_url: str, usd_rate_override: Optional[float] = None) -> bool:
         """
         Синхронізує одне оголошення OLX в зведену таблицю.
         
         Args:
             olx_url: URL оголошення OLX
+            usd_rate_override: опційний курс USD для конвертації (напр. з reformat)
             
         Returns:
             True якщо успішно
         """
+        if usd_rate_override is not None and usd_rate_override > 0:
+            self._usd_rate = usd_rate_override
+        else:
+            self._ensure_usd_rate()
         olx_doc = self.olx_repo.find_by_url(olx_url)
         if not olx_doc:
             logger.warning(f"OLX оголошення {olx_url} не знайдено")
@@ -687,7 +683,21 @@ class UnifiedListingsService:
         
         try:
             unified_doc = self._convert_olx_to_unified(olx_doc)
-            return self.unified_repo.upsert_listing(unified_doc)
+            property_type = unified_doc.get("property_type", "")
+            # Не синхронізуємо сміттєві оголошення (не нерухомість, не земля)
+            if property_type == "інше":
+                canonical_url = olx_doc.get("url", olx_url)
+                self.unified_repo.delete_by_source_id("olx", canonical_url)
+                return False
+            ok = self.unified_repo.upsert_listing(unified_doc)
+            if ok:
+                try:
+                    from business.services.real_estate_objects_service import RealEstateObjectsService
+                    reo_service = RealEstateObjectsService()
+                    reo_service.process_listing("olx", olx_url, olx_doc=olx_doc)
+                except Exception as reo_err:
+                    logger.warning("Обробка ОНМ для OLX %s: %s", olx_url[:50], reo_err)
+            return ok
         except Exception as e:
             logger.error(f"Помилка синхронізації OLX оголошення {olx_url}: {e}", exc_info=True)
             raise  # Піднімаємо помилку далі для детального логування в міграції
@@ -709,7 +719,15 @@ class UnifiedListingsService:
         
         try:
             unified_doc = self._convert_prozorro_to_unified(prozorro_doc)
-            return self.unified_repo.upsert_listing(unified_doc)
+            ok = self.unified_repo.upsert_listing(unified_doc)
+            if ok:
+                try:
+                    from business.services.real_estate_objects_service import RealEstateObjectsService
+                    reo_service = RealEstateObjectsService()
+                    reo_service.process_listing("prozorro", auction_id, prozorro_doc=prozorro_doc)
+                except Exception as reo_err:
+                    logger.warning("Обробка ОНМ для ProZorro %s: %s", auction_id, reo_err)
+            return ok
         except Exception as e:
             logger.error(f"Помилка синхронізації ProZorro аукціону {auction_id}: {e}", exc_info=True)
             raise  # Піднімаємо помилку далі для детального логування в міграції
@@ -730,7 +748,7 @@ class UnifiedListingsService:
         elif not isinstance(source_updated_at, datetime):
             source_updated_at = datetime.now(timezone.utc)
         
-        # Статус (для OLX завжди "активне")
+        # Статус: всі оголошення OLX вважаються активними
         status = "активне"
         
         # Заголовок та опис

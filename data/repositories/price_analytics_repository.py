@@ -9,6 +9,13 @@ from typing import Any, Dict, List, Optional
 
 from data.repositories.base_repository import BaseRepository
 
+# Типи оголошень для окремих розподілів
+LISTING_TYPE_LAND = "land"
+LISTING_TYPE_REAL_ESTATE = "real_estate"
+LISTING_TYPE_MIXED = "mixed"
+# Загальний (земля + нерухомість без змішаних) — fallback коли по типу замало даних
+LISTING_TYPE_GENERAL = "general"
+
 
 class PriceAnalyticsRepository(BaseRepository):
     """
@@ -31,6 +38,7 @@ class PriceAnalyticsRepository(BaseRepository):
             self.collection.create_index([("period_type", 1), ("period_key", 1)])
             self.collection.create_index([("city", 1), ("metric", 1)])
             self.collection.create_index([("region", 1), ("city", 1)])
+            self.collection.create_index([("listing_type", 1), ("region", 1), ("city", 1), ("metric", 1)])
             self.collection.create_index("computed_at")
             self._indexes_created = True
         except Exception:
@@ -57,8 +65,19 @@ class PriceAnalyticsRepository(BaseRepository):
             return str(existing.get("_id", ""))
         return str(self.create(doc))
 
-    def upsert_indicator(self, city: str, region: str, metric: str, q1: float, q2: float, q3: float, q4: float, count: int) -> str:
-        """Зберігає індикатор ціни (квартилі) для міста та метрики."""
+    def upsert_indicator(
+        self,
+        city: str,
+        region: str,
+        metric: str,
+        q1: float,
+        q2: float,
+        q3: float,
+        q4: float,
+        count: int,
+        listing_type: str = LISTING_TYPE_REAL_ESTATE,
+    ) -> str:
+        """Зберігає індикатор ціни (квартилі) для міста/області та метрики."""
         self._ensure_indexes()
         doc = {
             "period_type": "indicator",
@@ -66,6 +85,7 @@ class PriceAnalyticsRepository(BaseRepository):
             "city": city,
             "region": region or "",
             "metric": metric,
+            "listing_type": listing_type,
             "q1": q1,
             "q2": q2,
             "q3": q3,
@@ -73,34 +93,71 @@ class PriceAnalyticsRepository(BaseRepository):
             "count": count,
             "computed_at": datetime.now(timezone.utc),
         }
-        key = {"period_type": "indicator", "city": city, "region": region or "", "metric": metric}
+        key = {"period_type": "indicator", "city": city, "region": region or "", "metric": metric, "listing_type": listing_type}
         existing = self.collection.find_one(key)
         if existing:
             self.collection.update_one(key, {"$set": doc})
             return str(existing.get("_id", ""))
         return str(self.create(doc))
 
-    def get_indicator(self, city: str, metric: str, region: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Отримує індикатор ціни (квартилі) для міста та метрики."""
+    def get_indicator(
+        self,
+        city: str,
+        metric: str,
+        region: Optional[str] = None,
+        listing_type: str = LISTING_TYPE_REAL_ESTATE,
+    ) -> Optional[Dict[str, Any]]:
+        """Отримує індикатор ціни (квартилі) для населеного пункту (settlement) та метрики.
+        Пробує варіанти назви області (з/без суфікса « область»)."""
         self._ensure_indexes()
-        query = {"period_type": "indicator", "city": city, "metric": metric}
+        regions_to_try = [region] if region else [None]
         if region:
-            query["region"] = region
-        return self.find_one(query)
+            regions_to_try = [region, region.rstrip(" область"), region + " область"]
+        for r in regions_to_try:
+            query = {"period_type": "indicator", "city": city, "metric": metric, "listing_type": listing_type}
+            if r:
+                query["region"] = r
+            doc = self.find_one(query)
+            if doc:
+                return doc
+        return None
 
-    def get_region_indicator(self, region: str, metric: str) -> Optional[Dict[str, Any]]:
-        """Отримує індикатор ціни на рівні області (fallback, коли по місту замало даних)."""
+    def get_region_indicator(
+        self,
+        region: str,
+        metric: str,
+        listing_type: str = LISTING_TYPE_REAL_ESTATE,
+    ) -> Optional[Dict[str, Any]]:
+        """Отримує індикатор ціни на рівні області (fallback, коли по населеному пункту замало даних).
+        Пробує варіанти назви області (з/без суфікса « область»)."""
         self._ensure_indexes()
         if not region:
             return None
-        return self.find_one({
-            "period_type": "indicator",
-            "city": "",
-            "region": region,
-            "metric": metric,
-        })
+        for r in (region, region.rstrip(" область"), region + " область"):
+            if not r:
+                continue
+            doc = self.find_one({
+                "period_type": "indicator",
+                "city": "",
+                "region": r,
+                "metric": metric,
+                "listing_type": listing_type,
+            })
+            if doc:
+                return doc
+        return None
 
-    def upsert_region_indicator(self, region: str, metric: str, q1: float, q2: float, q3: float, q4: float, count: int) -> str:
+    def upsert_region_indicator(
+        self,
+        region: str,
+        metric: str,
+        q1: float,
+        q2: float,
+        q3: float,
+        q4: float,
+        count: int,
+        listing_type: str = LISTING_TYPE_REAL_ESTATE,
+    ) -> str:
         """Зберігає індикатор ціни на рівні області (city='')."""
         self._ensure_indexes()
         doc = {
@@ -109,6 +166,7 @@ class PriceAnalyticsRepository(BaseRepository):
             "city": "",
             "region": region or "",
             "metric": metric,
+            "listing_type": listing_type,
             "q1": q1,
             "q2": q2,
             "q3": q3,
@@ -116,14 +174,19 @@ class PriceAnalyticsRepository(BaseRepository):
             "count": count,
             "computed_at": datetime.now(timezone.utc),
         }
-        key = {"period_type": "indicator", "city": "", "region": region or "", "metric": metric}
+        key = {"period_type": "indicator", "city": "", "region": region or "", "metric": metric, "listing_type": listing_type}
         existing = self.collection.find_one(key)
         if existing:
             self.collection.update_one(key, {"$set": doc})
             return str(existing.get("_id", ""))
         return str(self.create(doc))
 
-    def get_indicators_batch(self, city_region_pairs: List[tuple], metrics: List[str]) -> Dict[str, Dict[str, Any]]:
+    def get_indicators_batch(
+        self,
+        city_region_pairs: List[tuple],
+        metrics: List[str],
+        listing_type: str = LISTING_TYPE_REAL_ESTATE,
+    ) -> Dict[str, Dict[str, Any]]:
         """
         Отримує індикатори для списку (city, region) та метрик.
         Returns: key "(city, region, metric)" -> {q1, q2, q3, q4}
@@ -132,11 +195,23 @@ class PriceAnalyticsRepository(BaseRepository):
         result = {}
         for city, region in city_region_pairs:
             for metric in metrics:
-                ind = self.get_indicator(city, metric, region)
+                ind = self.get_indicator(city, metric, region, listing_type)
                 key = (city or "", region or "", metric)
                 if ind:
                     result[key] = {"q1": ind.get("q1"), "q2": ind.get("q2"), "q3": ind.get("q3"), "q4": ind.get("q4")}
         return result
+
+    def _region_variants(self, region: str) -> List[str]:
+        """Повертає варіанти назви області для пошуку (з/без « область»)."""
+        if not region or not isinstance(region, str):
+            return []
+        r = region.strip()
+        variants = [r]
+        if r.endswith(" область"):
+            variants.append(r[:-8].strip())  # "Одеська область" -> "Одеська"
+        elif r and not r.endswith(" область"):
+            variants.append(r + " область")  # "Одеська" -> "Одеська область"
+        return [v for v in variants if v]
 
     def get_aggregates(
         self,
@@ -148,7 +223,8 @@ class PriceAnalyticsRepository(BaseRepository):
         city: Optional[str] = None,
         limit: int = 500,
     ) -> List[Dict[str, Any]]:
-        """Отримує агреговані метрики з фільтрами."""
+        """Отримує агреговані метрики з фільтрами.
+        Для region використовує варіанти назви (з/без « область»), як у get_indicator."""
         self._ensure_indexes()
         query = {"period_type": period_type}
         if period_key:
@@ -158,7 +234,11 @@ class PriceAnalyticsRepository(BaseRepository):
         if property_type:
             query["group_property_type"] = property_type
         if region:
-            query["group_region"] = region
+            region_variants = self._region_variants(region)
+            if region_variants:
+                query["group_region"] = {"$in": region_variants}
+            else:
+                query["group_region"] = region
         if city:
             query["group_city"] = city
         return list(self.collection.find(query).sort("period_key", -1).limit(limit))

@@ -2,6 +2,36 @@
 # Метаданні застосунку Pazuzu
 # Використовується для формування контексту для LLM агентів
 
+# Архітектура потоку даних — КРИТИЧНО для вибору маршруту отримання даних
+# Агент визначає маршрут: яку колекцію/інструмент використовувати
+data_flow_architecture:
+  description: |
+    Організація даних у базі: що є первинним, що деривованим, де вже є агреговані дані.
+  layers:
+    primary:
+      name: "Первинні джерела (сирі дані)"
+      collections: ["olx_listings", "prozorro_auctions"]
+      description: "Сирі дані з джерел. Не використовувати для агрегації по містах/регіонах — є вищі рівні."
+    unified:
+      name: "Зведена таблиця (очищені, нормалізовані)"
+      collections: ["unified_listings"]
+      description: "Єдиний інтерфейс для пошуку, фільтрації. Джерело для пайплайнів та агрегатів."
+    derived:
+      name: "Деривовані сутності"
+      collections: ["listing_analytics", "real_estate_objects"]
+      description: "listing_analytics — LLM-аналітика оголошень. real_estate_objects — витягнуті ОНМ."
+    aggregated:
+      name: "Передобчислені агрегати"
+      collections: ["price_analytics"]
+      description: "Середні ціни, квартилі по містах/регіонах за періодами. Обчислюється з unified_listings."
+  routing_rules:
+    - "Порівняння цін по містах (Київ vs Дніпро): execute_analytics з groupBy city або price_analytics. НЕ execute_query на raw listings."
+    - "Середня ціна по областях/регіонах: execute_analytics з groupBy region або price_analytics. НЕ перебирати оголошення."
+    - "Топ-N оголошень, пошук конкретних об'єктів: unified_listings через execute_query або пайплайн."
+    - "Експорт списку оголошень: unified_listings (save_query_to_temp_collection + export)."
+    - "Аналітика окремого оголошення: listing_analytics за source+source_id."
+    - "Питання про кадастрові ділянки, будівлі: real_estate_objects."
+
 app:
   name: "Pazuzu"
   purpose: |
@@ -52,6 +82,24 @@ data_sources:
     update_frequency: "Щоденно (автоматичне оновлення за останню добу/тиждень)"
 
 collections:
+  unified_listings:
+    description: "Зведена таблиця оголошень — основне джерело для пайплайнів. Об'єднує OLX та ProZorro."
+    purpose: "Єдиний інтерфейс для пошуку, фільтрації та аналітики оголошень з обох джерел"
+    key_metrics:
+      - "Ціна (price_uah, price_usd)"
+      - "Площа (building_area_sqm, land_area_ha)"
+      - "Ціна за м²/га (price_per_m2_uah, price_per_ha_uah)"
+      - "Тип нерухомості (property_type)"
+      - "Адреси (addresses[].region, addresses[].settlement)"
+    filtering_capabilities:
+      - "За регіоном/містом через addresses ($elemMatch)"
+      - "За джерелом через source (olx/prozorro)"
+      - "За датою через source_updated_at"
+      - "За типом нерухомості через property_type"
+    related_collections:
+      - "listing_analytics — LLM-аналітика за source+source_id"
+      - "real_estate_objects — ОНМ за real_estate_refs[].object_id"
+
   prozorro_auctions:
     description: "Колекція з даними про аукціони ProZorro.Sale"
     purpose: "Зберігання та пошук інформації про державні аукціони з продажу нерухомості"
@@ -86,6 +134,41 @@ collections:
     limitations:
       - "Деякі поля можуть бути відсутні (LLM витягування не завжди повне)"
       - "Ціна може бути в різних полях (detail.price або search_data.price)"
+
+  listing_analytics:
+    description: "LLM-згенерована детальна аналітика оголошення"
+    purpose: "Зберігання аналітики: ціна за одиницю площі, місцезнаходження, оточення"
+    key_metrics:
+      - "analysis_text — текст аналітики (3 блоки)"
+      - "source, source_id — зв'язок з оголошенням"
+    filtering_capabilities:
+      - "За джерелом через source (olx/prozorro)"
+      - "За датою через analysis_at"
+    relationships:
+      - "Зв'язок з unified_listings через source+source_id"
+
+  real_estate_objects:
+    description: "Об'єкти нерухомого майна (ОНМ): земельні ділянки, будівлі, приміщення"
+    purpose: "Єдина колекція з полем type (land_plot, building, premises)"
+    key_metrics:
+      - "type — тип об'єкта"
+      - "area_sqm — площа (м²)"
+      - "cadastral_info — для land_plot (кадастровий номер, призначення)"
+      - "address — для building (область, місто, вулиця)"
+    filtering_capabilities:
+      - "За типом через type"
+      - "За кадастровим номером через cadastral_info.cadastral_number"
+      - "За адресою через address.formatted_address"
+    relationships:
+      - "unified_listings.real_estate_refs[].object_id посилається на _id"
+
+  price_analytics:
+    description: "Зведена аналітика цін: агреговані метрики та індикатори"
+    purpose: "Квартилі по містах, середні ціни за періодами"
+    key_metrics:
+      - "period_type, period_key — період"
+      - "group_region, group_city — групування"
+      - "metric, q1, q2, q3, q4 — метрики"
 
 available_operations:
   - "Пошук та фільтрація даних за різними критеріями"

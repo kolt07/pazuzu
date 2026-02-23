@@ -221,7 +221,10 @@ def get_collection_info(collection_name: str) -> dict:
     """
     global _analyzer, _data_dictionary
     
-    allowed_collections = ['prozorro_auctions', 'llm_cache', 'olx_listings', 'unified_listings']
+    allowed_collections = [
+        'prozorro_auctions', 'llm_cache', 'olx_listings', 'unified_listings',
+        'listing_analytics', 'real_estate_objects', 'price_analytics',
+    ]
     
     if collection_name not in allowed_collections:
         return {

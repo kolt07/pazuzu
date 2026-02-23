@@ -60,7 +60,8 @@ class Settings:
         self.llm_api_keys = {
             'gemini': os.getenv('LLM_API_KEY_GEMINI', ''),
             'openai': os.getenv('LLM_API_KEY_OPENAI', ''),
-            'anthropic': os.getenv('LLM_API_KEY_ANTHROPIC', '')
+            'anthropic': os.getenv('LLM_API_KEY_ANTHROPIC', ''),
+            'ollama': os.getenv('LLM_API_KEY_OLLAMA', ''),  # Для Ollama не потрібен, залишається порожнім
         }
         # Параметри циклу агента (ітерації, токени, температура, time budget)
         self.llm_agent_max_iterations = int(os.getenv('LLM_AGENT_MAX_ITERATIONS', '10'))
@@ -68,6 +69,11 @@ class Settings:
         self.llm_agent_temperature = float(os.getenv('LLM_AGENT_TEMPERATURE', '0.7'))
         _tb = os.getenv('LLM_AGENT_TIME_BUDGET_SECONDS', '')
         self.llm_agent_time_budget_seconds = int(_tb) if _tb and _tb.isdigit() else None
+        # Thinking mode та Google Search grounding (лише для AI-асистента, не для парсингу/інших LLM)
+        _tbudget = os.getenv('LLM_AGENT_THINKING_BUDGET', '8192')
+        self.llm_agent_thinking_budget = int(_tbudget) if (_tbudget or '').lstrip('-').isdigit() else 8192  # 0 = вимкнено
+        self.llm_agent_google_search_grounding = os.getenv('LLM_AGENT_GOOGLE_SEARCH_GROUNDING', 'false').lower() in ('true', '1', 'yes')
+        self.llm_agent_include_thoughts = os.getenv('LLM_AGENT_INCLUDE_THOUGHTS', 'true').lower() in ('true', '1', 'yes')
         
         # Налаштування Telegram бота
         self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
@@ -146,6 +152,8 @@ class Settings:
                                     self.llm_api_keys['openai'] = api_keys['openai']
                                 if 'anthropic' in api_keys:
                                     self.llm_api_keys['anthropic'] = api_keys['anthropic']
+                                if 'ollama' in api_keys:
+                                    self.llm_api_keys['ollama'] = api_keys['ollama']
                             if 'agent' in llm_config:
                                 agent_config = llm_config['agent']
                                 if 'max_iterations' in agent_config:
@@ -156,6 +164,12 @@ class Settings:
                                     self.llm_agent_temperature = float(agent_config['temperature'])
                                 if 'time_budget_seconds' in agent_config:
                                     self.llm_agent_time_budget_seconds = int(agent_config['time_budget_seconds'])
+                                if 'thinking_budget' in agent_config:
+                                    self.llm_agent_thinking_budget = int(agent_config['thinking_budget'])
+                                if 'google_search_grounding' in agent_config:
+                                    self.llm_agent_google_search_grounding = bool(agent_config['google_search_grounding'])
+                                if 'include_thoughts' in agent_config:
+                                    self.llm_agent_include_thoughts = bool(agent_config['include_thoughts'])
 
                         # Налаштування Telegram бота
                         if 'telegram' in config:
@@ -200,7 +214,6 @@ class Settings:
                                 self.mini_app_port = int(ma['port'])
                             if ma.get('base_url'):
                                 self.mini_app_base_url = str(ma['base_url']).strip()
-                                print("Конфіг: mini_app base_url встановлено з config.yaml")
 
                         # Маршрутизація (confidence, уточнення)
                         if 'routing' in config:

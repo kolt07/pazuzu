@@ -199,9 +199,15 @@ def chat_stream(request: Request, body: ChatRequest):
 
     request_id = str(uuid.uuid4())
     events_queue = queue.Queue()
+    thinking_chunks = []
 
     def status_callback(msg: str) -> None:
         events_queue.put({"type": "status", "message": msg})
+
+    def thinking_callback(thinking_text: str) -> None:
+        if thinking_text:
+            thinking_chunks.append(thinking_text)
+            events_queue.put({"type": "thinking", "content": thinking_text})
 
     def run_query() -> None:
         try:
@@ -212,6 +218,7 @@ def chat_stream(request: Request, body: ChatRequest):
                 listing_context=body.listing_context,
                 stream_callback=None,
                 status_callback=status_callback,
+                thinking_callback=thinking_callback,
                 reply_to_text=body.reply_to_text,
                 request_id=request_id,
                 explicit_intent=body.intent,
@@ -259,6 +266,7 @@ def chat_stream(request: Request, body: ChatRequest):
                 "request_id": request_id,
                 "excel_files": out_excel_files,
                 "quick_actions": quick_actions,
+                "thinking": "\n\n".join(thinking_chunks) if thinking_chunks else None,
             })
         except Exception as e:
             events_queue.put({"type": "error", "message": str(e)})

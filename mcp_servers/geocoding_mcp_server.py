@@ -33,7 +33,9 @@ def geocode_address(address_or_place: str, region: str = "ua") -> dict:
         Словник: query_hash (для збереження в оголошенні), query_text, results (список місць з latitude, longitude, formatted_address, place_id, types), from_cache.
     """
     service = _get_service()
-    return service.geocode(query=address_or_place, region=region)
+    return service.geocode(
+        query=address_or_place, region=region, caller="geocoding_mcp"
+    )
 
 
 def main():

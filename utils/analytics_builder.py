@@ -78,8 +78,9 @@ class AnalyticsBuilder:
             elif not AnalyticsMetrics.is_valid_metric(raw_metric) and AnalyticsMetrics._resolve_metric_name(raw_metric) != 'average_price_per_m2':
                 return False, "Для olx_listings підтримується лише метрика average_price_per_m2 (ціна за м²)."
             group_by = query.get('groupBy') or []
-            if group_by and set(group_by) != {'date'}:
-                return False, "Для olx_listings зараз дозволено лише groupBy: ['date']."
+            allowed_olx_group = {'date', 'city', 'region'}
+            if group_by and not set(group_by).issubset(allowed_olx_group):
+                return False, f"Для olx_listings дозволено groupBy: ['date'], ['city'] або ['region']. Отримано: {group_by}"
             if query.get('filters'):
                 is_valid, error = self.query_builder._validate_filters(query['filters'], depth=0)
                 if not is_valid:
@@ -546,16 +547,23 @@ class AnalyticsBuilder:
                 region = item.get('region')
                 city = item.get('city')
                 if region:
+                    # resolved_locations[i].results[j].address_structured.region
                     or_conditions.append({
                         'detail.resolved_locations': {
-                            '$elemMatch': {'address_structured.region': {'$regex': str(region).strip(), '$options': 'i'}}
+                            '$elemMatch': {'results.address_structured.region': {'$regex': str(region).strip(), '$options': 'i'}}
                         }
                     })
                     or_conditions.append({'search_data.location': {'$regex': str(region).strip(), '$options': 'i'}})
                 if city:
+                    # resolved_locations[i].results[j].address_structured.city або .settlement
                     or_conditions.append({
                         'detail.resolved_locations': {
-                            '$elemMatch': {'address_structured.city': {'$regex': str(city).strip(), '$options': 'i'}}
+                            '$elemMatch': {
+                                '$or': [
+                                    {'results.address_structured.city': {'$regex': str(city).strip(), '$options': 'i'}},
+                                    {'results.address_structured.settlement': {'$regex': str(city).strip(), '$options': 'i'}},
+                                ]
+                            }
                         }
                     })
                     or_conditions.append({'search_data.location': {'$regex': str(city).strip(), '$options': 'i'}})
@@ -564,11 +572,12 @@ class AnalyticsBuilder:
         return {'$or': or_conditions}
     
     def _build_olx_price_per_sqm_pipeline(self, query: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Будує aggregation pipeline для OLX: середня ціна за м² за днями, з фільтрами за датою та регіоном/містом."""
+        """Будує aggregation pipeline для OLX: середня ціна за м² за днями/містом/регіоном."""
         filters = query.get('filters') or {}
+        group_by = query.get('groupBy') or ['date']
         pipeline = []
         
-        # 1. Match: діапазон дат (updated_at)
+        # 1. Match: діапазон дат (updated_at) — опційно для groupBy city/region
         date_range = filters.get('auction_data.dateModified') or filters.get('updated_at')
         if isinstance(date_range, dict) and '$gte' in date_range and '$lte' in date_range:
             gte = self._parse_iso_to_datetime(date_range['$gte'])
@@ -580,8 +589,13 @@ class AnalyticsBuilder:
         region_city = self._build_olx_region_city_match(filters)
         if region_city:
             pipeline.append({'$match': region_city})
+        # 2b. Match: property_type (Комерційна нерухомість тощо)
+        prop_type = filters.get('property_type')
+        if prop_type and isinstance(prop_type, str):
+            pt = str(prop_type).strip()
+            pipeline.append({'$match': {'detail.llm.property_type': pt}})
         
-        # 3. AddFields: ціна, площа, ціна за м² ($convert з onError: null щоб порожні рядки '' не ламали агрегацію)
+        # 3. AddFields: ціна, площа, ціна за м², _group_city, _group_region
         _safe_double = lambda field: {
             '$convert': {'input': field, 'to': 'double', 'onError': None, 'onNull': None}
         }
@@ -632,23 +646,73 @@ class AnalyticsBuilder:
         })
         pipeline.append({'$match': {'_price_per_sqm': {'$ne': None, '$gt': 0}}})
         
-        # 4. Групування за днем
+        # 4. AddFields: поля для групування (date, city, region)
+        # resolved_locations[i].results[j].address_structured.{city,region,settlement}
         pipeline.append({
             '$addFields': {
-                '_group_date': {
-                    '$dateToString': {'format': '%Y-%m-%d', 'date': '$updated_at'}
-                }
+                '_group_date': {'$dateToString': {'format': '%Y-%m-%d', 'date': '$updated_at'}},
+                '_first_loc': {'$arrayElemAt': [{'$ifNull': ['$detail.resolved_locations', []]}, 0]},
             }
         })
         pipeline.append({
-            '$group': {
-                '_id': {'date': '$_group_date'},
-                'value': {'$avg': '$_price_per_sqm'},
-                'date': {'$first': '$_group_date'}
+            '$addFields': {
+                '_first_result': {'$arrayElemAt': [{'$ifNull': ['$_first_loc.results', []]}, 0]},
             }
         })
-        pipeline.append({'$project': {'_id': 0, 'date': 1, 'value': 1}})
-        pipeline.append({'$sort': {'date': 1}})
+        pipeline.append({
+            '$addFields': {
+                '_group_city': {
+                    '$trim': {
+                        'input': {
+                            '$ifNull': [
+                                {'$ifNull': [
+                                    '$_first_result.address_structured.city',
+                                    '$_first_result.address_structured.settlement',
+                                    '$_first_loc.address_structured.city',
+                                    '$_first_loc.address_structured.settlement',
+                                ]},
+                                '$search_data.location',
+                                'н/д'
+                            ]
+                        }
+                    }
+                },
+                '_group_region': {
+                    '$trim': {
+                        'input': {
+                            '$ifNull': [
+                                '$_first_result.address_structured.region',
+                                '$_first_loc.address_structured.region',
+                                'н/д'
+                            ]
+                        }
+                    }
+                },
+            }
+        })
+        
+        # 5. $group: динамічно за groupBy
+        group_id = {}
+        if 'date' in group_by:
+            group_id['date'] = '$_group_date'
+        if 'city' in group_by:
+            group_id['city'] = '$_group_city'
+        if 'region' in group_by:
+            group_id['region'] = '$_group_region'
+        if not group_id:
+            group_id = {'date': '$_group_date'}
+        group_stage = {
+            '_id': group_id,
+            'value': {'$avg': '$_price_per_sqm'},
+            'count': {'$sum': 1},
+        }
+        for f in ['date', 'city', 'region']:
+            if f in group_id:
+                group_stage[f] = {'$first': f'$_group_{f}'}
+        pipeline.append({'$group': group_stage})
+        pipeline.append({'$project': {'_id': 0, 'value': 1, 'count': 1, **{f: 1 for f in group_by if f in ['date', 'city', 'region']}}})
+        sort_fields = {f: 1 for f in group_by if f in ['date', 'city', 'region']}
+        pipeline.append({'$sort': sort_fields if sort_fields else {'date': 1}})
         return pipeline
     
     def _execute_olx_analytics(self, query: Dict[str, Any]) -> Dict[str, Any]:
@@ -669,19 +733,24 @@ class AnalyticsBuilder:
                 }
             coll = self._get_database()['olx_listings']
             results = list(coll.aggregate(pipeline))
+            group_by = query.get('groupBy', ['date'])
             formatted = []
             for r in results:
-                formatted.append({
-                    'date': r.get('date', 'Unknown'),
-                    'value': round(float(r.get('value', 0)), 2),
-                    'unit': 'UAH/m²'
-                })
+                val = round(float(r.get('value', 0)), 2)
+                row = {'value': val, 'average_price_per_m2': val, 'unit': 'UAH/m²'}
+                if 'date' in group_by:
+                    row['date'] = r.get('date', 'Unknown')
+                if 'city' in group_by:
+                    row['city'] = r.get('city', 'н/д')
+                if 'region' in group_by:
+                    row['region'] = r.get('region', 'н/д')
+                formatted.append(row)
             out = {
                 'success': True,
                 'metric': query.get('metric') or 'average_price_per_m2',
                 'metric_description': 'Середня ціна за м² (OLX)',
                 'unit': 'UAH/m²',
-                'group_by': query.get('groupBy', ['date']),
+                'group_by': group_by,
                 'results': formatted,
                 'count': len(formatted),
                 'data_source': 'olx_listings',

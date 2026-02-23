@@ -81,18 +81,21 @@ class AnalyticalReasoningService:
             return None
 
     def _create_plan_prompt(self, user_query: str, analysis_intent: Dict[str, Any]) -> str:
-        return f"""Користувач запитує: {user_query[:1500]}
+        return f"""Тобі необхідно сформувати план кроків для виконання аналітичного запиту у форматі JSON.
 
-Поточний analysis_intent: {json.dumps(analysis_intent, ensure_ascii=False)[:500]}
+## Запит користувача: {user_query[:1500]}
 
-Сформуй план кроків для виконання. Поверни JSON з одним полем:
+## Поточний analysis_intent: {json.dumps(analysis_intent, ensure_ascii=False)[:500]}
+
+## Закріплення завдання:
+Поверни JSON з одним полем:
 - steps: масив об'єктів. Дозволені типи кроків:
   - {{ "step": "aggregate", "source": "olx_listings"|"prozorro_auctions", "metric": "avg_price", "group_by": "region"|"city" }}
   - {{ "step": "join_by_region" }} — об'єднати два попередні результати по регіону
   - {{ "step": "compute_difference", "field": "avg" }} — різниця значень по регіону
   - {{ "step": "sort", "field": "difference", "order": "desc" }}
 
-Максимум {MAX_STEPS} кроків. Тільки JSON, без коментарів."""
+Максимум {MAX_STEPS} кроків. Поверни тільки JSON з полем steps, без коментарів."""
 
     def validate_plan(self, plan: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         """Dry-run: перевірка плану на дозволені операції та max_steps."""

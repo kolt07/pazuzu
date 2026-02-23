@@ -6,7 +6,11 @@
 
 import os
 import random
-from typing import Optional
+from pathlib import Path
+from typing import Dict, Optional
+
+# Шлях до конфігу областей OLX (відносно кореня проекту)
+_OLX_REGION_SLUGS_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "olx_region_slugs.yaml"
 
 # Базовий URL сайту (без trailing slash)
 BASE_URL = os.getenv("OLX_SCRAPER_BASE_URL", "https://www.olx.ua")
@@ -30,11 +34,20 @@ DELAY_BEFORE_REQUEST_MAX = float(os.getenv("OLX_SCRAPER_DELAY_MAX", "5"))
 DELAY_DETAIL_MIN = float(os.getenv("OLX_SCRAPER_DELAY_DETAIL_MIN", "2"))
 DELAY_DETAIL_MAX = float(os.getenv("OLX_SCRAPER_DELAY_DETAIL_MAX", "10"))
 
-# Кількість сторінок пошуку, якщо не задано days (зупинка по даті). При заданому days обмеження не використовується.
-MAX_SEARCH_PAGES = int(os.getenv("OLX_SCRAPER_MAX_PAGES", "100"))
+# Кількість сторінок пошуку на один пошуковий запит. OLX перенаправляє на 25-ту сторінку при спробі
+# перейти далі — обмеження платформи. Для більшого обсягу використовуємо пошук по областях.
+MAX_SEARCH_PAGES = int(os.getenv("OLX_SCRAPER_MAX_PAGES", "25"))
+
+# Максимальна кількість областей, що обробляються паралельно (потоки). По одному потоку на область.
+MAX_PARALLEL_REGIONS = int(os.getenv("OLX_SCRAPER_MAX_PARALLEL_REGIONS", "25"))
 
 # Таймаут одного запиту (секунди)
 REQUEST_TIMEOUT = int(os.getenv("OLX_SCRAPER_TIMEOUT", "25"))
+
+# Затримка після отримання сторінки (секунди) — OLX може підвантажувати контент з затримкою
+DELAY_AFTER_PAGE_LOAD = float(os.getenv("OLX_SCRAPER_DELAY_AFTER_LOAD", "3"))
+# Кількість повторних спроб при 0 оголошень на сторінці
+RETRY_EMPTY_PAGE_COUNT = int(os.getenv("OLX_SCRAPER_RETRY_EMPTY", "2"))
 
 # User-Agent — звичайний браузер, не бот
 USER_AGENT = os.getenv(
@@ -45,6 +58,19 @@ USER_AGENT = os.getenv(
 # Каталог для збереження результатів (відносно кореня проекту або скрипта)
 OUTPUT_DIR = os.getenv("OLX_SCRAPER_OUTPUT_DIR", "output")
 OUTPUT_FILENAME = os.getenv("OLX_SCRAPER_OUTPUT_FILE", "olx_nedvizhimost_page1.json")
+
+
+def get_olx_region_slugs() -> Dict[str, str]:
+    """Повертає словник {назва області: OLX slug}. Завантажує з config/olx_region_slugs.yaml."""
+    try:
+        import yaml
+        if _OLX_REGION_SLUGS_PATH.exists():
+            with open(_OLX_REGION_SLUGS_PATH, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+                return dict(data.get("olx_region_slugs") or {})
+    except Exception:
+        pass
+    return {}
 
 
 def get_delay_seconds() -> float:
@@ -64,13 +90,12 @@ def get_real_estate_list_url(page: int = 1) -> str:
     return f"{BASE_URL.rstrip('/')}{REAL_ESTATE_FIRST_PAGE_PATH.rstrip('/')}/?page={page}"
 
 
-def get_commercial_real_estate_list_url(page: int = 1, sale_only: bool = True, sort_newest: bool = True) -> str:
-    """
-    Повертає URL сторінки списку нежитлової (комерційної) нерухомості.
-    sale_only: тільки оголошення про продаж (без оренди).
-    sort_newest: сортування «Найновіші спочатку».
-    """
-    path = (COMMERCIAL_REAL_ESTATE_SALE_PATH if sale_only else COMMERCIAL_REAL_ESTATE_PATH).rstrip("/")
+def _build_category_url(base_path: str, page: int, sort_newest: bool, region_slug: Optional[str] = None) -> str:
+    """Збирає URL категорії з опціональним фільтром по області.
+    OLX використовує path-суфікс /{slug}/ (короткі слаги з sitemap: vin, ko, lv тощо)."""
+    path = base_path.rstrip("/")
+    if region_slug:
+        path = f"{path}/{region_slug}"
     base = f"{BASE_URL.rstrip('/')}{path}/"
     params = []
     if page > 1:
@@ -82,9 +107,26 @@ def get_commercial_real_estate_list_url(page: int = 1, sale_only: bool = True, s
     return base
 
 
-def get_land_list_url(page: int = 1) -> str:
+def get_commercial_real_estate_list_url(
+    page: int = 1,
+    sale_only: bool = True,
+    sort_newest: bool = True,
+    region_slug: Optional[str] = None,
+) -> str:
+    """
+    Повертає URL сторінки списку нежитлової (комерційної) нерухомості.
+    sale_only: тільки оголошення про продаж (без оренди).
+    sort_newest: сортування «Найновіші спочатку».
+    region_slug: OLX slug області для фільтрації (напр. kyivskaya, lvivska).
+    """
+    path = COMMERCIAL_REAL_ESTATE_SALE_PATH if sale_only else COMMERCIAL_REAL_ESTATE_PATH
+    return _build_category_url(path, page, sort_newest, region_slug)
+
+
+def get_land_list_url(
+    page: int = 1,
+    sort_newest: bool = True,
+    region_slug: Optional[str] = None,
+) -> str:
     """Повертає URL сторінки списку земельних ділянок (земля, включно з ділянками під забудову)."""
-    path = LAND_PATH.rstrip("/")
-    if page <= 1:
-        return f"{BASE_URL.rstrip('/')}{path}/"
-    return f"{BASE_URL.rstrip('/')}{path}/?page={page}"
+    return _build_category_url(LAND_PATH, page, sort_newest, region_slug)

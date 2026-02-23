@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional, List, Callable
 from config.settings import Settings
 from business.services.llm_service import LLMService
 from business.services.app_metadata_service import AppMetadataService
-from business.services.pipeline_service import UNIFIED_COLLECTION, SOURCE_COLLECTIONS
+from business.services.pipeline_service import UNIFIED_COLLECTION, SOURCE_COLLECTIONS, PIPELINE_COLLECTIONS
 from data.repositories.pipeline_repository import PipelineRepository
 
 logger = logging.getLogger(__name__)
@@ -238,7 +238,7 @@ class PipelineBuilderAgent:
         metadata_summary = self.metadata_service.get_metadata_for_llm(max_length=1500)
         
         prompt_parts = [
-            "Сконструюй пайплайн обробки даних на основі структурного опису запиту.",
+            "Тобі необхідно сконструювати пайплайн обробки даних у форматі JSON на основі структурного опису запиту.",
             "",
             "## Контекст застосунку:",
             metadata_summary,
@@ -262,7 +262,7 @@ class PipelineBuilderAgent:
         
         prompt_parts.extend([
             "",
-            "## Формат пайплайну:",
+            "## Закріплення завдання — формат пайплайну:",
             "Пайплайн має бути ПАРАМЕТРИЗОВАНИМ ШАБЛОНОМ у форматі JSON з полем 'steps' (масив кроків).",
             "ВАЖЛИВО: Пайплайн НЕ має містити конкретні значення (регіони, міста, дати), а використовувати ПАРАМЕТРИ.",
             "",
@@ -613,9 +613,9 @@ class PipelineBuilderAgent:
         steps = []
         has_geo_filters = any(k in ("region", "city") for k in filter_metrics.keys())
         
-        # Визначаємо колекцію: за замовчуванням unified_listings
+        # Визначаємо колекцію: за замовчуванням unified_listings; або з sources якщо в PIPELINE_COLLECTIONS
         collection = main_collection
-        if sources and sources[0] in SOURCE_COLLECTIONS:
+        if sources and sources[0] in PIPELINE_COLLECTIONS:
             collection = sources[0]
         
         filter_step = {

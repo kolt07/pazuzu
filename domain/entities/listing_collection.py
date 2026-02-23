@@ -19,6 +19,8 @@ from domain.entities.base import BaseEntity
 from domain.entities.unified_listing import UnifiedListing
 from domain.entities.prozorro_auction import ProzorroAuction
 from domain.entities.olx_listing import OlxListing
+from domain.entities.listing_analytics import ListingAnalytics
+from domain.entities.real_estate_object import RealEstateObject
 
 
 T = TypeVar("T", bound=BaseEntity)
@@ -166,3 +168,44 @@ class OlxListingCollection(ListingCollectionBase[OlxListing]):
             elif item.id:
                 ids.append(item.id)
         return ids
+
+
+class ListingAnalyticsCollection(ListingCollectionBase[ListingAnalytics]):
+    """Колекція LLM-аналітики оголошень."""
+
+    def __init__(self, items: List[ListingAnalytics]):
+        super().__init__(items, "listing_analytics")
+
+    @classmethod
+    def from_raw_list(cls, raw_docs: List[Dict[str, Any]]) -> "ListingAnalyticsCollection":
+        """Створює колекцію зі списку сирих документів."""
+        items = [ListingAnalytics(d) for d in (raw_docs or [])]
+        return cls(items)
+
+    def get_ids(self) -> List[str]:
+        """Повертає список composite_id (source:source_id) або _id."""
+        ids = []
+        for item in self._items:
+            cid = item.composite_id
+            if cid:
+                ids.append(cid)
+            elif item.id:
+                ids.append(item.id)
+        return ids
+
+
+class RealEstateObjectCollection(ListingCollectionBase[RealEstateObject]):
+    """Колекція об'єктів нерухомого майна (ОНМ)."""
+
+    def __init__(self, items: List[RealEstateObject]):
+        super().__init__(items, "real_estate_objects")
+
+    @classmethod
+    def from_raw_list(cls, raw_docs: List[Dict[str, Any]]) -> "RealEstateObjectCollection":
+        """Створює колекцію зі списку сирих документів."""
+        items = [RealEstateObject(d) for d in (raw_docs or [])]
+        return cls(items)
+
+    def get_ids(self) -> List[str]:
+        """Повертає список _id."""
+        return [item.id for item in self._items if item.id]

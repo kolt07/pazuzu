@@ -4,7 +4,7 @@
 Ключ — хеш текстового запиту; значення — список результатів (координати, formatted_address тощо).
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from data.repositories.base_repository import BaseRepository
@@ -24,6 +24,7 @@ class GeocodeCacheRepository(BaseRepository):
             return
         try:
             self.collection.create_index("query_hash", unique=True)
+            self.collection.create_index("created_at")
             self._indexes_created = True
         except Exception:
             pass
@@ -54,3 +55,45 @@ class GeocodeCacheRepository(BaseRepository):
             )
             return str(existing["_id"])
         return self.create(document)
+
+    def count_api_calls_by_day(self, days: int = 60) -> List[Dict[str, Any]]:
+        """
+        Агрегація запитів до Google Geocoding API по днях за останні N днів.
+        Кожен новий запис у кеші = один виклик API (cache miss).
+        Повертає список {date: "YYYY-MM-DD", count: N}.
+        """
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            pipeline = [
+                {"$match": {"created_at": {"$gte": cutoff}}},
+                {
+                    "$group": {
+                        "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
+                        "count": {"$sum": 1},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+                {"$project": {"date": "$_id", "count": 1, "_id": 0}},
+            ]
+            cursor = self.collection.aggregate(pipeline)
+            return list(cursor)
+        except Exception:
+            return []
+
+    def count_total(self) -> int:
+        """Загальна кількість записів у кеші (унікальних запитів до API)."""
+        self._ensure_indexes()
+        try:
+            return self.collection.count_documents({})
+        except Exception:
+            return 0
+
+    def count_last_month(self) -> int:
+        """Кількість нових записів (викликів API) за останні 30 днів."""
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+            return self.collection.count_documents({"created_at": {"$gte": cutoff}})
+        except Exception:
+            return 0

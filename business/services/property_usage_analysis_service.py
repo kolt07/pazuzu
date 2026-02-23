@@ -345,7 +345,9 @@ class PropertyUsageAnalysisService:
                 return coords
         if address_str:
             try:
-                result = self.geocoding.geocode(query=address_str, region="ua")
+                result = self.geocoding.geocode(
+                    query=address_str, region="ua", caller="property_usage_analysis"
+                )
                 results = result.get("results", [])
                 if results:
                     r = results[0]

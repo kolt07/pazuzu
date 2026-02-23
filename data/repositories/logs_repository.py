@@ -4,7 +4,7 @@
 """
 
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from data.repositories.base_repository import BaseRepository
 
 
@@ -25,6 +25,8 @@ class LogsRepository(BaseRepository):
             self.collection.create_index('timestamp')
             self.collection.create_index('event_type')
             self.collection.create_index('initiator')
+            self.collection.create_index([('event_type', 1), ('metadata.action', 1), ('timestamp', 1)])
+            self.collection.create_index([('event_type', 1), ('metadata.service', 1), ('timestamp', 1)])
             self._indexes_created = True
         except Exception:
             # Якщо не вдалося створити індекси (наприклад, MongoDB не ініціалізовано), просто пропускаємо
@@ -94,3 +96,158 @@ class LogsRepository(BaseRepository):
             limit=limit,
             skip=skip
         )
+
+    def count_llm_queries_by_day(self, days: int = 60) -> List[Dict[str, Any]]:
+        """
+        Агрегація запитів LLM (action=llm_query) по днях за останні N днів.
+        Повертає список {date: "YYYY-MM-DD", count: N}.
+        """
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            pipeline = [
+                {
+                    "$match": {
+                        "event_type": "user_action",
+                        "metadata.action": "llm_query",
+                        "timestamp": {"$gte": cutoff},
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}},
+                        "count": {"$sum": 1},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+                {"$project": {"date": "$_id", "count": 1, "_id": 0}},
+            ]
+            cursor = self.collection.aggregate(pipeline)
+            return list(cursor)
+        except Exception:
+            return []
+
+    def count_llm_queries_total(self) -> int:
+        """Загальна кількість записів llm_query."""
+        self._ensure_indexes()
+        try:
+            return self.collection.count_documents({
+                "event_type": "user_action",
+                "metadata.action": "llm_query",
+            })
+        except Exception:
+            return 0
+
+    def count_llm_queries_last_month(self) -> int:
+        """Кількість llm_query за останні 30 днів."""
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            return self.collection.count_documents({
+                "event_type": "user_action",
+                "metadata.action": "llm_query",
+                "timestamp": {"$gte": cutoff},
+            })
+        except Exception:
+            return 0
+
+    def count_api_usage_by_day(
+        self, service: str, days: int = 60, from_cache_only: Optional[bool] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Агрегація викликів API (api_usage) по днях.
+        service: 'llm' | 'geocoding'
+        from_cache_only: None = всі, True = тільки з кешу, False = тільки реальні виклики API
+        """
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            match = {
+                "event_type": "api_usage",
+                "metadata.service": service,
+                "timestamp": {"$gte": cutoff},
+            }
+            if from_cache_only is not None:
+                match["metadata.from_cache"] = from_cache_only
+            pipeline = [
+                {"$match": match},
+                {
+                    "$group": {
+                        "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}},
+                        "count": {"$sum": 1},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+                {"$project": {"date": "$_id", "count": 1, "_id": 0}},
+            ]
+            cursor = self.collection.aggregate(pipeline)
+            return list(cursor)
+        except Exception:
+            return []
+
+    def count_api_usage_total(
+        self, service: str, from_cache_only: Optional[bool] = None
+    ) -> int:
+        """Загальна кількість викликів api_usage для service."""
+        self._ensure_indexes()
+        try:
+            match = {"event_type": "api_usage", "metadata.service": service}
+            if from_cache_only is not None:
+                match["metadata.from_cache"] = from_cache_only
+            return self.collection.count_documents(match)
+        except Exception:
+            return 0
+
+    def count_api_usage_last_month(
+        self, service: str, from_cache_only: Optional[bool] = None
+    ) -> int:
+        """Кількість api_usage за останні 30 днів."""
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            match = {
+                "event_type": "api_usage",
+                "metadata.service": service,
+                "timestamp": {"$gte": cutoff},
+            }
+            if from_cache_only is not None:
+                match["metadata.from_cache"] = from_cache_only
+            return self.collection.count_documents(match)
+        except Exception:
+            return 0
+
+    def count_api_usage_by_source(
+        self,
+        service: str,
+        days: int = 60,
+        from_cache_only: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Агрегація викликів api_usage по source (metadata.source).
+        Повертає: [{"source": "llm_service.parse_auction_description", "count": N}, ...]
+        """
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            match = {
+                "event_type": "api_usage",
+                "metadata.service": service,
+                "timestamp": {"$gte": cutoff},
+            }
+            if from_cache_only is not None:
+                match["metadata.from_cache"] = from_cache_only
+            pipeline = [
+                {"$match": match},
+                {
+                    "$group": {
+                        "_id": {"$ifNull": ["$metadata.source", "unknown"]},
+                        "count": {"$sum": 1},
+                    }
+                },
+                {"$sort": {"count": -1}},
+                {"$project": {"source": "$_id", "count": 1, "_id": 0}},
+            ]
+            cursor = self.collection.aggregate(pipeline)
+            return list(cursor)
+        except Exception:
+            return []

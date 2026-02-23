@@ -178,7 +178,7 @@ class ReportTemplateService:
         elif prop_type == "zemelna_dilyanka_z_neruhomistyu":
             parts.append("ЗД з нерухомістю")
 
-        return f"Параметри звіту: {', '.join(parts)}. Згенеруй коротку назву шаблону українською."
+        return f"Тобі необхідно згенерувати коротку назву шаблону звіту українською (максимум 6-8 слів). Параметри звіту: {', '.join(parts)}. Поверни тільки назву без лапок."
 
     def _fallback_template_name(self, params: Dict[str, Any]) -> str:
         """Формує просту назву без LLM."""

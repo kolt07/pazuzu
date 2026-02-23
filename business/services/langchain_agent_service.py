@@ -31,6 +31,7 @@ from utils.query_builder import QueryBuilder
 from utils.report_generator import ReportGenerator
 from utils.file_utils import generate_excel_in_memory, ensure_directory_exists
 from business.services.geocoding_service import GeocodingService
+from business.services.logging_service import LoggingService
 from business.services.places_service import PlacesService
 from business.services.collection_knowledge_service import CollectionKnowledgeService
 from business.services.prozorro_service import ProZorroService
@@ -89,6 +90,29 @@ VECTOR_STORE_MAX_DOCS = 100
 # Retry при тимчасових помилках LLM (503, 429, timeout, connection)
 AGENT_LLM_RETRY_ATTEMPTS = 2
 AGENT_LLM_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+
+
+def _extract_and_send_thinking(response: Any, thinking_callback: Callable[[str], None]) -> None:
+    """Витягує thinking-блоки з відповіді AIMessage та викликає callback."""
+    content = getattr(response, 'content', None)
+    if not content:
+        return
+    parts = content if isinstance(content, list) else [content]
+    thinking_parts = []
+    for item in parts:
+        if isinstance(item, dict) and item.get('type') == 'thinking':
+            text = item.get('thinking') or item.get('reasoning') or ''
+            if text:
+                thinking_parts.append(str(text).strip())
+        elif isinstance(item, dict) and item.get('type') == 'reasoning':
+            text = item.get('reasoning') or ''
+            if text:
+                thinking_parts.append(str(text).strip())
+    if thinking_parts:
+        try:
+            thinking_callback('\n\n'.join(thinking_parts))
+        except Exception as e:
+            logger.debug("thinking_callback error: %s", e)
 
 # Логічні групи tools за маршрутом (None = усі інструменти)
 TOOL_ROUTES = {
@@ -231,6 +255,7 @@ class LangChainAgentService:
         self.report_generator = ReportGenerator()
         self.prozorro_service = ProZorroService(settings)
         self.geocoding_service = GeocodingService(settings)
+        self.logging_service = LoggingService()
         self.places_service = PlacesService(settings)
         self.temp_exports_repo = AgentTempExportsRepository()
         self.export_daily_count_repo = ExportDailyCountRepository()
@@ -240,8 +265,9 @@ class LangChainAgentService:
         # Ініціалізуємо підключення до БД
         MongoDBConnection.initialize(settings)
         
-        # Ініціалізуємо LLM
+        # Ініціалізуємо LLM: базовий (summarize, fallback) та асистент (thinking + grounding)
         self.llm = self._create_llm()
+        self.llm_assistant = self._create_assistant_llm() if self.settings.llm_provider.lower() == 'gemini' else self.llm
         
         # Створюємо tools
         self.tools = self._create_tools()
@@ -286,7 +312,15 @@ class LangChainAgentService:
         self._last_request_metrics: Dict[str, Any] = {}
     
     def _create_llm(self):
-        """Створює LLM на основі налаштувань."""
+        """Створює базовий LLM (без thinking) для summarize, fallback та інших випадків."""
+        return self._create_llm_internal(use_assistant_config=False)
+
+    def _create_assistant_llm(self):
+        """Створює LLM для AI-асистента з Thinking mode (лише Gemini). Google Search — через bind_tools."""
+        return self._create_llm_internal(use_assistant_config=True)
+
+    def _create_llm_internal(self, use_assistant_config: bool = False):
+        """Створює LLM. use_assistant_config=True — thinking_budget + include_thoughts для асистента."""
         provider_name = self.settings.llm_provider.lower()
         api_key = self.settings.llm_api_keys.get(provider_name, '')
         
@@ -294,29 +328,36 @@ class LangChainAgentService:
             raise ValueError(f"API ключ для провайдера {provider_name} не вказано")
         
         model_name = getattr(self.settings, 'llm_model_name', 'gemini-2.5-flash')
-        
         temperature = getattr(self.settings, 'llm_agent_temperature', 0.7)
         max_tokens = getattr(self.settings, 'llm_agent_max_output_tokens', 8192)
+        
         if provider_name == 'gemini':
-            return ChatGoogleGenerativeAI(
+            kwargs = dict(
                 model=model_name,
                 google_api_key=api_key,
                 temperature=temperature,
-                max_output_tokens=max_tokens
+                max_output_tokens=max_tokens,
             )
+            if use_assistant_config:
+                thinking_budget = getattr(self.settings, 'llm_agent_thinking_budget', 0)
+                include_thoughts = getattr(self.settings, 'llm_agent_include_thoughts', False)
+                if thinking_budget > 0:
+                    kwargs['thinking_budget'] = thinking_budget
+                    kwargs['include_thoughts'] = include_thoughts
+            return ChatGoogleGenerativeAI(**kwargs)
         elif provider_name == 'openai':
             return ChatOpenAI(
                 model=model_name,
                 api_key=api_key,
                 temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
             )
         elif provider_name == 'anthropic':
             return ChatAnthropic(
                 model=model_name,
                 api_key=api_key,
                 temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
             )
         else:
             raise ValueError(f"Невідомий провайдер LLM: {provider_name}")
@@ -339,6 +380,15 @@ class LangChainAgentService:
             "збережи ключові факти та запити:\n\n" + text[:4000]
         )
         try:
+            try:
+                self.logging_service.log_api_usage(
+                    service="llm",
+                    source="langchain_agent_summarize",
+                    from_cache=False,
+                    metadata={"prompt_preview": prompt[:100] + ("..." if len(prompt) > 100 else "")},
+                )
+            except Exception as e:
+                logger.debug("log_api_usage (summarize): %s", e)
             resp = self.llm.invoke([HumanMessage(content=prompt)])
             content = getattr(resp, "content", None) or ""
             return content.strip() if isinstance(content, str) else ""
@@ -775,6 +825,9 @@ Important: Use terms from the glossary correctly."""
                 "olx_listings": "Оголошення OLX (нежитлова нерухомість, земля). Поля: url (ід для експорту), search_data (title, price, location, area_m2), detail (description, llm.property_type, llm.building_area_sqm, llm.land_area_ha, resolved_locations, parameters), updated_at (BSON Date — для фільтра за періодом $gte/$lte). Повна схема — get_collection_info('olx_listings').",
                 "llm_cache": "Кеш результатів LLM-парсингу описів; description_hash, result (property_type, addresses, тощо).",
                 "unified_listings": "Зведена таблиця оголошень, що об'єднує дані з OLX та ProZorro в єдину структуру. Поля: source (olx/prozorro), source_id, status, property_type, title, description, addresses (масив з region, settlement, coordinates, is_complete), cadastral_numbers, price_uah, price_usd, price_per_m2_uah/usd, price_per_ha_uah/usd, currency_rate, source_updated_at, system_updated_at. Фільтр за регіоном/містом: addresses з $elemMatch. Це основна колекція для пошуку — використовуй її замість olx_listings/prozorro_auctions для уніфікованих даних.",
+                "listing_analytics": "LLM-аналітика оголошень (ціна за одиницю, місцезнаходження, оточення). Поля: source, source_id, analysis_text, analysis_at. Зв'язок з unified_listings через source+source_id.",
+                "real_estate_objects": "Об'єкти нерухомого майна (ОНМ): land_plot, building, premises. Поля: type, area_sqm, cadastral_info, address, source_listing_ids. unified_listings.real_estate_refs посилається на _id.",
+                "price_analytics": "Зведена аналітика цін: метрики за періодами, квартілі по містах.",
             }
             collections = [
                 {"id": c, "description": descriptions.get(c, "")}
@@ -1622,7 +1675,9 @@ Important: Use terms from the glossary correctly."""
         """Перетворює адресу або топонім на координати (через кеш або Google API)."""
         logger.info(f"🔍 [Geocoding MCP] Виклик geocode_address: {address_or_place!r}, region={region}")
         try:
-            result = self.geocoding_service.geocode(query=address_or_place, region=region)
+            result = self.geocoding_service.geocode(
+                query=address_or_place, region=region, caller="langchain_agent"
+            )
             results_list = result.get("results", [])
             logger.info(f"✓ [Geocoding MCP] Результат: {len(results_list)} місць, from_cache={result.get('from_cache')}")
             result = dict(result)
@@ -1849,7 +1904,7 @@ Important: Use terms from the glossary correctly."""
         
         logger.info(f"Знайдено Excel файлів: {len(excel_files)}")
         return excel_files
-    
+
     def process_query(
         self,
         user_query: str,
@@ -1857,6 +1912,7 @@ Important: Use terms from the glossary correctly."""
         chat_id: Optional[str] = None,
         listing_context: Optional[Dict[str, Any]] = None,
         stream_callback: Optional[Callable[[str], None]] = None,
+        thinking_callback: Optional[Callable[[str], None]] = None,
         reply_to_text: Optional[str] = None,
         request_id: Optional[str] = None,
         route: Optional[str] = None,
@@ -1876,6 +1932,7 @@ Important: Use terms from the glossary correctly."""
             user_query: Запит користувача
             user_id: Ідентифікатор користувача для per-user пам'яті (опційно)
             stream_callback: Функція для трансляції проміжних результатів
+            thinking_callback: Функція для трансляції ходу думок (thinking) агента
             reply_to_text: Текст повідомлення, на яке користувач відповідає (контекст для відповіді на конкретне повідомлення)
             request_id: Ідентифікатор запиту для трасування в логах (опційно)
             route: Маршрут для підмножини tools (free_form, query_export, analytics, geo); None = free_form
@@ -1898,8 +1955,8 @@ Important: Use terms from the glossary correctly."""
         logger.info("="*80)
         try:
             return self._process_query_impl(
-                user_query, user_id, chat_id, listing_context, stream_callback, reply_to_text,
-                req_id, log_ctx, start_time, route,
+                user_query, user_id, chat_id, listing_context, stream_callback, thinking_callback,
+                reply_to_text, req_id, log_ctx, start_time, route,
             )
         finally:
             self._current_request_id = None
@@ -1918,6 +1975,7 @@ Important: Use terms from the glossary correctly."""
         chat_id: Optional[str],
         listing_context: Optional[Dict[str, Any]],
         stream_callback: Optional[Callable[[str], None]],
+        thinking_callback: Optional[Callable[[str], None]],
         reply_to_text: Optional[str],
         req_id: str,
         log_ctx: str,
@@ -2078,11 +2136,33 @@ Important: Use terms from the glossary correctly."""
             logger.info("%s--- Ітерація %s/%s ---", log_ctx, iteration, max_iterations)
 
             try:
-                # Bind tools до LLM (підмножина за маршрутом)
-                llm_with_tools = self.llm.bind_tools(tools_for_request)
+                # Bind tools до LLM асистента (thinking + grounding для Gemini)
+                tools_to_bind = list(tools_for_request)
+                # Google Search grounding несумісний з function tools у langchain-google:
+                # https://github.com/langchain-ai/langchain-google/issues/1116
+                # Додаємо лише коли немає інших tools (на практиці завжди є tools для агента)
+                if (
+                    getattr(self.settings, 'llm_agent_google_search_grounding', False)
+                    and len(tools_for_request) == 0
+                ):
+                    tools_to_bind = tools_to_bind + [{"google_search": {}}]
+                llm_with_tools = self.llm_assistant.bind_tools(tools_to_bind)
                 
                 # Отримуємо відповідь від LLM (з retry при тимчасових помилках)
                 logger.info("%sВідправляю запит до LLM...", log_ctx)
+                try:
+                    self.logging_service.log_api_usage(
+                        service="llm",
+                        source="langchain_agent_main",
+                        from_cache=False,
+                        metadata={
+                            "iteration": iteration,
+                            "request_id": req_id,
+                            "history_len": len(self.conversation_history),
+                        },
+                    )
+                except Exception as e:
+                    logger.debug("log_api_usage (main): %s", e)
                 last_err = None
                 for attempt in range(AGENT_LLM_RETRY_ATTEMPTS + 1):
                     try:
@@ -2102,6 +2182,10 @@ Important: Use terms from the glossary correctly."""
                     response = None
                 
                 logger.info("%sОтримано відповідь від LLM. Тип: %s", log_ctx, type(response))
+                
+                # Витягуємо thinking (ход думок) для відображення
+                if thinking_callback:
+                    _extract_and_send_thinking(response, thinking_callback)
                 
                 # Додаємо відповідь до історії
                 self.conversation_history.append(response)
@@ -2454,6 +2538,15 @@ Important: Use terms from the glossary correctly."""
             fallback_messages.append(HumanMessage(
                 content="[СИСТЕМА] Досягнуто ліміт ітерацій. На основі наявних даних у цій бесіді дай фінальну відповідь користувачу текстом: перелік з посиланнями (URL), короткий опис кожного. НЕ викликай інструменти."
             ))
+            try:
+                self.logging_service.log_api_usage(
+                    service="llm",
+                    source="langchain_agent_fallback",
+                    from_cache=False,
+                    metadata={"request_id": req_id, "iteration": iteration},
+                )
+            except Exception as e:
+                logger.debug("log_api_usage (fallback): %s", e)
             last_err = None
             for attempt in range(AGENT_LLM_RETRY_ATTEMPTS + 1):
                 try:

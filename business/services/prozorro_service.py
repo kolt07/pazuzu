@@ -481,7 +481,16 @@ class ProZorroService:
                 pass  # Якщо логування не працює, просто продовжуємо
             raise
     
-    def _save_auctions_to_database(self, auctions: List[AuctionDTO]) -> Dict[str, Any]:
+    def _is_active_auction(self, auction_data: Dict[str, Any]) -> bool:
+        """Перевіряє, чи аукціон активний (status починається з 'active')."""
+        status = (auction_data.get("status") or "").strip().lower()
+        return status.startswith("active")
+
+    def _save_auctions_to_database(
+        self,
+        auctions: List[AuctionDTO],
+        llm_only_for_active: bool = False,
+    ) -> Dict[str, Any]:
         """
         Зберігає аукціони в MongoDB з перевіркою версій.
         
@@ -489,11 +498,12 @@ class ProZorroService:
         Перевіряє, чи змінились дані в порівнянні з тим, що збережено у базі.
         Якщо дані ті ж самі - нічого не міняємо. Якщо версія змінилася - записуємо нові дані.
         Записує ті, яких там ще немає.
-        Обробляє описи через LLM для нових/оновлених аукціонів.
-        
+        Обробляє описи через LLM для нових/оновлених аукціонів (або тільки для активних, якщо llm_only_for_active).
+
         Args:
             auctions: Список аукціонів для збереження
-            
+            llm_only_for_active: Якщо True — LLM тільки для активних, інші парсяться з полів
+
         Returns:
             Dict[str, Any]: Словник зі статистикою: llm_requests_count, saved_count (кількість збережених без аренди)
         """
@@ -565,12 +575,13 @@ class ProZorroService:
                         # Версія не змінилася - перевіряємо, чи є результат LLM в кеші
                         # (на випадок, якщо промпт змінився і кеш очистили)
                         if existing_description_hash and description:
-                            cached_entry = self.llm_cache_service.repository.find_by_description_hash(existing_description_hash)
-                            if not cached_entry:
-                                # Хеш є в БД, але немає в кеші - викликаємо LLM
-                                if self.llm_service:
-                                    llm_requests_count += self._process_auction_with_llm(auction_data)
-                                    llm_progress.update(1)
+                            use_llm = not (llm_only_for_active and not self._is_active_auction(auction_data))
+                            if use_llm:
+                                cached_entry = self.llm_cache_service.repository.find_by_description_hash(existing_description_hash)
+                                if not cached_entry:
+                                    if self.llm_service:
+                                        llm_requests_count += self._process_auction_with_llm(auction_data)
+                                        llm_progress.update(1)
                         unchanged_count += 1
                     else:
                         # Версія змінилася - перед оновленням додаємо цінові метрики
@@ -585,12 +596,11 @@ class ProZorroService:
                         )
                         self._sync_auction_to_unified(auction_id)
                         updated_count += 1
-                        # Обробляємо через LLM для оновлених аукціонів
-                        # Перевіряємо кеш по description_hash перед викликом LLM
-                        if description_hash and self.llm_service:
+                        # Обробляємо через LLM для оновлених аукціонів (якщо не llm_only_for_active для неактивних)
+                        use_llm = not (llm_only_for_active and not self._is_active_auction(auction_data))
+                        if use_llm and description_hash and self.llm_service:
                             cached_entry = self.llm_cache_service.repository.find_by_description_hash(description_hash)
                             if not cached_entry:
-                                # Немає в кеші - викликаємо LLM
                                 llm_requests_count += self._process_auction_with_llm(auction_data)
                                 llm_progress.update(1)
                 else:
@@ -605,12 +615,11 @@ class ProZorroService:
                     )
                     self._sync_auction_to_unified(auction_id)
                     created_count += 1
-                    # Обробляємо через LLM для нових аукціонів
-                    # Перевіряємо кеш по description_hash перед викликом LLM
-                    if description_hash and self.llm_service:
+                    # Обробляємо через LLM для нових аукціонів (якщо не llm_only_for_active для неактивних)
+                    use_llm = not (llm_only_for_active and not self._is_active_auction(auction_data))
+                    if use_llm and description_hash and self.llm_service:
                         cached_entry = self.llm_cache_service.repository.find_by_description_hash(description_hash)
                         if not cached_entry:
-                            # Немає в кеші - викликаємо LLM
                             llm_requests_count += self._process_auction_with_llm(auction_data)
                     
             except Exception as e:
@@ -3806,7 +3815,8 @@ class ProZorroService:
         days: Optional[int] = None,
         output_dir: Optional[str] = None,
         user_id: Optional[int] = None,
-        auctions: Optional[List[AuctionDTO]] = None
+        auctions: Optional[List[AuctionDTO]] = None,
+        full: bool = False,
     ) -> Dict[str, Any]:
         """
         Отримує та зберігає список аукціонів про нерухомість за останні N днів.
@@ -3818,13 +3828,16 @@ class ProZorroService:
             output_dir: Директорія для збереження (не використовується, залишено для сумісності)
             user_id: Ідентифікатор користувача, який сформував файл (опціонально)
             auctions: Вже отримані аукціони (опціонально, якщо вказано - не викликається API)
+            full: Якщо True — завантажує всю історію (роки), LLM тільки для активних
 
         Returns:
             Dict[str, Any]: Результат операції з інформацією про кількість знайдених аукціонів
         """
-        if days is None:
+        if days is None and not full:
             days = self.settings.default_days_range
-        
+        if full:
+            return self._fetch_and_save_full_optimized(output_dir, user_id)
+
         # Для тижня використовуємо оптимізовану паралельну обробку
         if days == 7:
             return self._fetch_and_save_week_optimized(output_dir, user_id)
@@ -3854,11 +3867,13 @@ class ProZorroService:
                     'count': 0,
                     'file_path': None,
                     'message': 'Аукціони не знайдено',
-                    'update_result': update_result
                 }
 
             # Зберігаємо аукціони в MongoDB та обробляємо через LLM
-            save_result = self._save_auctions_to_database(auctions)
+            save_result = self._save_auctions_to_database(
+                auctions,
+                llm_only_for_active=full,
+            )
             llm_requests_count = save_result['llm_requests_count']
             saved_count = save_result['saved_count']
             
@@ -3894,6 +3909,108 @@ class ProZorroService:
                 'error': str(e)
             }
     
+    def _fetch_and_save_full_optimized(
+        self,
+        output_dir: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Повне оновлення історії: пакетна обробка по місяцях з паралелізмом.
+        Розбиває ~6 років на місяці, обробляє кілька місяців паралельно.
+        LLM тільки для активних аукціонів.
+        """
+        import concurrent.futures
+
+        def month_ranges(years: int = 6):
+            """Генерує (month_start, month_end) для кожного місяця за останні years років."""
+            now = datetime.now(timezone.utc)
+            end = now
+            start_year = now.year - years
+            start_month = now.month
+            current = datetime(start_year, start_month, 1, 0, 0, 0, tzinfo=timezone.utc)
+            while current < end:
+                if current.month == 12:
+                    next_month = datetime(current.year + 1, 1, 1, tzinfo=timezone.utc)
+                else:
+                    next_month = datetime(current.year, current.month + 1, 1, tzinfo=timezone.utc)
+                month_end = next_month - timedelta(seconds=1)
+                if month_end > end:
+                    month_end = end
+                yield current, month_end
+                current = next_month
+
+        months = list(month_ranges())
+        total_months = len(months)
+        print(f"Повне оновлення ProZorro: {total_months} місяців (пакетна обробка)...")
+
+        all_auctions = []
+        max_workers = min(6, total_months)
+        completed = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self.get_real_estate_auctions_by_date_range,
+                    month_start,
+                    month_end,
+                ): (month_start, month_end)
+                for month_start, month_end in months
+            }
+            for future in concurrent.futures.as_completed(futures):
+                month_start, month_end = futures[future]
+                completed += 1
+                try:
+                    month_auctions = future.result()
+                    all_auctions.extend(month_auctions)
+                    label = f"{month_start.strftime('%Y-%m')}"
+                    print(f"Місяць {completed}/{total_months} ({label}): {len(month_auctions)} аукціонів")
+                except Exception as e:
+                    print(f"Помилка місяця {month_start.strftime('%Y-%m')}: {e}")
+
+        unique_auctions = {}
+        for auction in all_auctions:
+            aid = getattr(auction, "id", None) or (auction.data.get("id") if auction.data else None)
+            if aid and aid not in unique_auctions:
+                unique_auctions[aid] = auction
+            elif not aid:
+                unique_auctions[f"_empty_{len(unique_auctions)}"] = auction
+
+        final_auctions = list(unique_auctions.values())
+        print(f"Всього унікальних аукціонів: {len(final_auctions)}")
+
+        if not final_auctions:
+            return {
+                "success": True,
+                "count": 0,
+                "file_path": None,
+                "message": "Аукціони не знайдено",
+            }
+
+        fast_update_result = self._fast_update_active_auctions()
+        save_result = self._save_auctions_to_database(
+            final_auctions,
+            llm_only_for_active=True,
+        )
+        llm_requests_count = save_result["llm_requests_count"]
+        saved_count = save_result["saved_count"]
+
+        update_date = datetime.now(timezone.utc)
+        self.app_data_repository.set_update_date(7, update_date)
+        self.app_data_repository.set_update_date(1, update_date)
+
+        print(f"Дата оновлення збережена: {format_datetime_display(update_date, '%d.%m.%Y %H:%M:%S')}")
+        print(f"Викликів LLM: {llm_requests_count}")
+
+        return {
+            "success": True,
+            "count": saved_count,
+            "file_path": None,
+            "update_date": update_date,
+            "llm_requests_count": llm_requests_count + fast_update_result.get("llm_requests_count", 0),
+            "message": f"Успішно оновлено {saved_count} аукціонів (повна історія)",
+            "fast_update_result": fast_update_result,
+        }
+
     def _fetch_and_save_week_optimized(
         self,
         output_dir: Optional[str] = None,

@@ -14,6 +14,7 @@ class LoggingService:
     EVENT_TYPE_API_EXCHANGE = 'api_exchange'
     EVENT_TYPE_USER_ACTION = 'user_action'
     EVENT_TYPE_APP_EVENT = 'app_event'
+    EVENT_TYPE_API_USAGE = 'api_usage'
     
     def __init__(self):
         """Ініціалізація сервісу логування."""
@@ -128,4 +129,40 @@ class LoggingService:
             initiator='system',
             metadata=app_metadata,
             error=error
+        )
+
+    def log_api_usage(
+        self,
+        service: str,
+        source: str,
+        from_cache: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Логує кожен виклик зовнішнього API (LLM, Google Geocoding тощо).
+        Використовується для статистики та діагностики.
+
+        Args:
+            service: 'llm' | 'geocoding'
+            source: джерело виклику (напр. 'langchain_agent', 'parse_auction', 'unified_listings')
+            from_cache: чи результат з кешу (для geocoding — True = не було виклику API)
+            metadata: додаткові метадані (query_preview, request_id, results_count тощо)
+
+        Returns:
+            ID створеного запису
+        """
+        usage_metadata = {
+            'service': service,
+            'source': source,
+            'from_cache': from_cache,
+        }
+        if metadata:
+            usage_metadata.update(metadata)
+        msg = f"{service} call from {source}" + (" (cache)" if from_cache else " (API)")
+        return self.repository.create_log(
+            event_type=self.EVENT_TYPE_API_USAGE,
+            message=msg,
+            initiator='system',
+            metadata=usage_metadata,
+            error=None
         )

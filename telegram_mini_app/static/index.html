@@ -8,6 +8,7 @@
   <meta http-equiv="Expires" content="0">
   <title>Pazuzu</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -50,6 +51,21 @@
       <div id="screen-admin" class="hidden">
         <h2>Адміністрування</h2>
         <div class="admin-block">
+          <h3>Використання API</h3>
+          <p class="admin-hint">Запити LLM та виклики Google Geocoding по днях, загальна кількість та за останній місяць.</p>
+          <div id="admin-usage-stats-summary" class="admin-usage-summary"></div>
+          <div class="admin-usage-charts">
+            <div class="admin-chart-wrap">
+              <h4>Запити LLM по днях</h4>
+              <canvas id="admin-chart-llm"></canvas>
+            </div>
+            <div class="admin-chart-wrap">
+              <h4>Виклики Google Geocoding по днях</h4>
+              <canvas id="admin-chart-geocoding"></canvas>
+            </div>
+          </div>
+        </div>
+        <div class="admin-block">
           <h3>Додати користувача / адміністратора</h3>
           <input type="number" id="admin-add-user-id" placeholder="Telegram ID" />
           <input type="text" id="admin-add-nickname" placeholder="Псевдонім" />
@@ -70,14 +86,44 @@
           <div class="admin-data-update-actions">
             <button type="button" id="admin-data-update-1" class="btn" data-days="1">Оновити за 1 день</button>
             <button type="button" id="admin-data-update-7" class="btn" data-days="7">Оновити за 7 днів</button>
+            <button type="button" id="admin-data-update-30" class="btn" data-days="30">Оновити за місяць</button>
+            <button type="button" id="admin-data-update-full-olx" class="btn btn-primary" data-mode="full_olx">Оновити OLX повністю</button>
+            <button type="button" id="admin-data-update-full-prozorro" class="btn btn-primary" data-mode="full_prozorro">Оновити ProZorro повністю</button>
           </div>
           <div id="admin-data-update-status" class="admin-data-update-status hidden"></div>
+        </div>
+        <div class="admin-block">
+          <h3>Скрапер кадастру</h3>
+          <p class="admin-hint">Збір ділянок з kadastrova-karta.com. Center-first: спочатку Київ, потім решта України.</p>
+          <div id="admin-cadastral-stats" class="admin-hint"></div>
+          <div class="admin-data-update-actions">
+            <button type="button" id="admin-cadastral-start-10" class="btn">Запустити (10 тайлів)</button>
+            <button type="button" id="admin-cadastral-start-50" class="btn">Запустити (50 тайлів)</button>
+            <button type="button" id="admin-cadastral-start-unlimited" class="btn btn-primary">Запустити (без обмеження)</button>
+            <button type="button" id="admin-cadastral-reset-stale" class="btn">Скинути завислі</button>
+            <button type="button" id="admin-cadastral-reset" class="btn btn-danger">Скинути комірки</button>
+          </div>
+          <div class="admin-cadastral-index-actions" style="margin-top: 0.5rem;">
+            <p class="admin-hint">Після завершення завантаження кадастру: індекс місцезнаходження та кластеризація.</p>
+            <button type="button" id="admin-cadastral-build-index" class="btn">Індексація (область/район з номера)</button>
+            <button type="button" id="admin-cadastral-build-clusters" class="btn">Кластеризація ділянок</button>
+            <button type="button" id="admin-cadastral-clear-clusters" class="btn btn-danger">Очистити кластери</button>
+          </div>
+          <div id="admin-cadastral-status" class="admin-data-update-status hidden"></div>
+          <div id="admin-cadastral-index-status" class="admin-data-update-status hidden"></div>
+          <div id="admin-cadastral-clusters-status" class="admin-data-update-status hidden"></div>
         </div>
         <div class="admin-block">
           <h3>Аналітика цін</h3>
           <p class="admin-hint">Перерахувати зведену аналітику (квартилі, середні ціни по містах). Виконується автоматично після оновлення даних.</p>
           <button type="button" id="admin-rebuild-analytics" class="btn">Перерахувати аналітику</button>
           <span id="admin-analytics-status" class="admin-hint"></span>
+        </div>
+        <div class="admin-block">
+          <h3>Обробка аномальних цін</h3>
+          <p class="admin-hint">Виявлення оголошень з аномальними цінами (глобально, потім по місцевості). Результат — список для перевірки.</p>
+          <button type="button" id="admin-process-anomalous-prices" class="btn">Знайти аномальні ціни</button>
+          <span id="admin-anomalous-prices-status" class="admin-hint"></span>
         </div>
         <div class="admin-block admin-collapsible">
           <h3 class="admin-collapsible-header">
@@ -286,7 +332,7 @@
             <label>Джерело:</label>
             <select id="filter-source" class="filter-select">
               <option value="">Всі (OLX + ProZorro)</option>
-              <option value="olx">OLX</option>
+              <option value="olx" selected>OLX</option>
               <option value="prozorro">ProZorro</option>
             </select>
           </div>
@@ -316,6 +362,7 @@
           <div class="filter-group">
             <label>Тип:</label>
             <select id="filter-property-type" class="filter-select">
+              <option value="kommercheska_ta_zd" selected>Комерційна нерухомість та ЗД</option>
               <option value="">Всі</option>
               <option value="neruhomist">Нерухомість</option>
               <option value="zemelna_dilyanka">ЗД</option>

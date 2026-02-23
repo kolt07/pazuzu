@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Репозиторій оголошень OLX: збереження даних зі сторінки пошуку та опційно зі сторінки оголошення (detail).
-Ідентифікатор — URL оголошення.
+Ідентифікатор — канонічний URL оголошення (без query-параметрів).
+Оголошення з search_reason=promoted та search_reason=organic — одне й те саме.
 """
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from data.repositories.base_repository import BaseRepository
+from utils.olx_url import normalize_olx_listing_url
 
 COLLECTION_NAME = "olx_listings"
 
@@ -22,11 +24,10 @@ def _normalize_doc(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 def _olx_url_variants(url: str) -> list:
-    """Повертає варіанти URL для пошуку (різні домени, протоколи, без query)."""
-    variants = [url]
-    u = url.strip()
-    if "?" in u:
-        variants.append(u.split("?")[0])
+    """Повертає варіанти URL для пошуку (канонічний + різні домени, протоколи)."""
+    canonical = normalize_olx_listing_url(url) or url.strip()
+    variants = [canonical]
+    u = canonical
     if u.startswith("https://"):
         variants.append("http://" + u[8:])
     elif u.startswith("http://"):
@@ -49,34 +50,80 @@ class OlxListingsRepository(BaseRepository):
         super().__init__(COLLECTION_NAME)
 
     def find_by_url(self, url: str) -> Optional[Dict[str, Any]]:
-        """Знаходить оголошення за URL (url зберігається в полі url). Пробує варіанти нормалізації."""
+        """Знаходить оголошення за URL. Приймає будь-який варіант (з query чи без)."""
         if not url or not url.strip():
             return None
         url = url.strip()
-        doc = self.collection.find_one({"url": url})
+        canonical = normalize_olx_listing_url(url) or url
+        doc = self.collection.find_one({"url": canonical})
         if doc:
             return _normalize_doc(doc)
         variants = _olx_url_variants(url)
         for v in variants:
-            if v != url:
-                doc = self.collection.find_one({"url": v})
-                if doc:
-                    return _normalize_doc(doc)
+            if v == canonical:
+                continue
+            doc = self.collection.find_one({"url": v})
+            if doc:
+                return _normalize_doc(doc)
         return None
+
+    def delete_by_url(self, url: str) -> int:
+        """
+        Видаляє оголошення за URL (канонічний або варіанти).
+        Повертає кількість видалених документів (0 або 1).
+        """
+        if not url or not url.strip():
+            return 0
+        variants = _olx_url_variants(url.strip())
+        result = self.collection.delete_one({"url": {"$in": variants}})
+        return result.deleted_count
+
+    def mark_inactive_by_urls(self, urls: List[str]) -> int:
+        """
+        Позначає оголошення як неактивні (is_active=False), якщо їх URL у списку.
+        Повертає кількість оновлених документів.
+        """
+        if not urls:
+            return 0
+        url_set = set()
+        for u in urls:
+            url_set.update(_olx_url_variants(u))
+        result = self.collection.update_many(
+            {"url": {"$in": list(url_set)}, "is_active": {"$ne": False}},
+            {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}},
+        )
+        return result.modified_count
+
+    def find_urls_in_period(
+        self, cutoff_from: datetime, cutoff_to: datetime
+    ) -> List[str]:
+        """
+        Повертає список URL оголошень, у яких updated_at в діапазоні [cutoff_from, cutoff_to].
+        """
+        cursor = self.collection.find(
+            {
+                "updated_at": {"$gte": cutoff_from, "$lte": cutoff_to},
+                "url": {"$exists": True, "$ne": ""},
+            },
+            {"url": 1},
+        )
+        return [d["url"] for d in cursor if d.get("url")]
 
     def upsert_listing(
         self,
         url: str,
         search_data: Dict[str, Any],
         detail: Optional[Dict[str, Any]] = None,
+        is_active: Optional[bool] = None,
     ) -> bool:
         """
-        Створює або оновлює оголошення. url — унікальний ідентифікатор.
+        Створює або оновлює оголошення. url — нормалізується до канонічного (без query).
         search_data — дані зі сторінки пошуку; detail — опційно дані зі сторінки оголошення.
+        is_active — True (активне), False (зняте з публікації). Якщо None — не змінюємо.
         """
         if not url or not url.strip():
             return False
-        url = url.strip()
+        url = normalize_olx_listing_url(url.strip()) or url.strip()
         now = datetime.now(timezone.utc)
         update: Dict[str, Any] = {
             "$set": {
@@ -87,6 +134,8 @@ class OlxListingsRepository(BaseRepository):
         }
         if detail is not None:
             update["$set"]["detail"] = detail
+        if is_active is not None:
+            update["$set"]["is_active"] = is_active
         update["$setOnInsert"] = {"created_at": now}
         result = self.collection.update_one(
             {"url": url},

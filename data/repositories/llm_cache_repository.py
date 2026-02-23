@@ -74,3 +74,30 @@ class LLMCacheRepository(BaseRepository):
         else:
             # Створюємо новий
             return self.create(document)
+
+    def find_by_cache_key(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        """Знаходить кешований результат за довільним ключем (напр. reo_<hash>)."""
+        self._ensure_indexes()
+        return self.find_one({"description_hash": cache_key})
+
+    def save_result_by_key(self, cache_key: str, result: Dict[str, Any]) -> str:
+        """Зберігає результат за довільним ключем."""
+        existing = self.find_by_cache_key(cache_key)
+        document = {
+            "description_hash": cache_key,
+            "result": result,
+            "created_at": datetime.now(timezone.utc),
+        }
+        if existing:
+            self.update_by_id(existing["_id"], {
+                "$set": {"result": result, "created_at": datetime.now(timezone.utc)},
+            })
+            return existing["_id"]
+        return self.create(document)
+
+    def delete_by_prefix(self, prefix: str) -> int:
+        """Видаляє записи, у яких description_hash починається з prefix."""
+        result = self.collection.delete_many({
+            "description_hash": {"$regex": f"^{prefix}"},
+        })
+        return result.deleted_count

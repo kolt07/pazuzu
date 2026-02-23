@@ -185,10 +185,13 @@ def generate_report_from_template(
     }
     actual_sort = sort_field_map.get(sort_field, "source_updated_at")
     sort_direction = -1 if sort_order == "desc" else 1
+    sort_list = [(actual_sort, sort_direction)]
+    if actual_sort == "source_updated_at":
+        sort_list.append(("system_updated_at", sort_direction))
 
     docs = repo.find_many(
         filter=filters,
-        sort=[(actual_sort, sort_direction)],
+        sort=sort_list,
         limit=10000,
         skip=0,
     )

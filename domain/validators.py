@@ -11,6 +11,7 @@ from domain.exceptions import LogicalLayerViolation
 ALLOWED_LOGICAL_FILTER_KEYS: FrozenSet[str] = frozenset({
     "city",
     "region",
+    "exclude_city",
     "price",
     "date",
     "status",

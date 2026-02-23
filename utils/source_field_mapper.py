@@ -58,7 +58,23 @@ class SourceFieldMapper:
             # unified_listings не має fallback — addresses є основним полем
             "city_fallback": None,
             "region_fallback": None,
-        }
+        },
+        "listing_analytics": {
+            "source": "source",
+            "source_id": "source_id",
+            "date": "analysis_at",
+            "city_fallback": None,
+            "region_fallback": None,
+        },
+        "real_estate_objects": {
+            "type": "type",
+            "area": "area_sqm",
+            "region": "address.region",
+            "city": "address.settlement",
+            "date": "updated_at",
+            "city_fallback": None,
+            "region_fallback": None,
+        },
     }
     
     @classmethod

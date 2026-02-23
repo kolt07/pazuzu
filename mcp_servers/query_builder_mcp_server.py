@@ -206,6 +206,21 @@ _COLLECTION_DESCRIPTIONS = {
         "Це основна колекція для пошуку та аналітики — використовуй її замість olx_listings/prozorro_auctions, "
         "якщо потрібні уніфіковані дані."
     ),
+    "listing_analytics": (
+        "LLM-згенерована аналітика оголошень. Поля: source (olx/prozorro), source_id (url або auction_id), "
+        "analysis_text (3 блоки: ціна за одиницю, місцезнаходження, оточення), analysis_at, updated_at. "
+        "Зв'язок з unified_listings через source+source_id. Використовуй для запитів про «аналітику оголошень»."
+    ),
+    "real_estate_objects": (
+        "Об'єкти нерухомого майна (ОНМ). Поля: type (land_plot, building, premises), area_sqm, "
+        "cadastral_info (для land_plot: cadastral_number, purpose), address (для building: region, settlement, street), "
+        "source_listing_ids (зв'язок з оголошеннями). unified_listings.real_estate_refs[].object_id посилається на _id. "
+        "Використовуй для запитів про «об'єкти нерухомості», «кадастрові ділянки», «будівлі»."
+    ),
+    "price_analytics": (
+        "Зведена аналітика цін: агреговані метрики (avg, std, q1–q4) за періодами та індикатори (квартилі по містах). "
+        "Поля: period_type, period_key, group_region, group_city, metric, q1, q2, q3, q4."
+    ),
 }
 
 

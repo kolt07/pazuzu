@@ -1,5 +1,580 @@
 # Історія розробки
 
+## 2026-02-23 — Київська область без Києва та відображення списків у відповіді
+
+- **Запит**: (1) Запит «10 найвигідніших земельних ділянок в Київській області» повертав оголошення з м. Києва замість області; (2) АІ помічник створював відповідь «знайшов 10» без фактичного списку — користувач не бачив дані.
+
+- **Дії**:
+  - **InterpreterAgent._infer_region_filter**: «Київська область» / «Київської області» (БЕЗ «та») → region: «Київська», exclude_city: «Київ». Київ не входить до Київської області.
+  - **prompts.yaml, QueryStructureAgent**: для «Київська область» — filter_metrics з region + exclude_city.
+  - **domain/validators.py**: додано exclude_city до ALLOWED_LOGICAL_FILTER_KEYS.
+  - **PipelineExecutor**: підтримка exclude_city у GEO_KEYS, передача в geo_filters_dict для GeoFilterService.from_dict.
+  - **FinalAnswerRefinementService**: для запитів типу «топ-N», «найвигідніші» — інструкція: відповідь ОБОВ'ЯЗКОВО має містити список з описом кожного об'єкта, не замінювати фразою «готові до ознайомлення».
+
+## 2026-02-23 — Аналіз використання Google Maps та прайсинг
+
+- **Запит**: Створити аналогічний аналіз та прайсинг по використанню Google Maps та інших сервісів Google.
+
+- **Дії**:
+  - **scripts/google_maps_usage_analysis.py**: аналіз Geocoding API та Places API (Nearby Search); дані з logs (api_usage service=geocoding), geocode_cache; екстраполяція на місяць; прайсинг за Google Maps Platform (березень 2025) — Geocoding $5/1000 після 10k безкоштовних, Places Nearby $32/1000 після 5k безкоштовних.
+  - Запуск: `py scripts/google_maps_usage_analysis.py --days 60`.
+
+## 2026-02-23 — Тестування та порівняння методів парсингу з існуючими потоками
+
+- **Запит**: Провести тестування та порівняння із існуючими потоками обробки інформації.
+
+- **Дії**:
+  - Розширено benchmark: порівняння з існуючим кешем (результати поточного потоку Gemini), підрахунок заповнених полів.
+  - Запуск: 16 зразків (8 ProZorro + 8 OLX). Regex: 0.001 с, 2.8 полів/8; LLM: 4.7 полів/8; узгодженість regex з LLM 0–67%.
+  - Ollama (gemma3:27b): 2 зразки, ~68 с/опис (перший запуск), 100% узгодженість з Gemini.
+  - **docs/benchmark_parsing_report.md**: звіт з результатами, висновками та рекомендаціями.
+
+## 2026-02-23 — План зменшення токенів, regex-екстрактор, Ollama (gemma3:27b), benchmark
+
+- **Запит**: План зменшення токенів і запитів до LLM; альтернативні методи розпізнавання (regex, BERT); тестування локальної LLM gemma3:27b через Ollama; використання кешу для порівняння результатів. Фокус на парсингу оголошень та аукціонів.
+
+- **Дії**:
+  - **docs/plan_token_reduction.md**: план — каскадний підхід (regex → LLM), скорочення промпту, локальна LLM; альтернативи (regex, BERT, Ollama).
+  - **utils/listing_regex_extractor.py**: regex-екстрактор — cadastral_number, building_area_sqm, land_area_ha, addresses, floor, property_type, utilities, tags; `extract_from_description()`, `can_skip_llm()`.
+  - **OllamaLLMProvider**: провайдер для Ollama (gemma3:27b); `parse_auction_description`, `generate_text`; підтримка в LLMService._create_provider.
+  - **config/settings.py, config.example.yaml**: підтримка `ollama` у provider, model_name, api_keys.
+  - **requirements.txt**: додано `ollama>=0.3.0`.
+  - **scripts/benchmark_parsing_methods.py**: benchmark — зразки з prozorro_auctions та olx_listings; методи regex, gemini, ollama; порівняння результатів та часу. Запуск: `py scripts/benchmark_parsing_methods.py --limit 5 --methods regex,gemini,ollama`.
+
+## 2026-02-23 — Аналіз використання LLM: токени на оголошення, екстраполяція, прайсинг
+
+- **Запит**: Глибока аналітика та прогнозування застосування LLM: (1) середня кількість вхідних-вихідних токенів на обробку одного оголошення OLX + пов’язаного ОНМ; (2) екстраполяція на місяць за середньою кількістю оголошень/аукціонів на добу; (3) приблизні місячні витрати за Gemini 3 Flash.
+
+- **Дії**:
+  - **LogsRepository**: метод `count_api_usage_by_source(service, days, from_cache_only)` — агрегація api_usage по metadata.source.
+  - **scripts/llm_usage_analysis.py**: скрипт аналізу — оцінки токенів з коду (parsing template ~3200 символів, real_estate_objects ~1200), середня кількість оголошень/аукціонів на добу з БД, екстраполяція на 30 днів, вартість за Gemini 3 Flash ($0.50/1M input, $3.00/1M output) та Gemini 2.5 Flash ($0.30/1M, $2.50/1M).
+  - **Результати (приклад)**: ~2113 токенів на 1 оголошення OLX+ОНМ; ~1428 на аукціон ProZorro; при ~1926 OLX/добу та ~79 ProZorro/добу — ~125M токенів/міс, ~$105 (Gemini 3 Flash) або ~$75 (Gemini 2.5 Flash). Запуск: `py scripts/llm_usage_analysis.py --days 60`.
+
+## 2026-02-23 — Контекст архітектури даних для маршрутизації (порівняння цін по містах)
+
+- **Запит**: LLM не бачило оголошення Дніпра при порівнянні цін Київ vs Дніпро; неправильний вибір розрахунку — лізло в raw listings замість агрегованих даних. Потрібен кращий контекст для частини процесу, що відповідає за маршрут отримання даних.
+
+- **Дії**:
+  - **app_metadata.yaml**: додано секцію `data_flow_architecture` — шари (primary → unified → aggregated), правила маршрутизації (порівняння по містах → execute_analytics, НЕ execute_query).
+  - **AppMetadataService.get_metadata_for_llm**: включено data_flow_architecture та routing_rules у контекст для LLM.
+  - **prompts.yaml (langchain_system)**: блок «КРИТИЧНО — Пріоритет інструментів» — для порівняння по містах використовувати execute_analytics з groupBy city, не raw listings.
+  - **_try_analytics_aggregation_by_city**: фільтр city з $in для settlement-варіантів (Київ, м. Київ, Дніпро, м. Дніпро) — збіг з addresses.settlement у БД.
+
+## 2026-02-23 — Domain-шар для listing_analytics та real_estate_objects, контекст LLM
+
+- **Запит**: LLM-помічник має мати актуальний контекст структури доступних даних доменного рівня. Domain-шар не тільки над таблицями з джерел і зведеною таблицею, але й над аналітикою та об'єктами нерухомого майна. Ці сутності мають бути включати в пайплайни обробки інформації.
+
+- **Дії**:
+  - **data_dictionary.yaml**: додано колекцію `listing_analytics` (source, source_id, analysis_text, analysis_at).
+  - **app_metadata.yaml**: додано описи `unified_listings`, `listing_analytics`, `real_estate_objects`, `price_analytics` для контексту LLM.
+  - **Domain entities**: `ListingAnalytics`, `RealEstateObject`; колекції `ListingAnalyticsCollection`, `RealEstateObjectCollection`.
+  - **CollectionManagers**: `ListingAnalyticsCollectionManager`, `RealEstateObjectsCollectionManager` — find(), get_field_structure(), get_available_field_values().
+  - **PipelineExecutor, PipelineService**: підтримка listing_analytics та real_estate_objects як колекцій пайплайну; `PIPELINE_COLLECTIONS`.
+  - **QueryBuilder, schema_mcp_server**: додано listing_analytics, real_estate_objects, price_analytics до ALLOWED_COLLECTIONS.
+  - **SourceFieldMapper**: маппінг логічних полів для listing_analytics та real_estate_objects.
+  - **prompts.yaml (query_structure)**: джерела — unified_listings (за замовч.), listing_analytics, real_estate_objects для відповідних запитів.
+  - **get_allowed_collections**: описи нових колекцій для LangChain та MCP.
+
+## 2026-02-23 — Перезаповнення земельних ділянок з кадастру в процедурі оновлення ОНМ
+
+- **Запит**: У процедуру оновлення колекції об'єктів нерухомого майна додати перезаповнення даних земельних ділянок на базі кадастру. Для існуючих записів — якщо знаходимо земельну ділянку по номеру в кадастрі, завантажувати в ОНМ те, чого немає в оголошенні. Якщо площа в кадастрі та в оголошенні суттєво різна (±50 м²), створювати окремий показник «площа за кадастром» і підсвічувати різницю в інтерфейсі.
+
+- **Дії**:
+  - **RealEstateObjectsService**: `_merge_cadastral_info` — повертає `(cadastral_info, area_sqm_for_doc, area_by_cadastre_sqm)`; заповнює з кадастру purpose, purpose_label, category, ownership_form, address; при різниці площ >50 м² додає `area_by_cadastre_sqm`.
+  - **RealEstateObjectsService**: `_backfill_land_plot_from_cadastre` — перезаповнення існуючих land_plot даними з cadastral_parcels.
+  - **process_listing**: для існуючих land_plot викликається `_backfill_land_plot_from_cadastre` перед add_source_listing; для нових — `area_by_cadastre_sqm` передається в create при різниці площ.
+  - **backfill_real_estate_objects.py**: після обробки оголошень — перезаповнення всіх land_plot з cadastral_info.cadastral_number з кадастру (опція `--no-cadastral-backfill` для пропуску).
+  - **data_dictionary.yaml**: поле `area_by_cadastre_sqm` для real_estate_objects.
+  - **Mini App UI**: відображення «за кадастром: X м²» для land_plot з area_by_cadastre_sqm; CSS-підсвітка `.detail-reo-card-area-cadastre-diff`, `.detail-reo-cadastre-diff` (жовтий фон).
+
+## 2026-02-22 — Виправлення: порівняння цін Київ vs Львів (продовження)
+
+- **Запит**: Після попередніх змін відповідь все ще була поганою: «11 записів», «неможливо сформувати окремі середні для Києва та Львова», хоча даних по містах багато.
+
+- **Причина**: (1) unified_listings fallback використовував ISO-рядок для source_updated_at замість datetime (BSON Date); (2) addresses.settlement має варіанти «Київ» / «м. Київ» — exact match пропускав частину даних; (3) не було фільтра property_type для «комерційна нерухомість»; (4) price_analytics fallback не фільтрував за типом оголошення.
+
+- **Дії**:
+  - **MultiAgentService._try_analytics_aggregation_by_city**: фільтр property_type="Комерційна нерухомість" при наявності «комерційн» у запиті — для ProZorro, OLX, price_analytics та unified_listings fallback.
+  - **unified_listings fallback**: source_updated_at як datetime.fromisoformat(); settlement_values включають «Київ» та «м. Київ»; base_match з status="активне" та property_type при want_commercial.
+  - **AnalyticsBuilder._build_olx_price_per_sqm_pipeline**: додано $match за detail.llm.property_type при наявності filters.property_type.
+  - **price_analytics fallback**: get_aggregated_analytics з property_type="Комерційна нерухомість" при want_commercial.
+
+## 2026-02-22 — Виправлення: порівняння цін Київ vs Львів
+
+- **Запит**: Відповідь асистента на «Порівняй середню ціну за м² на комерційну нерухомість у Києві та Львові» була поганою: «1007 оголошень в Києві», «даних по Львову немає», «немає агрегованих показників». При цьому дані є по обох містах.
+
+- **Причина**: (1) _try_analytics_aggregation_by_region спрацьовував лише на «по областям/регіонах», не на «порівняй Київ і Львів»; (2) execute_analytics для olx_listings підтримував лише groupBy: ["date"], не city/region; (3) не було явного шляху для порівняння по містах.
+
+- **Дії**:
+  - **MultiAgentService**: додано _try_analytics_aggregation_by_city — перехоплює запити «порівняй ціни в містах X та Y» (Київ, Львів, Харків, Одеса, Дніпро). Викликає execute_analytics з groupBy: ["city"], filters: $or для міст, діапазон last_30_days. ProZorro, потім OLX як fallback.
+  - **AnalyticsBuilder**: для olx_listings дозволено groupBy: ["city"], ["region"] (крім ["date"]). _build_olx_price_per_sqm_pipeline — динамічне групування за groupBy; витягування city/region з detail.resolved_locations[0].address_structured.
+  - **prompts.yaml**: додано інструкцію «Порівняння по містах (Київ vs Львів)» — groupBy: ["city"], filters: $or.
+  - **Fallback на price_analytics**: якщо execute_analytics (ProZorro + OLX) повертає 0 — використовуємо PriceAnalyticsService.get_aggregated_analytics (передобчислені агрегати з unified_listings). Отримуємо monthly aggregates, фільтруємо по cities, для кожного міста беремо рядок з max count.
+
+## 2026-02-22 — Виправлення: Tool use unsupported (Gemini + Google Search)
+
+- **Запит**: Помилка `Tool use with function calling is unsupported by the model` при запиті до geo_assessment (приміщення під аптеку в Луцьку).
+
+- **Причина**: langchain-google не підтримує сумісність `{"google_search": {}}` з function tools (StructuredTool). При їх сумісному використанні Gemini повертає INVALID_ARGUMENT. Див. https://github.com/langchain-ai/langchain-google/issues/1116
+
+- **Дії**:
+  - **LangChainAgentService**: Google Search grounding додається лише коли `len(tools_for_request) == 0`; на практиці агент завжди має tools, тому grounding не застосовується.
+  - **Settings**: дефолт `llm_agent_google_search_grounding` змінено на `false`.
+  - **config.example.yaml**: приклад `google_search_grounding: false` з поясненням несумісності.
+
+## 2026-02-22 — Thinking mode та Google Search grounding для AI-асистента
+
+- **Запит**: Увімкнути Thinking mode, Google Search grounding та відображення ходу думок агента в AI-асистенті. Пріоритет — інформація з бази. У інших випадках (парсинг тощо) Thinking mode не вмикати.
+
+- **Дії**:
+  - **Settings**: `llm_agent_thinking_budget` (8192 за замовч., 0 = вимкнено), `llm_agent_google_search_grounding`, `llm_agent_include_thoughts`.
+  - **LangChainAgentService**: окремий `llm_assistant` з thinking_budget та include_thoughts для Gemini; базовий `llm` без thinking для summarize/fallback. Google Search — через `bind_tools([{"google_search": {}}])` при grounding.
+  - **System prompt** (prompts.yaml): блок «ПРІОРИТЕТ ДЖЕРЕЛ ІНФОРМАЦІЇ» — пріоритет даних з БД над інтернетом.
+  - **process_query**: параметр `thinking_callback`; витягування thinking-блоків з AIMessage та виклик callback.
+  - **MultiAgentService**: проброс `thinking_callback` до LangChain (основний шлях та geo_assessment).
+  - **chat-stream API**: `thinking_callback` накопичує thinking; подія `done` містить `thinking`.
+  - **Mini App UI**: блок «Хід думок агента» (details/summary) під відповіддю бота; стилі `.chat-msg-thinking`.
+  - **config.example.yaml**: приклади `thinking_budget`, `google_search_grounding`, `include_thoughts` в llm.agent.
+
+## 2026-02-21 — Екранування regex у RealEstateObjectsRepository
+
+- **Запит**: Помилка backfill ОНМ: `Regular expression is invalid: missing closing parenthesis` при обробці оголошень OLX (напр. з адресами типу «м. Київ (обласний центр)»).
+
+- **Дії**:
+  - **RealEstateObjectsRepository.find_building_by_address**: екранування `formatted_address`, `region`, `settlement` через `re.escape()` перед підстановкою в `$regex` — дужки та інші спецсимволи regex більше не ламають запит.
+
+## 2026-02-21 — OLX: фільтр сміття, дефолти пошуку, очищення
+
+- **Запит**: У завантаженні з OLX з’явились оголошення про кепки та губну помаду. Потрібно: 1) на сторінці пошуку лише комерційна нерухомість та земельні ділянки; 2) вичистити сміття з БД.
+
+- **Дії**:
+  - **UnifiedListingsService.sync_olx_listing**: не синхронізує оголошення з property_type="інше" у unified_listings; видаляє їх із unified, якщо вже є.
+  - **_determine_property_type**: fallback за заголовком/описом, якщо LLM не повернув тип — інферує "Земельна ділянка" / "Комерційна нерухомість" за ключовими словами.
+  - **Сторінка пошуку**: дефолтні фільтри — Джерело: OLX, Тип: «Комерційна нерухомість та ЗД»; при відкритті екрану пошуку фільтри синхронізуються з DOM і застосовуються.
+  - **_PROPERTY_TYPE_MAP**: додано `kommercheska_ta_zd` — Нерухомість, Комерційна нерухомість, Земельна ділянка, Земельна ділянка з нерухомістю.
+  - **UnifiedListingsRepository.delete_by_source_id**: метод для видалення за source+source_id; для OLX — fallback на канонічний URL.
+  - **OlxListingsRepository.delete_by_url**: метод для видалення за URL.
+  - **scripts/cleanup_olx_junk_listings.py**: скрипт видалення сміття за ключовими словами (кепк, помад, шапк, губна помада, бейсболк). Видалено 2 оголошення (кепка, губна помада).
+  - **run_update.py**: зупинка при 0 результатів — (1) «знайшли 0 оголошень» / «ми знайшли 0 оголошень»; (2) «ми нічого не знайшли, тому підібрали рекламні» + regex N=0. Фраза «рекламні» є й на сторінках з результатами (Донецька): «знайшли 0 оголошень», «ми нічого не знайшли, тому підібрали рекламні». Окрема «ми нічого не знайшли» прибрано — вона з’являється й на сторінках з результатами (напр. у фільтрах).
+
+## 2026-02-21 — Детальне логування викликів LLM та геосервісів
+
+- **Запит**: Щось мало запитів до LLM. Почати детально логувати кожен виклик LLM та геосервісів.
+
+- **Дії**:
+  - **LoggingService**: `log_api_usage(service, source, from_cache, metadata)` — новий тип події `api_usage` для збереження кожного виклику.
+  - **LogsRepository**: `count_api_usage_by_day`, `count_api_usage_total`, `count_api_usage_last_month` — агрегація по `event_type=api_usage`, `metadata.service`.
+  - **GeocodingService**: логування кожного виклику `geocode()` — cache hit (from_cache=True) та API call (from_cache=False). Опційний параметр `caller` для джерела.
+  - **LangChainAgentService**: логування перед кожним `llm.invoke` (summarize, main loop, fallback).
+  - **LLMService**: логування в `parse_auction_description`, `generate_text`, `extract_intent_for_routing`.
+  - **usage-stats**: переведено на `api_usage` — LLM та Geocoding рахуються з логів; додано user_queries, cache_hits.
+  - **caller** у geocode: langchain_agent, unified_listings_olx, unified_listings_prozorro, olx_scraper.
+
+## 2026-02-21 — Графіки використання LLM та Geocoding в адмін-панелі
+
+- **Запит**: Створити на сторінці адміністрування графіки з використанням запитів LLM та геосервісів Google по днях, плюс загальна кількість, плюс кількість за останній місяць.
+
+- **Дії**:
+  - **LogsRepository**: `count_llm_queries_by_day(days)`, `count_llm_queries_total()`, `count_llm_queries_last_month()` — агрегація по `event_type=user_action`, `metadata.action=llm_query`.
+  - **GeocodeCacheRepository**: `count_api_calls_by_day(days)`, `count_total()`, `count_last_month()` — кожен запис у кеші = один виклик Google Geocoding API (cache miss).
+  - **Admin API**: GET `/api/admin/usage-stats?days=60` — повертає `llm` та `geocoding` з `by_day`, `total`, `last_month`.
+  - **index.html**: блок «Використання API» з підсумком (всього / за місяць) та двома bar-графіками (Chart.js).
+  - **app.js**: `loadAdminUsageStats()` — завантаження даних та `renderAdminUsageCharts()` для відображення.
+  - **styles.css**: `.admin-usage-summary`, `.admin-usage-charts`, `.admin-chart-wrap` для оформлення.
+
+## 2026-02-21 — OLX: паралельна обробка по областях
+
+- **Запит**: Обробка скрапера OLX в окремих потоках — по одному на область. Використовувати connection повторно в рамках потоку.
+
+- **Дії**:
+  - **fetcher.py**: `fetch_page(session=None)` — опційний параметр для повторного використання HTTP-сеансу (keep-alive).
+  - **config.py**: `MAX_PARALLEL_REGIONS` (за замовчуванням 25) — кількість потоків.
+  - **run_update.py**: `ThreadPoolExecutor` — один потік на область; `_process_region` обробляє 2 категорії (нежитлова + земля) з одним `requests.Session`; thread-safe лог через `threading.Lock`. При явній передачі `categories` — legacy послідовний режим.
+
+## 2026-02-21 — OLX: об'єднання дублікатів за канонічним URL
+
+- **Запит**: Оголошення з search_reason=promoted та search_reason=organic — одне й те саме. Такі оголошення в базі слід поєднати і розглядати як одне.
+
+- **Дії**:
+  - **utils/olx_url.py**: `normalize_olx_listing_url(url)` — повертає URL без query-параметрів.
+  - **olx_listings_repository**: зберігання та пошук за канонічним URL; `upsert_listing` нормалізує вхідний url; `find_by_url` приймає будь-який варіант (з query чи без).
+  - **unified_listings_repository**: `find_by_source_id` для OLX — fallback на канонічний URL, якщо з query не знайдено.
+  - **Міграція 038**: об'єднання дублікатів в olx_listings, оновлення source_id у unified_listings, listing_analytics, real_estate_objects.
+
+## 2026-02-21 — OLX: пошук по областях, обмеження 25 сторінок
+
+- **Запит**: Завантаження даних з OLX обмежуємо 25 сторінками пошуку (OLX перенаправляє на 25-ту при спробі більше). Для більшого обсягу — пошук послідовно по всім областям, max 25 сторінок на область, з зупинкою по даті (cutoff).
+
+- **Дії**:
+  - **config.py**: MAX_SEARCH_PAGES = 25 (за замовчуванням); додано `get_olx_region_slugs()` — завантаження з `config/olx_region_slugs.yaml`; `get_commercial_real_estate_list_url` та `get_land_list_url` приймають `region_slug` для фільтрації по області (URL: `.../{slug}/` — path-суфікс з короткими слагами з sitemap).
+  - **config/olx_region_slugs.yaml**: маппінг областей → короткі OLX slugs з sitemap (Вінницька→vin, Київська→ko, Львівська→lv тощо); АР Крим та Севастополь пропущено.
+  - **run_update.py**: `_build_region_categories()` — будує категорії як (тип × область): «Нежитлова нерухомість — Вінницька», «Земельні ділянки — Київська» тощо; кожен пошук max 25 сторінок; зупинка по cutoff_utc при days; при full — 25 сторінок без зупинки по даті.
+  - Fallback: якщо olx_region_slugs.yaml відсутній — два пошуки без фільтра (як раніше).
+
+## 2026-02-21 — LLM-аналітика оголошення: ціна за одиницю площі, місцезнаходження, оточення
+
+- **Запит**: Текст «У Рівне за останній місяць зареєстровано 50 схожих оголошень. Середня ціна становить близько 6 919 930 грн. Для оцінки відносності ціни потрібно більше даних» — не інформативний. Порівнюємо ціни за одиницю площі (грн/м², грн/га), а не абсолютні. Потрібен детальний LLM-розбір: ціна, місцезнаходження, оточення. Аналітику формуємо при запиті через LLM-помічника або натисканні кнопки «Сформувати аналітику». Зберігаємо в прив'язці до оголошення.
+
+- **Дії**:
+  - **Текст аналітики**: Підкреслено порівняння за одиницю площі (грн/м², грн/га), а не абсолютні суми. Додано заклик «Сформувати аналітику» для детального розбору.
+  - **ListingAnalyticsRepository** + колекція **listing_analytics**: збереження LLM-згенерованої аналітики за source+source_id.
+  - **ListingAnalyticsService**: генерація через LLM (промпт listing_analytics у config/prompts.yaml) — 3 блоки: ціна за одиницю площі, місцезнаходження, оточення.
+  - **API**: GET /api/analytics/listing, POST /api/analytics/listing/generate (body: source, source_id, force).
+  - **Міграція 037**: колекція listing_analytics.
+  - **UI**: кнопка «Сформувати аналітику» / «Оновити аналітику» у вкладці Аналітика; відображення збереженої LLM-аналітики в блоці «Детальний розбір».
+  - **Інтеграція з LLM-помічником**: поки що тільки кнопка; збереження при запиті через чат — окремо.
+  - **2026-02-21 (поправка)**: LLM тепер отримує ринковий контекст з бази (індикатор, агрегати, середня ціна за м²/га) — блок «Ринковий контекст» у промпті. Перша частина аналітики: пріоритет price_per_m2_uah над price_uah; прибрано надлишкові фрази; при price_uah — «середня абсолютна ціна (для об'єктів без площі)».
+
+## 2026-02-21 — OLX: прибрано фільтр «дата не змінюється 5 сторінок поспіль»
+
+- **Запит**: Прибрати фільтр, що відсікає пошук OLX, якщо дата не змінюється 5 сторінок поспіль. Шукати допоки не отримаємо потрібну дату (cutoff) або не закінчаться сторінки пошуку.
+
+- **Дії**:
+  - **run_update.py**: видалено логіку `last_date_stale_count` / `prev_last_date_key` — зупинка лише при cutoff (більше половини оголошень старші за граничну дату) або при порожній сторінці / max_pages.
+  - **config.py**: видалено `STALE_DATE_CONSECUTIVE_PAGES` та змінну середовища `OLX_SCRAPER_STALE_DATE_PAGES`.
+
+## 2026-02-21 — OLX: зупинка по даті — більше половини сторінки; пропуск sync при незмінних даних; нормалізація region для агрегатів; узгодження індикатора з агрегатами міста
+
+- **Запит**: На сторінках пошуку OLX є «топові» (платні) оголошення, вставлені без урахування сортування. Потрібно поліпшити визначення граничної дати. Також — не запускати sync_olx_listing і process_listing (ОНМ), якщо дані з пошуку не змінились. Питання: чому по Одесі плашка показує «Нижче середньої (місто)», а вкладка Аналітика — «Немає достатніх даних»? Протиріччя в Смілі: плашка «Аномально висока (область)», а LLM-розбір правильно каже «нижча за середню в місті».
+
+- **Причина розбіжності**: Плашка використовує get_indicator, який має нормалізацію варіантів області («Одеська область» / «Одеська»). Агрегати (вкладка Аналітика) використовували точний збіг group_region — при різному форматі запит не знаходив записів. Протиріччя плашка vs агрегати: при < 5 оголошень у місті індикатор береться з області, а середня ціна — з міста; розподіл по області може відрізнятись (напр. 8438 грн/м² нижче середньої в Смілі 12492, але «аномально висока» для області).
+
+- **Дії**:
+  - **run_update.py**: змінено логіку зупинки по cutoff_utc — зупиняємось лише якщо більше половини оголошень на сторінці старші за граничну дату (count_older_than_cutoff > len(listings) / 2). Раніше зупинка відбувалась при першому ж старому оголошенні, що призводило до передчасної зупинки через топові оголошення.
+  - **run_update.py**: при пропуску завантаження деталей (search_data не змінився) більше не викликаємо sync_olx_listing — unified_listings і ОНМ не потребують оновлення, контент той самий.
+  - **PriceAnalyticsRepository**: додано _region_variants() та нормалізацію region у get_aggregates — пошук за $in варіантів («Одеська», «Одеська область»), як у get_indicator.
+  - **app.js**, **ListingAnalyticsService**: індикатор області — основа аналітики. Коли є дані міста (totalCount < 5) і вони суперечать індикатору області — додаємо пояснення: «Ми маємо небагато (N) даних із міста, але якщо орієнтуватись по них — ціна по цій місцевості нижче/вища за середню. Це може вказувати на переваги локації в межах області. З накопиченням масиву оголошень аналітика буде більш точна.» Без перевизначення індикатора.
+
+## 2026-02-20 — Плашка ціни: settlement 5+, 3 розподіли, фільтрація викидів
+
+- **Запит**: Плашка має дивитись на аналітику по найнижчому топоніму (місто, громада). Якщо 5+ оголошень схожого типу — розподіл по локації; інакше — область. Рахувати при відображенні. Виключати з розрахунку значення за межами Q1-2*IQR та Q4+2*IQR по країні. Три окремі розподіли: земля, нерухомість, змішані.
+
+- **Дії**:
+  - **PriceAnalyticsRepository**: додано `listing_type` (land, real_estate, mixed) до індикаторів; `get_indicator`, `get_region_indicator`, `upsert_indicator`, `upsert_region_indicator` приймають listing_type.
+  - **PriceAnalyticsService**: `_compute_indicators` — три окремі пайплайни (land, real_estate, mixed); фільтрація викидів за країнськими квартилями (Q1-2*IQR, Q4+2*IQR); settlement — мінімум 5 оголошень, fallback — область; `_get_country_quartiles`, `_listing_type_match`, `_listing_type_from_item`.
+  - **get_price_indicator**: settlement 5+ → локальний розподіл, інакше — область; приймає listing_type.
+  - **get_price_indicators_for_items**: визначає listing_type з building_area_sqm/land_area_ha; не вимагає city (може бути порожнім для region-only).
+  - **PriceAnomalyService**: `_get_local_distribution` приймає listing_type; `_get_listing_type` для визначення типу з doc.
+  - **search.py**: `_build_item_for_price_indicator` — додано building_area_sqm, land_area_ha для OLX (detail.llm, price_metrics) та ProZorro (itemProps); `_normalize_unified_doc` — додано addresses для fallback.
+  - **analytics API**: GET /api/analytics/price-indicator — параметр listing_type (land, real_estate, mixed, general).
+  - **2026-02-20 (поправка)**: Додано LISTING_TYPE_GENERAL (земля+нерухомість) як fallback коли по типу замало даних; нормалізація назви області (з/без « область»).
+  - **2026-02-20 (діагностика)**: Якщо є тільки mixed-індикатори — fallback на mixed для land/real_estate. scripts/diagnose_price_badges.py для діагностики.
+  - **2026-02-20 (джерело плашки)**: get_price_indicator повертає (indicator, source); price_indicator_source = "city"|"region". Плашка показує «(місто)» або «(область)». Секція аналітики — оновлено опис (у місті/в області).
+
+## 2026-02-20 — Номер будинку в адресах (ProZorro, OLX, ОНМ)
+
+- **Запит**: У жодному об'єкті НМ не заповнена повна адреса до номера будинку, хоча часто є деталізація до вулиці.
+
+- **Причини**:
+  1. ProZorro: streetAddress містить вулицю та номер в одному полі ("вул. Соборності, 7") — не парсили окремо.
+  2. Real estate objects: _extract_objects_from_prozorro_items не витягував building з streetAddress.
+  3. Geocode fallback: коли Google не повертає street_number, втрачали building з LLM/джерела.
+  4. GeocodingService: додано premise як fallback для street_number (Google іноді повертає premise).
+
+- **Дії**:
+  - **utils/address_parser.py**: parse_street_address, parse_prozorro_item_address — парсинг streetAddress на street + building (формати "вул. Хрещатик, 15", "вул. Соборності 7").
+  - **RealEstateObjectsService**: використання parse_prozorro_item_address для items; fallback addr.building коли geocode не повертає street_number.
+  - **UnifiedListingsService**: items fallback — parse_prozorro_item_address замість ручного парсингу; збереження building з парсера.
+  - **GeocodingService**: ADDRESS_COMPONENT_MAP — premise як fallback для street_number.
+  - **prompts.yaml**: посилення real_estate_objects_parsing — обов'язково витягувати building, якщо є в тексті.
+
+## 2026-02-20 — Відображення зв'язків ОНМ: будівля↔ділянка, приміщення
+
+- **Запит**: У об'єктах нерухомого майна не видно прямої прив'язки будівлі до земельної ділянки та приміщень.
+
+- **Дії**:
+  - **API** GET /api/search/real-estate-objects: розкриття зв'язків — для будівель додано `land_plots` (з land_plot_ids) та `premises` (з premises_ids); для приміщень додано `building` (з building_id).
+  - **UI** вкладка «Об'єкти нерухомості»: для будівлі показуються блоки «Земельні ділянки» та «Приміщення»; для приміщення — блок «Будівля».
+  - **Стилі**: detail-reo-card-related, detail-reo-related-list.
+
+## 2026-02-20 — Прискорення обробки порожніх кадастрових тайлів
+
+- **Запит**: Порожній тайл обробляється ~10 секунд — потрібно прискорити.
+
+- **Причини**:
+  1. Нова HTTP-сесія на кожен запит — немає повторного використання TCP/TLS з'єднання.
+  2. При workers > 1 — затримка 1–3 с перед кожним запитом (навіть порожнім).
+  3. Порожні відповіді (Content-Length: 0) — повне читання тіла не потрібне.
+
+- **Дії**:
+  - **Reuse HTTP session**: одна сесія при workers=1, окрема на воркер при workers>1. Зменшення накладних витрат на з'єднання.
+  - **Early exit для Content-Length: 0**: stream=True, перевірка заголовка, повернення b"" без читання тіла.
+  - **Менша затримка при workers>1**: для запитів після першого — 0.2–0.5 с замість 1–3 с (CADASTRAL_DELAY_SUBSEQUENT_MIN/MAX).
+  - **CADASTRAL_TIMING=1**: діагностика — лог fetch_ms, total_ms, parcels для кожного тайлу.
+  - **count_total_estimated()**: замість count_documents({}) на 16M+ документів — estimated_document_count() (O(1)) для прогрес-бару та _report_progress. Усунуто вузьке місце ~2–15 с на тайл.
+
+## 2026-02-20 — Об'єкти нерухомого майна (ОНМ)
+
+- **Запит**: Упорядкувати та уніфікувати обробку оголошень з кількома об'єктами (ділянки, будівлі, приміщення). Створити сутності ОНМ, витягувати їх з оголошень, зберігати посилання.
+
+- **Уточнення (точність адреси)**: Будівлю без адреси або з неповною адресою створювати можна. Але по неповній адресі (напр. «м. Київ») не поєднуємо будівлі з різних оголошень. Групування тільки за: (1) точною адресою (вулиця + номер будинку), (2) кадастровим номером земельної ділянки — одна ділянка = одна будівля або комплекс.
+
+- **Дії**:
+  - **Колекція real_estate_objects**: єдина колекція з type (land_plot, building, premises). Поля: description, area_sqm, cadastral_info (для land_plot), address, building_info (для building), building_id, floor, premises_type (для premises).
+  - **Міграції 035, 036**: колекція real_estate_objects з індексами; поле real_estate_object_refs у unified_listings.
+  - **RealEstateObjectsRepository**: find_by_cadastral_number, find_building_by_address, find_by_ids, find_by_listing.
+  - **RealEstateObjectsLLMExtractorService**: LLM-екстракція з промптом real_estate_objects_parsing, кеш reo_*.
+  - **RealEstateObjectsService**: process_listing — витягує ОНМ, геокодує адреси, створює/оновлює записи, зливає кадастрову інформацію з cadastral_parcels. Групування: тільки за точною адресою (вулиця+номер) або за кадастровим номером земельної ділянки. find_building_by_land_plot_id для групування по ділянці.
+  - **ProZorro — структурована екстракція**: _extract_objects_from_prozorro_items — витягує ОНМ безпосередньо з auction_data.items (кадастр, itemProps, address). LLM — fallback, якщо items не дають результатів.
+  - **Інтеграція**: sync_olx_listing та sync_prozorro_auction викликають process_listing після upsert.
+  - **Backfill**: scripts/backfill_real_estate_objects.py з опцією --clear-llm-cache.
+  - **API** GET /api/search/real-estate-objects (source, source_id).
+  - **UI**: related_objects_count у картках пошуку; вкладка «Об'єкти нерухомості» в деталях оголошення.
+
+## 2026-02-19 — Прибрати логіку помітки неактивності OLX
+
+- **Запит**: Прибери існуючу логіку помітки неактивності оголошень OLX, позначь все активним.
+
+- **Дії**:
+  - **run_update.py**: видалено блок позначення неактивних (оголошення в БД за період, але відсутні в пошуку).
+  - **search.py**: прибрано фільтр `is_active: {$ne: False}` з _build_olx_filters — показуються всі оголошення OLX.
+  - **unified_listings_service**: для OLX завжди status = "активне" (ігнорується is_active).
+  - **Міграція 034**: olx_listings — is_active=True для всіх; unified_listings (source=olx) — status="активне".
+
+## 2026-02-19 — Уніфікація відображення: сторінка оголошення та пошук
+
+- **Запит**: По-різному виглядає на сторінці оголошення і на сторінці пошуку.
+
+- **Дії**:
+  - **Заголовок**: fixTitlePriceDisplay застосовано і на сторінці деталей (renderUnifiedDetail, renderDetail для OLX) — корекція "| $2" на коректну ціну в USD.
+  - **Бейдж ціни**: однакова логіка: `badgeToShow = price_indicator || price_notes` на сторінці пошуку, сторінці unified-деталей та сторінці olx/prozorro-деталей. Пріоритет: price_indicator (якщо є аналітика), інакше price_notes.
+  - **Відображення ціни на пошуку**: addPriceRow — бейдж показується біля основної метрики (price/m2/ha) залежно від типу оголошення.
+
+## 2026-02-19 — Курс валют, аномалії за одиницю, змішані оголошення
+
+- **Запит**: Коректна конвертація USD→UAH; аномалії тільки за ціною за одиницю (га/м²); змішані оголошення — окрема аналітика з ширшими межами.
+
+- **Дії**:
+  - **Курс**: sync_olx_listing приймає usd_rate_override; reformat передає курс. _ensure_usd_rate() для оновлення при потребі.
+  - **Аномалії**: find_anomalous_listings використовує ТІЛЬКИ price_per_m2_uah або price_per_ha_uah (не price_uah).
+  - **Змішані**: _is_mixed_listing (building_area_sqm>0 і land_area_ha>0). Виключені з загальної статистики (_compute_indicators, _compute_aggregates). Окремий розподіл _get_global_distribution_mixed з IQR_MULTIPLIER_MIXED=2.5.
+
+## 2026-02-19 — Парсер ціни: 4.68 замість 2 000 000 (OLX)
+
+- **Проблема**: Оголошення https://www.olx.ua/.../prodazh-promislovo-bazi-4-68-ga-volin-2-000-000-IDZUDDD.html показувало 4.68 $ замість 2 000 000 $.
+
+- **Причини**:
+  1. `_extract_price_value` повертав перше число — "4.68" (площа) замість "2 000 000" (ціна).
+  2. `parse_detail_page` знаходив price у `<title>`, де є і площа, і ціна.
+  3. Відсутній fallback з URL slug.
+
+- **Дії**:
+  - **`_extract_price_value`**: якщо кілька чисел — повертає найбільше з тих, що >= 100 (ціна зазвичай більша за площу).
+  - **`parse_detail_page`**: спочатку шукає h2/h3/h4 з коротким текстом ціни; не бере price з `title`/`head`.
+  - **`_extract_price_from_olx_url`**: fallback — витягує ціну з slug (патерн X-XXX-XXX перед -ID).
+  - **`_reparse_price_from_text`**: приймає olx_url для fallback з URL.
+
+## 2026-02-19 — Переформатування: re-fetch з OLX
+
+- **Проблема**: Перерахунок не вирішував проблему — ціна залишалась некоректною.
+
+- **Дії**:
+  - **Re-fetch**: перед обробкою ListingReformatService завантажує сторінку оголошення з OLX, парсить її через parse_detail_page. Якщо отримано price_text/price_value — оновлює search_data.
+  - **parse_detail_page**: додано витягування ціни з HTML (data-cy="ad-price", fallback на текст з грн/$/€). Повертає price_text, price_value, currency.
+
+## 2026-02-19 — Переформатування: ціна, аномалії, price_notes
+
+- **Проблема**: Після переформатування оголошення все одно показувало 2$ замість 2 млн; аномальна ціна позначалась як «Вигідна».
+
+- **Дії**:
+  - **ListingReformatService**: повторний парсинг ціни з `price_text`; fallback — витягування з опису/заголовка (патерни $X XXX XXX). Конвертація USD/ EUR в UAH перед compute_price_metrics.
+  - **price_notes**: при виявленні аномалії після переформатування — `set_price_notes("Ціна потребує перевірки")`; якщо аномалії немає — очищення.
+  - **API**: `price_notes` у `_normalize_unified_doc`; для olx/prozorro detail — додаємо price_notes з unified_listings.
+  - **UI**: якщо `price_notes` встановлено — показуємо його замість індикатора «Вигідна»; бейдж «Ціна потребує перевірки» з класом `search-item-price-anomalous`.
+
+## 2026-02-19 — Переформатування оголошень та обробка аномальних цін
+
+- **Запит**: Кнопка «Переформатувати дані» для адмінів, повторна обробка через LLM/гео, контрольна перевірка. Обробка аномальних цін: глобально → по місцевості, LLM-верифікація, позначка «Ціна потребує перевірки».
+
+- **Дії**:
+  - **ListingReformatService**: повторний LLM-парсинг, геокодування, перерахунок метрик для OLX; для ProZorro — повторна синхронізація. Після переформатування — контрольна перевірка аномалій.
+  - **API** POST /api/admin/reformat-listing (source, source_id).
+  - **Кнопка** «Переформатувати дані» на формі оголошення/аукціону (тільки для адмінів).
+  - **PriceAnomalyService**: виявлення аномалій — спочатку глобально (країна), потім по місцевості. Метод set_price_notes для позначки «Ціна потребує перевірки».
+  - **API** POST /api/admin/process-anomalous-prices — ручний запуск пошуку аномальних цін.
+  - **Адмін-меню**: блок «Обробка аномальних цін» з кнопкою «Знайти аномальні ціни».
+  - **data_dictionary**: поле price_notes для unified_listings.
+  - LLM-верифікація (ціна за одиницю, оренда, договірна) — залишена як TODO для подальшої реалізації.
+
+## 2026-02-19 — OLX парсер ціни: роздільник тисяч (·)
+
+- **Проблема**: Оголошення «2 000 000 $» зберігалось як 2 долари.
+
+- **Причина**: OLX використовує middle dot (·) як роздільник тисяч. Regex `[\d\s.]+` давав окремі фрагменти ["2", "000", "000"], поверталось перше значення — 2.
+
+- **Виправлення**: У `_extract_price_value` додано нормалізацію роздільників тисяч: `\u00a0` (nbsp), `\u202f` (narrow nbsp), `\u00b7` (·) → пробіл перед парсингом.
+
+## 2026-02-19 — OLX скрапер: зупинка при однаковій даті, діагностика фільтрів
+
+- **Проблема**: Скрапер заходив на дуже глибокі сторінки (155+), хоча дата останнього оголошення не змінювалась («18 лютого 2026 р.»).
+
+- **Дії**:
+  - **Евристика зупинки**: якщо дата останнього оголошення на сторінці однакова N сторінок поспіль (за замовчуванням 5) — зупиняємо. Конфіг `OLX_SCRAPER_STALE_DATE_PAGES`.
+  - **Лог URL**: на першій сторінці виводимо повний URL пошуку для перевірки наявності `search[order]=created_at:desc`.
+  - **Діагностика парсингу**: при cutoff (days) на першій сторінці логуємо, скільки оголошень мають `listed_at_iso` — для перевірки коректності парсингу дати.
+
+## 2026-02-19 — Сортування за датою: джерело + БД
+
+- **Запит**: Сортування за датою означає дату оновлення в джерелі (source_updated_at), а не в нашій базі. Якщо дата в джерелі однакова — сортуємо за датою оновлення в нашій базі (system_updated_at).
+
+- **Дії**:
+  - **search.py**: search_unified, export endpoints — при сортуванні за source_updated_at додано вторинне сортування за system_updated_at.
+  - **report_templates.py**: той самий патерн для експорту звітів.
+  - **pipeline_executor**: для unified_listings при сортуванні за source_updated_at (за замовчуванням або явно) додано вторинне сортування за system_updated_at.
+
+## 2026-02-19 — OLX скрапер: Accept-Encoding br, сортування землі
+
+- **Проблема**: Скрапер отримував 0 оголошень — HTML приходив як бінарний мусор.
+
+- **Причина**: Заголовок Accept-Encoding: gzip, deflate, br. OLX повертав br (brotli). Без пакета brotli requests не декодує br, і response.text містить стиснуті байти.
+
+- **Виправлення**: fetcher.py — прибрано "br" з Accept-Encoding. Сервер віддає gzip/deflate, requests коректно декодує. Парсер знову знаходить оголошення.
+
+- **Інше**: config.py — get_land_list_url додано sort_newest (search[order]=created_at:desc) для узгодженості з комерційною нерухомістю.
+
+## 2026-02-19 — OLX скрапер: затримка після завантаження, повне оновлення, неактивні оголошення
+
+- **Запит**: OLX додав таймаут — спочатку 0 оголошень, потім підвантаження. Додати опції «Оновити OLX повністю», «Оновити ProZorro повністю», «Оновити дані за місяць». При оновленні за період — позначати неактивними оголошення, що є в БД, але відсутні в пошуку.
+
+- **Дії**:
+  - **OLX fetcher**: затримка після отримання сторінки (DELAY_AFTER_PAGE_LOAD), повторні спроби при 0 оголошень (RETRY_EMPTY_PAGE_COUNT). config.py: DELAY_AFTER_PAGE_LOAD, RETRY_EMPTY_PAGE_COUNT.
+  - **OLX run_update**: параметр `full` — завантаження всіх сторінок пошуку без обмеження; `days=30` для місяця.
+  - **Позначення неактивних**: при оновленні за період (days) — оголошення в БД за період, але відсутні в результатах пошуку, позначаються is_active=False. OlxListingsRepository: mark_inactive_by_urls, find_urls_in_period; upsert_listing приймає is_active.
+  - **UnifiedListingsService**: статус OLX з is_active (активне/неактивне).
+  - **Admin API**: POST /api/admin/data-update з mode=full_olx|full_prozorro, days=1|7|30.
+  - **ProZorro full**: fetch_and_save_real_estate_auctions(full=True) — завантаження ~6 років історії, LLM тільки для активних (llm_only_for_active). _save_auctions_to_database: llm_only_for_active, _is_active_auction. Пакетна обробка по місяцях з паралелізмом (ThreadPoolExecutor, до 6 місяців одночасно).
+  - **UI**: кнопки «Оновити за місяць», «Оновити OLX повністю», «Оновити ProZorro повністю».
+  - **data_dictionary**: поле is_active для olx_listings.
+
+## 2026-02-19 — Кадастрова мапа: індекс місцезнаходження та кластеризація
+
+- **Запит**: Покращити роботу з кадастровою мапою: дослідити структуру кадастрового номера, створити індекс для пошуку за місцезнаходженням, кластеризувати ділянки за спільними кордонами та однаковим призначенням/формою власності.
+
+- **Дії**:
+  - **Парсер кадастрового номера** (`utils/cadastral_code_parser.py`): розбір формату НКЗ:НКК:НЗД, витягування КОАТУУ (перші 10 цифр), коду області (2 цифри), району, міста, зони, кварталу, ділянки.
+  - **Маппінг КОАТУУ** (`config/koatuu_oblast_codes.yaml`): відповідність кодів областей (01–85) до назв (АР Крим, Вінницька, Київ тощо).
+  - **Індекс місцезнаходження** (`cadastral_parcel_location_index`): колекція для пошуку ділянок за областю, районом, префіксом КОАТУУ. Міграція 032, репозиторій, CadastralLocationIndexService.
+  - **Кластеризація** (`cadastral_parcel_clusters`): групування ділянок зі спільними кордонами (або в межах ~5 м), однаковим призначенням та формою власності. Shapely STRtree для пошуку сусідів, union-find для об'єднання. Міграція 033, CadastralClusteringService.
+  - **Інтеграція**: run_scraper при збереженні ділянок індексує їх у location index.
+  - **Скрипти**: `cadastral_build_location_index.py`, `cadastral_build_clusters.py`, `test_cadastral_mechanisms.py`.
+  - **data_dictionary**: опис cadastral_parcel_location_index, cadastral_parcel_clusters.
+
+## 2026-02-19 — Дизайн промптів: завдання → контекст → закріплення
+
+- **Запит**: Внести зміну в усі промпти до LLM: на початку — завдання, потім контекст, далі закріплення завдання. Створити правило для дизайну промптів. Прогнати тести основних пайплайнів.
+
+- **Дії**:
+  - **Правило** `.cursor/rules/prompt-design.mdc`: трьохчастинна структура (завдання → контекст → закріплення), приклади, заборонені/дозволені патерни.
+  - **prompts.yaml**: intent_detection, query_structure, parsing — перебудовано за новою структурою.
+  - **Агенти**: IntentDetectorAgent, QueryStructureAgent, PipelineBuilderAgent — fallback-промпти оновлено.
+  - **Сервіси**: ResultValidatorService, FinalAnswerRefinementService, LLMService (parsing, intent extraction), ReportTemplateService, AnalyticalReasoningService, AgentTestRunnerService — промпти оновлено.
+  - Прогнано тести: `run_agent_test_queries.py --quick` та повний прогон для порівняння результатів.
+
+## 2026-02-19 — Скрапер кадастру: підтримка MultiPolygon у MVT
+
+- **Проблема**: Тайли з raw>0, features=1 повертали parsed=0. Діагностика: geometry type = MultiPolygon.
+
+- **Причина**: Парсер очікував лише Polygon; MultiPolygon має іншу структуру coordinates (масив полігонів).
+
+- **Дії**: `parser.py` — `_decode_geometry` тепер обробляє MultiPolygon: бере перший полігон, його кільця, конвертує в WGS84.
+
+## 2026-02-19 — Скрапер кадастру: усунення сповільнення та rate limiting
+
+- **Проблема**: Скрапер сильно сповільнився, зросла кількість "0 ділянок (тайл порожній або помилка завантаження)".
+
+- **Причини**:
+  1. **index_parcel у циклі** — для кожної ділянки (500–3000/тайл) викликався location_index_service.index_parcel (парсинг + DB upsert). Це створювало велике навантаження.
+  2. **Rate limiting** — 10 workers без затримки між запитами могли отримувати 429 або порожні відповіді.
+
+- **Дії**:
+  - Видалено виклики index_parcel з run_scraper. Індекс будується окремо: `py scripts/cadastral_build_location_index.py`.
+  - При workers > 1 — завжди delay_before перед кожним запитом (зменшення rate limiting).
+
+## 2026-02-19 — Скрапер кадастру: збереження адреси ділянки
+
+- **Запит**: Зберігати адресу ділянки (якщо вказана в кадастрі). Очистити завантажені дані для перезавантаження у новому форматі.
+
+- **Дії**:
+  - **parser.py**: екстракція `address` з MVT properties (address, full_address, addr, адреса).
+  - **data_dictionary.yaml**: поле `address` для cadastral_parcels.
+  - **scripts/clear_cadastral_for_reload.py**: скрипт очищення — видаляє cadastral_parcels, скидає cadastral_scraper_cells на pending.
+  - **cadastral_scraper_research.md**: додано address до таблиці властивостей.
+
+## 2026-02-18 — Скрапер кадастру: паралельна обробка в 5 потоків
+
+- **Запит**: Запуск обробки в 5 потоків.
+
+- **Дії**:
+  - `run_scraper.py`: параметр `workers` (default 1), ThreadPoolExecutor при workers > 1.
+  - Кожен воркер атомарно бере комірку через `get_next_pending_cell()`, обробляє, оновлює shared counters під lock.
+  - `run_cadastral_from_project_root.py`, `main()`: `--workers 5` (default 5 для CLI).
+  - Адмін-панель залишається з workers=1 (не передає параметр).
+
+## 2026-02-18 — Скрапер кадастру: прогрес-бар з ETA
+
+- **Запит**: Додати прогрес-бар з приблизним часом, що лишився.
+
+- **Дії**:
+  - `run_scraper.py`: tqdm-прогрес-бар (тільки для CLI, без progress_callback).
+  - Формат: `{l_bar}{bar}| {n_fmt}/{total_fmt} [elapsed<remaining, rate]`, postfix: ділянок, за_сесію.
+  - `_log_loop()` — лог через pbar.write щоб не ламати відображення бару.
+  - total = max_cells або (cells_total - cells_done) при запуску без ліміту.
+
+## 2026-02-18 — Скрапер кадастру: center-first порядок та zoom 12
+
+- **Проблема**: Скрапер повертав 0 ділянок — перші тайли (NW кут України) порожні.
+
+- **Причина**: Ітерація по cell_id (asc) починала з тайлів над морем/кордоном; тайли з даними (Київ) були в кінці черги.
+
+- **Дії**:
+  - **config.py**: DEFAULT_ZOOM 14→12 (менше тайлів, більша площа; Київський тайл z=12 містить дані), UKRAINE_CENTER_LAT/LON.
+  - **grid_iterator.py**: sort_priority — відстань від центру України (Київ); менше = вищий пріоритет.
+  - **CadastralScraperProgressRepository**: get_next_pending_cell сортує за sort_priority, cell_id; ensure_cells_exist зберігає sort_priority; індекс (status, sort_priority, cell_id).
+  - **Міграція 031**: backfill sort_priority для існуючих комірок (з bbox).
+  - **Admin API**: POST /api/admin/cadastral-scraper/reset-cells — очищення комірок для перезапуску з новою сіткою.
+  - Перша комірка тепер 12_2395_1381 (Київ) — ~1MB даних.
+  - **Діагностика 0 ділянок**: 609 комірок були оброблені раніше (порожні NW тайли), 4 зависли в processing. Зменшено поріг reset_stale до 5 хв, додано POST /cadastral-scraper/reset-stale та кнопку «Скинути завислі» в адмінці.
+  - **Тест зберігає, робочий — ні**: MongoDBConnection — fork-safety: перевірка _init_pid; після fork (uvicorn workers) створюється нове підключення. Явна ініціалізація MongoDB у admin route перед запуском потоку скрапера.
+  - **Ділянки не створюються**: MongoDB 2dsphere відхиляв полігони з самоперетином («Loop is not valid: Edges cross»). parser.py — Shapely make_valid() для виправлення невалідних полігонів; cadastral_parcels_repository — try/except на кожен upsert (пропуск при помилці). requirements.txt — shapely>=2.0.0.
+  - **Скрипт/інтерфейс не збільшують кількість**: run_scraper — os.chdir(project_root) для однакового контексту; діагностика БД у логах та stats (db_info); scripts/run_cadastral_from_project_root.py — обгортка; GET /cadastral-scraper/db-info.
+
+## 2026-02-18 — Дослідження kadastrova-karta.com: vector tiles
+
+- **Запит**: Самостійно дослідити kadastrova-karta.com для визначення джерела даних.
+
+- **Результати дослідження**:
+  - Джерело: Mapbox Vector Tiles (MVT/PBF) — `https://kadastrova-karta.com/tiles/maps/kadastr/land_polygons/{z}/{x}/{y}.pbf`
+  - Zoom 11–16 для детальних ділянок (land_polygons)
+  - Властивості: cadnum, purpose_code, purpose, category, area (га), ownership
+  - Playwright використано для перехоплення мережевих запитів
+
+- **Оновлення скрапера**:
+  - `grid_iterator.py` — перехід на тайлову сітку (z/x/y) замість bbox
+  - `fetcher.py` — завантаження PBF тайлів
+  - `parser.py` — парсинг MVT через `mapbox-vector-tile`, конвертація координат у WGS84
+  - `config.py` — TILE_BASE_URL, LAND_POLYGONS_ZOOM
+  - `requirements.txt` — додано mapbox-vector-tile
+  - `docs/cadastral_scraper_research.md` — оновлено з результатами
+
+## 2026-02-18 — Скрапер кадастрової карти kadastrova-karta.com
+
+- **Запит**: Створити скрапер, що поступово викачує мапу кадастрового реєстру з kadastrova-karta.com по сітці, зберігає дані в БД, керується з адмін-панелі, запам'ятовує оброблені комірки та продовжує при перезапуску.
+
+- **Дії**:
+  - **Дослідження**: `docs/cadastral_scraper_research.md` — інструкція для ручного аналізу мережевих запитів сайту.
+  - **Міграція 030**: колекції `cadastral_parcels`, `cadastral_scraper_cells` з індексами.
+  - **Репозиторії**: `CadastralParcelsRepository`, `CadastralScraperProgressRepository` (bulk seed для сітки).
+  - **Скрапер**: `scripts/cadastral_scraper/` — config, grid_iterator, fetcher, parser, run_scraper. Підтримка HTTP API (після дослідження) та GeoJSON.
+  - **Адмін-панель**: `POST /api/admin/cadastral-scraper/start`, `GET status`, `GET stats`.
+  - **data_dictionary**: опис колекцій cadastral_parcels, cadastral_scraper_cells.
+  - Для роботи з реальними даними потрібно налаштувати `CADASTRAL_API_URL` після дослідження мережевих запитів kadastrova-karta.com.
+
+## 2026-02-18 — Опис системи для клієнта
+
+- **Запит**: Створити опис системи для клієнта без складних технічних термінів: що може система, переваги порівняно з OLX/ProZorro, потенційні напрямки розвитку.
+
+- **Дії**: Створено `docs/client_system_description.md` — опис можливостей (пошук, чат з асистентом, звіти, експорт, аналітика), порівняльна таблиця з OLX/ProZorro, окремий блок перспективних напрямків (карта, додаткові джерела, поглиблене використання AI, збережені пошуки, розширена аналітика).
+
 ## 2026-02-17 — Модульна архітектура: платформа, конфігурація та дані
 
 - **Запит**: Зробити конфігурацію зовнішньою (промпти, налаштування в bundle), експорт/імпорт конфігу та даних, версіонування, відстеження міграцій, перевірка цілісності.

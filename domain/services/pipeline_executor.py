@@ -12,6 +12,8 @@ import pandas as pd
 from domain.managers.collection_manager import (
     BaseCollectionManager,
     UnifiedListingsCollectionManager,
+    ListingAnalyticsCollectionManager,
+    RealEstateObjectsCollectionManager,
 )
 from domain.models.filter_models import (
     FilterElement,
@@ -30,6 +32,8 @@ DEFAULT_SORT_FIELD = {
     "unified_listings": "source_updated_at",
     "prozorro_auctions": "auction_data.dateModified",
     "olx_listings": "updated_at",
+    "listing_analytics": "analysis_at",
+    "real_estate_objects": "updated_at",
 }
 # Фільтр за замовчуванням: лише активні аукціони (якщо користувач не вказав статус)
 DEFAULT_STATUS_ACTIVE = "активне"  # unified_listings
@@ -61,6 +65,8 @@ SORT_FIELD_MAP = {
     },
     "prozorro_auctions": {"price": "auction_data.value.amount"},
     "olx_listings": {"price": "search_data.price"},
+    "listing_analytics": {"date": "analysis_at"},
+    "real_estate_objects": {"type": "type", "area": "area_sqm"},
 }
 
 
@@ -68,6 +74,10 @@ def get_collection_manager(collection: str) -> Optional[BaseCollectionManager]:
     """Повертає CollectionManager для колекції."""
     if collection == "unified_listings":
         return UnifiedListingsCollectionManager()
+    if collection == "listing_analytics":
+        return ListingAnalyticsCollectionManager()
+    if collection == "real_estate_objects":
+        return RealEstateObjectsCollectionManager()
     # Prozorro та Olx — поки що делегуємо на unified_listings якщо джерело зведено
     return None
 
@@ -106,14 +116,17 @@ def execute_pipeline(
     calculate_steps = []
     aggregate_step = None
     
-    # city/region — геофільтр лише для одиночного string; $in/list → звичайні умови (addresses.$elemMatch)
-    GEO_KEYS = frozenset(("city", "region", "addresses.settlement", "addresses.region"))
+    # city/region/exclude_city — геофільтр; $in/list → звичайні умови (addresses.$elemMatch)
+    GEO_KEYS = frozenset(("city", "region", "exclude_city", "addresses.settlement", "addresses.region"))
 
     for step in steps:
         st = step.get("type")
         if st == "filter":
             conds = step.get("conditions") or step.get("filter_metrics") or step.get("filters") or {}
             for k, v in conds.items():
+                if k == "exclude_city" and isinstance(v, str) and not v.startswith("$") and not (v.startswith("{{") and v.endswith("}}")):
+                    geo_filters_dict["exclude_city"] = v
+                    continue
                 if k in GEO_KEYS:
                     # GeoFilterService.from_dict приймає лише string — city/region з $in/in або list йдуть в all_conditions
                     v_list = None
@@ -161,6 +174,7 @@ def execute_pipeline(
     diagnostic_info["applied_filters_count"] = applied_filters_count
     
     # Маппінг полів сортування; за замовчуванням — від нового до старого
+    # Для unified_listings: сортування за датою = source_updated_at (дата в джерелі); при однаковій — system_updated_at (дата в БД)
     sort_mapped = []
     for s in sort_spec:
         field = s.get("field") or s.get("field_path")
@@ -168,7 +182,11 @@ def execute_pipeline(
             phys = SORT_FIELD_MAP.get(collection, {}).get(field) or SourceFieldMapper.get_field_path(field, collection)
             sort_mapped.append({"field": phys, "order": s.get("order", s.get("direction", -1))})
     if not sort_mapped and collection in DEFAULT_SORT_FIELD:
-        sort_mapped = [{"field": DEFAULT_SORT_FIELD[collection], "order": -1}]
+        primary = DEFAULT_SORT_FIELD[collection]
+        sort_mapped = [{"field": primary, "order": -1}]
+    if sort_mapped and collection == "unified_listings" and sort_mapped[0].get("field") == "source_updated_at":
+        if len(sort_mapped) == 1 or sort_mapped[1].get("field") != "system_updated_at":
+            sort_mapped.append({"field": "system_updated_at", "order": sort_mapped[0].get("order", -1)})
     
     try:
         limit_int = int(limit_val) if limit_val is not None else None

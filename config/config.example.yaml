@@ -21,11 +21,13 @@
 
 # Налаштування LLM провайдерів
 llm:
-  # Провайдер за замовчуванням: gemini, openai, anthropic
+  # Провайдер за замовчуванням: gemini, openai, anthropic, ollama
+  # ollama — локальна LLM через Ollama (gemma3:27b), без API ключа
   provider: gemini
   
-  # Назва моделі (для Gemini: gemini-2.5-flash, gemini-2.5-pro, gemini-2.5-flash-lite)
-  # Старі моделі (gemini-1.5-*) більше не підтримуються
+  # Назва моделі:
+  # - Gemini: gemini-2.5-flash, gemini-2.5-pro, gemini-2.5-flash-lite
+  # - Ollama: gemma3:27b, gemma3:12b, llama3.2 тощо
   model_name: gemini-2.5-flash
   
   # Обмеження швидкості запитів
@@ -39,6 +41,9 @@ llm:
   #   max_output_tokens: 8192
   #   temperature: 0.7
   #   time_budget_seconds: 120  # макс. секунд на один process_query; порожньо = без обмеження
+  #   thinking_budget: 8192     # Thinking mode для Gemini (0 = вимкнено; лише AI-асистент)
+  #   google_search_grounding: false  # Google Search grounding — несумісний з function tools (langchain-google)
+  #   include_thoughts: true    # Відображати хід думок у UI
   
   # API ключі для різних провайдерів
   api_keys:
@@ -50,6 +55,9 @@ llm:
     
     # Anthropic (Claude) API ключ
     anthropic: ""
+    
+    # Ollama — локальна LLM, ключ не потрібен (порожній рядок)
+    ollama: ""
 
 # Регламентне фонове оновлення даних (ProZorro + OLX за минулу добу)
 # Працює лише при запуску Telegram бота. Інтервал у хвилинах; 0 = вимкнено

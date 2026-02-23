@@ -222,7 +222,9 @@ class GeoFilterService:
         if not self.geocoding_service:
             return None
         try:
-            result = self.geocoding_service.geocode(query=address, region="ua")
+            result = self.geocoding_service.geocode(
+                query=address, region="ua", caller="geo_filter_service"
+            )
             results_list = result.get("results", [])
             if not results_list:
                 return None

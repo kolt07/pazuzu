@@ -133,7 +133,7 @@ def _collect_and_geocode_locations(
     
     for q in query_strings:
         try:
-            out = geocoding_service.geocode(query=q, region="ua")
+            out = geocoding_service.geocode(query=q, region="ua", caller="olx_scraper")
             geocode_hashes.append(out["query_hash"])
             resolved_locations.append({
                 "query_hash": out["query_hash"],

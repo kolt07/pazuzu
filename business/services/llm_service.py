@@ -9,7 +9,11 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
 
+import logging
+
 from config.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
@@ -96,13 +100,13 @@ class BaseLLMProvider(ABC):
         except Exception:
             pass
         # Fallback — захардкодений промпт (legacy)
-        return f"""Проаналізуй наступний опис аукціону нерухомості та витягни структуровану інформацію.
+        return f"""Тобі необхідно витягти структуровану інформацію з опису аукціону нерухомості у форматі JSON.
 Якщо інформація відсутня або невизначена, поверни порожнє значення або null.
 
-Опис:
+## Опис:
 {description}
 
-Витягни та поверни JSON з наступними полями:
+## Закріплення завдання — витягни та поверни JSON з наступними полями:
 - cadastral_number: кадастровий номер, номер земельного кадастру (строка, якщо є). 
   Шукай формати типу "6320685503:03:000:0202" або подібні. Якщо є кілька номерів - використовуй основний.
 - building_area_sqm: площа нерухомості (будівель, споруд, приміщень, квартир) в квадратних метрах (число, якщо є).
@@ -730,25 +734,202 @@ class AnthropicLLMProvider(BaseLLMProvider):
         }
 
 
+class OllamaLLMProvider(BaseLLMProvider):
+    """Провайдер для локальної LLM через Ollama (gemma3:27b тощо)."""
+
+    def __init__(self, api_key: str, rate_limiter: RateLimiter, model_name: str = 'gemma3:27b'):
+        super().__init__(api_key or '', rate_limiter)
+        try:
+            from ollama import Client
+            self.client = Client()
+            self.model_name = model_name
+        except ImportError:
+            raise ImportError("Для використання Ollama потрібно встановити ollama: pip install ollama")
+
+    def parse_auction_description(self, description: str) -> Dict[str, Any]:
+        """Парсить опис аукціону через Ollama API."""
+        if not description or not description.strip():
+            return self._empty_result()
+
+        self.rate_limiter.wait_if_needed()
+
+        try:
+            prompt = self._create_parsing_prompt(description)
+            response = self.client.generate(
+                model=self.model_name,
+                prompt=prompt,
+                options={"temperature": 0.0},
+            )
+            response_text = (response.get("response") or "").strip()
+            if not response_text:
+                return self._empty_result()
+
+            json_text = self._extract_json_from_response(response_text)
+            if not json_text:
+                return self._empty_result()
+
+            result = json.loads(json_text)
+            if isinstance(result, list):
+                if len(result) > 0 and isinstance(result[0], dict):
+                    result = result[0]
+                else:
+                    return self._empty_result()
+            elif not isinstance(result, dict):
+                return self._empty_result()
+
+            return self._normalize_result(result)
+        except Exception as e:
+            print(f"Помилка при парсингу через Ollama: {e}")
+            return self._empty_result()
+
+    def _extract_json_from_response(self, text: str) -> str:
+        """Витягує JSON з відповіді."""
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            json_lines = []
+            in_json = False
+            for line in lines:
+                if line.strip().startswith("```"):
+                    if not in_json:
+                        in_json = True
+                    else:
+                        break
+                    continue
+                if in_json:
+                    json_lines.append(line)
+            return "\n".join(json_lines)
+        if "{" in text:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return text[start : end + 1]
+        return text
+
+    def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Нормалізує результат парсингу (аналог GeminiLLMProvider)."""
+        addresses = result.get("addresses", [])
+        if not addresses and (result.get("address_region") or result.get("address_city")):
+            addresses = [{
+                "region": result.get("address_region", ""),
+                "district": result.get("address_district", ""),
+                "settlement_type": result.get("address_settlement_type", ""),
+                "settlement": result.get("address_city", ""),
+                "settlement_district": result.get("address_settlement_district", ""),
+                "street_type": result.get("address_street_type", ""),
+                "street": result.get("address_street", ""),
+                "building": result.get("address_building", ""),
+                "building_part": result.get("address_building_part", ""),
+                "room": result.get("address_room", ""),
+            }]
+
+        building_area_sqm = result.get("building_area_sqm", "")
+        land_area_ha = result.get("land_area_ha", "")
+        if not building_area_sqm and not land_area_ha:
+            old_area = result.get("area", "")
+            old_unit = result.get("area_unit", "")
+            if old_area:
+                try:
+                    area_value = float(str(old_area).replace(",", ".").replace(" ", ""))
+                    if old_unit:
+                        unit_lower = str(old_unit).lower()
+                        if any(x in unit_lower for x in ["гектар", "hectare", "га"]):
+                            land_area_ha = area_value
+                        elif any(x in unit_lower for x in ["м²", "м2", "кв.м", "квадратний метр"]):
+                            building_area_sqm = area_value
+                        elif any(x in unit_lower for x in ["сотка", "соток"]):
+                            land_area_ha = area_value * 0.01 if area_value < 100 else area_value * 100
+                    else:
+                        building_area_sqm = area_value if area_value > 1000 else ""
+                        land_area_ha = area_value if area_value < 10 else ""
+                except (ValueError, AttributeError):
+                    pass
+
+        tags_raw = result.get("tags", [])
+        tags = [str(t).strip().lower() for t in (tags_raw if isinstance(tags_raw, list) else []) if t and str(t).strip()]
+        tags = list(dict.fromkeys(tags))
+
+        return {
+            "cadastral_number": result.get("cadastral_number", ""),
+            "building_area_sqm": building_area_sqm if building_area_sqm else "",
+            "land_area_ha": land_area_ha if land_area_ha else "",
+            "addresses": addresses,
+            "floor": result.get("floor", ""),
+            "property_type": result.get("property_type", ""),
+            "utilities": result.get("utilities", ""),
+            "tags": tags,
+            "arrests_info": result.get("arrests_info", ""),
+        }
+
+    def _empty_result(self) -> Dict[str, Any]:
+        """Повертає порожній результат."""
+        return {
+            "cadastral_number": "",
+            "building_area_sqm": "",
+            "land_area_ha": "",
+            "addresses": [],
+            "floor": "",
+            "property_type": "",
+            "utilities": "",
+            "tags": [],
+            "arrests_info": "",
+        }
+
+    def generate_text(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.0,
+    ) -> str:
+        """Генерує текст за промптом через Ollama."""
+        self.rate_limiter.wait_if_needed()
+        try:
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            response = self.client.chat(
+                model=self.model_name,
+                messages=messages,
+                options={"temperature": temperature},
+            )
+            return (response.get("message", {}).get("content") or "").strip()
+        except Exception:
+            return ""
+
+
 class LLMService:
     """Сервіс для роботи з LLM провайдерами."""
-    
+
     def __init__(self, settings: Optional[Settings] = None):
         """
         Ініціалізація сервісу.
-        
+
         Args:
             settings: Налаштування застосунку
         """
         self.settings = settings or Settings()
         self.rate_limiter = RateLimiter(self.settings.llm_rate_limit_calls_per_minute)
         self.provider = self._create_provider()
+        self._logging = None
+
+    def _get_logging(self):
+        if self._logging is None:
+            try:
+                from business.services.logging_service import LoggingService
+                self._logging = LoggingService()
+            except Exception:
+                pass
+        return self._logging
     
     def _create_provider(self) -> BaseLLMProvider:
         """Створює провайдера на основі налаштувань."""
         provider_name = self.settings.llm_provider.lower()
         api_key = self.settings.llm_api_keys.get(provider_name, '')
         
+        if provider_name == 'ollama':
+            model_name = getattr(self.settings, 'llm_model_name', 'gemma3:27b')
+            return OllamaLLMProvider(api_key, self.rate_limiter, model_name)
         if not api_key:
             raise ValueError(f"API ключ для провайдера {provider_name} не вказано в конфігурації")
         
@@ -765,14 +946,61 @@ class LLMService:
     def parse_auction_description(self, description: str) -> Dict[str, Any]:
         """
         Парсить опис аукціону та повертає структуровані дані.
-        
+
         Args:
             description: Текст опису аукціону
-            
+
         Returns:
             Dict з структурованою інформацією
         """
+        log_svc = self._get_logging()
+        if log_svc:
+            try:
+                log_svc.log_api_usage(
+                    service="llm",
+                    source="llm_service.parse_auction_description",
+                    from_cache=False,
+                    metadata={"desc_preview": (description or "")[:80] + ("..." if len(description or "") > 80 else "")},
+                )
+            except Exception as e:
+                logger.debug("log_api_usage (parse_auction): %s", e)
         return self.provider.parse_auction_description(description)
+
+    def parse_real_estate_objects(self, description: str) -> Dict[str, Any]:
+        """
+        Витягує об'єкти нерухомого майна (ОНМ) з опису оголошення.
+
+        Args:
+            description: Текст опису оголошення
+
+        Returns:
+            Dict з ключем "objects" — масив об'єктів (land_plot, building, premises)
+        """
+        if not description or not description.strip():
+            return {"objects": []}
+        try:
+            from config.config_loader import get_config_loader
+            loader = get_config_loader()
+            template = loader.get_prompt("real_estate_objects_parsing")
+            if not template:
+                return {"objects": []}
+            prompt = template.format(description=description)
+        except Exception:
+            return {"objects": []}
+        raw = self.generate_text(prompt, temperature=0.0)
+        if not raw or not raw.strip():
+            return {"objects": []}
+        json_text = self._extract_json_from_intent_response(raw)
+        if not json_text:
+            return {"objects": []}
+        try:
+            data = json.loads(json_text)
+            objects = data.get("objects")
+            if not isinstance(objects, list):
+                return {"objects": []}
+            return {"objects": objects}
+        except json.JSONDecodeError:
+            return {"objects": []}
 
     def extract_intent_for_routing(
         self,
@@ -791,6 +1019,17 @@ class LLMService:
             return {"intent": "query", "confidence": 0.5}
 
         try:
+            log_svc = self._get_logging()
+            if log_svc:
+                try:
+                    log_svc.log_api_usage(
+                        service="llm",
+                        source="llm_service.extract_intent_for_routing",
+                        from_cache=False,
+                        metadata={"query_preview": (user_query or "")[:80] + ("..." if len(user_query or "") > 80 else "")},
+                    )
+                except Exception as e:
+                    logger.debug("log_api_usage (extract_intent): %s", e)
             raw = self.provider.generate_text(
                 prompt,
                 system_prompt="Ти класифікатор намірів. Повертай тільки валідний JSON без пояснень.",
@@ -818,12 +1057,24 @@ class LLMService:
         prompt: str,
         system_prompt: Optional[str] = None,
         temperature: float = 0.0,
+        _caller: Optional[str] = None,
     ) -> str:
         """
         Генерує текст за промптом (для плану аналітики тощо). Повертає порожній рядок, якщо провайдер не підтримує.
         """
         if not hasattr(self.provider, "generate_text"):
             return ""
+        log_svc = self._get_logging()
+        if log_svc:
+            try:
+                log_svc.log_api_usage(
+                    service="llm",
+                    source=_caller or "llm_service.generate_text",
+                    from_cache=False,
+                    metadata={"prompt_preview": (prompt or "")[:80] + ("..." if len(prompt or "") > 80 else "")},
+                )
+            except Exception as e:
+                logger.debug("log_api_usage (generate_text): %s", e)
         try:
             return self.provider.generate_text(
                 prompt,
@@ -839,11 +1090,12 @@ class LLMService:
         now = datetime.now(timezone.utc)
         date_ctx = f"Поточна дата/час (UTC): {now.isoformat()}. Періоди: остання добу = last_1_day, останні 7 днів = last_7_days, останні 30 днів = last_30_days."
         ctx_block = f"\nКонтекст розмови (коротко):\n{context[:800]}" if context else ""
-        return f"""Визнач намір користувача за запитом. {date_ctx}{ctx_block}
+        return f"""Тобі необхідно визначити намір користувача за запитом. {date_ctx}{ctx_block}
 
-Запит користувача:
+## Запит користувача:
 {user_query[:2000]}
 
+## Закріплення завдання:
 Поверни ТІЛЬКИ один JSON-об'єкт без коментарів з полями:
 - intent: один з "report_last_day", "report_last_week", "export_data", "query", "analytical_query"
 - confidence: число від 0 до 1 (впевненість у класифікації)

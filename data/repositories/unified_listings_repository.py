@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from data.repositories.base_repository import BaseRepository
+from utils.olx_url import normalize_olx_listing_url
 
 COLLECTION_NAME = "unified_listings"
 
@@ -52,6 +53,7 @@ class UnifiedListingsRepository(BaseRepository):
     def find_by_source_id(self, source: str, source_id: str) -> Optional[Dict[str, Any]]:
         """
         Знаходить оголошення за джерелом та ID в джерелі.
+        Для OLX: приймає URL з query (search_reason) — шукає за канонічним.
         
         Args:
             source: Джерело даних ("olx" або "prozorro")
@@ -62,6 +64,12 @@ class UnifiedListingsRepository(BaseRepository):
         """
         self._ensure_indexes()
         doc = self.collection.find_one({"source": source, "source_id": source_id})
+        if doc:
+            return _normalize_doc(doc)
+        if source.lower() == "olx" and source_id and "?" in source_id:
+            canonical = normalize_olx_listing_url(source_id)
+            if canonical:
+                doc = self.collection.find_one({"source": "olx", "source_id": canonical})
         return _normalize_doc(doc)
 
     def upsert_listing(self, listing_data: Dict[str, Any]) -> bool:
@@ -178,3 +186,45 @@ class UnifiedListingsRepository(BaseRepository):
         self._ensure_indexes()
         docs = list(self.collection.find(criteria))
         return [_normalize_doc(d) for d in docs]
+
+    def delete_by_source_id(self, source: str, source_id: str) -> int:
+        """
+        Видаляє оголошення за джерелом та ID в джерелі.
+        Для OLX: приймає URL, шукає за канонічним.
+        Повертає кількість видалених документів (0 або 1).
+        """
+        if not source or not source_id:
+            return 0
+        result = self.collection.delete_one({"source": source, "source_id": source_id})
+        if result.deleted_count > 0:
+            return result.deleted_count
+        if source.lower() == "olx" and source_id:
+            canonical = normalize_olx_listing_url(source_id)
+            if canonical and canonical != source_id:
+                result = self.collection.delete_one({"source": "olx", "source_id": canonical})
+        return result.deleted_count
+
+    def update_real_estate_object_refs(
+        self,
+        source: str,
+        source_id: str,
+        refs: List[Dict[str, Any]],
+    ) -> bool:
+        """
+        Оновлює посилання на об'єкти нерухомого майна (ОНМ).
+
+        Args:
+            source: Джерело (olx, prozorro)
+            source_id: ID в джерелі
+            refs: Масив {object_id: str, role: str}
+
+        Returns:
+            True якщо оновлено
+        """
+        if not refs:
+            return False
+        result = self.collection.update_one(
+            {"source": source, "source_id": source_id},
+            {"$set": {"real_estate_object_refs": refs}},
+        )
+        return result.modified_count > 0
