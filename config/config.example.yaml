@@ -44,6 +44,7 @@ llm:
   #   thinking_budget: 8192     # Thinking mode для Gemini (0 = вимкнено; лише AI-асистент)
   #   google_search_grounding: false  # Google Search grounding — несумісний з function tools (langchain-google)
   #   include_thoughts: true    # Відображати хід думок у UI
+  #   use_langgraph: false     # LangGraph state machine замість while-циклу (checkpoints, durable execution)
   
   # API ключі для різних провайдерів
   api_keys:

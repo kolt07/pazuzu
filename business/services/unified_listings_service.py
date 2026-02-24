@@ -24,6 +24,7 @@ class UnifiedListingsService:
 
     def __init__(self, settings=None):
         """Ініціалізація сервісу."""
+        self.settings = settings
         self.unified_repo = UnifiedListingsRepository()
         self.olx_repo = OlxListingsRepository()
         self.prozorro_repo = ProZorroAuctionsRepository()
@@ -327,6 +328,9 @@ class UnifiedListingsService:
             prop_type = (llm.get("property_type") or "").strip()
             if prop_type:
                 prop_type_lower = prop_type.lower()
+                # Земля с/г призначення — перевіряємо першим, щоб не звести до "Земельна ділянка"
+                if "с/г" in prop_type_lower or "сільськогосподарськ" in prop_type_lower:
+                    return "Землі с/г призначення"
                 if "земля" in prop_type_lower or "ділянка" in prop_type_lower:
                     if "нерухомість" in prop_type_lower or "будівл" in prop_type_lower:
                         return "Земельна ділянка з нерухомістю"
@@ -337,6 +341,8 @@ class UnifiedListingsService:
             # Fallback: якщо LLM не повернув тип — інферуємо з заголовка/опису
             search_data = doc.get("search_data", {})
             title = ((search_data.get("title") or "") + " " + (detail.get("description") or "")).lower()
+            if "с/г" in title or "сільськогосподарськ" in title:
+                return "Землі с/г призначення"
             if any(kw in title for kw in ("земельн", "земля", "ділянк", "соток", "га ", " гектар")):
                 if any(kw in title for kw in ("будинк", "будівл", "приміщен", "офіс", "склад", "магазин")):
                     return "Земельна ділянка з нерухомістю"

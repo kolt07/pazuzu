@@ -412,12 +412,22 @@ def _process_region(
     return total_listings, total_detail_fetches, by_category, all_search_urls
 
 
-# Базові категорії: нежитлова нерухомість + земельні ділянки.
-# Фактичні пошуки виконуються по областях (config/olx_region_slugs.yaml) — до 25 сторінок на область.
-BASE_CATEGORIES: List[Dict[str, Any]] = [
-    {"label": "Нежитлова нерухомість", "get_list_url": scraper_config.get_commercial_real_estate_list_url},
-    {"label": "Земельні ділянки", "get_list_url": scraper_config.get_land_list_url},
-]
+# Базові категорії: нежитлова нерухомість + земля по типах (без с/г).
+# Земля: окрема категорія на тип з olx_land_type_slugs — фільтрація на рівні URL OLX.
+def _get_base_categories() -> List[Dict[str, Any]]:
+    """Повертає базові категорії: комерційна + земля по типах (без с/г)."""
+    cats: List[Dict[str, Any]] = [
+        {"label": "Нежитлова нерухомість", "get_list_url": scraper_config.get_commercial_real_estate_list_url},
+    ]
+    land_slugs = scraper_config.get_olx_land_type_slugs()
+    for label, slug in land_slugs.items():
+        get_fn = lambda p, fn=scraper_config.get_land_list_url, lt=slug, **kw: fn(p, land_type_slug=lt, **kw)
+        cats.append({"label": f"Земля — {label}", "get_list_url": get_fn})
+    if not land_slugs:
+        cats.append({"label": "Земельні ділянки", "get_list_url": scraper_config.get_land_list_url})
+    return cats
+
+
 
 
 def _build_region_categories() -> List[Dict[str, Any]]:
@@ -441,7 +451,7 @@ def _build_region_categories() -> List[Dict[str, Any]]:
             },
         ]
     categories = []
-    for base in BASE_CATEGORIES:
+    for base in _get_base_categories():
         for region_name, region_slug in slugs.items():
             get_fn = base["get_list_url"]
             # Замикання: rs=region_slug у default-аргументі, щоб не захопити змінну циклу
@@ -471,7 +481,7 @@ def _build_regions_with_categories() -> List[Tuple[str, List[Dict[str, Any]]]]:
     result = []
     for region_name, region_slug in slugs.items():
         cats = []
-        for base in BASE_CATEGORIES:
+        for base in _get_base_categories():
             get_fn = base["get_list_url"]
             get_list_url = lambda p, fn=get_fn, rs=region_slug: fn(p, region_slug=rs)
             cats.append({

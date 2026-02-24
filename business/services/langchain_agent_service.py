@@ -308,7 +308,7 @@ class LangChainAgentService:
         
         # Флаг для відстеження, чи вже згенеровано Excel файл для поточного запиту
         self.excel_generated = False
-        # Метрики останнього запиту (для observability): iterations, duration_seconds
+        # Метрики останнього запиту (для observability): iterations, duration_seconds, tool_failures_count, tool_recovery_attempted
         self._last_request_metrics: Dict[str, Any] = {}
     
     def _create_llm(self):
@@ -367,6 +367,23 @@ class LangChainAgentService:
         if user_id not in self._user_memories:
             self._user_memories[user_id] = UserConversationMemory()
         return self._user_memories[user_id]
+
+    def _build_request_metrics(
+        self,
+        iteration: int,
+        start_time: float,
+        time_budget_exceeded: bool = False,
+    ) -> Dict[str, Any]:
+        """Формує словник метрик запиту для observability (recovery metrics включено)."""
+        m = {
+            "iterations": iteration,
+            "duration_seconds": time.perf_counter() - start_time,
+            "tool_failures_count": getattr(self, "_tool_failures_this_request", 0),
+            "tool_recovery_attempted": getattr(self, "_had_tool_failure_before_success", False),
+        }
+        if time_budget_exceeded:
+            m["time_budget_exceeded"] = True
+        return m
 
     def _summarize_exchanges(self, exchanges: List[Tuple[str, str]]) -> str:
         """Саммарізує список обмінів (ConversationSummaryMemory-стиль) через LLM."""
@@ -1946,6 +1963,8 @@ Important: Use terms from the glossary correctly."""
         self._current_chat_id = chat_id
         start_time = time.perf_counter()
         self._last_request_metrics = {}
+        self._tool_failures_this_request = 0
+        self._had_tool_failure_before_success = False
         log_ctx = f"[request_id={req_id}] "
         logger.info("="*80)
         logger.info("%sПОЧАТОК ОБРОБКИ ЗАПИТУ (LangChain Agent)", log_ctx)
@@ -1967,6 +1986,56 @@ Important: Use terms from the glossary correctly."""
                 self._last_request_metrics["duration_seconds"] = duration_sec
             logger.info("%sЗАВЕРШЕНО ОБРОБКУ ЗАПИТУ | duration_sec=%.2f", log_ctx, duration_sec)
             logger.info("="*80)
+
+    def _run_langgraph_loop(
+        self,
+        tools_for_request: List[Any],
+        user_id: Optional[str],
+        user_query: str,
+        chat_id: Optional[str],
+        req_id: str,
+        log_ctx: str,
+        start_time: float,
+        stream_callback: Optional[Callable[[str], None]] = None,
+        thinking_callback: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """Запускає агента через LangGraph state machine (agent -> tools -> agent)."""
+        from business.services.langgraph_agent_runner import build_agent_graph
+        max_iter = getattr(self.settings, 'llm_agent_max_iterations', self.MAX_ITERATIONS)
+        graph = build_agent_graph(self, list(tools_for_request), max_iterations=max_iter)
+        initial = {"messages": list(self.conversation_history), "iteration": 0}
+        result = graph.invoke(initial)
+        messages = result.get("messages", [])
+        iteration = result.get("iteration", 0)
+        # Витягуємо останню текстову відповідь
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and hasattr(msg, 'content') and msg.content:
+                content = msg.content
+                if isinstance(content, list):
+                    parts = [p.get("text", "") if isinstance(p, dict) and p.get("type") == "text" else str(p) for p in content if isinstance(p, (str, dict))]
+                    content = "\n".join(p for p in parts if p)
+                if content and isinstance(content, str) and content.strip():
+                    self._save_response_to_memory(user_id, user_query, content.strip(), chat_id)
+                    self._last_request_metrics = self._build_request_metrics(iteration, start_time)
+                    return content.strip()
+        # Fallback: досягнуто max ітерацій без текстової відповіді
+        fallback_msg = HumanMessage(
+            content="[СИСТЕМА] Досягнуто ліміт ітерацій. На основі наявних даних дай фінальну відповідь текстом. НЕ викликай інструменти."
+        )
+        try:
+            resp = self.llm.invoke(list(messages) + [fallback_msg])
+            fc = getattr(resp, 'content', None)
+            if fc:
+                if isinstance(fc, list):
+                    fc = "\n".join(str(x.get("text", x)) if isinstance(x, dict) else str(x) for x in fc)
+                if isinstance(fc, str) and fc.strip():
+                    self._save_response_to_memory(user_id, user_query, fc.strip(), chat_id)
+                    self._last_request_metrics = self._build_request_metrics(iteration, start_time)
+                    return fc.strip()
+        except Exception as e:
+            logger.warning("%sLangGraph fallback LLM failed: %s", log_ctx, e)
+        self._last_request_metrics = self._build_request_metrics(iteration, start_time)
+        return "Не вдалося сформувати відповідь після максимальної кількості ітерацій."
 
     def _process_query_impl(
         self,
@@ -2113,6 +2182,18 @@ Important: Use terms from the glossary correctly."""
         user_msg = HumanMessage(content=user_query)
         self.conversation_history.append(user_msg)
         
+        # LangGraph path: state machine з checkpoints (якщо use_langgraph=True)
+        if getattr(self.settings, 'llm_agent_use_langgraph', False):
+            try:
+                from business.services.langgraph_agent_runner import build_agent_graph, LANGGRAPH_AVAILABLE
+                if LANGGRAPH_AVAILABLE:
+                    return self._run_langgraph_loop(
+                        tools_for_request, user_id, user_query, chat_id,
+                        req_id, log_ctx, start_time, stream_callback, thinking_callback,
+                    )
+            except Exception as e:
+                logger.warning("%sLangGraph loop failed, falling back to while loop: %s", log_ctx, e)
+        
         # Підказка при запиті на звіт/експорт за добу — щоб агент обов'язково викликав інструменти
         _q = (user_query or "").strip().lower()
         if any(phrase in _q for phrase in ("звіт за добу", "виведи звіт", "експорт за добу", "оголошення за добу", "звіт за день")):
@@ -2130,7 +2211,7 @@ Important: Use terms from the glossary correctly."""
         while iteration < max_iterations:
             if time_budget_seconds and (time.perf_counter() - start_time) > time_budget_seconds:
                 logger.warning("%sЧас вичерпано (time budget %s с). Зупинка.", log_ctx, time_budget_seconds)
-                self._last_request_metrics = {"iterations": iteration, "duration_seconds": time.perf_counter() - start_time, "time_budget_exceeded": True}
+                self._last_request_metrics = self._build_request_metrics(iteration, start_time, time_budget_exceeded=True)
                 return "Час обробки запиту вичерпано. Спробуйте скоротити запит або повторити пізніше."
             iteration += 1
             logger.info("%s--- Ітерація %s/%s ---", log_ctx, iteration, max_iterations)
@@ -2221,7 +2302,7 @@ Important: Use terms from the glossary correctly."""
                     if response_content and response_content.strip():
                         logger.info("%sЗнайдено фінальну текстову відповідь", log_ctx)
                         self._save_response_to_memory(user_id, user_query, response_content, getattr(self, "_current_chat_id", None))
-                        self._last_request_metrics = {"iterations": iteration, "duration_seconds": time.perf_counter() - start_time}
+                        self._last_request_metrics = self._build_request_metrics(iteration, start_time)
                         return response_content
 
                     # Порожня відповідь без викликів: підказка про фінальну відповідь (один раз, при повторі — коротша)
@@ -2417,6 +2498,12 @@ Important: Use terms from the glossary correctly."""
                                 tool_result = {'success': False, 'error': str(e)}
                     
                     logger.info(f"Результат tool {tool_name}: success={tool_result.get('success', False)}")
+                    # Метрики recovery: підрахунок помилок та відстеження спроби іншого підходу
+                    if isinstance(tool_result, dict) and tool_result.get('success') is False:
+                        self._tool_failures_this_request = getattr(self, '_tool_failures_this_request', 0) + 1
+                    else:
+                        if getattr(self, '_tool_failures_this_request', 0) > 0:
+                            self._had_tool_failure_before_success = True
                     
                     # Логуємо, якщо отримано результати для Excel / експорту
                     if tool_name in ['execute_query', 'execute_aggregation'] and tool_result.get('success'):
@@ -2458,12 +2545,33 @@ Important: Use terms from the glossary correctly."""
                             if isinstance(tool_args, dict):
                                 coll = (tool_args.get("collection_name") or tool_args.get("collection") or
                                         (tool_args.get("query") or {}).get("collection", "")) or ""
-                            if user_wants_file and coll in ("prozorro_auctions", "olx_listings") and isinstance(tool_result, dict):
+                            if isinstance(tool_result, dict):
                                 tool_result = dict(tool_result)
-                                tool_result["_agent_hint"] = (
-                                    f"Користувач просив файл Excel. Запит повернув 0 записів. "
-                                    f"Викликай export_listings_to_file з ids=[] та collection={coll}, щоб надіслати порожній файл (файл відправиться автоматично)."
-                                )
+                                hint_parts = []
+                                if user_wants_file and coll in ("prozorro_auctions", "olx_listings"):
+                                    hint_parts.append(
+                                        f"Користувач просив файл Excel. Запит повернув 0 записів. "
+                                        f"Викликай export_listings_to_file з ids=[] та collection={coll}, щоб надіслати порожній файл (файл відправиться автоматично)."
+                                    )
+                                # Retry при порожніх результатах: підказка про альтернативну колекцію (ProZorro↔OLX)
+                                if not hint_parts or not user_wants_file:
+                                    if coll == "prozorro_auctions":
+                                        hint_parts.append(
+                                            "По ProZorro результатів 0. Спробуй execute_query/execute_aggregation з collection: 'olx_listings' "
+                                            "(ті ж фільтри, updated_at замість auction_data.dateModified) або execute_analytics з collection: 'olx_listings'."
+                                        )
+                                    elif coll == "olx_listings":
+                                        hint_parts.append(
+                                            "По OLX результатів 0. Спробуй execute_query/execute_aggregation з collection: 'prozorro_auctions' "
+                                            "(auction_data.dateModified — рядки ISO 8601) або execute_analytics з collection: 'prozorro_auctions'."
+                                        )
+                                    elif coll == "unified_listings":
+                                        hint_parts.append(
+                                            "По unified_listings результатів 0. Спробуй окремо prozorro_auctions та olx_listings "
+                                            "(execute_query/execute_aggregation або execute_analytics для кожної колекції)."
+                                        )
+                                if hint_parts:
+                                    tool_result["_agent_hint"] = (tool_result.get("_agent_hint") or "") + " " + " ".join(hint_parts)
                     
                     # Логуємо результати execute_analytics та підказка агенту
                     if tool_name == 'execute_analytics' and tool_result.get('success'):
@@ -2505,6 +2613,17 @@ Important: Use terms from the glossary correctly."""
                             logger.info(f"ℹ️ Результат обрізано: передано count={len(data_list)} та ids_for_export ({len(ids_for_export)} id) замість повних записів")
                             tool_result = truncated
                     
+                    # Error recovery hint: при success=false додаємо інструкцію само-корекції (PALADIN, Reflexion)
+                    if isinstance(tool_result, dict) and tool_result.get('success') is False:
+                        error_hint = (
+                            "[ПОМИЛКА ІНСТРУМЕНТУ] Результат невдалий. Проаналізуй причину "
+                            "(невірні параметри, порожні дані, заборонені операції) і спробуй інший підхід: "
+                            "інший інструмент, інші фільтри або зміна стратегії запиту.\n\n"
+                        )
+                        existing = tool_result.get('_agent_hint', '')
+                        tool_result = dict(tool_result)
+                        tool_result['_agent_hint'] = (error_hint + existing).strip() if existing else error_hint.strip()
+
                     # Створюємо ToolMessage для LangChain: підказку (_agent_hint) виводимо першою, щоб агент її врахував
                     if isinstance(tool_result, dict) and tool_result.get('_agent_hint'):
                         hint_text = tool_result.get('_agent_hint', '')
@@ -2525,7 +2644,7 @@ Important: Use terms from the glossary correctly."""
                 
             except Exception as e:
                 logger.exception("%sПомилка в ітерації %s: %s", log_ctx, iteration, e)
-                self._last_request_metrics = {"iterations": iteration, "duration_seconds": time.perf_counter() - start_time}
+                self._last_request_metrics = self._build_request_metrics(iteration, start_time)
                 error_msg = f"Помилка обробки запиту: {str(e)}"
                 return error_msg
         
@@ -2581,12 +2700,12 @@ Important: Use terms from the glossary correctly."""
                     final_str = str(fc)
                 if final_str.strip():
                     self._save_response_to_memory(user_id, user_query, final_str, chat_id)
-                self._last_request_metrics = {"iterations": iteration, "duration_seconds": time.perf_counter() - start_time}
+                self._last_request_metrics = self._build_request_metrics(iteration, start_time)
                 return final_str
             else:
-                self._last_request_metrics = {"iterations": iteration, "duration_seconds": time.perf_counter() - start_time}
+                self._last_request_metrics = self._build_request_metrics(iteration, start_time)
                 return "Не вдалося сформувати відповідь після максимальної кількості ітерацій."
         except Exception as e:
             logger.exception("%sПомилка формування фінальної відповіді: %s", log_ctx, e)
-            self._last_request_metrics = {"iterations": iteration, "duration_seconds": time.perf_counter() - start_time}
+            self._last_request_metrics = self._build_request_metrics(iteration, start_time)
             return f"Помилка формування відповіді: {str(e)}"

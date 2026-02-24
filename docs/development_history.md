@@ -1,5 +1,45 @@
 # Історія розробки
 
+## 2026-02-24 — Фільтрація землі OLX за типами (без с/г, без LLM)
+
+- **Запит**: При завантаженні земельних ділянок з OLX завантажувати всі, окрім сільськогосподарського призначення — через фільтри OLX (як області й типи оголошень), без використання LLM.
+
+- **Дії**:
+  - **config/olx_land_type_slugs.yaml**: словник типів землі (житлова, оздоровча, рекреаційна, лісова, водна, промислова, запасу) — с/г виключено.
+  - **scripts/olx_scraper/config.py**: `LAND_SALE_PATH`, `get_olx_land_type_slugs()`, `get_land_list_url(land_type_slug=...)` — URL типу `.../prodazha-zemli/{land_type_slug}/{region_slug}/`.
+  - **scripts/olx_scraper/run_update.py**: `_get_base_categories()` — замість однієї «Земельні ділянки» 7 категорій за типами з olx_land_type_slugs.
+  - Прибрано LLM-фільтрацію с/г з UnifiedListingsService та config (olx.exclude_agricultural_land).
+
+## 2026-02-24 — Подальші кроки ревʼю: метрики recovery, retry, LangGraph
+
+- **Запит**: Реалізувати всі три подальші кроки з ревʼю AI-помічника.
+
+- **Дії**:
+  - **Метрики recovery**: `tool_failures_count`, `tool_recovery_attempted` у `_last_request_metrics` та `agent_activity_log`; `_build_request_metrics()` для формування словника.
+  - **Retry при порожніх результатах**: розширено `_agent_hint` для execute_query/execute_aggregation з 0 результатів — підказки про альтернативні колекції (prozorro↔olx, unified→both).
+  - **LangGraph**: додано `langgraph>=0.2.0`; `business/services/langgraph_agent_runner.py` — StateGraph (agent→tools→agent), checkpointer MemorySaver; `llm_agent_use_langgraph` у config (default false); інтеграція в `_process_query_impl` з fallback на while-цикл при помилці.
+
+## 2026-02-24 — Ревʼю AI-помічника: ReAct, error recovery, тестування флоу
+
+- **Запит**: Провести ревʼю ШІ-помічника, вивчити Reddit та тематичні ресурси для концепцій (MCP, LangChain), запропонувати способи покращення, протестувати та порівняти з існуючим флоу.
+
+- **Дії**:
+  - **docs/ai_assistant_review_2026.md**: документ ревʼю з концепціями з ReAct, PALADIN, Reflexion, Reddit (hybrid workflow), LangChain MCP docs.
+  - **Покращення 1 — Error recovery hint**: при `success=false` у результаті tool додається `[ПОМИЛКА ІНСТРУМЕНТУ]` з інструкцією само-корекції (проаналізуй причину, спробуй інший підхід). `langchain_agent_service.py`.
+  - **Покращення 2 — ReAct/антиципаторне міркування**: у `config/prompts.yaml` (langchain_system) додано блок «МІРКУВАННЯ ТА ПЕРЕВІРКИ» — перед викликом інструменту формулювати, що шукаєш і чому; перевіряти параметри; мати на увазі альтернативи (ProZorro→OLX); при помилці — аналізувати і пробувати інший підхід.
+  - **scripts/review_ai_assistant_flow.py**: скрипт для прогону тестових запитів через LangChainAgentService, збір метрик (ітерації, тривалість), порівняння флоу. Запуск: `py scripts/review_ai_assistant_flow.py` (опції: --filter, --limit).
+
+## 2026-02-24 — Фільтр області в пошуку: Київська замість Житомирської
+
+- **Запит**: При фільтрі «Житомирська область» в результатах з’являлись оголошення з «Київська область».
+
+- **Причина**: (1) Документи з кількома адресами (напр. лот з Київської + лот з Житомирської) потрапляли через $elemMatch, але відображалась перша адреса (Київська); (2) regex без re.escape міг давати неочікувані збіги.
+
+- **Дії**:
+  - **telegram_mini_app/routes/search.py**: `_build_unified_filters` — re.escape для region, нормалізація варіантів («Житомирська область» → «Житомирська» для substring-збігу).
+  - **telegram_mini_app/routes/search.py**: `_filter_addresses_by_region` — при наявності фільтра області залишає тільки адреси, що збігаються; `_normalize_unified_doc` отримує вже відфільтрований doc, тому показує правильну область.
+  - Застосовано до search_unified, export, send-export-via-bot.
+
 ## 2026-02-23 — Київська область без Києва та відображення списків у відповіді
 
 - **Запит**: (1) Запит «10 найвигідніших земельних ділянок в Київській області» повертав оголошення з м. Києва замість області; (2) АІ помічник створював відповідь «знайшов 10» без фактичного списку — користувач не бачив дані.

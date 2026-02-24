@@ -1,0 +1,17 @@
+# OLX.ua: типи землі для фільтрації при завантаженні.
+# Формат URL: .../prodazha-zemli/{slug}/ або .../prodazha-zemli/{slug}/{region_slug}/
+# Джерело: https://www.olx.ua/uk/nedvizhimost/zemlya/prodazha-zemli/
+#
+# За замовчуванням завантажуємо всі типи, ОКРІМ сільськогосподарського призначення
+# (відповідає фільтру «Тип нерухомості» в інтерфейсі OLX).
+
+olx_land_type_slugs:
+  "Земля житлової й суспільної забудови": "zemlya-zhitlovo-y-susplno-zabudovi"
+  "Земля оздоровчого призначення": "zemlya-ozdorovchogo-priznachennya"
+  "Земля рекреаційного призначення": "zemlya-rekreatsynogo-priznachennya"
+  "Земля лісового фонду": "zemlya-lsovogo-fondu"
+  "Земля водного фонду": "zemlya-vodnogo-fondu"
+  "Земля промисловості, транспорту та іншого призначення": "zemlya-promislovost-transportu-ta-nshogo-priznachennya"
+  "Земля запасу, резервного фонду та загального користування": "zemlya-zapasu-rezervnogo-fondu-ta-zagalnogo-koristuvannya"
+
+# Виключено: "Земля сільськогосподарського призначення" (zemlya-slskogospodarskogo-priznachennya)

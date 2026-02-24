@@ -804,19 +804,24 @@ class MultiAgentService:
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         metrics = getattr(self.langchain_service, "_last_request_metrics", None) or {}
         self._log_request_state(request_id, user_id, REQUEST_STATE_DELIVERED)
+        payload = {
+            "response_length": len(response_text),
+            "excel_count": len(self.get_last_excel_files()),
+            "duration_ms": duration_ms,
+            "path": "langchain",
+            "routing_path": structured.get("routing_path", "llm"),
+            "iterations": metrics.get("iterations"),
+        }
+        if metrics.get("tool_failures_count") is not None:
+            payload["tool_failures_count"] = metrics["tool_failures_count"]
+        if metrics.get("tool_recovery_attempted") is not None:
+            payload["tool_recovery_attempted"] = metrics["tool_recovery_attempted"]
         self.activity_log.log(
             request_id=request_id,
             user_id=user_id,
             agent_name="assistant",
             step=AgentActivityLogRepository.STEP_RESPONSE,
-            payload={
-                "response_length": len(response_text),
-                "excel_count": len(self.get_last_excel_files()),
-                "duration_ms": duration_ms,
-                "path": "langchain",
-                "routing_path": structured.get("routing_path", "llm"),
-                "iterations": metrics.get("iterations"),
-            },
+            payload=payload,
         )
         return response_text
 

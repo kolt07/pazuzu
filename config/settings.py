@@ -74,6 +74,7 @@ class Settings:
         self.llm_agent_thinking_budget = int(_tbudget) if (_tbudget or '').lstrip('-').isdigit() else 8192  # 0 = вимкнено
         self.llm_agent_google_search_grounding = os.getenv('LLM_AGENT_GOOGLE_SEARCH_GROUNDING', 'false').lower() in ('true', '1', 'yes')
         self.llm_agent_include_thoughts = os.getenv('LLM_AGENT_INCLUDE_THOUGHTS', 'true').lower() in ('true', '1', 'yes')
+        self.llm_agent_use_langgraph = os.getenv('LLM_AGENT_USE_LANGGRAPH', 'false').lower() in ('true', '1', 'yes')
         
         # Налаштування Telegram бота
         self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
@@ -97,6 +98,7 @@ class Settings:
         self.background_update_interval_minutes = int(
             os.getenv('BACKGROUND_UPDATE_INTERVAL_MINUTES', '10')
         )
+
 
         # Telegram Mini App (веб-застосунок у Telegram)
         self.mini_app_port = int(os.getenv('MINI_APP_PORT', '8000'))
@@ -170,6 +172,8 @@ class Settings:
                                     self.llm_agent_google_search_grounding = bool(agent_config['google_search_grounding'])
                                 if 'include_thoughts' in agent_config:
                                     self.llm_agent_include_thoughts = bool(agent_config['include_thoughts'])
+                                if 'use_langgraph' in agent_config:
+                                    self.llm_agent_use_langgraph = bool(agent_config['use_langgraph'])
 
                         # Налаштування Telegram бота
                         if 'telegram' in config:

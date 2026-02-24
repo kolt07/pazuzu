@@ -274,7 +274,9 @@ def _build_unified_filters(
                 escaped = re.escape(r)
                 elem_match["settlement"] = {"$regex": f"^(м\\.\\s*)?{escaped}", "$options": "i"}
             else:
-                elem_match["region"] = {"$regex": r, "$options": "i"}
+                # re.escape для безпеки; substring-збіг для варіантів "Житомирська"/"Житомирська область"
+                r_base = r.replace(" область", "").replace(" обл.", "").strip() or r
+                elem_match["region"] = {"$regex": re.escape(r_base), "$options": "i"}
         if city:
             c = str(city).strip()
             escaped = re.escape(c)
@@ -348,6 +350,30 @@ def _build_unified_filters(
             filters[price_ha_field] = price_ha_cond
 
     return filters
+
+
+def _filter_addresses_by_region(
+    doc: Dict[str, Any], region_filter: Optional[str]
+) -> Dict[str, Any]:
+    """
+    Якщо задано region_filter — залишає тільки адреси, що збігаються з фільтром.
+    Це вирішує проблему: документ з кількома адресами (напр. Київська + Житомирська)
+    потрапляв у результати через $elemMatch, але відображалась перша (неправильна) адреса.
+    """
+    if not region_filter or not region_filter.strip():
+        return doc
+    addresses = doc.get("addresses", [])
+    if not addresses or not isinstance(addresses, list):
+        return doc
+    r = region_filter.strip()
+    r_base = r.replace(" область", "").replace(" обл.", "").strip() or r
+    pattern = re.compile(re.escape(r_base), re.IGNORECASE)
+    matching = [a for a in addresses if isinstance(a, dict) and pattern.search(str(a.get("region") or ""))]
+    if not matching:
+        return doc
+    result = dict(doc)
+    result["addresses"] = matching
+    return result
 
 
 def _normalize_unified_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -923,7 +949,11 @@ def search_unified(
 
     total = repo.collection.count_documents(filters)
 
-    items = [_normalize_unified_doc(doc) for doc in docs]
+    # Якщо є фільтр за областю — показуємо тільки адреси, що збігаються (не першу з іншої області)
+    items = [
+        _normalize_unified_doc(_filter_addresses_by_region(doc, region))
+        for doc in docs
+    ]
     try:
         from business.services.price_analytics_service import PriceAnalyticsService
         analytics = PriceAnalyticsService()
@@ -1013,6 +1043,8 @@ def export_search_results(request: Request, body: ExportSearchRequest):
         skip=0,
     )
 
+    docs = [_filter_addresses_by_region(doc, body.region) for doc in docs]
+
     from domain.gateways.listing_gateway import ListingGateway
     from utils.file_utils import generate_excel_in_memory
 
@@ -1093,6 +1125,8 @@ def send_export_via_bot(request: Request, body: ExportSearchRequest):
         limit=10000,
         skip=0,
     )
+
+    docs = [_filter_addresses_by_region(doc, body.region) for doc in docs]
 
     from domain.gateways.listing_gateway import ListingGateway
     from utils.file_utils import generate_excel_in_memory

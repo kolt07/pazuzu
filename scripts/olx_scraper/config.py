@@ -11,6 +11,7 @@ from typing import Dict, Optional
 
 # Шлях до конфігу областей OLX (відносно кореня проекту)
 _OLX_REGION_SLUGS_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "olx_region_slugs.yaml"
+_OLX_LAND_TYPE_SLUGS_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "olx_land_type_slugs.yaml"
 
 # Базовий URL сайту (без trailing slash)
 BASE_URL = os.getenv("OLX_SCRAPER_BASE_URL", "https://www.olx.ua")
@@ -23,6 +24,8 @@ COMMERCIAL_REAL_ESTATE_PATH = "/uk/nedvizhimost/kommercheskaya-nedvizhimost/"
 COMMERCIAL_REAL_ESTATE_SALE_PATH = "/uk/nedvizhimost/kommercheskaya-nedvizhimost/prodazha-kommercheskoy-nedvizhimosti/"
 # Земельні ділянки (включно з ділянками під забудову)
 LAND_PATH = "/uk/nedvizhimost/zemlya/"
+# Продаж землі (підкатегорія з фільтром за типом: житлова, оздоровча, рекреаційна тощо)
+LAND_SALE_PATH = "/uk/nedvizhimost/zemlya/prodazha-zemli/"
 
 # Сортування: найновіші спочатку (параметр у URL)
 OLX_SORT_NEWEST = "search[order]=created_at:desc"
@@ -73,6 +76,20 @@ def get_olx_region_slugs() -> Dict[str, str]:
     return {}
 
 
+def get_olx_land_type_slugs() -> Dict[str, str]:
+    """Повертає словник {назва типу землі: OLX slug}. Завантажує з config/olx_land_type_slugs.yaml.
+    Використовується для фільтрації — за замовчуванням без с/г призначення."""
+    try:
+        import yaml
+        if _OLX_LAND_TYPE_SLUGS_PATH.exists():
+            with open(_OLX_LAND_TYPE_SLUGS_PATH, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+                return dict(data.get("olx_land_type_slugs") or {})
+    except Exception:
+        pass
+    return {}
+
+
 def get_delay_seconds() -> float:
     """Повертає випадкову затримку в межах [MIN, MAX]."""
     return random.uniform(DELAY_BEFORE_REQUEST_MIN, DELAY_BEFORE_REQUEST_MAX)
@@ -90,10 +107,18 @@ def get_real_estate_list_url(page: int = 1) -> str:
     return f"{BASE_URL.rstrip('/')}{REAL_ESTATE_FIRST_PAGE_PATH.rstrip('/')}/?page={page}"
 
 
-def _build_category_url(base_path: str, page: int, sort_newest: bool, region_slug: Optional[str] = None) -> str:
-    """Збирає URL категорії з опціональним фільтром по області.
-    OLX використовує path-суфікс /{slug}/ (короткі слаги з sitemap: vin, ko, lv тощо)."""
+def _build_category_url(
+    base_path: str,
+    page: int,
+    sort_newest: bool,
+    region_slug: Optional[str] = None,
+    land_type_slug: Optional[str] = None,
+) -> str:
+    """Збирає URL категорії з опціональними фільтрами.
+    OLX: path-суфікс /{region_slug}/ для областей; для землі — /{land_type_slug}/{region_slug}/."""
     path = base_path.rstrip("/")
+    if land_type_slug:
+        path = f"{path}/{land_type_slug}"
     if region_slug:
         path = f"{path}/{region_slug}"
     base = f"{BASE_URL.rstrip('/')}{path}/"
@@ -127,6 +152,10 @@ def get_land_list_url(
     page: int = 1,
     sort_newest: bool = True,
     region_slug: Optional[str] = None,
+    land_type_slug: Optional[str] = None,
 ) -> str:
-    """Повертає URL сторінки списку земельних ділянок (земля, включно з ділянками під забудову)."""
-    return _build_category_url(LAND_PATH, page, sort_newest, region_slug)
+    """Повертає URL сторінки списку земельних ділянок.
+    land_type_slug: фільтр за типом землі (з olx_land_type_slugs) — виключає с/г при використанні.
+    Без land_type_slug — загальна сторінка /zemlya/ (legacy)."""
+    base = LAND_SALE_PATH if land_type_slug else LAND_PATH
+    return _build_category_url(base, page, sort_newest, region_slug, land_type_slug)
