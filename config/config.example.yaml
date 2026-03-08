@@ -1,19 +1,54 @@
 # Приклад конфігураційного файлу для Pazuzu
 # Скопіюйте цей файл як config.yaml та заповніть API ключі
 
+# Маршрутизація запитів (intent confidence)
+# routing:
+#   confidence_threshold: 0.7   # при confidence < порогу: уточнення або fallback у LangChain
+#   ask_on_low_confidence: false # true = повернути уточнююче питання; false = fallback у вільний агент
+
+# Security layer: rate limit та max complexity (0 = без обмежень)
+# security_layer:
+#   rate_limit_requests_per_minute: 0
+#   max_query_complexity_length: 8000
+
+# Ліміти експорту та артефактів
+# limits:
+#   export_max_rows: 50000
+#   export_max_file_size_mb: 50
+#   exports_per_user_per_day: 20
+#   artifact_ttl_seconds: 3600
+#   export_confirm_rows_threshold: 50000  # при більшій кількості рядків — запит підтвердження
+
 # Налаштування LLM провайдерів
 llm:
-  # Провайдер за замовчуванням: gemini, openai, anthropic
+  # Загальні (fallback для старих конфігів). Краще задавати assistant та parsing окремо.
   provider: gemini
-  
-  # Назва моделі (для Gemini: gemini-2.5-flash, gemini-2.5-pro, gemini-2.5-flash-lite)
-  # Старі моделі (gemini-1.5-*) більше не підтримуються
   model_name: gemini-2.5-flash
-  
-  # Обмеження швидкості запитів
-  # Для безкоштовного тарифу Gemini ліміт 5 запитів/хвилину, тому використовуємо 4 для безпеки
+
+  # AI-асистент (діалог, tool-calling) — за замовчуванням Gemini
+  assistant:
+    provider: gemini
+    model_name: gemini-2.5-flash
+
+  # Парсинг описів оголошень (ProZorro, OLX) — за замовчуванням локальна модель через Ollama
+  parsing:
+    provider: ollama
+    model_name: gemma3:27b
+
+  # Обмеження швидкості запитів (0 = без обмежень; стосується провайдерів з API)
   rate_limit:
-    calls_per_minute: 4
+    calls_per_minute: 0
+  
+  # Параметри циклу агента (опційно)
+  # agent:
+  #   max_iterations: 10      # макс. ітерацій tool-calling за один запит
+  #   max_output_tokens: 8192
+  #   temperature: 0.7
+  #   time_budget_seconds: 120  # макс. секунд на один process_query; порожньо = без обмеження
+  #   thinking_budget: 8192     # Thinking mode для Gemini (0 = вимкнено; лише AI-асистент)
+  #   google_search_grounding: false  # Google Search grounding — несумісний з function tools (langchain-google)
+  #   include_thoughts: true    # Відображати хід думок у UI
+  #   use_langgraph: false     # LangGraph state machine замість while-циклу (checkpoints, durable execution)
   
   # API ключі для різних провайдерів
   api_keys:
@@ -25,3 +60,66 @@ llm:
     
     # Anthropic (Claude) API ключ
     anthropic: ""
+    
+    # Ollama — локальна LLM, ключ не потрібен (порожній рядок)
+    ollama: ""
+
+# OLX скрапер: отримання сторінок пошуку та деталей через браузер (Playwright) замість HTTP
+# true = клікер (області обробляються послідовно); false або відсутнє = requests (паралельно)
+# Також можна задати змінною середовища OLX_SCRAPER_USE_BROWSER=1
+# olx:
+#   use_browser: false
+
+# Регламентне фонове оновлення даних (ProZorro + OLX за минулу добу)
+# Працює лише при запуску Telegram бота. Інтервал у хвилинах; 0 = вимкнено
+# background_update:
+#   interval_minutes: 10
+
+# Налаштування Telegram бота
+telegram:
+  # Токен бота від @BotFather
+  bot_token: ""
+  
+  # Шлях до файлу з користувачами (опціонально, за замовчуванням config/users.yaml)
+  # users_config_path: "config/users.yaml"
+
+# Telegram Mini App (веб-застосунок у Telegram)
+# base_url — обов'язково HTTPS. Без нього команда /app покаже "Mini App поки не налаштовано".
+# Локальна розробка: використайте ngrok (ngrok http 8000) і вставте виданий https://... URL нижче.
+#
+# Кнопка "Open" у результатах пошуку (як у BotFather):
+#   Налаштовується тільки через @BotFather, не через код:
+#   1. Відкрити @BotFather
+#   2. /mybots → обрати Pazuzu → Bot Settings → Configure Mini App → Enable Mini App
+#   3. Вказати URL (той самий base_url) та опційно завантажити превью
+#
+# Кнопка меню (☰) в чаті: встановлюється автоматично при запуску бота за наявності base_url.
+mini_app:
+  # Порт локального сервера Mini App (0 = вимкнено)
+  port: 8000
+  # Публічний HTTPS URL застосунку — для кнопки меню та команди /app (напр. https://your-domain.com або https://xxxx.ngrok.io)
+  base_url: ""
+
+# Google Maps API (геокодування: адреси, топоніми, назви ЖК/ТРЦ тощо)
+google_maps:
+  api_key: ""
+
+# Налаштування MongoDB
+mongodb:
+  # Хост MongoDB (за замовчуванням localhost)
+  host: localhost
+  
+  # Порт MongoDB (за замовчуванням 27017)
+  port: 27017
+  
+  # Назва бази даних (за замовчуванням pazuzu)
+  database_name: pazuzu
+  
+  # Ім'я користувача (опціонально, для локального MongoDB зазвичай не потрібно)
+  # username: ""
+  
+  # Пароль (опціонально, для локального MongoDB зазвичай не потрібно)
+  # password: ""
+  
+  # База даних для аутентифікації (за замовчуванням admin)
+  # auth_source: admin

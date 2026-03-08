@@ -1,10 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 Утиліти для роботи з датами.
+Усі дати для відображення користувачу (меню ТГ, файли, Excel) формуються в київському часі (Europe/Kyiv).
 """
 
 from datetime import datetime, timedelta, timezone
 from typing import Tuple
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
+# Часовий пояс Києва для виводу дат користувачу
+KYIV_TZ = ZoneInfo('Europe/Kyiv')
 
 
 def get_date_range(days: int = 1) -> Tuple[datetime, datetime]:
@@ -101,3 +110,57 @@ def format_datetime_for_byDateModified(dt: datetime) -> str:
     
     # Форматуємо з мілісекундами та 'Z'
     return dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+
+def to_kyiv(dt: datetime) -> datetime:
+    """
+    Конвертує datetime в київський час для відображення.
+
+    Args:
+        dt: Дата та час (UTC або naive)
+
+    Returns:
+        datetime: Той самий момент у часовому поясі Europe/Kyiv
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(KYIV_TZ)
+
+
+def format_datetime_display(dt: datetime, fmt: str = '%d.%m.%Y %H:%M') -> str:
+    """
+    Форматує datetime для відображення користувачу в київському часі.
+    Використовувати для меню ТГ, назв файлів, Excel, логів тощо.
+
+    Args:
+        dt: Дата та час (UTC або naive)
+        fmt: Формат виводу (за замовчуванням дд.мм.рррр ГГ:ХХ)
+
+    Returns:
+        str: Відформатований рядок у київському часі
+    """
+    return to_kyiv(dt).strftime(fmt)
+
+
+def format_date_display(date_str: str, fmt: str = '%d.%m.%Y %H:%M') -> str:
+    """
+    Парсить ISO-рядок дати/часу та повертає рядок для відображення в київському часі.
+    Для виводу в Excel, повідомленнях тощо.
+
+    Args:
+        date_str: ISO-рядок (наприклад з API: 2024-01-15T12:00:00.000Z)
+        fmt: Формат виводу (за замовчуванням дд.мм.рррр ГГ:ХХ)
+
+    Returns:
+        str: Відформатований рядок у київському часі або порожній рядок при помилці парсингу
+    """
+    if not date_str:
+        return ''
+    try:
+        s = date_str.replace('Z', '+00:00') if isinstance(date_str, str) and date_str.endswith('Z') else date_str
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return to_kyiv(dt).strftime(fmt)
+    except (ValueError, AttributeError):
+        return str(date_str)

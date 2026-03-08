@@ -1,0 +1,72 @@
+{
+  "total_listings": 50,
+  "fetch_errors": 0,
+  "parsers": {
+    "bs4": {
+      "name": "BeautifulSoup (lxml)",
+      "avg_time_ms": 57.0,
+      "match_ratio": 0.28735632183908044,
+      "filled_avg": 4.42,
+      "samples": 50
+    },
+    "lxml": {
+      "name": "lxml",
+      "avg_time_ms": 16.8,
+      "match_ratio": 0.28735632183908044,
+      "filled_avg": 4.44,
+      "samples": 50
+    },
+    "selectolax": {
+      "name": "Selectolax",
+      "avg_time_ms": 51.5,
+      "match_ratio": 0.2857142857142857,
+      "filled_avg": 4.7,
+      "samples": 50
+    },
+    "parsel": {
+      "name": "Parsel",
+      "avg_time_ms": 23.0,
+      "match_ratio": 0.2857142857142857,
+      "filled_avg": 4.7,
+      "samples": 50
+    }
+  },
+  "field_accuracy": {
+    "cadastral_number": {
+      "bs4": 0.94,
+      "lxml": 0.94,
+      "selectolax": 0.94,
+      "parsel": 0.94
+    },
+    "building_area_sqm": {
+      "bs4": 0.8,
+      "lxml": 0.8,
+      "selectolax": 0.8,
+      "parsel": 0.8
+    },
+    "land_area_ha": {
+      "bs4": 0.78,
+      "lxml": 0.78,
+      "selectolax": 0.78,
+      "parsel": 0.78
+    },
+    "floor": {
+      "bs4": 0.94,
+      "lxml": 0.94,
+      "selectolax": 0.94,
+      "parsel": 0.94
+    },
+    "property_type": {
+      "bs4": 0.04,
+      "lxml": 0.04,
+      "selectolax": 0.04,
+      "parsel": 0.04
+    },
+    "addresses": {
+      "bs4": 0.02,
+      "lxml": 0.02,
+      "selectolax": 0.0,
+      "parsel": 0.0
+    }
+  }
+}

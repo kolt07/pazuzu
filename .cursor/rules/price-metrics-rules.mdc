@@ -1,0 +1,27 @@
+---
+description: Правила заповнення цінових метрик (ціна за кв. м., ціна за га/за сотку) в unified_listings та prozorro_auctions
+alwaysApply: true
+---
+
+# Цінові метрики: price_per_m2 та price_per_ha
+
+Правила застосовуються для полів `price_per_m2_uah`, `price_per_m2_usd`, `price_per_ha_uah`, `price_per_ha_usd` у колекціях **unified_listings**, **prozorro_auctions** та при формуванні price_metrics.
+
+**Одиниці площі:** Усі площі зберігаються в м² (`land_area_sqm`). Для земельних ділянок у UI відображаються сотки (с): площа в сотках = `land_area_sqm/100`, ціна за сотку = `price_per_ha_uah/100` (грн/с).
+
+---
+
+## Правила заповнення
+
+| Тип оголошення                        | building_area_sqm | land_area_sqm | price_per_m2 | price_per_ha |
+|--------------------------------------|-------------------|---------------|--------------|--------------|
+| Земельна ділянка без нерухомості     | null/0            | > 0           | **NULL**     | заповнена    |
+| Земельна ділянка з нерухомістю       | > 0               | > 0           | заповнена    | заповнена    |
+| Чисто нерухомість                    | > 0               | null/0        | заповнена    | **NULL**     |
+
+---
+
+## Реалізація
+
+- **utils/price_metrics.py** — `compute_price_metrics()`: приймає `land_area_sqm` (м²); price_per_m2 тільки при `building_area_sqm > 0`; price_per_ha тільки при `land_area_sqm > 0`. Для відображення землі: ціна за сотку = price_per_ha_uah/100.
+- **UnifiedListingsService._extract_area_info**: повертає `land_area_sqm` у м²; для OLX не використовувати `search_data.area_m2` як fallback для building_area, якщо вже є `land_area_sqm`.

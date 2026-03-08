@@ -1,0 +1,261 @@
+---
+description: LLM Agent Architecture Rules – Pazuzu
+alwaysApply: true
+---
+
+# LLM Agent Architecture Rules – Pazuzu
+
+## 1. Загальні принципи
+
+### 1.1 LLM ≠ бізнес-логіка
+
+❌ **Агент не реалізує бізнес-логіку**
+
+❌ **Агент не приймає фінальних рішень**
+
+✅ **Агент аналізує, планує, інтерпретує**
+
+**Золоте правило:** LLM думає — код виконує
+
+### 1.2 Агент не має прямого доступу до даних
+
+❌ **Заборонено:**
+- прямі виклики БД
+- HTTP-запити до зовнішніх API
+- доступ до файлової системи
+
+✅ **Дозволено:**
+- виклики тільки через MCP tools
+- строго по схемах
+
+### 1.3 Мінімальний доступ
+
+Кожен агент отримує тільки ті інструменти, які йому реально потрібні.
+
+❌ Заборонено створювати агентів з `*` доступом до MCP.
+
+---
+
+## 2. Типи агентів (обов'язкова класифікація)
+
+### 2.1 Interpreter Agent
+
+**Призначення:** розбір user intent
+
+**Правила:**
+- Повертає тільки JSON
+- Не викликає MCP
+- Не виконує дії
+
+**Приклад виводу:**
+```json
+{
+  "intent": "export_data",
+  "confidence": 0.78,
+  "entities": {
+    "collection": "prozorro",
+    "period": "last_week",
+    "region": "kyiv"
+  }
+}
+```
+
+### 2.2 Planner Agent
+
+**Призначення:** побудова плану дій
+
+**Правила:**
+- Повертає детермінований план
+- Без виконання
+- Без доступу до MCP
+
+**Приклад виводу:**
+```json
+[
+  {"step": "update_data"},
+  {"step": "query", "collection": "prozorro"},
+  {"step": "export", "format": "xlsx"}
+]
+```
+
+### 2.3 Executor (НЕ LLM)
+
+**Призначення:** виконання плану
+
+**Правила:**
+- ❌ не використовує LLM
+- ✅ виконує кроки строго по схемі
+- ✅ валідовує кожен step
+
+### 2.4 Conversational / Tool Agent
+
+**Призначення:** вільний діалог + tools
+
+**Правила:**
+- Обмежений reasoning loop
+- Чіткий system prompt
+- Обмежений набір MCP tools
+
+---
+
+## 3. Routing та управління потоком
+
+### 3.1 Rule-based routing має пріоритет
+
+Якщо intent можна визначити без LLM → LLM не використовується.
+
+LLM — тільки fallback.
+
+### 3.2 Confidence-based fallback
+
+Якщо confidence < threshold:
+- або уточнення
+- або free-form агент
+
+---
+
+## 4. MCP Tool Rules
+
+### 4.1 MCP — domain API, не proxy
+
+❌ **Заборонено:**
+- raw SQL / Mongo queries
+- user-defined filters без allow-list
+
+✅ **Дозволено:**
+- domain-level methods (`get_auctions_by_period`)
+
+### 4.2 MCP tools мають бути чистими
+
+Без побічних ефектів, якщо це явно не зазначено.
+
+Кожен tool:
+- чіткий input schema
+- чіткий output schema
+
+### 4.3 Заборона небезпечних операцій
+
+`$where`, `$regex`, eval-подібні патерни — заборонені.
+
+Валідація відбувається до виконання.
+
+---
+
+## 5. Артефакти та файли
+
+### 5.1 Агент не працює з файлами напряму
+
+❌ Агент не отримує path або URL
+
+✅ Агент працює з `artifact_id`
+
+**Приклад:**
+```json
+{
+  "artifact_id": "export_20260208_ab12",
+  "type": "xlsx"
+}
+```
+
+### 5.2 TTL та ownership
+
+Кожен artifact має:
+- `owner` (user_id)
+- `TTL`
+- `request_id`
+
+---
+
+## 6. Пам'ять і контекст
+
+### 6.1 Контекст мінімальний
+
+❌ не передавати всю історію чату
+
+✅ передавати:
+- session state
+- summary
+- релевантні факти
+
+### 6.2 Memory tiers
+
+- short buffer
+- summary
+- vector store (факти, не діалог)
+
+---
+
+## 7. Безпека
+
+### 7.1 Security — не через промпт
+
+❌ «будь обережним» у system prompt
+
+✅ окремий security layer до агентів
+
+### 7.2 Rate limits
+
+- По `user_id`
+- По типу операцій (експорт, аналітика)
+
+---
+
+## 8. Observability (обов'язково)
+
+### 8.1 Correlation ID
+
+Один `request_id` проходить через:
+- клієнт
+- агентів
+- MCP
+- executor
+
+### 8.2 Structured logs
+
+Кожен агент логуює:
+
+```json
+{
+  "request_id": "...",
+  "agent": "PlannerAgent",
+  "input": "...",
+  "output": "...",
+  "duration_ms": 840
+}
+```
+
+---
+
+## 9. Logical vs Physical Layer
+
+### 9.1 Жоден агент не генерує Mongo-поля
+
+❌ **Заборонено:** address_refs.city, addresses.settlement, будь-які шляхи з крапкою
+
+✅ **Дозволено:** тільки логічні поля: city, region, price, date, status, source, property_type, area, bids_count, bidders_count
+
+Mongo — виключно зона відповідальності PipelineInterpreter (через FieldMappingService).
+
+---
+
+## 10. Заборонені патерни (❌)
+
+❌ LLM виконує дії
+
+❌ LLM пише запити до БД
+
+❌ «Один агент на все»
+
+❌ Передача user input напряму в MCP
+
+❌ Файли без TTL
+
+❌ Магія без логів
+
+❌ Агенти повертають фізичні поля (address_refs, addresses.settlement)
+
+---
+
+## 11. Золоте правило
+
+**Якщо поведінку агента неможливо відтворити без LLM — архітектура неправильна.**

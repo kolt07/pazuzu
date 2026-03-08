@@ -1,0 +1,20 @@
+# OLX.ua: типи об'єкта комерційної нерухомості (фільтр «Тип об'єкта»).
+# Використовується для формування URL: search[filter_enum_comm_re_object_type]=<slug>.
+# Джерело: https://www.olx.ua/uk/nedvizhimost/kommercheskaya-nedvizhimost/prodazha-kommercheskoy-nedvizhimosti/
+#
+# За замовчуванням завантажуємо всі типи, ОКРІМ «Бізнес центр»
+# (передаємо усі слаги з цього списку — кожен як окремий параметр search[filter_enum_comm_re_object_type]).
+# Slug для «Бізнес центр» (виключено): business_center.
+
+olx_comm_re_object_type_slugs_include:
+  - "other"                                    # Інше
+  - "shopping_and_office_center"               # Торгово-офісний центр
+  - "administrative_building"                  # Адміністративна будівля
+  - "non_residential_in_residential_fund"      # Нежитлове приміщення у житловому фонді
+  - "residential_fund"                         # Житловий фонд
+  - "hotel"                                    # Готель (якщо є в фільтрі на головній категорії)
+
+# Виключено: business_center (Бізнес центр)
+#
+# Якщо якийсь тип дає 0 оголошень — перевірте slug на OLX: виберіть цей тип у фільтрі
+# «Тип об'єкта» і подивіться значення параметра search[filter_enum_comm_re_object_type] в URL.

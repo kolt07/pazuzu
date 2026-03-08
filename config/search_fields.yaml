@@ -1,0 +1,79 @@
+# Конфіг полів пошуку для сторінки пошуку та звітів.
+# Використовується для побудови фільтрів (елемент = поле + тип порівняння + значення).
+# value_type визначає доступні оператори порівняння.
+
+collections:
+  unified_listings:
+    description: "Поля для пошуку в зведених оголошеннях"
+    fields:
+      status:
+        label_uk: "Активність"
+        value_type: "string"
+        allowed_operators: [eq, ne, in, nin]
+      source:
+        label_uk: "Джерело"
+        value_type: "string"
+        allowed_operators: [eq, ne, in, nin]
+      source_updated_at:
+        label_uk: "Дата в джерелі"
+        value_type: "date"
+        allowed_operators: [eq, gte, lte, gt, lt]
+      property_type:
+        label_uk: "Тип оголошення"
+        value_type: "string"
+        allowed_operators: [eq, ne, in, nin]
+      title:
+        label_uk: "Заголовок"
+        value_type: "string"
+        allowed_operators: [eq, contains, not_contains, filled, empty]
+      description:
+        label_uk: "Опис"
+        value_type: "string"
+        allowed_operators: [contains, not_contains, filled, empty]
+      price_uah:
+        label_uk: "Ціна, грн"
+        value_type: "number"
+        allowed_operators: [eq, gte, lte, gt, lt]
+      price_usd:
+        label_uk: "Ціна, USD"
+        value_type: "number"
+        allowed_operators: [eq, gte, lte, gt, lt]
+      building_area_sqm:
+        label_uk: "Площа нерухомості, м²"
+        value_type: "number"
+        allowed_operators: [eq, gte, lte, gt, lt]
+      land_area_ha:
+        label_uk: "Площа землі, га"
+        value_type: "number"
+        allowed_operators: [eq, gte, lte, gt, lt]
+      price_per_m2_uah:
+        label_uk: "Ціна за м², грн"
+        value_type: "number"
+        allowed_operators: [eq, gte, lte, gt, lt]
+      price_per_m2_usd:
+        label_uk: "Ціна за м², USD"
+        value_type: "number"
+        allowed_operators: [eq, gte, lte, gt, lt]
+      price_per_ha_uah:
+        label_uk: "Ціна за га, грн"
+        value_type: "number"
+        allowed_operators: [eq, gte, lte, gt, lt]
+      price_per_ha_usd:
+        label_uk: "Ціна за га, USD"
+        value_type: "number"
+        allowed_operators: [eq, gte, lte, gt, lt]
+
+# Геопошук — окремий елемент. Топонім з точністю до району міста.
+geo:
+  toponym_precision:
+    - region
+    - settlement
+    - city_district
+  operators:
+    inside:
+      label_uk: "в межах"
+    not_inside:
+      label_uk: "не в межах"
+    in_radius:
+      label_uk: "в радіусі"
+      extra_value: "radius_km"
