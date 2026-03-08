@@ -169,6 +169,9 @@ class Settings:
                                     self.llm_parsing_provider = p['provider']
                                 if 'model_name' in p:
                                     self.llm_parsing_model_name = p['model_name']
+                            elif 'model_name' in llm_config:
+                                # Якщо llm.parsing не задано — використовувати загальну модель для парсингу
+                                self.llm_parsing_model_name = llm_config['model_name']
                             if 'rate_limit' in llm_config and 'calls_per_minute' in llm_config['rate_limit']:
                                 self.llm_rate_limit_calls_per_minute = llm_config['rate_limit']['calls_per_minute']
                             if 'api_keys' in llm_config:
@@ -200,13 +203,19 @@ class Settings:
                                 if 'use_langgraph' in agent_config:
                                     self.llm_agent_use_langgraph = bool(agent_config['use_langgraph'])
 
-                        # Налаштування Telegram бота
+                        # Налаштування Telegram бота (в т.ч. парсинг — може перевизначити llm.parsing)
                         if 'telegram' in config:
                             telegram_config = config['telegram']
                             if 'bot_token' in telegram_config:
                                 self.telegram_bot_token = telegram_config['bot_token']
                             if 'users_config_path' in telegram_config:
                                 self.telegram_users_config_path = telegram_config['users_config_path']
+                            if 'parsing' in telegram_config:
+                                p = telegram_config['parsing']
+                                if 'provider' in p:
+                                    self.llm_parsing_provider = p['provider']
+                                if 'model_name' in p:
+                                    self.llm_parsing_model_name = p['model_name']
                         
                         # Google Maps
                         if 'google_maps' in config:

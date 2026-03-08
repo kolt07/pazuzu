@@ -419,6 +419,8 @@ class GeminiLLMProvider(BaseLLMProvider):
         full_content = prompt
         if system_prompt:
             full_content = f"{system_prompt}\n\n{prompt}"
+        self._last_request_text = full_content
+        self._last_response_text = None
         try:
             response = self.client.models.generate_content(
                 model=self.model_name,
@@ -426,14 +428,14 @@ class GeminiLLMProvider(BaseLLMProvider):
                 config={"temperature": temperature},
             )
             self._last_usage = self._usage_from_response(response)
-            self._last_request_text = full_content
             if not hasattr(response, 'text') or response.text is None:
                 self._last_response_text = ""
                 return ""
             out = str(response.text).strip()
             self._last_response_text = out
             return out
-        except Exception:
+        except Exception as e:
+            self._last_response_text = f"[error] {e!s}"
             return ""
 
 
@@ -773,9 +775,11 @@ class OllamaLLMProvider(BaseLLMProvider):
             return self._empty_result()
 
         self.rate_limiter.wait_if_needed()
+        prompt = self._create_parsing_prompt(description)
+        self._last_request_text = prompt
+        self._last_response_text = None
 
         try:
-            prompt = self._create_parsing_prompt(description)
             response = self.client.generate(
                 model=self.model_name,
                 prompt=prompt,
@@ -803,6 +807,7 @@ class OllamaLLMProvider(BaseLLMProvider):
 
             return self._normalize_result(result)
         except Exception as e:
+            self._last_response_text = f"[error] {e!s}"
             print(f"Помилка при парсингу через Ollama: {e}")
             return self._empty_result()
 
@@ -914,12 +919,14 @@ class OllamaLLMProvider(BaseLLMProvider):
     ) -> str:
         """Генерує текст за промптом через Ollama."""
         self.rate_limiter.wait_if_needed()
+        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+        self._last_request_text = full_prompt
+        self._last_response_text = None
         try:
             messages = []
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
-            full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
             response = self.client.chat(
                 model=self.model_name,
                 messages=messages,
@@ -927,10 +934,10 @@ class OllamaLLMProvider(BaseLLMProvider):
             )
             self._last_usage = self._usage_from_ollama_response(response)
             out = (response.get("message", {}).get("content") or "").strip()
-            self._last_request_text = full_prompt
             self._last_response_text = out
             return out
-        except Exception:
+        except Exception as e:
+            self._last_response_text = f"[error] {e!s}"
             return ""
 
 
