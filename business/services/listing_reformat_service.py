@@ -128,7 +128,7 @@ class ListingReformatService:
                 import time
                 from scripts.olx_scraper import config as scraper_config
                 time.sleep(scraper_config.get_delay_detail_seconds())
-                response = fetch_page(olx_url, delay_before=False)
+                response = fetch_page(olx_url, delay_before=False, is_detail=True)
                 fresh_detail = parse_detail_page(response.text)
                 if fresh_detail.get("price_text") and fresh_detail.get("price_value") is not None:
                     search_data["price_text"] = fresh_detail["price_text"]
@@ -181,7 +181,12 @@ class ListingReformatService:
                 logger.info("Виправлено ціну з %s на %s (price_text: %r)", old_price, price_value, search_data.get("price_text", "")[:60])
             llm_struct = detail_data.get("llm") or {}
             total_area_m2 = llm_struct.get("total_area_m2") or search_data.get("area_m2")
-            land_area_ha = llm_struct.get("land_area_ha")
+            land_area_sqm = llm_struct.get("land_area_sqm")
+            if land_area_sqm is None and llm_struct.get("land_area_ha") is not None:
+                try:
+                    land_area_sqm = float(llm_struct["land_area_ha"]) * 10000.0
+                except (TypeError, ValueError):
+                    land_area_sqm = None
 
             usd_rate = None
             try:
@@ -202,7 +207,7 @@ class ListingReformatService:
             metrics = compute_price_metrics(
                 total_price_uah=total_price_uah,
                 building_area_sqm=total_area_m2,
-                land_area_ha=land_area_ha,
+                land_area_sqm=land_area_sqm,
                 uah_per_usd=usd_rate,
             )
             detail_data["price_metrics"] = metrics

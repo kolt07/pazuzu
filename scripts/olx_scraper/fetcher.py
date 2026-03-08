@@ -22,7 +22,7 @@ from scripts.olx_scraper import config as scraper_config
 
 
 def get_session() -> requests.Session:
-    """Повертає сесію з заголовками, схожими на звичайний браузер."""
+    """Повертає сесію з заголовками, схожими на звичайний браузер (Chrome)."""
     session = requests.Session()
     session.headers.update({
         "User-Agent": scraper_config.USER_AGENT,
@@ -36,7 +36,16 @@ def get_session() -> requests.Session:
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
+        # Client hints (Chrome) — допомагають виглядати як звичайний браузер
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
     })
+    # Підміна куків з конфігу/файлу (обхід антиботу)
+    cookies_list = getattr(scraper_config, "get_cookies_for_session", lambda: [])()
+    if cookies_list:
+        for c in cookies_list:
+            session.cookies.set(c.get("name", ""), c.get("value", ""), domain=".olx.ua")
     return session
 
 
@@ -45,11 +54,13 @@ def fetch_page(
     delay_before: bool = True,
     delay_after: bool = False,
     session: Optional["requests.Session"] = None,
+    is_detail: bool = False,
 ) -> requests.Response:
     """
     Завантажує одну сторінку. Перед запитом робить паузу (антибот).
     Опційно — затримка після отримання (OLX може підвантажувати контент з затримкою).
     session: якщо передано — використовується для повторного використання з'єднання (keep-alive).
+    is_detail: True для сторінки оголошення — використовується більший таймаут (REQUEST_DETAIL_TIMEOUT).
     """
     if delay_before:
         sec = scraper_config.get_delay_seconds()
@@ -57,10 +68,11 @@ def fetch_page(
         time.sleep(sec)
 
     sess = session if session is not None else get_session()
+    timeout = getattr(scraper_config, "REQUEST_DETAIL_TIMEOUT", scraper_config.REQUEST_TIMEOUT) if is_detail else scraper_config.REQUEST_TIMEOUT
     # Referer на головну сторінку категорії при першому запиті не обов'язковий
     response = sess.get(
         url,
-        timeout=scraper_config.REQUEST_TIMEOUT,
+        timeout=timeout,
         allow_redirects=True,
     )
     response.raise_for_status()

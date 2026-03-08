@@ -5,6 +5,7 @@ API: пошук оголошень за зведеною таблицею (unifi
 """
 
 import re
+import math
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Request, HTTPException, Query, Depends
@@ -18,6 +19,17 @@ from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepos
 
 
 router = APIRouter(prefix="/api/search", tags=["search"])
+
+
+def _sanitize_json_floats(obj: Any) -> Any:
+    """Замінює float nan/inf/-inf на None для JSON-серіалізації."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_json_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json_floats(x) for x in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
 
 
 def _get_validated_user(request: Request):
@@ -256,6 +268,8 @@ def _build_unified_filters(
     price_per_ha_min: Optional[float] = None,
     price_per_ha_max: Optional[float] = None,
     price_per_ha_currency: Optional[str] = None,
+    title_contains: Optional[str] = None,
+    description_contains: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Будує MongoDB фільтри для зведеної таблиці unified_listings."""
     filters: Dict[str, Any] = {}
@@ -313,12 +327,14 @@ def _build_unified_filters(
         if op:
             filters["building_area_sqm"] = {op: float(building_area_sqm_value)}
 
-    # Фільтр за площею земельної ділянки (га)
+    # Фільтр за площею земельної ділянки: клієнт передає значення в сотках, зберігаємо в м²
     if land_area_ha_op and land_area_ha_value is not None:
         op_map = {"eq": "$eq", "gte": "$gte", "lte": "$lte"}
         op = op_map.get(land_area_ha_op)
         if op:
-            filters["land_area_ha"] = {op: float(land_area_ha_value)}
+            # land_area_ha_value у API — у сотках (для зручності), переводимо в м²
+            land_sqm = float(land_area_ha_value) * 100.0
+            filters["land_area_sqm"] = {op: land_sqm}
 
     # Фільтр за датою (source_updated_at за останні N днів)
     if date_filter_days is not None and date_filter_days > 0:
@@ -348,6 +364,12 @@ def _build_unified_filters(
             price_ha_cond["$lte"] = price_per_ha_max
         if price_ha_cond:
             filters[price_ha_field] = price_ha_cond
+
+    # Пошук за заголовком та описом (текстовий збіг)
+    if title_contains and str(title_contains).strip():
+        filters["title"] = {"$regex": re.escape(str(title_contains).strip()), "$options": "i"}
+    if description_contains and str(description_contains).strip():
+        filters["description"] = {"$regex": re.escape(str(description_contains).strip()), "$options": "i"}
 
     return filters
 
@@ -421,7 +443,8 @@ def _normalize_unified_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "status": doc.get("status", ""),
         "property_type": doc.get("property_type", ""),
         "building_area_sqm": doc.get("building_area_sqm"),
-        "land_area_ha": doc.get("land_area_ha"),
+        "land_area_sqm": doc.get("land_area_sqm"),
+        "land_area_sotky": (doc.get("land_area_sqm") / 100.0) if doc.get("land_area_sqm") else None,
         "floor": doc.get("floor"),
         "tags": doc.get("tags") or [],
         "page_url": doc.get("page_url"),
@@ -880,7 +903,7 @@ def search_unified(
     building_area_sqm_op: Optional[str] = Query(None, description="Оператор площі нерухомості (eq/gte/lte)"),
     building_area_sqm_value: Optional[float] = Query(None, description="Значення площі нерухомості (кв. м.)"),
     land_area_ha_op: Optional[str] = Query(None, description="Оператор площі землі (eq/gte/lte)"),
-    land_area_ha_value: Optional[float] = Query(None, description="Значення площі землі (га)"),
+    land_area_ha_value: Optional[float] = Query(None, description="Значення площі землі в сотках (с)"),
     date_filter_days: Optional[int] = Query(None, description="Фільтр за датою: 1, 7 або 30 днів"),
     price_per_m2_min: Optional[float] = Query(None),
     price_per_m2_max: Optional[float] = Query(None),
@@ -888,6 +911,8 @@ def search_unified(
     price_per_ha_min: Optional[float] = Query(None),
     price_per_ha_max: Optional[float] = Query(None),
     price_per_ha_currency: Optional[str] = Query("uah"),
+    title_contains: Optional[str] = Query(None, description="Фрагмент у заголовку"),
+    description_contains: Optional[str] = Query(None, description="Фрагмент в описі"),
     sort_field: str = Query("source_updated_at", description="Поле для сортування"),
     sort_order: str = Query("desc", description="Напрямок сортування (asc/desc)"),
     limit: int = Query(50, ge=1, le=200, description="Кількість результатів"),
@@ -918,6 +943,8 @@ def search_unified(
         price_per_ha_min=price_per_ha_min,
         price_per_ha_max=price_per_ha_max,
         price_per_ha_currency=price_per_ha_currency,
+        title_contains=title_contains,
+        description_contains=description_contains,
     )
 
     # Маппінг sort_field на MongoDB поле
@@ -974,8 +1001,105 @@ def search_unified(
     }
 
 
+class SearchByFilterRequest(BaseModel):
+    """Тіло запиту пошуку за рядком фільтрів або деревом."""
+    filter_string: Optional[str] = None
+    sort_field: str = "source_updated_at"
+    sort_order: str = "desc"
+    limit: int = 50
+    skip: int = 0
+
+
+@router.post("/query")
+def search_by_filter(
+    request: Request,
+    body: SearchByFilterRequest,
+):
+    """
+    Пошук за рядком фільтрів (формат: "Активність" = True AND "Дата в джерелі" >= '...' AND geo('Область' INSIDE 'Київська')).
+    Якщо filter_string порожній або відсутній — повертаються усі активні оголошення з урахуванням limit/skip.
+    """
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+
+    from domain.services.unified_search_service import find_by_filter_string
+
+    data, total, err = find_by_filter_string(
+        filter_string=body.filter_string or "",
+        sort=[{"field": body.sort_field, "order": -1 if body.sort_order == "desc" else 1}],
+        limit=min(body.limit, 200),
+        skip=max(0, body.skip),
+    )
+    if err is not None:
+        raise HTTPException(status_code=400, detail=err)
+
+    items = [
+        _normalize_unified_doc(doc)
+        for doc in (data or [])
+    ]
+    try:
+        from business.services.price_analytics_service import PriceAnalyticsService
+        analytics = PriceAnalyticsService()
+        indicators = analytics.get_price_indicators_for_items(items)
+        for item in items:
+            cid = f"{item.get('source', '')}:{item.get('source_id', '')}"
+            if cid in indicators:
+                item["price_indicator"] = indicators[cid]["indicator"]
+                item["price_indicator_source"] = indicators[cid].get("source", "region")
+    except Exception:
+        pass
+
+    payload = {
+        "items": items,
+        "total": total or 0,
+        "limit": body.limit,
+        "skip": body.skip,
+    }
+    return _sanitize_json_floats(payload)
+
+
+@router.get("/filter-fields")
+def get_filter_fields(request: Request):
+    """Повертає конфіг полів та гео для конструктора фільтрів (рядок пошуку)."""
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+    from domain.services.filter_string_service import get_builder_config
+    return get_builder_config("unified_listings")
+
+
+class FilterStructureRequest(BaseModel):
+    """Тіло запиту для перетворення структури фільтрів на рядок. Або root (дерево), або filters+geo (плоский список)."""
+    root: Optional[Dict[str, Any]] = None  # дерево: { group_type: "and"|"or", items: [ {type, ...} ] }
+    filters: Optional[List[Dict[str, Any]]] = None
+    geo: Optional[List[Dict[str, Any]]] = None
+
+
+@router.post("/filter-string-from-structure")
+def filter_string_from_structure_endpoint(request: Request, body: FilterStructureRequest):
+    """Перетворює структуру фільтрів (дерево або плоский список) на рядок відборів."""
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+    from domain.services.filter_string_service import filter_string_from_structure, filter_string_from_tree
+    try:
+        if body.root is not None and isinstance(body.root, dict):
+            s = filter_string_from_tree(body.root, collection="unified_listings")
+        else:
+            s = filter_string_from_structure(
+                filters=body.filters or [],
+                geo=body.geo,
+                collection="unified_listings",
+            )
+        return {"filter_string": s}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 class ExportSearchRequest(BaseModel):
     """Параметри експорту результатів пошуку."""
+    filter_string: Optional[str] = None
     source: Optional[str] = None
     region: Optional[str] = None
     city: Optional[str] = None
@@ -1002,33 +1126,12 @@ class ExportSearchRequest(BaseModel):
 def export_search_results(request: Request, body: ExportSearchRequest):
     """
     Експортує результати пошуку у форматі зведеної таблиці (Excel).
+    Якщо передано filter_string — пошук за рядком фільтрів; інакше за flat-параметрами.
     """
     user_id, user_service = _get_validated_user(request)
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
 
-    filters = _build_unified_filters(
-        region=body.region,
-        city=body.city,
-        price_min=body.price_min,
-        price_max=body.price_max,
-        price_eq=body.price_eq,
-        source=body.source,
-        property_type=body.property_type,
-        building_area_sqm_op=body.building_area_sqm_op,
-        building_area_sqm_value=body.building_area_sqm_value,
-        land_area_ha_op=body.land_area_ha_op,
-        land_area_ha_value=body.land_area_ha_value,
-        date_filter_days=body.date_filter_days,
-        price_per_m2_min=body.price_per_m2_min,
-        price_per_m2_max=body.price_per_m2_max,
-        price_per_m2_currency=body.price_per_m2_currency,
-        price_per_ha_min=body.price_per_ha_min,
-        price_per_ha_max=body.price_per_ha_max,
-        price_per_ha_currency=body.price_per_ha_currency,
-    )
-
-    repo = UnifiedListingsRepository()
     sort_field_map = {"source_updated_at": "source_updated_at", "price": "price_uah", "title": "title"}
     actual_sort = sort_field_map.get(body.sort_field, "source_updated_at")
     sort_direction = -1 if body.sort_order == "desc" else 1
@@ -1036,25 +1139,60 @@ def export_search_results(request: Request, body: ExportSearchRequest):
     if actual_sort == "source_updated_at":
         sort_list.append(("system_updated_at", sort_direction))
 
-    docs = repo.find_many(
-        filter=filters,
-        sort=sort_list,
-        limit=10000,
-        skip=0,
-    )
-
-    docs = [_filter_addresses_by_region(doc, body.region) for doc in docs]
+    if body.filter_string and body.filter_string.strip():
+        from domain.services.unified_search_service import find_by_filter_string
+        sort_spec = [{"field": actual_sort, "order": -1 if body.sort_order == "desc" else 1}]
+        if actual_sort == "source_updated_at":
+            sort_spec.append({"field": "system_updated_at", "order": -1 if body.sort_order == "desc" else 1})
+        data, _total, err = find_by_filter_string(
+            filter_string=body.filter_string.strip(),
+            sort=sort_spec,
+            limit=10000,
+            skip=0,
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        docs = [_normalize_unified_doc(d) for d in (data or [])]
+    else:
+        filters = _build_unified_filters(
+            region=body.region,
+            city=body.city,
+            price_min=body.price_min,
+            price_max=body.price_max,
+            price_eq=body.price_eq,
+            source=body.source,
+            property_type=body.property_type,
+            building_area_sqm_op=body.building_area_sqm_op,
+            building_area_sqm_value=body.building_area_sqm_value,
+            land_area_ha_op=body.land_area_ha_op,
+            land_area_ha_value=body.land_area_ha_value,
+            date_filter_days=body.date_filter_days,
+            price_per_m2_min=body.price_per_m2_min,
+            price_per_m2_max=body.price_per_m2_max,
+            price_per_m2_currency=body.price_per_m2_currency,
+            price_per_ha_min=body.price_per_ha_min,
+            price_per_ha_max=body.price_per_ha_max,
+            price_per_ha_currency=body.price_per_ha_currency,
+        )
+        repo = UnifiedListingsRepository()
+        docs = repo.find_many(
+            filter=filters,
+            sort=sort_list,
+            limit=10000,
+            skip=0,
+        )
+        docs = [_filter_addresses_by_region(doc, body.region) for doc in docs]
 
     from domain.gateways.listing_gateway import ListingGateway
     from utils.file_utils import generate_excel_in_memory
 
     columns = [
-        "source", "source_id", "status", "property_type", "building_area_sqm", "land_area_ha",
+        "source", "source_id", "status", "property_type", "building_area_sqm", "land_area_sqm",
         "title", "description", "page_url", "price_uah", "price_usd", "addresses", "source_updated_at",
     ]
     headers = {
         "source": "Джерело", "source_id": "ID", "status": "Статус", "property_type": "Тип",
-        "building_area_sqm": "Площа, м²", "land_area_ha": "Площа, га", "title": "Назва",
+        "building_area_sqm": "Площа, м²", "land_area_sqm": "Площа землі, м²", "land_area_sotky": "Площа землі, с", "title": "Назва",
         "description": "Опис", "page_url": "Посилання", "price_uah": "Ціна, грн", "price_usd": "Ціна, $",
         "addresses": "Адреса", "source_updated_at": "Оновлено",
     }
@@ -1090,28 +1228,6 @@ def send_export_via_bot(request: Request, body: ExportSearchRequest):
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
 
-    filters = _build_unified_filters(
-        region=body.region,
-        city=body.city,
-        price_min=body.price_min,
-        price_max=body.price_max,
-        price_eq=body.price_eq,
-        source=body.source,
-        property_type=body.property_type,
-        building_area_sqm_op=body.building_area_sqm_op,
-        building_area_sqm_value=body.building_area_sqm_value,
-        land_area_ha_op=body.land_area_ha_op,
-        land_area_ha_value=body.land_area_ha_value,
-        date_filter_days=body.date_filter_days,
-        price_per_m2_min=body.price_per_m2_min,
-        price_per_m2_max=body.price_per_m2_max,
-        price_per_m2_currency=body.price_per_m2_currency,
-        price_per_ha_min=body.price_per_ha_min,
-        price_per_ha_max=body.price_per_ha_max,
-        price_per_ha_currency=body.price_per_ha_currency,
-    )
-
-    repo = UnifiedListingsRepository()
     sort_field_map = {"source_updated_at": "source_updated_at", "price": "price_uah", "title": "title"}
     actual_sort = sort_field_map.get(body.sort_field, "source_updated_at")
     sort_direction = -1 if body.sort_order == "desc" else 1
@@ -1119,25 +1235,61 @@ def send_export_via_bot(request: Request, body: ExportSearchRequest):
     if actual_sort == "source_updated_at":
         sort_list.append(("system_updated_at", sort_direction))
 
-    docs = repo.find_many(
-        filter=filters,
-        sort=sort_list,
-        limit=10000,
-        skip=0,
-    )
-
-    docs = [_filter_addresses_by_region(doc, body.region) for doc in docs]
+    if body.filter_string and body.filter_string.strip():
+        from domain.services.unified_search_service import find_by_filter_string
+        sort_spec = [{"field": actual_sort, "order": -1 if body.sort_order == "desc" else 1}]
+        if actual_sort == "source_updated_at":
+            sort_spec.append({"field": "system_updated_at", "order": -1 if body.sort_order == "desc" else 1})
+        data, _total, err = find_by_filter_string(
+            filter_string=body.filter_string.strip(),
+            sort=sort_spec,
+            limit=10000,
+            skip=0,
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        docs = [_normalize_unified_doc(d) for d in (data or [])]
+    else:
+        filters = _build_unified_filters(
+            region=body.region,
+            city=body.city,
+            price_min=body.price_min,
+            price_max=body.price_max,
+            price_eq=body.price_eq,
+            source=body.source,
+            property_type=body.property_type,
+            building_area_sqm_op=body.building_area_sqm_op,
+            building_area_sqm_value=body.building_area_sqm_value,
+            land_area_ha_op=body.land_area_ha_op,
+            land_area_ha_value=body.land_area_ha_value,
+            date_filter_days=body.date_filter_days,
+            price_per_m2_min=body.price_per_m2_min,
+            price_per_m2_max=body.price_per_m2_max,
+            price_per_m2_currency=body.price_per_m2_currency,
+            price_per_ha_min=body.price_per_ha_min,
+            price_per_ha_max=body.price_per_ha_max,
+            price_per_ha_currency=body.price_per_ha_currency,
+        )
+        repo = UnifiedListingsRepository()
+        docs = repo.find_many(
+            filter=filters,
+            sort=sort_list,
+            limit=10000,
+            skip=0,
+        )
+        docs = [_filter_addresses_by_region(doc, body.region) for doc in docs]
+        docs = [_normalize_unified_doc(d) for d in docs]
 
     from domain.gateways.listing_gateway import ListingGateway
     from utils.file_utils import generate_excel_in_memory
 
     columns = [
-        "source", "source_id", "status", "property_type", "building_area_sqm", "land_area_ha",
+        "source", "source_id", "status", "property_type", "building_area_sqm", "land_area_sqm",
         "title", "description", "page_url", "price_uah", "price_usd", "addresses", "source_updated_at",
     ]
     headers = {
         "source": "Джерело", "source_id": "ID", "status": "Статус", "property_type": "Тип",
-        "building_area_sqm": "Площа, м²", "land_area_ha": "Площа, га", "title": "Назва",
+        "building_area_sqm": "Площа, м²", "land_area_sqm": "Площа землі, м²", "land_area_sotky": "Площа землі, с", "title": "Назва",
         "description": "Опис", "page_url": "Посилання", "price_uah": "Ціна, грн", "price_usd": "Ціна, $",
         "addresses": "Адреса", "source_updated_at": "Оновлено",
     }
@@ -1267,6 +1419,47 @@ def get_unified_cities(request: Request, region: Optional[str] = Query(None)):
                 result.append(city)
                 result.sort()
     return {"cities": result}
+
+
+@router.get("/unified/filters/districts")
+def get_unified_districts(
+    request: Request,
+    region: Optional[str] = Query(None, description="Область"),
+    city: Optional[str] = Query(None, description="Населений пункт / місто"),
+):
+    """Отримує список районів міста (city_district) для обраної області та міста."""
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+    if not region or not city:
+        return {"districts": []}
+    repo = UnifiedListingsRepository()
+    districts = set()
+    try:
+        reg_esc = re.escape(region.strip())
+        city_esc = re.escape(city.strip())
+        match_root = {
+            "region": {"$regex": "^" + reg_esc, "$options": "i"},
+            "city": {"$regex": "^" + city_esc, "$options": "i"},
+            "city_district": {"$exists": True, "$nin": [None, ""]},
+        }
+        for item in repo.collection.find(match_root, {"city_district": 1}).limit(1000):
+            if item.get("city_district"):
+                districts.add(item["city_district"])
+        pipeline = [
+            {"$match": {"addresses": {"$elemMatch": {"region": {"$regex": "^" + reg_esc, "$options": "i"}, "settlement": {"$regex": "^" + city_esc, "$options": "i"}, "city_district": {"$exists": True, "$nin": [None, ""]}}}}},
+            {"$unwind": "$addresses"},
+            {"$match": {"addresses.region": {"$regex": "^" + reg_esc, "$options": "i"}, "addresses.settlement": {"$regex": "^" + city_esc, "$options": "i"}, "addresses.city_district": {"$exists": True, "$nin": [None, ""]}}},
+            {"$group": {"_id": "$addresses.city_district"}},
+            {"$sort": {"_id": 1}},
+            {"$limit": 200},
+        ]
+        for item in repo.collection.aggregate(pipeline):
+            if item.get("_id"):
+                districts.add(item["_id"])
+    except Exception:
+        pass
+    return {"districts": sorted(list(districts))}
 
 
 @router.get("/unified-detail")
@@ -1465,7 +1658,7 @@ def _build_item_for_price_indicator(doc: Dict[str, Any], source: str) -> Optiona
             if len(parts) > 1:
                 region = parts[1]
         b_sqm = detail.get("llm", {}).get("building_area_sqm") or price_metrics.get("building_area_sqm")
-        l_ha = detail.get("llm", {}).get("land_area_ha") or price_metrics.get("land_area_ha")
+        l_sqm = detail.get("llm", {}).get("land_area_sqm") or (detail.get("llm", {}).get("land_area_ha") and float(detail["llm"]["land_area_ha"]) * 10000) or price_metrics.get("land_area_sqm")
         return {
             "source": "olx",
             "source_id": doc.get("url", ""),
@@ -1475,7 +1668,7 @@ def _build_item_for_price_indicator(doc: Dict[str, Any], source: str) -> Optiona
             "price_per_m2_uah": price_metrics.get("price_per_m2_uah"),
             "price_per_ha_uah": price_metrics.get("price_per_ha_uah"),
             "building_area_sqm": b_sqm,
-            "land_area_ha": l_ha,
+            "land_area_sqm": l_sqm,
         }
     if source == "prozorro":
         auction_data = doc.get("auction_data", {})
@@ -1502,11 +1695,17 @@ def _build_item_for_price_indicator(doc: Dict[str, Any], source: str) -> Optiona
         price = value.get("amount") if isinstance(value, dict) else None
         pm = auction_data.get("price_metrics") or {}
         items = auction_data.get("items") or []
-        b_sqm, l_ha = None, None
+        b_sqm, l_sqm = None, None
         if items and isinstance(items[0], dict):
             ip = items[0].get("itemProps") or {}
             b_sqm = ip.get("totalBuildingArea") or ip.get("totalObjectArea") or ip.get("usableArea")
-            l_ha = ip.get("landArea")
+            land_area_raw = ip.get("landArea")
+            if land_area_raw is not None:
+                try:
+                    v = float(land_area_raw)
+                    l_sqm = v * 10000.0 if v < 10000 else v
+                except (TypeError, ValueError):
+                    l_sqm = None
         return {
             "source": "prozorro",
             "source_id": doc.get("auction_id", ""),
@@ -1516,7 +1715,7 @@ def _build_item_for_price_indicator(doc: Dict[str, Any], source: str) -> Optiona
             "price_per_m2_uah": pm.get("price_per_m2_uah"),
             "price_per_ha_uah": pm.get("price_per_ha_uah"),
             "building_area_sqm": b_sqm,
-            "land_area_ha": l_ha,
+            "land_area_sqm": l_sqm,
         }
     return None
 

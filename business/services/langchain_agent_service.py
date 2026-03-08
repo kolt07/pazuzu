@@ -28,6 +28,7 @@ from utils.data_dictionary import DataDictionary
 from utils.date_utils import format_date_display, format_datetime_display
 from utils.analytics_builder import AnalyticsBuilder
 from utils.query_builder import QueryBuilder
+from domain.services.analytics_extracts_service import AnalyticsExtractsService
 from utils.report_generator import ReportGenerator
 from utils.file_utils import generate_excel_in_memory, ensure_directory_exists
 from business.services.geocoding_service import GeocodingService
@@ -36,7 +37,7 @@ from business.services.places_service import PlacesService
 from business.services.collection_knowledge_service import CollectionKnowledgeService
 from business.services.prozorro_service import ProZorroService
 from data.database.connection import MongoDBConnection
-from scripts.olx_scraper.run_update import run_olx_update
+from business.services.source_data_load_service import run_full_pipeline
 
 # LangChain imports
 try:
@@ -56,6 +57,18 @@ except ImportError:
     ChatOpenAI = None  # type: ignore
     ChatAnthropic = None  # type: ignore
     LANGCHAIN_AVAILABLE = False
+
+# Ollama (локальна LLM) — без API ключа
+try:
+    from langchain_ollama import ChatOllama
+    CHAT_OLLAMA_AVAILABLE = True
+except ImportError:
+    try:
+        from langchain_community.chat_models import ChatOllama
+        CHAT_OLLAMA_AVAILABLE = True
+    except ImportError:
+        ChatOllama = None  # type: ignore
+        CHAT_OLLAMA_AVAILABLE = False
 
 # Опціонально: embeddings для VectorStoreRetrieverMemory-стилю пошуку
 try:
@@ -79,6 +92,106 @@ if not logger.handlers:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     logger.propagate = False
+
+
+def _extract_usage_from_aimessage(msg: Any) -> Optional[Dict[str, int]]:
+    """Витягує input_tokens, output_tokens з AIMessage (LangChain Google GenAI). Повертає None якщо немає."""
+    if msg is None:
+        return None
+    try:
+        um = getattr(msg, "usage_metadata", None) or (getattr(msg, "response_metadata", None) or {}).get("usage_metadata")
+        if not um:
+            return None
+        if isinstance(um, dict):
+            inp = um.get("input_tokens") or um.get("prompt_token_count")
+        else:
+            inp = getattr(um, "input_tokens", None) or getattr(um, "prompt_token_count", None)
+        if isinstance(um, dict):
+            out = um.get("output_tokens") or um.get("candidates_token_count")
+        else:
+            out = getattr(um, "output_tokens", None) or getattr(um, "candidates_token_count", None)
+        if inp is not None or out is not None:
+            return {"input_tokens": int(inp or 0), "output_tokens": int(out or 0)}
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _message_content_to_str(content: Any) -> str:
+    """Перетворює content повідомлення (рядок або список блоків) на один рядок для логування."""
+    if content is None:
+        return ""
+    if isinstance(content, bytes):
+        try:
+            return content.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                # Різні формати: {"type": "text", "text": "..."}, {"thinking": "..."}, {"content": "..."}
+                part = (
+                    item.get("text")
+                    or item.get("content")
+                    or item.get("thinking", "")
+                )
+                if part:
+                    parts.append(str(part))
+            else:
+                # Об'єкти (наприклад блоки від SDK): .text, .content, .thinking
+                part = getattr(item, "text", None) or getattr(item, "content", None) or getattr(item, "thinking", None)
+                if part is not None and str(part).strip():
+                    parts.append(str(part))
+                else:
+                    parts.append(str(item))
+        return "\n".join(parts) if parts else ""
+    return str(content)
+
+
+def _messages_to_request_text(messages: List[Any]) -> str:
+    """Серіалізує список повідомлень (HumanMessage, SystemMessage, AIMessage, ToolMessage) у один рядок для логування."""
+    if not messages:
+        return ""
+    lines = []
+    for msg in messages:
+        role = type(msg).__name__
+        content = getattr(msg, "content", None)
+        if content is None:
+            content = getattr(msg, "text", None)
+        part = _message_content_to_str(content)
+        if not part.strip() and content is not None:
+            # Контент є, але не вдалося витягти текст (напр. невідомий формат)
+            part = f"(content type: {type(content).__name__}, repr: {repr(content)[:200]})"
+        lines.append(f"[{role}]\n{part}")
+    result = "\n---\n".join(lines)
+    if not result.strip():
+        return f"(серіалізація: {len(messages)} повідомлень, контент не витягнуто)"
+    return result
+
+
+def _aimessage_to_response_text(response: Any) -> str:
+    """Витягує повний текст відповіді з AIMessage для логування (включаючи thinking-блоки як текст)."""
+    if response is None:
+        return ""
+    content = getattr(response, "content", None)
+    if content is None:
+        content = getattr(response, "text", None)
+    # Частина інтеграцій (наприклад langchain_core) зберігає блоки в content_blocks
+    if (content is None or (isinstance(content, list) and not content)) and hasattr(response, "content_blocks"):
+        blocks = getattr(response, "content_blocks", None)
+        if blocks:
+            content = blocks
+    text = _message_content_to_str(content)
+    if not text.strip() and hasattr(response, "tool_calls") and getattr(response, "tool_calls", None):
+        tool_calls = response.tool_calls or []
+        names = [getattr(t, "name", t.get("name", "?")) if not isinstance(t, dict) else t.get("name", "?") for t in tool_calls]
+        text = f"(відповідь: виклики інструментів: {', '.join(str(n) for n in names)})"
+    return text
 
 
 # Параметри пам'яті (елементи ConversationBufferMemory, ConversationSummaryMemory, VectorStoreRetrieverMemory)
@@ -122,14 +235,19 @@ TOOL_ROUTES = {
         "get_distinct_values", "execute_query", "execute_aggregation", "save_query_to_temp_collection",
         "export_from_temp_collection", "export_listings_to_file", "save_query_results_to_excel",
         "trigger_data_update", "list_templates", "generate_report",
+        "generate_search_filter_string", "search_unified_listings",
     },
     "analytics": {
         "get_allowed_collections", "get_data_dictionary", "execute_analytics", "list_metrics",
+        "analytics_extracts_aggregate", "analytics_extracts_search", "analytics_extracts_list_metrics",
+        "analytics_extracts_list_dimensions", "analytics_extracts_get_distinct",
         "generate_report", "list_templates", "execute_query", "execute_aggregation",
         "save_query_to_temp_collection", "export_from_temp_collection",
+        "generate_search_filter_string", "search_unified_listings",
     },
     "geo": {"geocode_address", "search_nearby_places", "get_allowed_collections", "get_collection_info"},
     "geo_assessment": {"geocode_address", "search_nearby_places", "get_collection_info", "execute_query"},
+    "listing_detail": {"get_listing_details", "geocode_address", "get_collection_info"},
 }
 
 
@@ -252,6 +370,7 @@ class LangChainAgentService:
         self.data_dictionary = DataDictionary()
         self.analytics_builder = AnalyticsBuilder()
         self.query_builder = QueryBuilder()
+        self.analytics_extracts_service = AnalyticsExtractsService()
         self.report_generator = ReportGenerator()
         self.prozorro_service = ProZorroService(settings)
         self.geocoding_service = GeocodingService(settings)
@@ -267,7 +386,7 @@ class LangChainAgentService:
         
         # Ініціалізуємо LLM: базовий (summarize, fallback) та асистент (thinking + grounding)
         self.llm = self._create_llm()
-        self.llm_assistant = self._create_assistant_llm() if self.settings.llm_provider.lower() == 'gemini' else self.llm
+        self.llm_assistant = self._create_assistant_llm() if self.settings.llm_assistant_provider.lower() == 'gemini' else self.llm
         
         # Створюємо tools
         self.tools = self._create_tools()
@@ -294,7 +413,9 @@ class LangChainAgentService:
         self._current_user_id: Optional[str] = None
         # Chat ID поточного діалогу (Mini App)
         self._current_chat_id: Optional[str] = None
-        if EMBEDDINGS_AVAILABLE and self.settings.llm_provider.lower() == 'gemini':
+        # Контекст оголошення для маршруту listing_detail (get_listing_details використовує його, якщо не передано source/source_id)
+        self._current_listing_context: Optional[Dict[str, Any]] = None
+        if EMBEDDINGS_AVAILABLE and self.settings.llm_assistant_provider.lower() == 'gemini':
             api_key = self.settings.llm_api_keys.get('gemini', '')
             if api_key:
                 try:
@@ -320,14 +441,29 @@ class LangChainAgentService:
         return self._create_llm_internal(use_assistant_config=True)
 
     def _create_llm_internal(self, use_assistant_config: bool = False):
-        """Створює LLM. use_assistant_config=True — thinking_budget + include_thoughts для асистента."""
-        provider_name = self.settings.llm_provider.lower()
+        """Створює LLM для асистента. use_assistant_config=True — thinking_budget + include_thoughts (лише Gemini)."""
+        provider_name = self.settings.llm_assistant_provider.lower()
         api_key = self.settings.llm_api_keys.get(provider_name, '')
-        
+
+        # Ollama — локальна LLM, API ключ не потрібен
+        if provider_name == 'ollama':
+            if not CHAT_OLLAMA_AVAILABLE or ChatOllama is None:
+                raise ImportError(
+                    "Для використання Ollama встановіть: pip install langchain-ollama або langchain-community"
+                )
+            model_name = getattr(self.settings, 'llm_assistant_model_name', 'gemma3:27b')
+            temperature = getattr(self.settings, 'llm_agent_temperature', 0.7)
+            max_tokens = getattr(self.settings, 'llm_agent_max_output_tokens', 8192)
+            return ChatOllama(
+                model=model_name,
+                temperature=temperature,
+                num_predict=max_tokens,
+            )
+
         if not api_key:
             raise ValueError(f"API ключ для провайдера {provider_name} не вказано")
-        
-        model_name = getattr(self.settings, 'llm_model_name', 'gemini-2.5-flash')
+
+        model_name = getattr(self.settings, 'llm_assistant_model_name', 'gemini-2.5-flash')
         temperature = getattr(self.settings, 'llm_agent_temperature', 0.7)
         max_tokens = getattr(self.settings, 'llm_agent_max_output_tokens', 8192)
         
@@ -393,20 +529,34 @@ class LangChainAgentService:
             f"Користувач: {h}\nАсистент: {a}" for h, a in exchanges
         )
         prompt = (
-            "Коротко підсумуй цей фрагмент діалогу українською в 2-4 реченнях, "
-            "збережи ключові факти та запити:\n\n" + text[:4000]
+            "Summarize this dialogue fragment in 2-4 sentences. Output must be in Ukrainian. "
+            "Preserve key facts and requests:\n\n" + text[:4000]
         )
         try:
+            messages = [HumanMessage(content=prompt)]
+            resp = self.llm.invoke(messages)
             try:
+                usage = _extract_usage_from_aimessage(resp)
+                meta = {"prompt_preview": prompt[:100] + ("..." if len(prompt) > 100 else "")}
+                if usage:
+                    meta["input_tokens"] = usage.get("input_tokens", 0)
+                    meta["output_tokens"] = usage.get("output_tokens", 0)
                 self.logging_service.log_api_usage(
                     service="llm",
                     source="langchain_agent_summarize",
                     from_cache=False,
-                    metadata={"prompt_preview": prompt[:100] + ("..." if len(prompt) > 100 else "")},
+                    metadata=meta,
+                )
+                self.logging_service.log_llm_exchange(
+                    request_text=_messages_to_request_text(messages),
+                    response_text=_aimessage_to_response_text(resp),
+                    input_tokens=meta.get("input_tokens", 0),
+                    output_tokens=meta.get("output_tokens", 0),
+                    source="langchain_agent_summarize",
+                    provider=(getattr(self.settings, "llm_assistant_provider", None) or "gemini"),
                 )
             except Exception as e:
-                logger.debug("log_api_usage (summarize): %s", e)
-            resp = self.llm.invoke([HumanMessage(content=prompt)])
+                logger.warning("Не вдалося записати llm_exchange (summarize): %s", e)
             content = getattr(resp, "content", None) or ""
             return content.strip() if isinstance(content, str) else ""
         except Exception as e:
@@ -458,96 +608,84 @@ class LangChainAgentService:
         if base_from_config:
             base_prompt = metadata_text + "\n\n" + base_from_config.strip()
         else:
-            # Fallback — захардкодений промпт (legacy)
+            # Fallback — hardcoded prompt (legacy). Instructions in English; answer and all text output in Ukrainian only.
             base_prompt = metadata_text + """
 
 ---
-
-Ти — асистент-аналітик даних по оголошеннях (аукціони ProZorro, оголошення OLX). Ти працюєш у верхньому шарі застосунку: всі операції з даними виконуються виключно через інструменти (MCP); прямого доступу до БД, API чи файлової системи немає. Нові сервіси можуть додаватися — використовуй лише надані інструменти.
-
----
-## РОЛЬ ТА КОНТЕКСТ АРХІТЕКТУРИ
-
-**Хто обробляє запит:** Кожен запит спочатку перевіряє **агент безпеки** (SecurityAgent). Далі система вирішує: якщо користувач явно просить «звіт за добу/тиждень» або «експорт за період» — спрацьовує **мультиагентний пайплайн** (агент-помічник → планувальник → аналітик): планувальник формує кроки (вибірка, експорт), аналітик виконує їх через ті самі MCP-інструменти і повертає файли. Усі інші запити потрапляють до **тебе (LangChain-агент)**.
-
-**Твоя роль:** Ти отримуєш вільні та складні запити. Ти сам будуєш план дій на основі доступних інструментів (get_collection_info, get_distinct_values, execute_query, execute_aggregation, execute_analytics тощо) і гнучко формуєш відповідь. Для запитів про «найдорожчу/найдешевшу нерухомість», «топ за ціною», «по регіону/області» завжди враховуй обидва джерела даних, якщо користувач не вказав одне: викликай execute_query або execute_aggregation для prozorro_auctions і окремо для olx_listings (з відповідними фільтрами за регіоном/містом через addresses). Результати оформлюй у відповіді двома блоками: «За даними ProZorro …» та «За даними OLX …» — у кожному вкажи найвищу ціну (абсолютну), за можливості ціну за м², та коротко об’єкт/лот. Якщо в одному з джерел немає відповідних записів — явно напиши «немає відповідних лотів/оголошень», але все одно покажи другий блок. Планувальник і аналітик викликаються системою лише для явних звітів/експортів за період; решта — твоя зона відповідальності.
-
-**Підхід до запиту:** Отримай запит → за потреби уточни його в користувача → проаналізуй доступні інструменти та дані (схема, колекції, метрики) → творчо оброби запит і дай відповідь. Якщо запит стосується вибірки чи агрегації — викликай відповідні інструменти і підкріпи відповідь числовими даними (кількість записів, підсумки). Якщо користувач явно просить файл або експорт — використай save_query_to_temp_collection та export_from_temp_collection; якщо достатньо підсумку або аналітики — дай текстову відповідь з числами, без вивантаження файлів.
+You are a data analysis assistant for listings (ProZorro auctions, OLX). You work in the app top layer: all data operations go through tools (MCP); no direct DB/API/filesystem access. Use only the tools provided. You must answer the user and any text output in Ukrainian only.
 
 ---
-**Як працювати (деталі):** Зрозумій запит за контекстом діалогу. За потреби уточни у користувача. Склади план з інструментів і втілюй або поясни обмеження.
+## ROLE AND ARCHITECTURE CONTEXT
+
+**Who handles the request:** SecurityAgent first. If the user explicitly asks for a "report for day/week" or "export for period", the multi-agent pipeline runs (planner → analyst). All other requests go to you (LangChain agent).
+
+**Your role:** You receive free-form requests. Build a plan from available tools (get_collection_info, get_distinct_values, execute_query, execute_aggregation, execute_analytics, etc.) and respond. For «найдорожчу/найдешевшу нерухомість», «топ за ціною», «по регіону/області» завжди враховуй обидва джерела даних, якщо користувач не вказав одне: викликай execute_query або execute_aggregation для prozorro_auctions і окремо для olx_listings (з відповідними фільтрами за регіоном/містом через addresses). Результати оформлюй у відповіді двома блоками: «За даними ProZorro …» та «За даними OLX …» — у кожному вкажи найвищу ціну (абсолютну), за можливості ціну за м², та коротко об’єкт/лот. Якщо в одному з джерел немає відповідних записів — явно напиши «немає відповідних лотів/оголошень», але все одно покажи другий блок. Планувальник і аналітик викликаються системою лише для явних звітів/експортів за період; Present two blocks in Ukrainian: \"За даними ProZorro …\" and \"За даними OLX …\". If one source has no data, say so and still show the other.
+
+**Approach:** Understand the request → clarify if needed → use tools and data (schema, collections, metrics) → respond in Ukrainian. For selection/aggregation use tools and support the answer with numbers. For file/export use save_query_to_temp_collection and export_from_temp_collection; otherwise give a short text answer with numbers.
+
+---
+**How to work:** Understand the request from dialogue context. Clarify with the user if needed. Build a tool plan and execute it or explain limitations. Answer only in Ukrainian.
 
 
 ---
-## 1. ІНІЦІАЦІЯ ОБМІНІВ (оновлення даних із джерел)
+## 1. DATA UPDATE (triggering imports)
 
-**trigger_data_update** — ініціює оновлення даних у базі (з параметрами).
-- source="olx": оновлення оголошень OLX (нежитлова нерухомість, земельні ділянки). Параметр days (опційно): 1 або 7.
-- source="prozorro": нагадування, що оновлення ProZorro виконується через головний пайплайн/Telegram.
-Викликай, коли користувач просить оновити або перезавантажити дані.
-
----
-## 2. ВИБІРКА, АГРЕГАЦІЯ ТА ІНТЕЛЕКТУАЛЬНА ОБРОБКА
-
-**Схема та контекст:** get_database_schema, get_collection_info(collection_name), get_data_dictionary — дослідження структури. Колекції: prozorro_auctions, llm_cache, olx_listings.
-
-**Метрики та фільтри:** execute_analytics — агреговані метрики. За замовчуванням collection: prozorro_auctions. Можеш використовувати вбудовані метрики (list_metrics) або кастомні: metric як {{ name, formula, aggregation (опціонально) }}; formula — auction_data.*, llm_result.result.* (+, -, *, /). Фільтрація за status, region, city, property_type, building_area_sqm, land_area_ha, auction_data.dateModified. Регіон без суфікса «область» (Київська, Львівська). Місто і область окремо: $or: [{{"city": "Київ"}}, {{"region": "Київська"}}]. Для звітів «по днях» / «зміна цін за кв. м. по днях» — один виклик з groupBy: ["date"] та фільтрами за датами і регіоном. **Порівняння по областям:** ProZorro — execute_analytics з groupBy: ["region"]; OLX — execute_analytics підтримує лише groupBy: ["date"], для групування по регіону використовуй execute_aggregation (поля регіону в OLX: detail.resolved_locations, search_data.location). Якщо по ProZorro результатів 0, спробуй execute_analytics з collection: "olx_listings", groupBy: ["date"] та тими ж фільтрами за датою та регіоном.
-
-**КРИТИЧНО — Пошук за адресами (region/city):** Використовуй колекцію **unified_listings** і поле **addresses**. Адреси — масив: addresses[].region, addresses[].settlement.
-- **unified_listings:** `{"addresses": {"$elemMatch": {"region": "Київська"}}}` або `{"addresses": {"$elemMatch": {"settlement": "Київ"}}}` (область — «Київська», «Львівська» без суфікса «область»).
-- **«Київ та область» (місто АБО область):** `$or`: [{"addresses": {"$elemMatch": {"settlement": "Київ"}}}, {"addresses": {"$elemMatch": {"region": "Київська"}}}].
-- **Перед фільтром:** викликай get_distinct_values(unified_listings, addresses.region) або addresses.settlement для перевірки точних значень.
-
-**ProZorro — вкладені сутності (ОБОВ'ЯЗКОВІ ПРАВИЛА):**
-- **bids та bidders:** Поле auction_data.numberOfBids НЕ існує. Заявки — масив auction_data.bids[]. Кожна заявка має bids[].bidders[] (учасники); унікальний ідентифікатор учасника — bids[].bidders[].identifier.id. Кількість заявок: $addFields з bids_count = $size($ifNull(auction_data.bids, [])). Кількість унікальних учасників: збирай identifier.id з усіх bids[].bidders[], потім $setUnion або підрахунок унікальних; не плутай з кількістю bids.
-- **Фінансові поля:** Стартова ціна — auction_data.value.amount (number, UAH); auction_data.value.valueAddedTaxIncluded (bool). Фінальна ціна — auction_data.contracts[].value.amount або auction_data.awards[].value.amount. Для аналітики та сортування за ціною використовуй auction_data.value.amount; не плутай з bids[].value.amount (ціна в заявці).
-- **Предмети (items):** Площі — auction_data.items[].quantity.value (одиниця: м² або га). Адреса лоту — items[].address; класифікація — items[].classification.id. При агрегаціях за регіоном через items використовуй $unwind по items і фільтруй по items.address.
-
-**Запити та агрегації:** execute_query — прості запити (параметр limit: за замовчуванням 100; для експорту «усіх» за період завжди передавай limit: 100). execute_aggregation — pipeline (групування, $unwind, $lookup, $match, $project, $limit). Для OLX використовуй execute_query/execute_aggregation з collection "olx_listings" (поля: url, search_data.*, detail.*, updated_at). get_allowed_collections — список дозволених колекцій. Для запитів типу «найдорожча/найдешевша нерухомість по області/регіону» або «топ за ціною» виконуй окремі виклики для prozorro_auctions та olx_listings і у відповіді завжди дай два блоки: «За даними ProZorro …» та «За даними OLX …» (ціна, за можливостю ціна за м², коротко об’єкт). **ProZorro — кількість учасників:** поля auction_data.numberOfBids у документах НЕМАЄ. Для «топ-N аукціонів за кількістю зареєстрованих учасників» використовуй pipeline: [{\"$addFields\": {\"bids_count\": {\"$size\": {\"$ifNull\": [\"$auction_data.bids\", []]}}}}, {\"$match\": {\"bids_count\": {\"$gt\": 0}}}, {\"$sort\": {\"bids_count\": -1}}, {\"$limit\": N}, {\"$project\": {\"auction_id\": 1, \"bids_count\": 1, \"auction_data.title\": 1, \"auction_data.value\": 1, \"_id\": 0}}]. **get_distinct_values(collection_name, field_path, unwrap_array=False)** — унікальні значення поля; для полів-масивів (наприклад detail.llm.tags) передай unwrap_array=True. **Перед фільтрацією за регіоном/локацією/текстовим полем обов'язково викликай get_distinct_values**; перед фільтром за тегами (крамниця, аптека, газ, вода тощо) — get_distinct_values(olx_listings, detail.llm.tags, unwrap_array=True), потім $match з "detail.llm.tags": {"$in": ["тег1", "тег2"]}. Теги в OLX зберігаються в detail.llm.tags (призначення та комунікації з парсингу опису).
-
-**Критично — дати в MongoDB:** У prozorro_auctions поля auction_data.dateModified та auction_data.dateCreated — рядки ISO 8601. У $match використовуй порівняння рядків: "auction_data.dateModified": {"$gte": "2026-02-06T00:00:00.000Z", "$lte": "..."}. НЕ використовуй {"$date": "..."}. У olx_listings поле updated_at — BSON Date; у execute_aggregation у $match передавай updated_at як ISO-рядки ($gte/$lte) — сервер автоматично перетворює їх на дату.
-
-**Безпека:** Оператор $regex у query-builder ЗАБОРОНЕНИЙ. Фільтрацію за статусом/регіоном для ProZorro роби через execute_analytics.
-
-**Геокодування:** geocode_address(address, region="ua") — адреса або топонім у координати та formatted_address (відповідь українською); результат кешується.
-
-**Гео-аналіз (Places):** search_nearby_places(latitude, longitude, place_types, radius_meters=500) — пошук місць поблизу: pharmacy, hospital, bus_station, transit_station, restaurant, cafe, supermarket, school, apartment_building. Використовуй для оцінки придатності приміщення для виду діяльності (аптека, кафе тощо): спочатку geocode_address(адреса), потім search_nearby_places з координатами та потрібними типами.
+**trigger_data_update** — initiates data refresh (with parameters).
+- source="olx": update OLX listings (non-residential, land). Optional param days: 1 or 7.
+- source="prozorro": reminder that ProZorro updates run via main pipeline/Telegram.
+Call when the user asks to update or reload data.
 
 ---
-## 3. ЗБЕРЕЖЕННЯ ДАНИХ У ФАЙЛ І ВІДПРАВКА КОРИСТУВАЧУ
+## 2. SELECTION, AGGREGATION AND ANALYTICS
 
-**Експорт у файл (основний спосіб):** Не отримуй результати запиту в контекст. Створи тимчасову вибірку та експортуй з неї:
-1. save_query_to_temp_collection(query) — виконує запит, зберігає результати на сервері, повертає temp_collection_id та count.
-2. export_from_temp_collection(temp_collection_id, format=xlsx, filename_prefix) — експортує вибірку в файл; filename_prefix має бути релевантним запиту (наприклад: mista_novovolynsk_kovel, ogoloshennya_kyiv, zvit_za_tyzhden). Після експорту тимчасові дані видаляються.
-- Підтримуються колекції prozorro_auctions та olx_listings. Для «оголошення за період» виконай save_query_to_temp_collection + export_from_temp_collection для кожної колекції окремо (два файли).
-**export_listings_to_file** — лише коли вже є список ids (наприклад з попереднього контексту). Параметри: ids, collection, format, filename_prefix. Без columns — стандартний формат.
+**Schema and context:** get_database_schema, get_collection_info(collection_name), get_data_dictionary — explore structure. Collections: prozorro_auctions, llm_cache, olx_listings.
 
-**save_query_results_to_excel** — збереження вже отриманих результатів (поле data/results) у Excel з указаними колонками та заголовками. Використовуй, коли потрібна довільна структура таблиці з даних запиту.
+**analytics_extracts (priority for avg price per m² and geo-aggregations):** For "average price per m²" always use **analytics_extracts_aggregate**. Collection has price_per_m2_uah in UAH. Examples: (1) avg price commercial in Kyiv area >500 m² → metric=price_per_m2_uah, aggregation=avg, filters city "Київ", property_type "Комерційна нерухомість", building_area_sqm $gt 500. (2) Kyiv district with highest avg price per m² → group_by=city_district, filters region "Київська", city "Київ". (3) Solomianskyi district → city_district regex. Kyiv districts may have apostrophe (Солом'янський). Operators: eq, gt, gte, lt, lte, in, regex. Do not use execute_query/execute_aggregation for avg price per m² — prices there may be in USD.
 
-**generate_report** — звіт з джерела analytics-mcp або query-builder-mcp (dataSource, format, columns). list_templates — список шаблонів.
+**Metrics and filters:** execute_analytics — aggregated metrics. Default collection: prozorro_auctions. Use list_metrics or custom metric { name, formula, aggregation }; formula may use auction_data.*, llm_result.result.* (+, -, *, /). Filter by status, region, city, property_type, building_area_sqm, land_area_ha, auction_data.dateModified. Region without "область" (e.g. Київська, Львівська). City and region: $or. For "by days" reports use groupBy: ["date"]. By region: ProZorro execute_analytics groupBy: ["region"]; OLX only groupBy: ["date"], for region use execute_aggregation (OLX region fields: detail.resolved_locations, search_data.location). If ProZorro returns 0, try execute_analytics collection "olx_listings" with same filters.
 
-Правило: для експорту результатів запиту в Excel не використовуй execute_query з поверненням результатів у чат. Замість цього: save_query_to_temp_collection(query) → export_from_temp_collection(temp_collection_id). При запиті «оголошення за період» / «всі оголошення» / «експорт за добу» — для кожної колекції (prozorro_auctions, olx_listings) викликай save_query_to_temp_collection потім export_from_temp_collection (користувач отримає два файли).
+**Critical — address search (region/city):** Use **unified_listings** and **addresses**. addresses[].region, addresses[].settlement.
+- unified_listings: $elemMatch on region or settlement (e.g. "Київська", "Київ" — region without "область").
+- "Kyiv and oblast": $or on settlement "Київ" and region "Київська".
+- Before filtering call get_distinct_values for exact values.
 
-Якщо користувач явно просить звіт за період або експорт у файл (наприклад «звіт за добу», «експорт за тиждень», «оголошення в Excel») — використай save_query_to_temp_collection та export_from_temp_collection. Якщо запит про аналітику, підсумок або підрахунок без згадки файлу — достатньо текстової відповіді з числами.
+**ProZorro — nested entities (mandatory):**
+- bids and bidders: auction_data.numberOfBids does not exist. Bids are in auction_data.bids[]. Each bid has bids[].bidders[]; unique participant ID is bids[].bidders[].identifier.id. Number of bids: $addFields bids_count = $size($ifNull(auction_data.bids, [])). Unique participants: collect identifier.id from all bids[].bidders[], then $setUnion or distinct count.
+- Financial: starting price auction_data.value.amount (UAH); final price auction_data.contracts[].value.amount or awards[].value.amount. Use auction_data.value.amount for analytics/sorting; not bids[].value.amount.
+- items: areas in items[].quantity.value (m² or ha). Lot address items[].address; classification items[].classification.id. For region aggregations use $unwind on items and filter by items.address.
+
+**Queries and aggregations:** execute_query — simple queries (default limit 100; for "all for period" export always pass limit 100). execute_aggregation — pipeline (групування, $unwind, $lookup, $match, $project, $limit). Для OLX використовуй execute_query/execute_aggregation з collection "olx_listings" (поля: url, search_data.*, detail.*, updated_at). get_allowed_collections — список дозволених колекцій. Для запитів типу «найдорожча/найдешевша нерухомість по області/регіону» або «топ за ціною» виконуй окремі виклики для prozorro_auctions та olx_listings і у відповіді завжди дай два блоки: «За даними ProZorro …» та «За даними OLX …» (ціна, за можливостю ціна за м², коротко об’єкт). **ProZorro — кількість учасників:** поля auction_data.numberOfBids у документах НЕМАЄ. Для «топ-N аукціонів за кількістю зареєстрованих учасників» використовуй pipeline: [{\"$addFields\": {\"bids_count\": {\"$size\": {\"$ifNull\": [\"$auction_data.bids\", []]}}}}, {\"$match\": {\"bids_count\": {\"$gt\": 0}}}, {\"$sort\": {\"bids_count\": -1}}, {\"$limit\": N}, {\"$project\": {\"auction_id\": 1, \"bids_count\": 1, \"auction_data.title\": 1, \"auction_data.value\": 1, \"_id\": 0}}]. **get_distinct_values(collection_name, field_path, unwrap_array=False)** — унікальні значення поля; для полів-масивів (наприклад detail.llm.tags) передай unwrap_array=True. **Перед фільтрацією за регіоном/локацією/текстовим полем обов'язково викликай get_distinct_values**; перед фільтром за тегами (крамниця, аптека, газ, вода тощо) — get_distinct_values(olx_listings, detail.llm.tags, unwrap_array=True), потім $match з "detail.llm.tags": {"$in": ["тег1", "тег2"]}. Теги в OLX зберігаються в detail.llm.tags (призначення та комунікації з парсингу опису).
+
+**Dates in MongoDB:** In prozorro_auctions auction_data.dateModified/dateCreated are ISO 8601 strings; use string comparison in $match. Do not use $date. In olx_listings updated_at is BSON Date; pass ISO strings in $match, server converts.
+
+**Security:** $regex in query-builder is forbidden. Use execute_analytics for status/region filtering for ProZorro.
+
+**Geocoding:** geocode_address(address, region="ua") — address or toponym to coordinates and formatted_address (response in Ukrainian); result cached.
+
+**Places:** search_nearby_places(lat, lon, place_types, radius_meters=500) — pharmacy, hospital, bus_station, etc. Use for suitability of premises: geocode_address then search_nearby_places.
+
+**Unified search:** For search across OLX/ProZorro, "generate filters", "search string by region/city": use generate_search_filter_string (region, city, source, property_type, price_min, price_max, etc.) and search_unified_listings (filter_string or flat params: limit, skip, sort_field, sort_order).
 
 ---
-## ДІАЛОГ, КОНТЕКСТ ТА ГЛОСАРІЙ
+## 3. SAVING DATA TO FILE AND SENDING TO USER
 
-- Інформація про діалог зберігається через сервіси пам'яті: ти отримуєш контекст попередніх обмінів (буфер, саммарі, за потреби — релевантні фрагменти). Використовуй його для відповіді на уточнюючі запити та відповіді «на конкретне повідомлення».
-- Термінологія проєкту (глосарій) надається окремо — використовуй терміни узгоджено. При наявності інструментів оновлення/збереження глосарію — використовуй їх за запитом користувача.
+**Export to file:** Do not load large query results into chat. Use save_query_to_temp_collection(query) then export_from_temp_collection(temp_collection_id, format=xlsx, filename_prefix). Supported: prozorro_auctions, olx_listings. For "listings for period" run for each collection (two files). export_listings_to_file when you already have a list of ids. save_query_results_to_excel for existing data/results. generate_report from analytics-mcp or query-builder-mcp; list_templates for templates. If the user asks for a period report or export to file, use save_query_to_temp_collection and export_from_temp_collection; otherwise a short text answer with numbers in Ukrainian is enough.
 
 ---
-## ЗАГАЛЬНІ ПРАВИЛА
+## DIALOGUE, CONTEXT AND GLOSSARY
 
-- У JSON використовуй "null", не None. Дозволені aggregation stages: $match, $project, $group, $unwind, $sort, $limit, $lookup, $addFields; заборонені: $out, $merge.
-- Не вигадуй поля чи колекції; якщо потрібних даних немає — явно повідом. Відповідай українською.
+- Dialogue context is stored via memory services (buffer, summary, relevant fragments). Use it for follow-up and "reply to specific message". Project glossary is provided separately — use terms consistently.
 
-**Посилання та переліки:**
-- Коли користувач просить посилання — надай лише ті, що є в даних. Не обіцяй «N оголошень», якщо їх менше.
-- Кожне посилання — це повний URL (https://...). Не пиши плейсхолдери типу «[Посилання на друге оголошення...]» — або надай URL, або пропусти пункт.
-- НЕ використовуй markdown для посилань: заборонено формат [текст](url). Пиши просто URL після опису: «1. Назва, адреса: https://...». Система сама зробить клікабельне посилання.
-- Не дублюй один і той самий URL у відповіді — кожне оголошення має одне посилання.
-- Формат: номер, короткий опис (адреса/назва), посилання. Без мета-пояснень про відсутність даних."""
+---
+## GENERAL RULES
+
+- In JSON use "null", not None. Allowed aggregation stages: $match, $project, $group, $unwind, $sort, $limit, $lookup, $addFields; forbidden: $out, $merge.
+- Do not invent fields or collections; if data is missing, say so explicitly. Answer the user only in Ukrainian.
+
+**Links and lists:**
+- When the user asks for links, only provide URLs that exist. Do not promise "N listings" if you have fewer.
+- Each link must be a full URL (https://...). No placeholders; either provide the URL or omit the item.
+- Do not use markdown links [text](url). Write plain URL after the description. Do not duplicate the same URL. Format: number, short description (address/title), URL."""
         
         glossary = self._load_glossary()
         if glossary:
@@ -638,6 +776,40 @@ Important: Use terms from the glossary correctly."""
                 return_direct=False
             )
         ])
+
+        # Analytics Extracts tools (колекція виокремлених даних для швидких агрегацій)
+        tools.extend([
+            StructuredTool.from_function(
+                func=self._analytics_extracts_aggregate,
+                name="analytics_extracts_aggregate",
+                description="""[Аналітика extracts] Агрегація по метриці. Ціни вже в UAH (price_per_m2_uah). Для «середня ціна за м² комерційної нерухомості в Києві з площею понад 500 м²»: metric=price_per_m2_uah, aggregation=avg, filters={city: 'Київ', property_type: 'Комерційна нерухомість', building_area_sqm: {$gt: 500}}. Для «район міста з найвищою ціною»: group_by=[city_district], filters={region: 'Київська', city: 'Київ'}. Оператори: eq, gt, gte, lt, lte, in. filters — dict або список [{\"field\": \"building_area_sqm\", \"operator\": \"gt\", \"value\": 500}].""",
+                return_direct=False
+            ),
+            StructuredTool.from_function(
+                func=self._analytics_extracts_search,
+                name="analytics_extracts_search",
+                description="[Аналітика extracts] Пошук з логічними умовами. filters — простий dict або список умов з $and/$or/$not. sort: [{\"field\": \"price_per_m2_uah\", \"order\": -1}].",
+                return_direct=False
+            ),
+            StructuredTool.from_function(
+                func=self._analytics_extracts_list_metrics,
+                name="analytics_extracts_list_metrics",
+                description="[Аналітика extracts] Список метрик для агрегації: price_per_m2_uah, price_per_ha_uah, building_area_sqm, land_area_sqm, price_uah тощо.",
+                return_direct=False
+            ),
+            StructuredTool.from_function(
+                func=self._analytics_extracts_list_dimensions,
+                name="analytics_extracts_list_dimensions",
+                description="[Аналітика extracts] Список полів для групування: region, city, city_district, oblast_raion, settlement, street, property_type, source тощо.",
+                return_direct=False
+            ),
+            StructuredTool.from_function(
+                func=self._analytics_extracts_get_distinct,
+                name="analytics_extracts_get_distinct",
+                description="[Аналітика extracts] Унікальні значення поля (напр. city_district для Києва). Викликай перед фільтрацією.",
+                return_direct=False
+            )
+        ])
         
         # Report MCP tools
         tools.extend([
@@ -670,6 +842,18 @@ Important: Use terms from the glossary correctly."""
                 name="export_from_temp_collection",
                 description="[Експорт] Експорт у файл з тимчасової вибірки. Викликай після save_query_to_temp_collection. Параметри: temp_collection_id (обов'язково), format=xlsx, filename_prefix (релевантний запиту, напр. mista_kyiv, zvit_za_tyzhden).",
                 return_direct=False
+            ),
+            StructuredTool.from_function(
+                func=self._generate_search_filter_string,
+                name="generate_search_filter_string",
+                description="[Пошук] Генерує рядок фільтрів для зведеного пошуку (unified_listings) з структурованих параметрів. Параметри: region, city, source (olx/prozorro), property_type, price_min, price_max, date_filter_days (1/7/30), title_contains, description_contains. Гео: geo('Область' INSIDE 'Київська'). Повертає filter_string для вставки на сторінку пошуку або для search_unified_listings.",
+                return_direct=False
+            ),
+            StructuredTool.from_function(
+                func=self._search_unified_listings,
+                name="search_unified_listings",
+                description="[Пошук] Пошук по зведеній таблиці (OLX + ProZorro). Або передай filter_string (рядок фільтрів), або параметри: region, city, source, property_type, price_min, price_max, date_filter_days, title_contains, description_contains. limit (за замовч. 50), skip, sort_field (source_updated_at/price/title), sort_order (asc/desc). Повертає items, total та згенерований filter_string (якщо передані параметри).",
+                return_direct=False
             )
         ])
         
@@ -678,7 +862,7 @@ Important: Use terms from the glossary correctly."""
             StructuredTool.from_function(
                 func=self._trigger_data_update,
                 name="trigger_data_update",
-                description="[Оновлення] Ініціює оновлення даних: source=olx (days 1/7) або source=prozorro (нагадування про пайплайн).",
+                description="[Оновлення] Ініціює оновлення даних: source=olx|prozorro|all, days=1|7. Опційно regions (список областей), listing_types (типи оголошень OLX) для точкового оновлення.",
                 return_direct=False
             )
         ])
@@ -689,6 +873,15 @@ Important: Use terms from the glossary correctly."""
                 func=self._geocode_address,
                 name="geocode_address",
                 description="[Контекст] Адреса/топонім → координати, formatted_address, place_id. region='ua'. Кеш.",
+                return_direct=False
+            )
+        ])
+        # Деталі оголошення (зведені + сирі) для аналізу локації/опису — використовуй для визначення місцезнаходження з тексту
+        tools.extend([
+            StructuredTool.from_function(
+                func=self._get_listing_details,
+                name="get_listing_details",
+                description="[Контекст оголошення] Повертає повні дані оголошення (зведені + сирі): опис, location.raw, llm.addresses, регіон/місто. Викликай без аргументів, якщо розмова про поточне оголошення; або передай source (olx/prozorro) та source_id (url або auction_id). Використовуй для розбору тексту та витягування топонімів, потім geocode_address для визначення координат.",
                 return_direct=False
             )
         ])
@@ -708,7 +901,7 @@ Important: Use terms from the glossary correctly."""
     def get_tools_for_route(self, route: Optional[str] = None) -> List[Any]:
         """
         Повертає підмножину інструментів для маршруту (cost control, less chaos).
-        route: free_form (усі інструменти, включно з execute_query та execute_aggregation), query_export, analytics, geo або None (= free_form).
+        route: free_form (усі інструменти, включно з execute_query та execute_aggregation), query_export, analytics, geo, geo_assessment, listing_detail або None (= free_form).
         """
         if not route or route not in TOOL_ROUTES:
             route = "free_form"
@@ -1008,6 +1201,79 @@ Important: Use terms from the glossary correctly."""
         except Exception as e:
             logger.error(f"✗ [Analytics MCP] Помилка: {e}")
             return {'success': False, 'error': str(e)}
+
+    # Analytics Extracts tool implementations
+    def _analytics_extracts_aggregate(
+        self,
+        metric: str,
+        aggregation: str = "avg",
+        group_by: Optional[List[str]] = None,
+        filters: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Агрегація по метриці з групуванням."""
+        logger.info("🔍 [Analytics Extracts] Виклик analytics_extracts_aggregate: metric=%s, aggregation=%s", metric, aggregation)
+        try:
+            return self.analytics_extracts_service.aggregate_by_metric(
+                metric=metric,
+                aggregation=aggregation,
+                group_by=group_by,
+                filters=filters,
+                limit=limit,
+            )
+        except Exception as e:
+            logger.exception("✗ [Analytics Extracts] Помилка: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def _analytics_extracts_search(
+        self,
+        filters: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
+        fields: Optional[List[str]] = None,
+        sort: Optional[List[Dict[str, Any]]] = None,
+        limit: int = 100,
+        skip: int = 0,
+    ) -> Dict[str, Any]:
+        """Пошук з логічними умовами."""
+        logger.info("🔍 [Analytics Extracts] Виклик analytics_extracts_search")
+        try:
+            return self.analytics_extracts_service.search(
+                filters=filters,
+                fields=fields,
+                sort=sort,
+                limit=limit,
+                skip=skip,
+            )
+        except Exception as e:
+            logger.exception("✗ [Analytics Extracts] Помилка: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def _analytics_extracts_list_metrics(self) -> Dict[str, Any]:
+        """Список метрик для агрегації."""
+        try:
+            metrics = self.analytics_extracts_service.get_available_metrics()
+            return {"success": True, "metrics": metrics}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _analytics_extracts_list_dimensions(self) -> Dict[str, Any]:
+        """Список полів для групування."""
+        try:
+            fields = self.analytics_extracts_service.get_group_by_fields()
+            return {"success": True, "dimensions": fields}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _analytics_extracts_get_distinct(
+        self,
+        field: str,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Унікальні значення поля."""
+        logger.info("🔍 [Analytics Extracts] Виклик analytics_extracts_get_distinct: field=%s", field)
+        try:
+            return self.analytics_extracts_service.get_distinct_values(field=field, filters=filters)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
     
     # Report MCP tool implementations
     def _generate_report(self, request: Dict[str, Any], return_base64: bool = True) -> Dict[str, Any]:
@@ -1038,6 +1304,86 @@ Important: Use terms from the glossary correctly."""
         except Exception as e:
             logger.error(f"✗ [Report MCP] Помилка: {e}")
             return {'success': False, 'error': str(e)}
+
+    def _generate_search_filter_string(self, **kwargs: Any) -> Dict[str, Any]:
+        """
+        Генерує рядок фільтрів для зведеного пошуку з структурованих параметрів.
+        Викликається з одним dict від LLM (kwargs).
+        """
+        from domain.services.unified_search_service import filter_string_from_flat_params
+        logger.info("🔍 [Search] Виклик generate_search_filter_string")
+        try:
+            # Нормалізація: якщо передано один dict (наприклад params)
+            params = dict(kwargs)
+            if len(params) == 1 and isinstance(next(iter(params.values())), dict):
+                params = next(iter(params.values()))
+            s = filter_string_from_flat_params(**params)
+            return {"success": True, "filter_string": s}
+        except Exception as e:
+            logger.exception("✗ [Search] generate_search_filter_string: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def _search_unified_listings(
+        self,
+        filter_string: Optional[str] = None,
+        limit: int = 50,
+        skip: int = 0,
+        sort_field: str = "source_updated_at",
+        sort_order: str = "desc",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Пошук по unified_listings: або за рядком фільтрів, або за структурованими параметрами.
+        """
+        from domain.services.unified_search_service import (
+            find,
+            find_by_filter_string,
+            build_query_from_flat_params,
+            filter_string_from_flat_params,
+        )
+        logger.info("🔍 [Search] Виклик search_unified_listings")
+        try:
+            params = dict(kwargs)
+            if filter_string and str(filter_string).strip():
+                docs, total, err = find_by_filter_string(
+                    str(filter_string).strip(),
+                    sort=[{"field": sort_field, "order": -1 if sort_order == "desc" else 1}],
+                    limit=min(limit, 200),
+                    skip=skip,
+                )
+                if err:
+                    return {"success": False, "error": err}
+                return {
+                    "success": True,
+                    "items": docs or [],
+                    "total": total or 0,
+                    "limit": limit,
+                    "skip": skip,
+                }
+            # Інакше збираємо flat params (можливо один вкладений dict від LLM)
+            if len(params) == 1 and isinstance(next(iter(params.values())), dict):
+                params = next(iter(params.values()))
+            query = build_query_from_flat_params(**params)
+            sort_spec = [{"field": sort_field, "order": -1 if sort_order == "desc" else 1}]
+            docs, total = find(
+                filter_group=query.filters,
+                geo_filter=query.geo_filters,
+                sort=sort_spec,
+                limit=min(limit, 200),
+                skip=skip,
+            )
+            generated_string = filter_string_from_flat_params(**params)
+            return {
+                "success": True,
+                "items": docs,
+                "total": total,
+                "limit": limit,
+                "skip": skip,
+                "filter_string": generated_string,
+            }
+        except Exception as e:
+            logger.exception("✗ [Search] search_unified_listings: %s", e)
+            return {"success": False, "error": str(e)}
     
     def _normalize_export_ids(
         self, ids: Any, collection: str
@@ -1297,50 +1643,59 @@ Important: Use terms from the glossary correctly."""
     def _trigger_data_update(
         self,
         source: str,
-        days: Optional[int] = None
+        days: Optional[int] = None,
+        regions: Optional[list] = None,
+        listing_types: Optional[list] = None,
     ) -> Dict[str, Any]:
         """
-        Ініціює оновлення даних у базі: OLX (оголошення) або повідомлення про ProZorro.
+        Ініціює оновлення даних у базі через pipeline raw → main → LLM (Phase 1 без LLM).
+        source: olx, prozorro або all (обидва). regions/listing_types — точкове оновлення по областях та типах.
         """
         logger.info("🔍 [Data Update] Виклик trigger_data_update: source=%s, days=%s", source, days)
         source_lower = (source or "").strip().lower()
+        days = days or 1
+        sources = []
         if source_lower == "olx":
-            try:
-                result = run_olx_update(
-                    settings=self.settings,
-                    categories=None,
-                    log_fn=None,
-                    days=days
+            sources = ["olx"]
+        elif source_lower == "prozorro":
+            sources = ["prozorro"]
+        elif source_lower in ("all", "both", ""):
+            sources = ["olx", "prozorro"]
+        else:
+            return {"success": False, "error": f"Невідомий source: {source}. Дозволено: olx, prozorro, all."}
+        regions_list = regions if isinstance(regions, list) and regions else None
+        listing_types_list = listing_types if isinstance(listing_types, list) and listing_types else None
+        try:
+            result = run_full_pipeline(
+                settings=self.settings,
+                sources=sources,
+                days=days,
+                regions=regions_list,
+                listing_types=listing_types_list,
+            )
+            p1 = result.get("phase1", {})
+            p2 = result.get("phase2", {})
+            msg_parts = []
+            if p1.get("olx"):
+                msg_parts.append(
+                    f"OLX: {p1['olx'].get('total_listings', 0)} оголошень, "
+                    f"{len(p1['olx'].get('loaded_urls') or [])} завантажено в raw; LLM: {p2.get('olx_llm_processed', 0)}"
                 )
-                logger.info(
-                    "✓ [Data Update] OLX оновлено: listings=%s, detail_fetches=%s",
-                    result.get("total_listings", 0),
-                    result.get("total_detail_fetches", 0)
+            if p1.get("prozorro"):
+                msg_parts.append(
+                    f"ProZorro: {p1['prozorro'].get('count', 0)} аукціонів у raw; LLM: {p2.get('prozorro_llm_processed', 0)}"
                 )
-                return {
-                    "success": True,
-                    "source": "olx",
-                    "message": (
-                        f"Оновлення OLX завершено. Оголошень оброблено: {result.get('total_listings', 0)}, "
-                        f"завантажено деталей: {result.get('total_detail_fetches', 0)}."
-                    ),
-                    "total_listings": result.get("total_listings", 0),
-                    "total_detail_fetches": result.get("total_detail_fetches", 0),
-                    "by_category": result.get("by_category", []),
-                }
-            except Exception as e:
-                logger.exception("✗ [Data Update] Помилка оновлення OLX: %s", e)
-                return {"success": False, "source": "olx", "error": str(e)}
-        if source_lower == "prozorro":
+            logger.info("✓ [Data Update] %s", "; ".join(msg_parts) or "завершено")
             return {
                 "success": True,
-                "source": "prozorro",
-                "message": "Оновлення даних ProZorro виконується через головний пайплайн застосунку або через Telegram (формування файлу за добу/тиждень). Запустіть оновлення звідти або попросіть адміністратора.",
+                "source": source_lower,
+                "message": "Оновлення завершено (Phase 1 — сирі дані без LLM, Phase 2 — LLM для обраних). " + ("; ".join(msg_parts) if msg_parts else ""),
+                "phase1": p1,
+                "phase2": p2,
             }
-        return {
-            "success": False,
-            "error": f"Невідомий source: {source}. Дозволено: olx, prozorro.",
-        }
+        except Exception as e:
+            logger.exception("✗ [Data Update] Помилка: %s", e)
+            return {"success": False, "source": source_lower, "error": str(e)}
     
     def _get_standard_excel_format(self) -> Tuple[List[str], Dict[str, str]]:
         """
@@ -1737,6 +2092,105 @@ Important: Use terms from the glossary correctly."""
             logger.exception("✗ [Places] Помилка: %s", e)
             return {"success": False, "places": [], "count": 0, "error": str(e)}
 
+    def _get_listing_details(
+        self,
+        source: Optional[str] = None,
+        source_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Повертає повні дані оголошення (зведені + сирі) для аналізу локації та опису.
+        Якщо source/source_id не передано — використовує _current_listing_context (контекст поточного оголошення).
+        """
+        logger.info("🔍 [ListingDetails] Виклик get_listing_details: source=%s", source or "(з контексту)")
+        try:
+            effective_source = source
+            effective_source_id = source_id
+            if not effective_source or not effective_source_id:
+                lc = getattr(self, "_current_listing_context", None)
+                if lc and isinstance(lc, dict):
+                    effective_source = lc.get("detail_source") or ""
+                    effective_source_id = lc.get("detail_id") or ""
+                if not effective_source and not effective_source_id and lc and lc.get("page_url"):
+                    page_url = (lc.get("page_url") or "").strip()
+                    if "prozorro.sale" in page_url or "prozorro" in page_url:
+                        effective_source = "prozorro"
+                        effective_source_id = page_url.rstrip("/").split("/")[-1] or ""
+                    elif "olx" in page_url:
+                        effective_source = "olx"
+                        effective_source_id = page_url
+            if not effective_source or not effective_source_id:
+                return {
+                    "success": False,
+                    "error": "Не вказано оголошення. Передай source (olx/prozorro) та source_id (url або auction_id) або викликай з контексту оголошення.",
+                }
+            from business.services.property_usage_analysis_service import PropertyUsageAnalysisService
+            from data.repositories.unified_listings_repository import UnifiedListingsRepository
+            usage_svc = PropertyUsageAnalysisService()
+            unified_repo = UnifiedListingsRepository()
+            raw_doc = usage_svc.get_listing_doc(effective_source, effective_source_id)
+            unified_doc = unified_repo.find_by_source_id(effective_source, effective_source_id)
+            out = {
+                "success": True,
+                "source": effective_source,
+                "source_id": effective_source_id[:200] if effective_source_id else "",
+                "summary": "",
+                "title": "",
+                "description": "",
+                "location_raw": "",
+                "llm_addresses": [],
+                "region": "",
+                "city": "",
+                "addresses_unified": [],
+            }
+            if unified_doc:
+                out["title"] = (unified_doc.get("title") or "")[:500]
+                out["description"] = (unified_doc.get("description") or "")[:8000]
+                out["region"] = (unified_doc.get("region") or "")[:200]
+                out["city"] = (unified_doc.get("city") or "")[:200]
+                addrs = unified_doc.get("addresses") or []
+                out["addresses_unified"] = [
+                    {"region": a.get("region"), "settlement": a.get("settlement"), "street": a.get("street"), "formatted": a.get("formatted_address")}
+                    for a in addrs[:10] if isinstance(a, dict)
+                ]
+            if raw_doc:
+                detail = raw_doc.get("detail") if isinstance(raw_doc.get("detail"), dict) else {}
+                loc = detail.get("location") if isinstance(detail.get("location"), dict) else {}
+                out["location_raw"] = (loc.get("raw") or "")[:1000]
+                search_data = raw_doc.get("search_data") or {}
+                if isinstance(search_data, dict) and search_data.get("location"):
+                    loc_str = search_data["location"]
+                    if isinstance(loc_str, str):
+                        out["search_location"] = loc_str[:500]
+                    elif isinstance(loc_str, dict):
+                        out["search_location"] = (loc_str.get("city") or "") + ", " + (loc_str.get("region") or "")
+                llm = detail.get("llm") or {}
+                if isinstance(llm.get("addresses"), list):
+                    out["llm_addresses"] = [
+                        (a.get("full") or str(a))[:300] if isinstance(a, dict) else str(a)[:300]
+                        for a in llm["addresses"][:15]
+                    ]
+                if not out["description"] and detail.get("description"):
+                    out["description"] = (detail.get("description") or "")[:8000]
+                if not out["title"] and (detail.get("title") or search_data.get("title")):
+                    out["title"] = (detail.get("title") or search_data.get("title") or "")[:500]
+            parts = []
+            if out["title"]:
+                parts.append("Назва: " + out["title"])
+            if out["description"]:
+                parts.append("Опис: " + out["description"][:3000] + ("..." if len(out["description"]) > 3000 else ""))
+            if out["location_raw"]:
+                parts.append("Локація (сирий текст): " + out["location_raw"])
+            if out["llm_addresses"]:
+                parts.append("Адреси з опису (LLM): " + "; ".join(out["llm_addresses"][:5]))
+            if out["region"] or out["city"]:
+                parts.append("Регіон/місто: " + (out["region"] or "") + ", " + (out["city"] or ""))
+            out["summary"] = "\n\n".join(parts) if parts else "Немає даних для відображення."
+            logger.info("✓ [ListingDetails] Отримано: title=%s, desc_len=%s", bool(out["title"]), len(out["description"]))
+            return out
+        except Exception as e:
+            logger.exception("✗ [ListingDetails] Помилка: %s", e)
+            return {"success": False, "error": str(e)}
+
     def run_tool(self, tool_name: str, tool_args: Optional[Dict[str, Any]] = None) -> Any:
         """
         Виконує один інструмент за назвою та аргументами. Для використання мультиагентною
@@ -1817,15 +2271,33 @@ Important: Use terms from the glossary correctly."""
                     filename_prefix=args.get("filename_prefix"),
                     skip_confirm=args.get("skip_confirm", False),
                 )
+            if tool_name == "generate_search_filter_string":
+                return self._generate_search_filter_string(**args)
+            if tool_name == "search_unified_listings":
+                return self._search_unified_listings(
+                    filter_string=args.get("filter_string"),
+                    limit=args.get("limit", 50),
+                    skip=args.get("skip", 0),
+                    sort_field=args.get("sort_field", "source_updated_at"),
+                    sort_order=args.get("sort_order", "desc"),
+                    **{k: v for k, v in args.items() if k not in ("filter_string", "limit", "skip", "sort_field", "sort_order")},
+                )
             if tool_name == "trigger_data_update":
                 return self._trigger_data_update(
                     source=args.get("source", ""),
                     days=args.get("days"),
+                    regions=args.get("regions"),
+                    listing_types=args.get("listing_types"),
                 )
             if tool_name == "geocode_address":
                 return self._geocode_address(
                     address_or_place=args.get("address_or_place", args.get("address", "")),
                     region=args.get("region", "ua"),
+                )
+            if tool_name == "get_listing_details":
+                return self._get_listing_details(
+                    source=args.get("source"),
+                    source_id=args.get("source_id"),
                 )
             if tool_name == "search_nearby_places":
                 pt = args.get("place_types", [])
@@ -1837,6 +2309,31 @@ Important: Use terms from the glossary correctly."""
                     place_types=pt,
                     radius_meters=int(args.get("radius_meters", 500)),
                     max_results=int(args.get("max_results", 20)),
+                )
+            if tool_name == "analytics_extracts_aggregate":
+                return self._analytics_extracts_aggregate(
+                    metric=args.get("metric", ""),
+                    aggregation=args.get("aggregation", "avg"),
+                    group_by=args.get("group_by"),
+                    filters=args.get("filters"),
+                    limit=int(args.get("limit", 100)),
+                )
+            if tool_name == "analytics_extracts_search":
+                return self._analytics_extracts_search(
+                    filters=args.get("filters"),
+                    fields=args.get("fields"),
+                    sort=args.get("sort"),
+                    limit=int(args.get("limit", 100)),
+                    skip=int(args.get("skip", 0)),
+                )
+            if tool_name == "analytics_extracts_list_metrics":
+                return self._analytics_extracts_list_metrics()
+            if tool_name == "analytics_extracts_list_dimensions":
+                return self._analytics_extracts_list_dimensions()
+            if tool_name == "analytics_extracts_get_distinct":
+                return self._analytics_extracts_get_distinct(
+                    field=args.get("field", ""),
+                    filters=args.get("filters"),
                 )
             return {"success": False, "error": f"Невідомий інструмент: {tool_name}"}
         except Exception as e:
@@ -1961,6 +2458,7 @@ Important: Use terms from the glossary correctly."""
         self._current_request_id = req_id
         self._current_user_id = user_id
         self._current_chat_id = chat_id
+        self._current_listing_context = listing_context if listing_context and isinstance(listing_context, dict) else None
         start_time = time.perf_counter()
         self._last_request_metrics = {}
         self._tool_failures_this_request = 0
@@ -1981,6 +2479,7 @@ Important: Use terms from the glossary correctly."""
             self._current_request_id = None
             self._current_user_id = None
             self._current_chat_id = None
+            self._current_listing_context = None
             duration_sec = time.perf_counter() - start_time
             if "duration_seconds" not in self._last_request_metrics:
                 self._last_request_metrics["duration_seconds"] = duration_sec
@@ -2129,6 +2628,14 @@ Important: Use terms from the glossary correctly."""
                         self.conversation_history.append(SystemMessage(content="\n".join(lines)))
             except Exception as e:
                 logger.debug("Не вдалося завантажити business_profiles: %s", e)
+        # listing_detail: підказка використовувати get_listing_details та geocode_address для визначення локації
+        if route == "listing_detail":
+            hint = SystemMessage(
+                content="Для визначення місцезнаходження оголошення: 1) викликай get_listing_details (без аргументів — поточне оголошення), "
+                "2) з поля summary/description та location_raw витягни топоніми (населені пункти, області, орієнтири), "
+                "3) викликай geocode_address для кожного топоніма, 4) інтерпретуй результати та сформулюй відповідь. Якщо точних координат немає — опиши приблизну локацію за наявними даними."
+            )
+            self.conversation_history.append(hint)
         
         # Саммарі попередньої частини розмови (ConversationSummaryMemory)
         if memory and memory.summary:
@@ -2167,6 +2674,7 @@ Important: Use terms from the glossary correctly."""
                 parts = [
                     "УВАГА: Розмова ведеться про КОНКРЕТНЕ оголошення. Усі відповіді, аналітика та рекомендації мають стосуватися САМЕ цього об'єкта.",
                     "Не змінюй фокус на інші оголошення. Якщо користувач питає «а яка ціна?», «що з оточенням?» — май на увазі це оголошення.",
+                    "Фрази «оголошення», «в оголошенні», «місцезнаходження», «розташування», «адреса ділянки» стосуються САМЕ цього оголошення. Посилання вже надано — НЕ проси його. Для визначення локації використовуй інструмент get_listing_details (дані оголошення + опис), потім geocode_address для топонімів з опису.",
                 ]
                 if page_url:
                     parts.append(f"Посилання на оголошення: {page_url}")
@@ -2231,20 +2739,8 @@ Important: Use terms from the glossary correctly."""
                 
                 # Отримуємо відповідь від LLM (з retry при тимчасових помилках)
                 logger.info("%sВідправляю запит до LLM...", log_ctx)
-                try:
-                    self.logging_service.log_api_usage(
-                        service="llm",
-                        source="langchain_agent_main",
-                        from_cache=False,
-                        metadata={
-                            "iteration": iteration,
-                            "request_id": req_id,
-                            "history_len": len(self.conversation_history),
-                        },
-                    )
-                except Exception as e:
-                    logger.debug("log_api_usage (main): %s", e)
                 last_err = None
+                response = None
                 for attempt in range(AGENT_LLM_RETRY_ATTEMPTS + 1):
                     try:
                         response = llm_with_tools.invoke(self.conversation_history)
@@ -2260,8 +2756,31 @@ Important: Use terms from the glossary correctly."""
                 else:
                     if last_err:
                         raise last_err
-                    response = None
-                
+                if response is not None:
+                    try:
+                        usage = _extract_usage_from_aimessage(response)
+                        meta = {"iteration": iteration, "request_id": req_id, "history_len": len(self.conversation_history)}
+                        if usage:
+                            meta["input_tokens"] = usage.get("input_tokens", 0)
+                            meta["output_tokens"] = usage.get("output_tokens", 0)
+                        self.logging_service.log_api_usage(
+                            service="llm",
+                            source="langchain_agent_main",
+                            from_cache=False,
+                            metadata=meta,
+                        )
+                        self.logging_service.log_llm_exchange(
+                            request_text=_messages_to_request_text(self.conversation_history),
+                            response_text=_aimessage_to_response_text(response),
+                            input_tokens=meta.get("input_tokens", 0),
+                            output_tokens=meta.get("output_tokens", 0),
+                            source="langchain_agent_main",
+                            request_id=req_id,
+                            provider=(getattr(self.settings, "llm_assistant_provider", None) or "gemini"),
+                        )
+                    except Exception as e:
+                        logger.warning("Не вдалося записати llm_exchange (main): %s", e)
+
                 logger.info("%sОтримано відповідь від LLM. Тип: %s", log_ctx, type(response))
                 
                 # Витягуємо thinking (ход думок) для відображення
@@ -2309,7 +2828,7 @@ Important: Use terms from the glossary correctly."""
                     if not injected_final_hint:
                         injected_final_hint = True
                         hint_msg = HumanMessage(
-                            content="На основі результатів інструментів вище сформуй коротку фінальну відповідь українською з числовими даними (дати, значення, одиниці). Відповідай лише текстом, без виклику інструментів."
+                            content="Based on the tool results above, form a short final answer. The answer must be in Ukrainian, with numeric data (dates, values, units). Reply with text only, no tool calls."
                         )
                         self.conversation_history.append(hint_msg)
                         logger.info("%sДодано підказку про фінальну відповідь (порожня відповідь без tools)", log_ctx)
@@ -2322,7 +2841,7 @@ Important: Use terms from the glossary correctly."""
                     if not injected_second_hint:
                         injected_second_hint = True
                         self.conversation_history.append(
-                            HumanMessage(content="Дай одразу коротку відповідь українською з числами з результатів вище. Тільки текст.")
+                            HumanMessage(content="Give a short answer immediately, in Ukrainian, with numbers from the results above. Text only.")
                         )
                         logger.info("%sДодано повторну підказку (коротку)", log_ctx)
                     continue
@@ -2535,8 +3054,8 @@ Important: Use terms from the glossary correctly."""
                                     logger.info("ℹ️ Додано підказку: викликати export_listings_to_file з ids з результатів.")
                                 else:
                                     tool_result["_agent_hint"] = (
-                                        "Користувач просив лише показати/вивести дані, не файл. На основі результатів вище дай фінальну текстову відповідь українською: "
-                                        "короткий перелік або підсумок (назви, ціни, посилання — що є в даних). Не викликай export_listings_to_file."
+                                        "The user asked only to show/display data, not a file. Based on the results above give a final text answer in Ukrainian: "
+                                        "short list or summary (titles, prices, links — whatever is in the data). Do not call export_listings_to_file."
                                     )
                         else:
                             logger.info(f"ℹ️ {tool_name} повернув 0 результатів. Можливо, потрібно перевірити фільтри або використати execute_analytics для перевірки наявності даних.")
@@ -2658,32 +3177,50 @@ Important: Use terms from the glossary correctly."""
                 content="[СИСТЕМА] Досягнуто ліміт ітерацій. На основі наявних даних у цій бесіді дай фінальну відповідь користувачу текстом: перелік з посиланнями (URL), короткий опис кожного. НЕ викликай інструменти."
             ))
             try:
-                self.logging_service.log_api_usage(
-                    service="llm",
-                    source="langchain_agent_fallback",
-                    from_cache=False,
-                    metadata={"request_id": req_id, "iteration": iteration},
-                )
-            except Exception as e:
-                logger.debug("log_api_usage (fallback): %s", e)
-            last_err = None
-            for attempt in range(AGENT_LLM_RETRY_ATTEMPTS + 1):
-                try:
-                    final_response = self.llm.invoke(fallback_messages)
-                    break
-                except Exception as e:
-                    last_err = e
-                    if attempt < AGENT_LLM_RETRY_ATTEMPTS and _is_transient_llm_error(e):
-                        backoff = AGENT_LLM_RETRY_BACKOFF_SECONDS[min(attempt, len(AGENT_LLM_RETRY_BACKOFF_SECONDS) - 1)]
-                        logger.warning("%sТимчасова помилка LLM при фінальній відповіді (спроба %s): %s. Повтор через %.1f с.", log_ctx, attempt + 1, e, backoff)
-                        time.sleep(backoff)
-                    else:
-                        raise
-            else:
-                if last_err:
-                    raise last_err
+                last_err_fb = None
                 final_response = None
-            
+                for attempt in range(AGENT_LLM_RETRY_ATTEMPTS + 1):
+                    try:
+                        final_response = self.llm.invoke(fallback_messages)
+                        break
+                    except Exception as e:
+                        last_err_fb = e
+                        if attempt < AGENT_LLM_RETRY_ATTEMPTS and _is_transient_llm_error(e):
+                            backoff = AGENT_LLM_RETRY_BACKOFF_SECONDS[min(attempt, len(AGENT_LLM_RETRY_BACKOFF_SECONDS) - 1)]
+                            logger.warning("%sТимчасова помилка LLM при фінальній відповіді (спроба %s): %s. Повтор через %.1f с.", log_ctx, attempt + 1, e, backoff)
+                            time.sleep(backoff)
+                        else:
+                            raise
+                else:
+                    if last_err_fb:
+                        raise last_err_fb
+                if final_response is not None:
+                    try:
+                        usage = _extract_usage_from_aimessage(final_response)
+                        meta = {"request_id": req_id, "iteration": iteration}
+                        if usage:
+                            meta["input_tokens"] = usage.get("input_tokens", 0)
+                            meta["output_tokens"] = usage.get("output_tokens", 0)
+                        self.logging_service.log_api_usage(
+                            service="llm",
+                            source="langchain_agent_fallback",
+                            from_cache=False,
+                            metadata=meta,
+                        )
+                        self.logging_service.log_llm_exchange(
+                            request_text=_messages_to_request_text(fallback_messages),
+                            response_text=_aimessage_to_response_text(final_response),
+                            input_tokens=meta.get("input_tokens", 0),
+                            output_tokens=meta.get("output_tokens", 0),
+                            source="langchain_agent_fallback",
+                            request_id=req_id,
+                            provider=(getattr(self.settings, "llm_assistant_provider", None) or "gemini"),
+                        )
+                    except Exception as e:
+                        logger.warning("Не вдалося записати llm_exchange (fallback): %s", e)
+            except Exception as e:
+                logger.debug("Fallback LLM invoke: %s", e)
+
             if final_response and hasattr(final_response, 'content') and final_response.content:
                 fc = final_response.content
                 if isinstance(fc, str):

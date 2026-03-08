@@ -235,9 +235,9 @@ async def start_generate(request: Request, days: int = 7):
                 tasks[task_id] = {"status": "error", "message": result.get("message", "Невідома помилка")}
                 return
             try:
-                from scripts.olx_scraper.run_update import run_olx_update
-                run_olx_update(settings=settings, days=days)
-            except Exception as olx_err:
+                from business.services.source_data_load_service import run_full_pipeline
+                run_full_pipeline(settings=settings, sources=["olx", "prozorro"], days=days)
+            except Exception as _err:
                 pass
             excel_bytes = prozorro.generate_excel_from_db(days)
             if not excel_bytes:

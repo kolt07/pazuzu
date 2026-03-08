@@ -14,13 +14,16 @@ from pydantic import BaseModel
 
 from telegram_mini_app.auth import validate_telegram_init_data
 from business.services.report_template_service import ReportTemplateService
-from data.repositories.unified_listings_repository import UnifiedListingsRepository
 from domain.gateways.listing_gateway import ListingGateway
 
 router = APIRouter(prefix="/api/report-templates", tags=["report-templates"])
 
-# Імпортуємо _build_unified_filters з search
-from telegram_mini_app.routes.search import _build_unified_filters
+# Імпортуємо unified_search для єдиного механізму фільтрів (пошук + звіти)
+from domain.services.unified_search_service import (
+    find,
+    find_by_filter_string,
+    build_query_from_flat_params,
+)
 
 
 def _get_user_id(request: Request) -> int:
@@ -110,15 +113,14 @@ def reorder_templates(request: Request, body: ReorderRequest):
     return {"ok": True}
 
 
-def _params_to_search_filters(params: Dict[str, Any]) -> tuple:
+def _params_to_flat_kwargs(params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Перетворює params шаблону на аргументи для _build_unified_filters.
-    Повертає (filters_dict, sort_field, sort_order).
+    Перетворює params шаблону на kwargs для build_query_from_flat_params.
+    Підтримує filter_string: якщо заданий — викликач використовує find_by_filter_string.
     """
     price = params.get("price") or {}
     price_per_m2 = params.get("price_per_m2") or {}
     price_per_ha = params.get("price_per_ha") or {}
-
     price_min = price.get("min") if isinstance(price, dict) else None
     price_max = price.get("max") if isinstance(price, dict) else None
     price_eq = price.get("value") if isinstance(price, dict) and price.get("op") == "eq" else None
@@ -126,30 +128,65 @@ def _params_to_search_filters(params: Dict[str, Any]) -> tuple:
         price_min = price.get("value")
     elif isinstance(price, dict) and price.get("op") == "lte":
         price_max = price.get("value")
+    building = params.get("building_area_sqm") or {}
+    land = params.get("land_area_ha") or {}
+    return {
+        "region": params.get("region"),
+        "city": params.get("city"),
+        "price_min": price_min,
+        "price_max": price_max,
+        "price_eq": price_eq,
+        "source": params.get("source") or None,
+        "property_type": params.get("property_type") or None,
+        "building_area_sqm_op": building.get("op") if isinstance(building, dict) else None,
+        "building_area_sqm_value": building.get("value") if isinstance(building, dict) else None,
+        "land_area_ha_op": land.get("op") if isinstance(land, dict) else None,
+        "land_area_ha_value": land.get("value") if isinstance(land, dict) else None,
+        "date_filter_days": params.get("date_filter"),
+        "title_contains": params.get("title_contains") or None,
+        "description_contains": params.get("description_contains") or None,
+        "price_per_m2_min": price_per_m2.get("min") if isinstance(price_per_m2, dict) else None,
+        "price_per_m2_max": price_per_m2.get("max") if isinstance(price_per_m2, dict) else None,
+        "price_per_ha_min": price_per_ha.get("min") if isinstance(price_per_ha, dict) else None,
+        "price_per_ha_max": price_per_ha.get("max") if isinstance(price_per_ha, dict) else None,
+    }
 
-    filters = _build_unified_filters(
-        region=params.get("region"),
-        city=params.get("city"),
-        price_min=price_min,
-        price_max=price_max,
-        price_eq=price_eq,
-        source=params.get("source") or None,
-        property_type=params.get("property_type") or None,
-        building_area_sqm_op=params.get("building_area_sqm", {}).get("op") if isinstance(params.get("building_area_sqm"), dict) else None,
-        building_area_sqm_value=params.get("building_area_sqm", {}).get("value") if isinstance(params.get("building_area_sqm"), dict) else None,
-        land_area_ha_op=params.get("land_area_ha", {}).get("op") if isinstance(params.get("land_area_ha"), dict) else None,
-        land_area_ha_value=params.get("land_area_ha", {}).get("value") if isinstance(params.get("land_area_ha"), dict) else None,
-        date_filter_days=params.get("date_filter"),
-        price_per_m2_min=price_per_m2.get("min") if isinstance(price_per_m2, dict) else None,
-        price_per_m2_max=price_per_m2.get("max") if isinstance(price_per_m2, dict) else None,
-        price_per_m2_currency=price_per_m2.get("currency", "uah") if isinstance(price_per_m2, dict) else "uah",
-        price_per_ha_min=price_per_ha.get("min") if isinstance(price_per_ha, dict) else None,
-        price_per_ha_max=price_per_ha.get("max") if isinstance(price_per_ha, dict) else None,
-        price_per_ha_currency=price_per_ha.get("currency", "uah") if isinstance(price_per_ha, dict) else "uah",
-    )
+
+def _params_to_search_filters(params: Dict[str, Any]) -> tuple:
+    """
+    Перетворює params шаблону на аргументи для unified_search.
+    Повертає (docs, total, sort_field, sort_order).
+    Якщо в params є filter_string — використовується find_by_filter_string, інакше build_query_from_flat_params + find.
+    """
     sort_field = params.get("sort_field", "source_updated_at")
     sort_order = params.get("sort_order", "desc")
-    return filters, sort_field, sort_order
+    sort_direction = -1 if sort_order == "desc" else 1
+    sort_spec = [{"field": sort_field, "order": sort_direction}]
+    if sort_field == "source_updated_at":
+        sort_spec.append({"field": "system_updated_at", "order": sort_direction})
+
+    filter_string = (params.get("filter_string") or "").strip()
+    if filter_string:
+        docs, total, err = find_by_filter_string(
+            filter_string,
+            sort=sort_spec,
+            limit=10000,
+            skip=0,
+        )
+        if err:
+            raise ValueError(err)
+        return (docs or []), (total or 0), sort_field, sort_order
+
+    kwargs = _params_to_flat_kwargs(params)
+    query = build_query_from_flat_params(**kwargs)
+    docs, total = find(
+        filter_group=query.filters,
+        geo_filter=query.geo_filters,
+        sort=sort_spec,
+        limit=10000,
+        skip=0,
+    )
+    return docs, total, sort_field, sort_order
 
 
 class GenerateReportRequest(BaseModel):
@@ -175,26 +212,10 @@ def generate_report_from_template(
     params = dict(template.get("params", {}))
     if template.get("is_default") and params.get("output_format") != "tabs_by_source":
         params["output_format"] = "tabs_by_source"
-    filters, sort_field, sort_order = _params_to_search_filters(params)
-
-    repo = UnifiedListingsRepository()
-    sort_field_map = {
-        "source_updated_at": "source_updated_at",
-        "price": "price_uah",
-        "title": "title",
-    }
-    actual_sort = sort_field_map.get(sort_field, "source_updated_at")
-    sort_direction = -1 if sort_order == "desc" else 1
-    sort_list = [(actual_sort, sort_direction)]
-    if actual_sort == "source_updated_at":
-        sort_list.append(("system_updated_at", sort_direction))
-
-    docs = repo.find_many(
-        filter=filters,
-        sort=sort_list,
-        limit=10000,
-        skip=0,
-    )
+    try:
+        docs, total, sort_field, sort_order = _params_to_search_filters(params)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     output_format = params.get("output_format", "unified_table")
     columns = [
@@ -207,7 +228,7 @@ def generate_report_from_template(
         "status": "Статус",
         "property_type": "Тип",
         "building_area_sqm": "Площа, м²",
-        "land_area_ha": "Площа, га",
+        "land_area_ha": "Площа землі, га",
         "title": "Назва",
         "description": "Опис",
         "page_url": "Посилання",

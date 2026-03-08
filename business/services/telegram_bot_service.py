@@ -32,7 +32,7 @@ from telegram.ext import (
 from config.settings import Settings
 from business.services.prozorro_service import ProZorroService
 from business.services.user_service import UserService
-from scripts.olx_scraper.run_update import run_olx_update
+from business.services.source_data_load_service import run_full_pipeline
 from business.services.logging_service import LoggingService
 from business.services.multi_agent_service import MultiAgentService
 from business.services.agent_test_runner_service import AgentTestRunnerService
@@ -398,155 +398,72 @@ class TelegramBotService:
         asyncio.create_task(self._generate_file_async(chat_id, user_id, days))
     
     async def _generate_file_async(self, chat_id: int, user_id: int, days: int) -> None:
-        """Асинхронна функція для формування файлу."""
+        """Асинхронна функція для формування файлу. Оновлення даних через pipeline raw → LLM (Phase 1 без LLM)."""
         try:
             loop = asyncio.get_event_loop()
-            
-            # Для тижня використовуємо оптимізовану паралельну обробку (без окремого повідомлення)
-            if days != 7:
-                # Отримуємо аукціони (синхронна операція, виконуємо в executor)
-                auctions = await loop.run_in_executor(
-                    None,
-                    self.prozorro_service.get_real_estate_auctions,
-                    days
+            await self._send_progress_message(chat_id, "Phase 1: завантаження сирих даних (без LLM)...")
+
+            result = await loop.run_in_executor(
+                None,
+                lambda: run_full_pipeline(
+                    settings=self.settings,
+                    sources=["olx", "prozorro"],
+                    days=days,
                 )
-                
-                if not auctions:
-                    await self._send_progress_message(
-                        chat_id,
-                        "Аукціони не знайдено."
-                    )
-                    return
-                
-                # Аналізуємо аукціони перед збереженням для отримання статистики
-                stats = await loop.run_in_executor(
-                    None,
-                    self.prozorro_service._analyze_auctions_before_save,
-                    auctions
-                )
-                
-                # Відправляємо повідомлення про статистику тільки якщо планується викликів LLM
-                if stats['llm_planned'] > 0:
-                    message = (
-                        f"Знайдено {stats['total']} попередньо відібраних аукціонів.\n"
-                        f"З них:\n"
-                        f"• Без змін: {stats['unchanged']}\n"
-                        f"• Змінено: {stats['changed']}\n"
-                        f"• Планується викликів LLM: {stats['llm_planned']}"
-                    )
-                    
-                    estimated_minutes = stats['llm_planned'] * 14 / 60
-                    message += f"\n\nПриблизний час обробки: {estimated_minutes:.1f} хвилин"
-                    
-                    await self._send_progress_message(chat_id, message)
-            
-            # Зберігаємо файл (синхронна операція, виконуємо в executor)
-            # Передаємо вже отримані аукціони, щоб уникнути повторного виклику API
-            if days == 7:
-                # Для тижня не передаємо аукціони, бо там використовується оптимізована обробка
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: self.prozorro_service.fetch_and_save_real_estate_auctions(
-                        days=days,
-                        user_id=user_id
-                    )
-                )
-            else:
-                # Для інших періодів передаємо вже отримані аукціони
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: self.prozorro_service.fetch_and_save_real_estate_auctions(
-                        days=days,
-                        user_id=user_id,
-                        auctions=auctions
-                    )
-                )
-            
-            if result['success']:
-                await self._send_progress_message(
-                    chat_id,
-                    f"Дані успішно оновлено. Знайдено {result.get('count', 0)} аукціонів."
-                )
-                
-                # Логуємо успішне оновлення
+            )
+            p1 = result.get("phase1", {})
+            p2 = result.get("phase2", {})
+            await self._send_progress_message(
+                chat_id,
+                f"Дані оновлено. ProZorro: {p1.get('prozorro', {}).get('count', 0)} аукц., "
+                f"OLX: {p1.get('olx', {}).get('total_listings', 0)} огол. LLM оброблено: ProZorro {p2.get('prozorro_llm_processed', 0)}, OLX {p2.get('olx_llm_processed', 0)}."
+            )
+            update_date = self.prozorro_service.app_data_repository.get_update_date(days)
+            if not update_date:
+                from datetime import datetime, timezone
+                update_date = datetime.now(timezone.utc)
+            if result.get("phase1"):
                 self.logging_service.log_user_action(
                     user_id=user_id,
                     action='generate_file',
-                    message=f"Дані за {days} днів успішно оновлено",
+                    message=f"Дані за {days} днів успішно оновлено (pipeline)",
                     metadata={
                         'days': days,
-                        'count': result.get('count'),
-                        'update_date': result.get('update_date').isoformat() if result.get('update_date') else None
+                        'phase1': result.get("phase1"),
+                        'phase2': result.get("phase2"),
+                        'update_date': update_date.isoformat() if update_date else None
                     }
                 )
-                
-                # Оновлення OLX: нежитлова нерухомість + земельні ділянки
-                try:
-                    await self._send_progress_message(chat_id, "Оновлення оголошень OLX...")
-                    olx_result = await loop.run_in_executor(
-                        None,
-                        lambda: run_olx_update(settings=self.settings, days=days)
+            # Генеруємо та відправляємо файл користувачу
+            try:
+                excel_bytes = self.prozorro_service.generate_excel_from_db(days)
+                if excel_bytes:
+                    if update_date:
+                        date_from = update_date - timedelta(days=days)
+                        archive_internal_name = f"Звіт по нерухомості ({format_datetime_display(date_from, '%d.%m.%Y')}-{format_datetime_display(update_date, '%d.%m.%Y')}).xlsx"
+                        zip_filename = f"Звіт по нерухомості ({format_datetime_display(date_from, '%d.%m.%Y')}-{format_datetime_display(update_date, '%d.%m.%Y')}).zip"
+                    else:
+                        archive_internal_name = f"Звіт по нерухомості ({days} днів).xlsx"
+                        zip_filename = f"Звіт по нерухомості ({days} днів).zip"
+                    import zipfile
+                    from io import BytesIO
+                    zip_bytes = BytesIO()
+                    with zipfile.ZipFile(zip_bytes, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        excel_bytes.seek(0)
+                        zipf.writestr(archive_internal_name, excel_bytes.read())
+                    zip_bytes.seek(0)
+                    await self.application.bot.send_document(
+                        chat_id=chat_id,
+                        document=zip_bytes,
+                        filename=zip_filename
                     )
-                    if olx_result.get("success"):
-                        await self._send_progress_message(
-                            chat_id,
-                            f"OLX: оброблено {olx_result.get('total_listings', 0)} оголошень, "
-                            f"завантажено деталей: {olx_result.get('total_detail_fetches', 0)}."
-                        )
-                except Exception as olx_err:
-                    await self._send_progress_message(
-                        chat_id,
-                        f"OLX: помилка оновлення — {olx_err!s}"
-                    )
-                
-                # Генеруємо та відправляємо файл користувачу
-                try:
-                    excel_bytes = self.prozorro_service.generate_excel_from_db(days)
-                    if excel_bytes:
-                        update_date = result.get('update_date')
-                        if update_date:
-                            date_from = update_date - timedelta(days=days)
-                            archive_internal_name = f"Звіт по нерухомості ({format_datetime_display(date_from, '%d.%m.%Y')}-{format_datetime_display(update_date, '%d.%m.%Y')}).xlsx"
-                            zip_filename = f"Звіт по нерухомості ({format_datetime_display(date_from, '%d.%m.%Y')}-{format_datetime_display(update_date, '%d.%m.%Y')}).zip"
-                        else:
-                            archive_internal_name = f"Звіт по нерухомості ({days} днів).xlsx"
-                            zip_filename = f"Звіт по нерухомості ({days} днів).zip"
-                        
-                        # Створюємо ZIP в пам'яті
-                        import zipfile
-                        from io import BytesIO
-                        
-                        zip_bytes = BytesIO()
-                        with zipfile.ZipFile(zip_bytes, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                            excel_bytes.seek(0)
-                            zipf.writestr(archive_internal_name, excel_bytes.read())
-                        
-                        zip_bytes.seek(0)
-                        
-                        # Відправляємо файл
-                        await self.application.bot.send_document(
-                            chat_id=chat_id,
-                            document=zip_bytes,
-                            filename=zip_filename
-                        )
-                        await self._send_main_menu_to_chat(chat_id, user_id)
-                except Exception as e:
-                    await self._send_progress_message(
-                        chat_id,
-                        f"Помилка при формуванні та відправці файлу: {e}"
-                    )
-            else:
-                error_msg = result.get('message', 'Невідома помилка')
+                    await self._send_main_menu_to_chat(chat_id, user_id)
+                else:
+                    await self._send_progress_message(chat_id, "Немає даних для формування файлу.")
+            except Exception as e:
                 await self._send_progress_message(
                     chat_id,
-                    f"Помилка при формуванні файлу: {error_msg}"
-                )
-                self.logging_service.log_user_action(
-                    user_id=user_id,
-                    action='generate_file',
-                    message=f"Помилка формування файлу за {days} днів",
-                    metadata={'days': days},
-                    error=error_msg
+                    f"Помилка при формуванні та відправці файлу: {e}"
                 )
         except Exception as e:
             await self._send_progress_message(
@@ -930,15 +847,13 @@ class TelegramBotService:
         context.user_data['waiting_for_prozorro_config'] = True
 
     def _run_data_update_sync(self, days: int) -> Dict[str, Any]:
-        """Синхронне оновлення даних ProZorro та OLX за вказану кількість днів. Для виклику з фонового потоку."""
-        result_prozorro = self.prozorro_service.fetch_and_save_real_estate_auctions(days=days)
-        result_olx = run_olx_update(settings=self.settings, days=days)
-        try:
-            from business.services.collection_knowledge_service import refresh_knowledge_after_sources
-            refresh_knowledge_after_sources(["prozorro", "olx"])
-        except Exception:
-            pass
-        return {"prozorro": result_prozorro, "olx": result_olx}
+        """Синхронне оновлення даних через pipeline raw → main → LLM (Phase 1 без LLM). Для виклику з фонового потоку."""
+        result = run_full_pipeline(
+            settings=self.settings,
+            sources=["olx", "prozorro"],
+            days=days,
+        )
+        return {"pipeline_result": result}
 
     async def _run_data_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE, days: int) -> None:
         """Запускає оновлення даних за добу (days=1) або за тиждень (days=7) у фоновому потоці та надсилає підсумок після завершення."""
@@ -952,13 +867,14 @@ class TelegramBotService:
         def work() -> None:
             try:
                 res = self._run_data_update_sync(days)
-                p = res["prozorro"]
-                o = res["olx"]
-                p_ok = "✓ " + (p.get("message", "OK") if p.get("success") else "✗ " + p.get("message", "помилка"))
-                o_ok = "✓ OK" if o.get("success") else "✗ помилка"
-                if o.get("success") and o.get("total_listings") is not None:
-                    o_ok += f" (оголошень: {o.get('total_listings', 0)}, деталей: {o.get('total_detail_fetches', 0)})"
-                summary = f"Оновлення даних {period_text} завершено.\nProZorro: {p_ok}\nOLX: {o_ok}"
+                r = res.get("pipeline_result", {})
+                p1 = r.get("phase1", {})
+                p2 = r.get("phase2", {})
+                olx_p1 = p1.get("olx", {})
+                prozorro_p1 = p1.get("prozorro", {})
+                o_ok = f"✓ raw: {olx_p1.get('total_listings', 0)} огол., LLM: {p2.get('olx_llm_processed', 0)}"
+                p_ok = f"✓ raw: {prozorro_p1.get('count', 0)} аукц., LLM: {p2.get('prozorro_llm_processed', 0)}"
+                summary = f"Оновлення даних {period_text} завершено (Phase 1 — без LLM).\nProZorro: {p_ok}\nOLX: {o_ok}"
             except Exception as e:
                 summary = f"Оновлення даних {period_text}: помилка — {e!s}"
             fut = asyncio.run_coroutine_threadsafe(bot.send_message(chat_id=chat_id, text=summary), loop)

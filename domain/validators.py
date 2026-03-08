@@ -11,6 +11,8 @@ from domain.exceptions import LogicalLayerViolation
 ALLOWED_LOGICAL_FILTER_KEYS: FrozenSet[str] = frozenset({
     "city",
     "region",
+    "city_district",
+    "district",  # Аліас для city_district (район міста: Солом'янський, Шевченківський тощо)
     "exclude_city",
     "price",
     "date",
@@ -19,7 +21,7 @@ ALLOWED_LOGICAL_FILTER_KEYS: FrozenSet[str] = frozenset({
     "property_type",
     "area",
     "building_area_sqm",
-    "land_area_ha",
+    "land_area_sqm",
     "bids_count",
     "bidders_count",
     "floor",

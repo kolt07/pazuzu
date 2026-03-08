@@ -66,6 +66,17 @@ def calculate_description_hash(description: str) -> str:
     return hash_obj.hexdigest()
 
 
+def calculate_search_data_hash(search_data: Dict[str, Any]) -> str:
+    """
+    Хеш даних з картки пошуку OLX (ті самі поля, що в search_data_changed).
+    Якщо хеш не змінився — сторінка пошуку не змінилась, оновлення сирих даних і LLM не потрібні.
+    """
+    keys = ("title", "price_text", "price_value", "currency", "location", "area_m2")
+    canonical = {k: search_data.get(k) for k in keys}
+    json_str = json.dumps(canonical, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(json_str.encode("utf-8")).hexdigest()
+
+
 def extract_auction_id(auction_data: Dict[str, Any]) -> Optional[str]:
     """
     Витягує ідентифікатор аукціону з даних.

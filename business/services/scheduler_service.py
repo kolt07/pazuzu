@@ -193,37 +193,27 @@ class SchedulerService:
             self._update_after_run(event_id, event)
 
     def _execute_data_update(self, event_id: str, payload: Dict[str, Any]) -> None:
-        """Оновлення даних з джерел (ProZorro, OLX)."""
-        from business.services.prozorro_service import ProZorroService
-        from scripts.olx_scraper.run_update import run_olx_update
-
+        """Оновлення даних через pipeline: Phase 1 raw (без LLM), Phase 2 promote + unified + LLM для обраних, Phase 3 аналітика. Payload: days, sources, regions (list), listing_types (list)."""
         days = payload.get("days", 1)
         sources = payload.get("sources", "all")
         if isinstance(sources, str) and sources == "all":
             sources = ["prozorro", "olx"]
         elif isinstance(sources, str):
             sources = [sources]
-
-        if "prozorro" in sources:
-            prozorro = ProZorroService(self.settings)
-            prozorro.fetch_and_save_real_estate_auctions(days=days)
-        if "olx" in sources:
-            run_olx_update(settings=self.settings, days=days)
-
-        try:
-            from business.services.collection_knowledge_service import refresh_knowledge_after_sources
-            refresh_knowledge_after_sources(sources)
-        except Exception as e:
-            logger.debug("Оновлення знань про колекції після data_update: %s", e)
-
-        try:
-            from business.services.price_analytics_service import PriceAnalyticsService
-            analytics = PriceAnalyticsService()
-            counts = analytics.rebuild_all()
-            logger.info("Price analytics оновлено після data_update: %s", counts)
-        except Exception as e:
-            logger.warning("Помилка оновлення price analytics після data_update: %s", e)
-
+        regions = payload.get("regions")
+        listing_types = payload.get("listing_types")
+        if isinstance(regions, str):
+            regions = [x.strip() for x in regions.split(",") if x.strip()] or None
+        if isinstance(listing_types, str):
+            listing_types = [x.strip() for x in listing_types.split(",") if x.strip()] or None
+        from business.services.source_data_load_service import run_full_pipeline
+        run_full_pipeline(
+            settings=self.settings,
+            sources=sources,
+            days=days,
+            regions=regions if isinstance(regions, list) and regions else None,
+            listing_types=listing_types if isinstance(listing_types, list) and listing_types else None,
+        )
         logger.info("Подія data_update %s виконано (days=%s)", event_id, days)
 
     def _execute_data_profile(self, event_id: str, payload: Dict[str, Any]) -> None:

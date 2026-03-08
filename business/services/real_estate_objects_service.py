@@ -44,30 +44,65 @@ class RealEstateObjectsService:
         self.cadastral_repo = CadastralParcelsRepository()
         self.llm_extractor = RealEstateObjectsLLMExtractorService(self.settings)
         self.geocoding = GeocodingService(self.settings)
+        self._olx_repo = None
+        self._prozorro_repo = None
+
+    def _get_olx_repo(self):
+        if self._olx_repo is None:
+            from data.repositories.olx_listings_repository import OlxListingsRepository
+            self._olx_repo = OlxListingsRepository()
+        return self._olx_repo
+
+    def _get_prozorro_repo(self):
+        if self._prozorro_repo is None:
+            from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepository
+            self._prozorro_repo = ProZorroAuctionsRepository()
+        return self._prozorro_repo
 
     def _build_description_from_olx(self, olx_doc: Dict[str, Any]) -> str:
-        """Формує текст для LLM з документа OLX."""
+        """
+        Формує повний текст для LLM з документа OLX (заголовок, локація, параметри, опис, картка).
+        Усі доступні поля з search_data та detail мають потрапляти в текст, щоб ОНМ-парсер мав контекст.
+        """
         parts = []
-        search_data = olx_doc.get("search_data", {})
-        detail = olx_doc.get("detail", {})
+        search_data = olx_doc.get("search_data", {}) or {}
+        detail = olx_doc.get("detail", {}) or {}
+
         title = (search_data.get("title") or "").strip()
         if title:
             parts.append(f"Заголовок: {title}")
         loc = (search_data.get("location") or "").strip()
         if loc:
             parts.append(f"Локація: {loc}")
+        # Ціна та площа з картки пошуку — корисний контекст для ОНМ
+        price_text = (search_data.get("price_text") or "").strip()
+        if price_text:
+            parts.append(f"Ціна (зі сторінки): {price_text}")
+        area_m2 = search_data.get("area_m2")
+        if area_m2 is not None and float(area_m2) > 0:
+            parts.append(f"Площа з картки: {area_m2} м²")
+
         params = detail.get("parameters") or []
         if params:
-            parts.append("Параметри:")
+            parts.append("Параметри об'єкта:")
             for p in params:
                 if isinstance(p, dict):
                     lv = (p.get("label") or "").strip()
                     vv = (p.get("value") or "").strip()
                     if lv or vv:
                         parts.append(f"- {lv}: {vv}")
+
         desc = (detail.get("description") or "").strip()
         if desc:
-            parts.append(f"Опис: {desc}")
+            parts.append("Повний опис оголошення:")
+            parts.append(desc)
+        else:
+            # Якщо опис сторінки деталей порожній — підставляємо текст з картки пошуку
+            raw_snippet = (search_data.get("raw_snippet") or "").strip()
+            if raw_snippet:
+                parts.append("Текст з картки оголошення (опис сторінки відсутній):")
+                parts.append(raw_snippet)
+
         llm = detail.get("llm", {})
         if isinstance(llm, dict):
             addrs = llm.get("addresses") or []
@@ -76,6 +111,7 @@ class RealEstateObjectsService:
                     line = ", ".join(str(v) for v in a.values() if v)
                     if line:
                         parts.append(f"Адреса: {line}")
+
         return "\n".join(parts)
 
     def _extract_objects_from_prozorro_items(
@@ -470,6 +506,12 @@ class RealEstateObjectsService:
             return []
         objects_raw: List[Dict[str, Any]] = []
 
+        # Якщо документ джерела не передано — пробуємо підвантажити з колекції, щоб мати повний опис для LLM
+        if not prozorro_doc and source == "prozorro":
+            prozorro_doc = self._get_prozorro_repo().find_by_auction_id(source_id)
+        if not olx_doc and source == "olx":
+            olx_doc = self._get_olx_repo().find_by_url(source_id)
+
         if prozorro_doc:
             objects_raw = self._extract_objects_from_prozorro_items(prozorro_doc)
             if not objects_raw:
@@ -484,6 +526,7 @@ class RealEstateObjectsService:
             unified = self.unified_repo.find_by_source_id(source, source_id)
             if not unified:
                 return []
+            # Fallback: тільки title + description з unified (менше контексту)
             description = f"{unified.get('title') or ''}\n{unified.get('description') or ''}"
             if description.strip():
                 objects_raw = self.llm_extractor.extract_objects(description, use_cache=use_cache) or []

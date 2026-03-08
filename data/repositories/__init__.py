@@ -29,6 +29,7 @@ from data.repositories.geography_repository import (
 )
 from data.repositories.unified_listings_repository import UnifiedListingsRepository
 from data.repositories.price_analytics_repository import PriceAnalyticsRepository
+from data.repositories.llm_exchange_logs_repository import LLMExchangeLogsRepository
 
 __all__ = [
     'BaseRepository',
@@ -55,5 +56,6 @@ __all__ = [
     'BuildingsRepository',
     'UnifiedListingsRepository',
     'PriceAnalyticsRepository',
+    'LLMExchangeLogsRepository',
 ]
 

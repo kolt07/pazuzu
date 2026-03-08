@@ -83,17 +83,17 @@ class LLMAgentService:
                 if glossary:
                     base_from_config += f"""
 
-## Термінологія проекту (Developer Glossary)
+## Project terminology (Developer Glossary)
 
-Використовуй цю термінологію при відповідях та роботі з даними:
+Use this terminology when responding and working with data:
 
 {glossary}
 
-Важливо: Використовуй терміни з глосарію правильно. Наприклад:
-- "тендер" = процедура закупівлі через ProZorro API
-- "аукціон" = процедура продажу майна через ProZorro.Sale API
-- "оголошення" = тендер або аукціон
-- "status" = статус тендера/аукціону (active, active.tendering, active.auction, complete, cancelled, unsuccessful)
+Important: Use terms from the glossary correctly. Examples:
+- "тендер" = procurement procedure via ProZorro API
+- "аукціон" = asset sale procedure via ProZorro.Sale API
+- "оголошення" = tender or auction
+- "status" = tender/auction status (active, active.tendering, active.auction, complete, cancelled, unsuccessful)
 """
                 return base_from_config
         except Exception:
@@ -358,19 +358,19 @@ Respond in Ukrainian language."""
         if glossary:
             base_prompt += f"""
 
-## Термінологія проекту (Developer Glossary)
+## Project terminology (Developer Glossary)
 
-Використовуй цю термінологію при відповідях та роботі з даними:
+Use this terminology when responding and working with data:
 
 {glossary}
 
-Важливо: Використовуй терміни з глосарію правильно. Наприклад:
-- "тендер" = процедура закупівлі через ProZorro API
-- "аукціон" = процедура продажу майна через ProZorro.Sale API
-- "оголошення" = тендер або аукціон
-- "status" = статус тендера/аукціону (active, active.tendering, active.auction, complete, cancelled, unsuccessful)
+Important: Use terms from the glossary correctly. Examples:
+- "тендер" = procurement procedure via ProZorro API
+- "аукціон" = asset sale procedure via ProZorro.Sale API
+- "оголошення" = tender or auction
+- "status" = tender/auction status (active, active.tendering, active.auction, complete, cancelled, unsuccessful)
 """
-        
+
         return base_prompt
     
     # SYSTEM_PROMPT буде формуватися динамічно через _get_system_prompt()
@@ -407,7 +407,7 @@ Respond in Ukrainian language."""
         
         self.rate_limiter = RateLimiter(self.settings.llm_rate_limit_calls_per_minute)
         self.client = genai.Client(api_key=api_key)
-        self.model_name = self.settings.llm_model_name
+        self.model_name = self.settings.llm_assistant_model_name
     
     def get_tools_descriptions(self) -> List[Dict[str, Any]]:
         """
@@ -940,7 +940,7 @@ Respond in Ukrainian language."""
 Використовуй цю інформацію для обчислення діапазонів дат у запитах типу "за останню добу", "за останній тиждень" тощо.
 """
             
-            full_prompt = f"{system_prompt}\n\n{context_info}\n\nКористувач запитує: {user_query}"
+            full_prompt = f"{system_prompt}\n\n{context_info}\n\nUser query: {user_query}"
             logger.debug(f"Повний промпт (довжина: {len(full_prompt)} символів)")
             logger.debug(f"Контекст дати/часу: {context_info.strip()}")
             

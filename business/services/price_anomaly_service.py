@@ -82,7 +82,7 @@ class PriceAnomalyService:
         """Визначає тип оголошення для аналітики."""
         if self._is_mixed_listing(doc):
             return LISTING_TYPE_MIXED
-        if doc.get("land_area_ha") and doc.get("land_area_ha", 0) > 0:
+        if doc.get("land_area_sqm") and doc.get("land_area_sqm", 0) > 0:
             return LISTING_TYPE_LAND
         return LISTING_TYPE_REAL_ESTATE
 
@@ -137,7 +137,7 @@ class PriceAnomalyService:
     def _is_mixed_listing(self, doc: Dict[str, Any]) -> bool:
         """Оголошення містить і нерухомість, і земельну ділянку."""
         b = doc.get("building_area_sqm") or 0
-        l = doc.get("land_area_ha") or 0
+        l = doc.get("land_area_sqm") or 0
         return (b and b > 0) and (l and l > 0)
 
     def _get_global_distribution(
@@ -153,7 +153,7 @@ class PriceAnomalyService:
         if exclude_mixed:
             match["$or"] = [
                 {"building_area_sqm": {"$not": {"$gt": 0}}},
-                {"land_area_ha": {"$not": {"$gt": 0}}},
+                {"land_area_sqm": {"$not": {"$gt": 0}}},
             ]
         pipeline = [{"$match": match}, {"$group": {"_id": None, "vals": {"$push": f"${metric}"}}}]
         for row in self.unified_repo.collection.aggregate(pipeline):
@@ -176,7 +176,7 @@ class PriceAnomalyService:
                 "source_updated_at": {"$gte": cutoff},
                 metric: {"$exists": True, "$ne": None, "$gt": 0},
                 "building_area_sqm": {"$exists": True, "$gt": 0},
-                "land_area_ha": {"$exists": True, "$gt": 0},
+                "land_area_sqm": {"$exists": True, "$gt": 0},
             }},
             {"$group": {"_id": None, "vals": {"$push": f"${metric}"}}},
         ]

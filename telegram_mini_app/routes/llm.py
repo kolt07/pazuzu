@@ -65,6 +65,8 @@ def _get_user_id_and_services(request: Request):
     agent = getattr(request.app.state, "multi_agent_service", None)
     if agent is None:
         try:
+            from data.database.connection import MongoDBConnection
+            MongoDBConnection.initialize(request.app.state.settings)
             from business.services.multi_agent_service import MultiAgentService
             logging_svc = request.app.state.logging_service
 

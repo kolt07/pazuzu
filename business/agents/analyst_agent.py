@@ -65,6 +65,7 @@ class AnalystAgent:
             "execute_query": "execute_query",
             "execute_aggregation": "execute_aggregation",
             "execute_analytics": "execute_analytics",
+            "analytics_extracts_aggregate": "analytics_extracts_aggregate",
             "get_allowed_collections": "get_allowed_collections",
             "get_database_schema": "get_database_schema",
             "get_collection_info": "get_collection_info",

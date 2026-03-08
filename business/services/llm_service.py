@@ -17,27 +17,27 @@ logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
-    """Клас для обмеження швидкості викликів API."""
-    
-    def __init__(self, calls_per_minute: int = 15):
+    """Клас для обмеження швидкості викликів API. При calls_per_minute <= 0 — без обмежень."""
+
+    def __init__(self, calls_per_minute: int = 0):
         """
         Ініціалізація rate limiter.
-        
+
         Args:
-            calls_per_minute: Максимальна кількість викликів за хвилину
+            calls_per_minute: Максимальна кількість викликів за хвилину. 0 = без обмежень.
         """
         self.calls_per_minute = calls_per_minute
-        self.min_interval = 60.0 / calls_per_minute  # Мінімальний інтервал між викликами в секундах
+        self.min_interval = 60.0 / calls_per_minute if calls_per_minute > 0 else 0.0
         self.last_call_time: Optional[float] = None
-    
+
     def wait_if_needed(self) -> None:
-        """Чекає, якщо потрібно, щоб не перевищити ліміт викликів."""
+        """Чекає, якщо потрібно, щоб не перевищити ліміт викликів. При вимкненому ліміті — нічого не робить."""
+        if self.calls_per_minute <= 0:
+            return
         if self.last_call_time is not None:
             elapsed = time.time() - self.last_call_time
             if elapsed < self.min_interval:
-                sleep_time = self.min_interval - elapsed
-                time.sleep(sleep_time)
-        
+                time.sleep(self.min_interval - elapsed)
         self.last_call_time = time.time()
 
 
@@ -91,91 +91,56 @@ class BaseLLMProvider(ABC):
         Returns:
             Текст промпту
         """
+        # Визначаємо, чи це, ймовірно, опис OLX (наш OlxLLMExtractorService додає префікси українською)
+        is_olx_like = "Заголовок оголошення:" in (description or "") or "Локація об'єкта:" in (description or "")
         try:
             from config.config_loader import get_config_loader
             loader = get_config_loader()
+            if is_olx_like:
+                tmpl = loader.get_prompt("olx_parsing", fallback=None)
+                if tmpl:
+                    return tmpl.format(description=description)
             template = loader.get_parsing_template()
             if template:
                 return template.format(description=description)
         except Exception:
             pass
-        # Fallback — захардкодений промпт (legacy)
-        return f"""Тобі необхідно витягти структуровану інформацію з опису аукціону нерухомості у форматі JSON.
-Якщо інформація відсутня або невизначена, поверни порожнє значення або null.
-
-## Опис:
-{description}
-
-## Закріплення завдання — витягни та поверни JSON з наступними полями:
-- cadastral_number: кадастровий номер, номер земельного кадастру (строка, якщо є). 
-  Шукай формати типу "6320685503:03:000:0202" або подібні. Якщо є кілька номерів - використовуй основний.
-- building_area_sqm: площа нерухомості (будівель, споруд, приміщень, квартир) в квадратних метрах (число, якщо є).
-  Це НЕ площа земельної ділянки — тільки площа будівель/приміщень. Шукай у ВСЬОМУ тексті: описі, параметрах, заголовку.
-  Фрази для пошуку: "площа", "площею", "загальна площа", "житлова площа", "корисна площа", "площа будівлі", "площа об'єкта",
-  "площа приміщень", "площа квартири", "площа будинку", "площа приміщення", "кв.м", "м²", "м2", "кв м", "квадратних метрів".
-  У параметрах (наприклад "Площа: 65 м²") — обов'язково витягуй. У заголовку ("3-к.кв. 65 м²") — також.
-  Формати чисел: "956,7 м²" -> 956.7; "25 659,90 кв.м" -> 25659.90 (пробіли як роздільник тисяч — видаляй);
-  "65м²", "65 м2", "65 кв.м" -> 65; "1 234.5" (крапка/кома як десяткова) -> 1234.5.
-  Якщо в гектарах (площа будівлі) — конвертуй: 1 га = 10000 м². Якщо в сотках — 1 сотка = 100 м².
-  Кілька значень площі нерухомості — СУМУЙ (наприклад "2,2 кв.м" і "19,8 кв.м" -> 22.0).
-  Якщо вказана тільки площа землі без будівель — залишай порожнім. Якщо є і будівля, і ділянка — витягуй обидві окремо.
-- land_area_ha: площа земельної ділянки в гектарах (число, якщо є).
-  Це площа ЗЕМЛІ, не будівель. Шукай у всьому тексті.
-  Фрази: "земельна ділянка", "площа ділянки", "площа землі", "на земельній ділянці", "га", "гектар", "соток", "соток землі".
-  Гектари — як є ("5,1545 га" -> 5.1545). Квадратні метри землі — конвертуй: 10000 м² = 1 га. Сотки — 100 соток = 1 га.
-  Кілька значень — СУМУЙ. Якщо тільки площа будівель — залишай порожнім.
-- addresses: масив адрес (якщо в тексті є кілька адрес - витягни всі). Кожна адреса - об'єкт з полями:
-  * region: область у форматі "Волинська", "Тернопільська", "Харківська" тощо (без скорочень, без додаткових слів). 
-    м. Київ та м. Симферополь НЕ входять в склад областей - для них залишай порожнє значення.
-    Крим пиши як "АР Крим".
-    Якщо в тексті є "Харківська область" - пиши "Харківська", якщо "Лозівський район" - це Харківська область.
-    Якщо в тексті не зустрічається назва області, але за назвою міста або іншого топоніма можна виявити, в якій він області знаходиться - доповни інформацію про область.
-  * district: район (якщо є, наприклад "Лозівський", "Бориспільський" тощо)
-  * settlement_type: скорочено тип населеного пункту (м., с., смт., с-ще тощо) - якщо є в тексті
-  * settlement: населений пункт/місто/село БЕЗ приставок м., с. тощо, з великої літери (наприклад, "Верхньоводяне", "Київ", "Львів").
-    Якщо є "с. Верхньоводяне" - пиши "Верхньоводяне", якщо "м. Київ" - пиши "Київ".
-    Якщо є "на території с. Верхньоводяне" - витягни "Верхньоводяне".
-    Може бути також топонім типу "сільрада", "міськрада", "районна рада" тощо - витягни як є.
-  * settlement_district: район населеного пункту (якщо є, наприклад "Шевченківський район м. Києва")
-  * street_type: тип вулиці (вул., просп., бул., пров., пл. тощо). Якщо в тексті є "вул." - пиши "вул."
-  * street: назва вулиці (без типу, наприклад "Незалежності" замість "вул. Незалежності")
-  * building: номер будинку/будівлі (тільки номер, наприклад "39" або "27")
-  * building_part: номер блоку/корпусу (якщо є, наприклад "корпус А", "блок 1" тощо)
-  * room: номер приміщення (офіс, квартира, тощо, якщо є, наприклад "кв. 5", "офіс 12")
-- floor: поверх (якщо є, тільки для будівель)
-- property_type: тип нерухомості зі списку: "Земля під будівництво", "Землі с/г призначення", "Нерухомість", "інше"
-  Якщо в описі є "земельна ділянка" або "землі житлової забудови" - це "Земля під будівництво".
-- utilities: підведені комунікації (через кому, наприклад: електрика, вода, газ, опалення).
-  Якщо в тексті є "електропостачання" - пиши "електрика", якщо "водопостачання" - пиши "вода".
-  Якщо вказано "відсутні" або "не підведені" - пиши "відсутні".
-- tags: масив тегів (рядків) для фільтрації оголошень. Кожен тег — короткий ідентифікатор у нижньому регістрі. Витягуй усі релевантні:
-  * Призначення/тип об'єкта: крамниця, аптека, офіс, склад, кафе, ресторан, виробництво, складське приміщення, коворкінг, логістика, автосервіс, СТО, паркінг, гараж, готель, склад-холодильник тощо — якщо в тексті явно або з контексту зрозуміло.
-  * Комунікації як окремі теги (якщо згадані): газ, вода, електрика, світло, каналізація, опалення, інтернет, вентиляція. Якщо "відсутні" — не додавай теги комунікацій.
-  * Інше: ремонт (якщо згадано стан ремонту), паркінг (якщо є), під\'їзд (якщо згадано).
-  Приклад: приміщення під крамницю, газ, вода, світло, каналізація → tags: ["крамниця", "газ", "вода", "електрика", "каналізація"].
-  Не вигадуй теги — лише з того, що є в тексті. Якщо нічого не підходить — порожній масив [].
-- arrests_info: інформація про обтяження майна (арешти) у форматі: "Арешт 1: Видав ХХХХХ, Дата: УУУУ, Можливе зняття так/ні" 
-  (якщо є декілька арештів - кожен на окремому рядку, наприклад: "Арешт 1: ...\\nАрешт 2: ...")
-  Якщо в тексті є "не зареєстровано" або "відсутні" - пиши "відсутні".
-
-ВАЖЛИВО:
-- Уважно читай весь текст, включаючи деталі про адресу, площу, кадастровий номер.
-- Площа нерухомості (building_area_sqm) та площа землі (land_area_ha) — різні речі. Не плутай: будівля/приміщення -> building_area_sqm; ділянка/земля -> land_area_ha.
-- Шукай площу в усіх блоках: "Параметри об'єкта", "Повний опис", "Заголовок", "Локація". Часто площа є в параметрах типу "Площа: 65" або "Загальна площа: 120 м²".
-- Якщо інформація вказана в різних форматах (наприклад, "0,5296 га" і "0.5296 га") - використовуй той, що згадується першим.
-- Для адреси: якщо є "Харківська область, Лозівський район, на території с. Верхньоводяне, вул. Центральна, 15" - 
-  витягни як: {{"region": "Харківська", "district": "Лозівський", "settlement_type": "с.", "settlement": "Верхньоводяне", "street_type": "вул.", "street": "Центральна", "building": "15"}}
-- Якщо в тексті є кілька адрес - витягни всі в масив addresses.
-- Якщо адреса неповна, спробуй доповнити її на основі доступної інформації.
-- Використовуй виключно ту інформацію, яка є в описі аукціону, або таку, яку можна отримати на базі інформації з опису аукціону. Не вигадуй іншу інформацію.
-- Поверни ТІЛЬКИ валідний JSON без додаткових пояснень."""
+        # Fallback — спрощений хардкод (англійські інструкції, усі текстові значення українською).
+        base = (
+            "Extract structured information from the real-estate description and return ONLY JSON. "
+            "If information is missing or unclear, use null or an empty value. "
+            "All extracted text values (addresses, tags, descriptions, labels) must be in Ukrainian. "
+            "Use square meters as the main unit for all areas; use the formula 1 hectare = 100 sotok = 10 000 m²."
+        )
+        fields = (
+            "- cadastral_number: cadastral number (string, if present).\n"
+            "- building_area_sqm: building/premises area in square meters (number; not land).\n"
+            "- land_area_sqm: land plot area in square meters (number; not buildings).\n"
+            "- addresses: array of address objects (region, district, settlement_type, settlement, settlement_district, "
+            "street_type, street, building, building_part, room) with Ukrainian text.\n"
+            "- floor: floor number if present.\n"
+            "- property_type: one of \"Земля під будівництво\", \"Землі с/г призначення\", \"Нерухомість\", \"інше\".\n"
+            "- utilities: short Ukrainian string with communications (e.g. \"електрика, вода, газ\") or \"відсутні\".\n"
+            "- tags: array of lowercase Ukrainian tags (purpose + utilities).\n"
+            "- arrests_info: text about encumbrances in Ukrainian or \"відсутні\" if none; for OLX-like listings you may simply return \"відсутні\"."
+        )
+        return (
+            f"{base}\n\n"
+            f"## Description:\n{description}\n\n"
+            "## Fields (field names in English, values in Ukrainian):\n"
+            f"{fields}\n\n"
+            "Return ONLY valid JSON without any extra text."
+        )
 
 
 class GeminiLLMProvider(BaseLLMProvider):
     """Провайдер для Google Gemini API."""
-    
+
     def __init__(self, api_key: str, rate_limiter: RateLimiter, model_name: str = 'gemini-2.5-flash'):
         super().__init__(api_key, rate_limiter)
+        self._last_usage: Optional[Dict[str, int]] = None  # input_tokens, output_tokens після останнього виклику
+        self._last_request_text: Optional[str] = None  # повний текст запиту для логування обміну
+        self._last_response_text: Optional[str] = None  # повний текст відповіді для логування обміну
         try:
             from google import genai
             self.client = genai.Client(api_key=self.api_key)
@@ -187,14 +152,12 @@ class GeminiLLMProvider(BaseLLMProvider):
             raise ImportError("Для використання Gemini потрібно встановити google-genai: pip install google-genai")
     
     def _validate_model(self, preferred_model: str):
-        """Валідує модель, спробувавши кілька варіантів."""
-        # Список моделей для спроби (в порядку пріоритету)
+        """Валідує модель, спробувавши кілька варіантів. Тільки Flash-моделі (Pro не використовується)."""
+        # Список моделей для спроби (в порядку пріоритету). Лише Flash — gemini-pro застаріла (404)
         models_to_try = [
             preferred_model,
             'gemini-2.5-flash',
-            'gemini-2.5-pro',
             'gemini-2.5-flash-lite',
-            'gemini-pro'  # Стара модель на випадок, якщо нові недоступні
         ]
         
         # Видаляємо дублікати, зберігаючи порядок
@@ -203,6 +166,20 @@ class GeminiLLMProvider(BaseLLMProvider):
         
         # Зберігаємо першу модель як активну (перевірка доступності буде при першому запиті)
         self.model_name = self._available_models[0]
+
+    def _usage_from_response(self, response: Any) -> Optional[Dict[str, int]]:
+        """Витягує input_tokens та output_tokens з відповіді Gemini (usage_metadata)."""
+        try:
+            um = getattr(response, "usage_metadata", None)
+            if um is None:
+                return None
+            inp = getattr(um, "prompt_token_count", None) or getattr(um, "input_token_count", None)
+            out = getattr(um, "candidates_token_count", None) or getattr(um, "output_token_count", None)
+            if inp is not None or out is not None:
+                return {"input_tokens": int(inp or 0), "output_tokens": int(out or 0)}
+        except (TypeError, ValueError):
+            pass
+        return None
     
     def parse_auction_description(self, description: str) -> Dict[str, Any]:
         """Парсить опис аукціону через Gemini API."""
@@ -229,14 +206,16 @@ class GeminiLLMProvider(BaseLLMProvider):
                         model=model_name,
                         contents=prompt
                     )
-                    
-                    # Витягуємо JSON з відповіді
-                    # Перевіряємо, чи response.text існує та є рядком
+
+                    # Зберігаємо використання токенів та тексти для логування обміну
+                    self._last_usage = self._usage_from_response(response)
+                    self._last_request_text = prompt
                     if not hasattr(response, 'text') or response.text is None:
                         raise ValueError("Відповідь від Gemini не містить тексту")
-                    
+
                     response_text = str(response.text).strip()
-                    
+                    self._last_response_text = response_text
+
                     if not response_text:
                         raise ValueError("Відповідь від Gemini порожня")
                     
@@ -288,12 +267,15 @@ class GeminiLLMProvider(BaseLLMProvider):
                             time.sleep(retry_delay)
                             continue
                         else:
-                            # Якщо досягнуто максимум спроб для цієї моделі, пробуємо наступну
+                            # Досягнуто максимум спроб для цієї моделі — чекаємо перед переходом на наступну
+                            if model_name != models_to_try[-1]:
+                                print(f"Перевищено квоту Gemini ({model_name}). Очікування {retry_delay:.1f} с перед спробою іншої моделі...")
+                                time.sleep(retry_delay)
                             break
                     else:
                         # Інша помилка - пробуємо наступну модель
                         break
-            
+
             # Якщо успішно виконали запит, виходимо з циклу по моделях
             if success:
                 break
@@ -391,10 +373,18 @@ class GeminiLLMProvider(BaseLLMProvider):
         tags_raw = result.get('tags', [])
         tags = [str(t).strip().lower() for t in (tags_raw if isinstance(tags_raw, list) else []) if t and str(t).strip()]
         tags = list(dict.fromkeys(tags))
+        # Площа землі зберігається в м² (land_area_sqm). Якщо LLM повернув land_area_ha — конвертуємо.
+        land_area_sqm = result.get('land_area_sqm', '')
+        if not land_area_sqm and land_area_ha:
+            try:
+                land_area_sqm = float(land_area_ha) * 10000.0
+            except (TypeError, ValueError):
+                land_area_sqm = ''
         return {
             'cadastral_number': result.get('cadastral_number', ''),
             'building_area_sqm': building_area_sqm if building_area_sqm else '',
             'land_area_ha': land_area_ha if land_area_ha else '',
+            'land_area_sqm': land_area_sqm if land_area_sqm else '',
             'addresses': addresses,  # Масив адрес
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
@@ -409,6 +399,7 @@ class GeminiLLMProvider(BaseLLMProvider):
             'cadastral_number': '',
             'building_area_sqm': '',
             'land_area_ha': '',
+            'land_area_sqm': '',
             'addresses': [],  # Порожній масив адрес
             'floor': '',
             'property_type': '',
@@ -434,9 +425,14 @@ class GeminiLLMProvider(BaseLLMProvider):
                 contents=full_content,
                 config={"temperature": temperature},
             )
+            self._last_usage = self._usage_from_response(response)
+            self._last_request_text = full_content
             if not hasattr(response, 'text') or response.text is None:
+                self._last_response_text = ""
                 return ""
-            return str(response.text).strip()
+            out = str(response.text).strip()
+            self._last_response_text = out
+            return out
         except Exception:
             return ""
 
@@ -561,10 +557,17 @@ class OpenAILLMProvider(BaseLLMProvider):
         tags_raw = result.get('tags', [])
         tags = [str(t).strip().lower() for t in (tags_raw if isinstance(tags_raw, list) else []) if t and str(t).strip()]
         tags = list(dict.fromkeys(tags))
+        land_area_sqm = result.get('land_area_sqm', '')
+        if not land_area_sqm and land_area_ha:
+            try:
+                land_area_sqm = float(land_area_ha) * 10000.0
+            except (TypeError, ValueError):
+                land_area_sqm = ''
         return {
             'cadastral_number': result.get('cadastral_number', ''),
             'building_area_sqm': building_area_sqm if building_area_sqm else '',
             'land_area_ha': land_area_ha if land_area_ha else '',
+            'land_area_sqm': land_area_sqm if land_area_sqm else '',
             'addresses': addresses,  # Масив адрес
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
@@ -579,6 +582,7 @@ class OpenAILLMProvider(BaseLLMProvider):
             'cadastral_number': '',
             'building_area_sqm': '',
             'land_area_ha': '',
+            'land_area_sqm': '',
             'addresses': [],  # Порожній масив адрес
             'floor': '',
             'property_type': '',
@@ -707,10 +711,17 @@ class AnthropicLLMProvider(BaseLLMProvider):
         tags_raw = result.get('tags', [])
         tags = [str(t).strip().lower() for t in (tags_raw if isinstance(tags_raw, list) else []) if t and str(t).strip()]
         tags = list(dict.fromkeys(tags))
+        land_area_sqm = result.get('land_area_sqm', '')
+        if not land_area_sqm and land_area_ha:
+            try:
+                land_area_sqm = float(land_area_ha) * 10000.0
+            except (TypeError, ValueError):
+                land_area_sqm = ''
         return {
             'cadastral_number': result.get('cadastral_number', ''),
             'building_area_sqm': building_area_sqm if building_area_sqm else '',
             'land_area_ha': land_area_ha if land_area_ha else '',
+            'land_area_sqm': land_area_sqm if land_area_sqm else '',
             'addresses': addresses,  # Масив адрес
             'floor': result.get('floor', ''),
             'property_type': result.get('property_type', ''),
@@ -725,6 +736,7 @@ class AnthropicLLMProvider(BaseLLMProvider):
             'cadastral_number': '',
             'building_area_sqm': '',
             'land_area_ha': '',
+            'land_area_sqm': '',
             'addresses': [],  # Порожній масив адрес
             'floor': '',
             'property_type': '',
@@ -739,12 +751,21 @@ class OllamaLLMProvider(BaseLLMProvider):
 
     def __init__(self, api_key: str, rate_limiter: RateLimiter, model_name: str = 'gemma3:27b'):
         super().__init__(api_key or '', rate_limiter)
+        self._last_usage: Optional[Dict[str, int]] = None
+        self._last_request_text: Optional[str] = None
+        self._last_response_text: Optional[str] = None
         try:
             from ollama import Client
             self.client = Client()
             self.model_name = model_name
         except ImportError:
             raise ImportError("Для використання Ollama потрібно встановити ollama: pip install ollama")
+
+    def _usage_from_ollama_response(self, response: Dict[str, Any]) -> Dict[str, int]:
+        """Витягує кількість токенів з відповіді Ollama (prompt_eval_count, eval_count)."""
+        inp = response.get("prompt_eval_count")
+        out = response.get("eval_count")
+        return {"input_tokens": int(inp or 0), "output_tokens": int(out or 0)}
 
     def parse_auction_description(self, description: str) -> Dict[str, Any]:
         """Парсить опис аукціону через Ollama API."""
@@ -760,7 +781,10 @@ class OllamaLLMProvider(BaseLLMProvider):
                 prompt=prompt,
                 options={"temperature": 0.0},
             )
+            self._last_usage = self._usage_from_ollama_response(response)
             response_text = (response.get("response") or "").strip()
+            self._last_request_text = prompt
+            self._last_response_text = response_text
             if not response_text:
                 return self._empty_result()
 
@@ -848,11 +872,17 @@ class OllamaLLMProvider(BaseLLMProvider):
         tags_raw = result.get("tags", [])
         tags = [str(t).strip().lower() for t in (tags_raw if isinstance(tags_raw, list) else []) if t and str(t).strip()]
         tags = list(dict.fromkeys(tags))
-
+        land_area_sqm = result.get("land_area_sqm", "")
+        if not land_area_sqm and land_area_ha:
+            try:
+                land_area_sqm = float(land_area_ha) * 10000.0
+            except (TypeError, ValueError):
+                land_area_sqm = ""
         return {
             "cadastral_number": result.get("cadastral_number", ""),
             "building_area_sqm": building_area_sqm if building_area_sqm else "",
             "land_area_ha": land_area_ha if land_area_ha else "",
+            "land_area_sqm": land_area_sqm if land_area_sqm else "",
             "addresses": addresses,
             "floor": result.get("floor", ""),
             "property_type": result.get("property_type", ""),
@@ -867,6 +897,7 @@ class OllamaLLMProvider(BaseLLMProvider):
             "cadastral_number": "",
             "building_area_sqm": "",
             "land_area_ha": "",
+            "land_area_sqm": "",
             "addresses": [],
             "floor": "",
             "property_type": "",
@@ -888,12 +919,17 @@ class OllamaLLMProvider(BaseLLMProvider):
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
+            full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
             response = self.client.chat(
                 model=self.model_name,
                 messages=messages,
                 options={"temperature": temperature},
             )
-            return (response.get("message", {}).get("content") or "").strip()
+            self._last_usage = self._usage_from_ollama_response(response)
+            out = (response.get("message", {}).get("content") or "").strip()
+            self._last_request_text = full_prompt
+            self._last_response_text = out
+            return out
         except Exception:
             return ""
 
@@ -910,7 +946,8 @@ class LLMService:
         """
         self.settings = settings or Settings()
         self.rate_limiter = RateLimiter(self.settings.llm_rate_limit_calls_per_minute)
-        self.provider = self._create_provider()
+        self.provider = self._create_provider()  # парсинг описів (Ollama за замовчуванням)
+        self._assistant_provider = self._create_assistant_provider()  # intent, generate_text (Gemini за замовчуванням)
         self._logging = None
 
     def _get_logging(self):
@@ -923,18 +960,18 @@ class LLMService:
         return self._logging
     
     def _create_provider(self) -> BaseLLMProvider:
-        """Створює провайдера на основі налаштувань."""
-        provider_name = self.settings.llm_provider.lower()
+        """Створює провайдера для парсингу описів (на основі llm_parsing_*)."""
+        provider_name = self.settings.llm_parsing_provider.lower()
         api_key = self.settings.llm_api_keys.get(provider_name, '')
-        
+
         if provider_name == 'ollama':
-            model_name = getattr(self.settings, 'llm_model_name', 'gemma3:27b')
+            model_name = getattr(self.settings, 'llm_parsing_model_name', 'gemma3:27b')
             return OllamaLLMProvider(api_key, self.rate_limiter, model_name)
         if not api_key:
             raise ValueError(f"API ключ для провайдера {provider_name} не вказано в конфігурації")
-        
+
+        model_name = getattr(self.settings, 'llm_parsing_model_name', 'gemini-2.5-flash')
         if provider_name == 'gemini':
-            model_name = getattr(self.settings, 'llm_model_name', 'gemini-1.5-flash')
             return GeminiLLMProvider(api_key, self.rate_limiter, model_name)
         elif provider_name == 'openai':
             return OpenAILLMProvider(api_key, self.rate_limiter)
@@ -942,6 +979,27 @@ class LLMService:
             return AnthropicLLMProvider(api_key, self.rate_limiter)
         else:
             raise ValueError(f"Невідомий провайдер LLM: {provider_name}")
+
+    def _create_assistant_provider(self) -> BaseLLMProvider:
+        """Створює провайдера для асистента (intent, generate_text) на основі llm_assistant_*."""
+        provider_name = self.settings.llm_assistant_provider.lower()
+        api_key = self.settings.llm_api_keys.get(provider_name, '')
+
+        if provider_name == 'ollama':
+            model_name = getattr(self.settings, 'llm_assistant_model_name', 'gemma3:27b')
+            return OllamaLLMProvider(api_key, self.rate_limiter, model_name)
+        if not api_key:
+            raise ValueError(f"API ключ для провайдера асистента {provider_name} не вказано в конфігурації")
+
+        model_name = getattr(self.settings, 'llm_assistant_model_name', 'gemini-2.5-flash')
+        if provider_name == 'gemini':
+            return GeminiLLMProvider(api_key, self.rate_limiter, model_name)
+        elif provider_name == 'openai':
+            return OpenAILLMProvider(api_key, self.rate_limiter)
+        elif provider_name == 'anthropic':
+            return AnthropicLLMProvider(api_key, self.rate_limiter)
+        else:
+            raise ValueError(f"Невідомий провайдер асистента: {provider_name}")
     
     def parse_auction_description(self, description: str) -> Dict[str, Any]:
         """
@@ -954,21 +1012,49 @@ class LLMService:
             Dict з структурованою інформацією
         """
         log_svc = self._get_logging()
+
+        # Короткий лог у консоль, щоб було видно живу активність при викликах LLM
+        preview = (description or "").strip()
+        if len(preview) > 80:
+            preview = preview[:80] + "…"
+        start_ts = time.time()
+        logger.info("LLM parse_auction_description: start (len=%d, preview=%r)", len(description or ""), preview)
+
+        result = self.provider.parse_auction_description(description)
+
+        elapsed = time.time() - start_ts
+        logger.info("LLM parse_auction_description: done in %.1fs", elapsed)
         if log_svc:
             try:
+                usage = getattr(self.provider, "_last_usage", None)
+                meta = {"desc_preview": (description or "")[:80] + ("..." if len(description or "") > 80 else "")}
+                if isinstance(usage, dict):
+                    meta["input_tokens"] = usage.get("input_tokens", 0)
+                    meta["output_tokens"] = usage.get("output_tokens", 0)
                 log_svc.log_api_usage(
                     service="llm",
                     source="llm_service.parse_auction_description",
                     from_cache=False,
-                    metadata={"desc_preview": (description or "")[:80] + ("..." if len(description or "") > 80 else "")},
+                    metadata=meta,
+                )
+                req_text = getattr(self.provider, "_last_request_text", None) or ""
+                resp_text = getattr(self.provider, "_last_response_text", None) or ""
+                log_svc.log_llm_exchange(
+                    request_text=req_text,
+                    response_text=resp_text,
+                    input_tokens=meta.get("input_tokens", 0),
+                    output_tokens=meta.get("output_tokens", 0),
+                    source="llm_service.parse_auction_description",
+                    provider=(getattr(self.settings, "llm_parsing_provider", None) or "ollama"),
                 )
             except Exception as e:
-                logger.debug("log_api_usage (parse_auction): %s", e)
-        return self.provider.parse_auction_description(description)
+                logger.warning("Не вдалося записати llm_exchange (parse_auction): %s", e)
+        return result
 
     def parse_real_estate_objects(self, description: str) -> Dict[str, Any]:
         """
         Витягує об'єкти нерухомого майна (ОНМ) з опису оголошення.
+        Використовує провайдер парсингу (Ollama), а не асистента (Gemini).
 
         Args:
             description: Текст опису оголошення
@@ -987,7 +1073,38 @@ class LLMService:
             prompt = template.format(description=description)
         except Exception:
             return {"objects": []}
-        raw = self.generate_text(prompt, temperature=0.0)
+        # ОНМ та парсинг — через провайдер парсингу (Ollama), не асистента
+        parsing_provider = getattr(self, "provider", None)
+        if parsing_provider and hasattr(parsing_provider, "generate_text"):
+            raw = parsing_provider.generate_text(prompt, system_prompt=None, temperature=0.0)
+            log_svc = self._get_logging()
+            if log_svc and raw:
+                try:
+                    usage = getattr(parsing_provider, "_last_usage", None)
+                    meta = {"desc_preview": (description or "")[:80] + ("..." if len(description or "") > 80 else "")}
+                    if isinstance(usage, dict):
+                        meta["input_tokens"] = usage.get("input_tokens", 0)
+                        meta["output_tokens"] = usage.get("output_tokens", 0)
+                    log_svc.log_api_usage(
+                        service="llm",
+                        source="llm_service.parse_real_estate_objects",
+                        from_cache=False,
+                        metadata=meta,
+                    )
+                    req_text = getattr(parsing_provider, "_last_request_text", None) or ""
+                    resp_text = getattr(parsing_provider, "_last_response_text", None) or ""
+                    log_svc.log_llm_exchange(
+                        request_text=req_text,
+                        response_text=resp_text,
+                        input_tokens=meta.get("input_tokens", 0),
+                        output_tokens=meta.get("output_tokens", 0),
+                        source="llm_service.parse_real_estate_objects",
+                        provider=(getattr(self.settings, "llm_parsing_provider", None) or "ollama"),
+                    )
+                except Exception as e:
+                    logger.warning("Не вдалося записати llm_exchange (parse_real_estate_objects): %s", e)
+        else:
+            raw = self.generate_text(prompt, temperature=0.0)
         if not raw or not raw.strip():
             return {"objects": []}
         json_text = self._extract_json_from_intent_response(raw)
@@ -1015,26 +1132,41 @@ class LLMService:
             return {"intent": "query", "confidence": 0.0}
 
         prompt = self._create_intent_extraction_prompt(user_query, context)
-        if not hasattr(self.provider, "generate_text"):
+        if not hasattr(self._assistant_provider, "generate_text"):
             return {"intent": "query", "confidence": 0.5}
 
         try:
             log_svc = self._get_logging()
+            raw = self._assistant_provider.generate_text(
+                prompt,
+                system_prompt="You are an intent classifier. Return only valid JSON, no explanations. All string values in the JSON (e.g. reasoning, templates) must be in Ukrainian.",
+                temperature=0.0,
+            )
             if log_svc:
                 try:
+                    usage = getattr(self._assistant_provider, "_last_usage", None)
+                    meta = {"query_preview": (user_query or "")[:80] + ("..." if len(user_query or "") > 80 else "")}
+                    if isinstance(usage, dict):
+                        meta["input_tokens"] = usage.get("input_tokens", 0)
+                        meta["output_tokens"] = usage.get("output_tokens", 0)
                     log_svc.log_api_usage(
                         service="llm",
                         source="llm_service.extract_intent_for_routing",
                         from_cache=False,
-                        metadata={"query_preview": (user_query or "")[:80] + ("..." if len(user_query or "") > 80 else "")},
+                        metadata=meta,
+                    )
+                    req_text = getattr(self._assistant_provider, "_last_request_text", None) or ""
+                    resp_text = getattr(self._assistant_provider, "_last_response_text", None) or ""
+                    log_svc.log_llm_exchange(
+                        request_text=req_text,
+                        response_text=resp_text,
+                        input_tokens=meta.get("input_tokens", 0),
+                        output_tokens=meta.get("output_tokens", 0),
+                        source="llm_service.extract_intent_for_routing",
+                        provider=(getattr(self.settings, "llm_assistant_provider", None) or "gemini"),
                     )
                 except Exception as e:
-                    logger.debug("log_api_usage (extract_intent): %s", e)
-            raw = self.provider.generate_text(
-                prompt,
-                system_prompt="Ти класифікатор намірів. Повертай тільки валідний JSON без пояснень.",
-                temperature=0.0,
-            )
+                    logger.warning("Не вдалося записати llm_exchange (extract_intent): %s", e)
         except Exception:
             return {"intent": "query", "confidence": 0.5}
 
@@ -1062,58 +1194,77 @@ class LLMService:
         """
         Генерує текст за промптом (для плану аналітики тощо). Повертає порожній рядок, якщо провайдер не підтримує.
         """
-        if not hasattr(self.provider, "generate_text"):
+        if not hasattr(self._assistant_provider, "generate_text"):
             return ""
         log_svc = self._get_logging()
-        if log_svc:
-            try:
-                log_svc.log_api_usage(
-                    service="llm",
-                    source=_caller or "llm_service.generate_text",
-                    from_cache=False,
-                    metadata={"prompt_preview": (prompt or "")[:80] + ("..." if len(prompt or "") > 80 else "")},
-                )
-            except Exception as e:
-                logger.debug("log_api_usage (generate_text): %s", e)
         try:
-            return self.provider.generate_text(
+            raw = self._assistant_provider.generate_text(
                 prompt,
                 system_prompt=system_prompt,
                 temperature=temperature,
             )
+            if log_svc:
+                try:
+                    usage = getattr(self._assistant_provider, "_last_usage", None)
+                    meta = {"prompt_preview": (prompt or "")[:80] + ("..." if len(prompt or "") > 80 else "")}
+                    if _caller:
+                        meta["caller"] = _caller
+                    if isinstance(usage, dict):
+                        meta["input_tokens"] = usage.get("input_tokens", 0)
+                        meta["output_tokens"] = usage.get("output_tokens", 0)
+                    log_svc.log_api_usage(
+                        service="llm",
+                        source=_caller or "llm_service.generate_text",
+                        from_cache=False,
+                        metadata=meta,
+                    )
+                    req_text = getattr(self._assistant_provider, "_last_request_text", None) or ""
+                    resp_text = getattr(self._assistant_provider, "_last_response_text", None) or ""
+                    log_svc.log_llm_exchange(
+                        request_text=req_text,
+                        response_text=resp_text,
+                        input_tokens=meta.get("input_tokens", 0),
+                        output_tokens=meta.get("output_tokens", 0),
+                        source=_caller or "llm_service.generate_text",
+                        provider=(getattr(self.settings, "llm_assistant_provider", None) or "gemini"),
+                    )
+                except Exception as e:
+                    logger.warning("Не вдалося записати llm_exchange (generate_text): %s", e)
+            return raw
         except Exception:
             return ""
 
     def _create_intent_extraction_prompt(self, user_query: str, context: Optional[str]) -> str:
-        """Промпт для LLM Intent Extractor."""
+        """Prompt for LLM Intent Extractor. Instructions in English; output JSON string values in Ukrainian."""
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
-        date_ctx = f"Поточна дата/час (UTC): {now.isoformat()}. Періоди: остання добу = last_1_day, останні 7 днів = last_7_days, останні 30 днів = last_30_days."
-        ctx_block = f"\nКонтекст розмови (коротко):\n{context[:800]}" if context else ""
-        return f"""Тобі необхідно визначити намір користувача за запитом. {date_ctx}{ctx_block}
+        date_ctx = f"Current date/time (UTC): {now.isoformat()}. Periods: last 1 day = last_1_day, last 7 days = last_7_days, last 30 days = last_30_days."
+        ctx_block = f"\nConversation context (brief):\n{context[:800]}" if context else ""
+        return f"""Determine the user's intent from the query. {date_ctx}{ctx_block}
 
-## Запит користувача:
+## User query:
 {user_query[:2000]}
 
-## Закріплення завдання:
-Поверни ТІЛЬКИ один JSON-об'єкт без коментарів з полями:
-- intent: один з "report_last_day", "report_last_week", "export_data", "query", "analytical_query"
-- confidence: число від 0 до 1 (впевненість у класифікації)
+## Task:
+Return ONLY one JSON object without comments. All text values in the JSON (e.g. in reasoning or analysis_intent filters) must be in Ukrainian.
+Fields:
+- intent: one of "report_last_day", "report_last_week", "export_data", "query", "analytical_query"
+- confidence: number 0–1 (classification confidence)
 
-Якщо intent = "analytical_query", додай об'єкт analysis_intent з полями:
-- entity: "olx_listings" або "prozorro_auctions"
-- time_range: "last_1_day" | "last_7_days" | "last_30_days" або null
-- dimensions: масив ["location"] | ["region"] | ["city"] | ["date"] | ["property_type"] або []
-- filters: об'єкт з опційними ключами city (рядок або масив), region (рядок або масив), property_type (рядок або масив)
-- metrics: масив об'єктів, кожен: {{ "field": "price"|"count"|..., "aggregation": "top"|"count"|"avg"|"sum"|"distribution"|"trend", "order": "asc"|"desc", "limit": число або null }}
-- presentation: "list" | "table" | "chart" або null
-- multi_step: true лише якщо запит вимагає порівняння двох джерел (OLX і ProZorro) або багатокрокової аналітики (наприклад "порівняй ціни OLX і ProZorro по регіонах"); інакше false або не вказуй
+If intent = "analytical_query", add object analysis_intent with:
+- entity: "olx_listings" or "prozorro_auctions"
+- time_range: "last_1_day" | "last_7_days" | "last_30_days" or null
+- dimensions: array ["location"] | ["region"] | ["city"] | ["date"] | ["property_type"] or []
+- filters: object with optional city (string or array), region (string or array), property_type (string or array) — use Ukrainian place names where applicable
+- metrics: array of {{ "field": "price"|"count"|..., "aggregation": "top"|"count"|"avg"|"sum"|"distribution"|"trend", "order": "asc"|"desc", "limit": number or null }}
+- presentation: "list" | "table" | "chart" or null
+- multi_step: true only if the query requires comparing two sources (OLX and ProZorro) or multi-step analytics; otherwise false or omit
 
-Приклади намірів:
+Examples:
 - "звіт за добу по Києву" -> intent: "report_last_day", confidence: 0.95
 - "топ-10 найдорожчих оголошень OLX за тиждень по Києву" -> intent: "analytical_query", confidence: 0.85, analysis_intent: {{ entity: "olx_listings", time_range: "last_7_days", dimensions: ["location"], filters: {{ city: ["Київ"] }}, metrics: [{{ field: "price", aggregation: "top", order: "desc", limit: 10 }}], presentation: "list" }}
 - "скільки аукціонів за місяць" -> intent: "analytical_query", confidence: 0.8, analysis_intent: {{ entity: "prozorro_auctions", time_range: "last_30_days", metrics: [{{ field: "count", aggregation: "count" }}], presentation: "list" }}
-- "привіт" або незрозуміло -> intent: "query", confidence: 0.3"""
+- "привіт" or unclear -> intent: "query", confidence: 0.3"""
 
     def _extract_json_from_intent_response(self, text: str) -> str:
         """Витягує JSON з відповіді (аналог _extract_json_from_response у провайдерів)."""

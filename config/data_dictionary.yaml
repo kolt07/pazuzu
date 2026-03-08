@@ -403,12 +403,12 @@ collections:
         source: "auction_data.items[].quantity.value (якщо unit='м²') або llm_cache.result.building_area_sqm"
         usage: "Використовується для експорту та аналітики (метрики: area, building_area)"
       
-      land_area_ha:
+      land_area_sqm:
         type: "number"
-        unit: "ha"
-        description: "Площа земельної ділянки в гектарах. Формується з auction_data.items[].quantity.value або llm_cache.result.land_area_ha. Для аналітики використовуй це поле в метриці 'land_area'."
-        example: 0.5296
-        source: "auction_data.items[].quantity.value (якщо unit='га') або llm_cache.result.land_area_ha"
+        unit: "m²"
+        description: "Площа земельної ділянки в м². Формується з auction_data.items[].quantity.value або llm_cache.result.land_area_sqm. Для відображення в сотках: land_area_sqm/100."
+        example: 5296
+        source: "auction_data.items[].quantity.value (конвертація в м²) або llm_cache.result.land_area_sqm"
         usage: "Використовується для експорту та аналітики (метрика: land_area)"
       
       # Фінансові поля (формуються з auction_data)
@@ -540,10 +540,10 @@ collections:
             type: "number"
             unit: "m²"
             description: "Площа будівлі в квадратних метрах"
-          land_area_ha:
+          land_area_sqm:
             type: "number"
-            unit: "ha"
-            description: "Площа земельної ділянки в гектарах"
+            unit: "m²"
+            description: "Площа земельної ділянки в м². Для відображення в сотках: land_area_sqm/100."
           addresses:
             type: "array"
             description: "Список адрес"
@@ -651,10 +651,10 @@ collections:
                 type: "number"
                 unit: "m²"
                 description: "Площа будівлі/приміщень у м²"
-              land_area_ha:
+              land_area_sqm:
                 type: "number"
-                unit: "ha"
-                description: "Площа земельної ділянки в гектарах"
+                unit: "m²"
+                description: "Площа земельної ділянки в м². Для відображення в сотках: /100."
           resolved_locations:
             type: "array"
             description: "Результати геокодування адрес (масив об'єктів з results[].address_structured: region, city, street, street_number, formatted_address)"
@@ -754,10 +754,10 @@ collections:
         type: "number"
         source: "detail.llm.building_area_sqm"
         description: "Площа будівлі (м²)"
-      detail_llm_land_area_ha:
+      detail_llm_land_area_sqm:
         type: "number"
-        source: "detail.llm.land_area_ha"
-        description: "Площа ділянки (га)"
+        source: "detail.llm.land_area_sqm"
+        description: "Площа ділянки (м²). Для відображення в сотках: /100."
       detail_llm_tags:
         type: "array"
         source: "detail.llm.tags"
@@ -843,6 +843,26 @@ collections:
         type: "string"
         required: false
         description: "Повний опис оголошення"
+      region:
+        type: "string"
+        required: false
+        description: "Область (базове гео в корені, з addresses)"
+        indexed: true
+      oblast_raion:
+        type: "string"
+        required: false
+        description: "Район області (базове гео в корені, з addresses)"
+        indexed: true
+      city:
+        type: "string"
+        required: false
+        description: "Місто/населений пункт (базове гео в корені, з addresses)"
+        indexed: true
+      city_district:
+        type: "string"
+        required: false
+        description: "Район міста (для великих міст, з addresses при наявності вулиці)"
+        indexed: true
       addresses:
         type: "array"
         required: false
@@ -857,7 +877,10 @@ collections:
             description: "Населений пункт"
           district:
             type: "string"
-            description: "Район"
+            description: "Район області"
+          city_district:
+            type: "string"
+            description: "Район міста (sublocality з геокодування, для великих міст)"
           street:
             type: "string"
             description: "Вулиця"
@@ -891,11 +914,11 @@ collections:
         required: false
         unit: "m²"
         description: "Площа нерухомості (будівель, приміщень) в квадратних метрах. Джерело: detail.llm.building_area_sqm (OLX); auction_data.items[].itemProps (totalObjectArea, totalBuildingArea, usableArea) або quantity.value за unit м² (ProZorro)."
-      land_area_ha:
+      land_area_sqm:
         type: "number"
         required: false
-        unit: "ha"
-        description: "Площа земельної ділянки в гектарах. Джерело: detail.llm.land_area_ha (OLX); auction_data.items[].itemProps.landArea або quantity.value за unit га (ProZorro)."
+        unit: "m²"
+        description: "Площа земельної ділянки в м². Джерело: detail.llm.land_area_sqm або detail.llm.land_area_ha*10000 (OLX); auction_data.items[].itemProps.landArea або quantity.value за unit га/м², конвертовані в м² (ProZorro). Для відображення в сотках: land_area_sqm/100."
       price_uah:
         type: "number"
         required: false
@@ -915,11 +938,11 @@ collections:
       price_per_ha_uah:
         type: "number"
         required: false
-        description: "Ціна за га в гривнях. NULL для чистої нерухомості без землі; заповнена для землі або землі з нерухомістю (при наявності land_area_ha)."
+        description: "Ціна за га в гривнях. NULL для чистої нерухомості без землі; заповнена для землі або землі з нерухомістю (при наявності land_area_sqm). Для відображення землі використовувати ціну за сотку = price_per_ha_uah/100 (грн/с)."
       price_per_ha_usd:
         type: "number"
         required: false
-        description: "Ціна за га в доларах. NULL для чистої нерухомості без землі."
+        description: "Ціна за га в доларах. Для відображення землі — ціна за сотку = price_per_ha_usd/100."
       currency_rate:
         type: "number"
         required: false
@@ -963,9 +986,9 @@ collections:
         type: "number"
         description: "Площа нерухомості (м²)"
         usage: "Фільтрація, сортування, аналітика"
-      land_area_ha:
+      land_area_sqm:
         type: "number"
-        description: "Площа земельної ділянки (га)"
+        description: "Площа земельної ділянки (м²). Відображення в сотках: /100."
         usage: "Фільтрація, сортування, аналітика"
       price_uah:
         type: "number"
@@ -975,16 +998,36 @@ collections:
         type: "number"
         description: "Ціна в доларах"
         usage: "Сортування та фільтрація за ціною"
+      region:
+        type: "string"
+        source: "region"
+        description: "Область (root geo)"
+        usage: "Фільтр за областю"
+      city:
+        type: "string"
+        source: "city"
+        description: "Місто/населений пункт (root geo)"
+        usage: "Фільтр за містом"
+      oblast_raion:
+        type: "string"
+        source: "oblast_raion"
+        description: "Район області (root geo)"
+        usage: "Фільтр за районом області"
+      city_district:
+        type: "string"
+        source: "city_district"
+        description: "Район міста (root geo)"
+        usage: "Фільтр за районом міста"
       addresses_region:
         type: "string"
         source: "addresses.region"
-        description: "Область з адрес"
-        usage: "Фільтр за областю (використовуй $elemMatch)"
+        description: "Область з адрес (fallback)"
+        usage: "Фільтр за областю"
       addresses_settlement:
         type: "string"
         source: "addresses.settlement"
-        description: "Населений пункт з адрес"
-        usage: "Фільтр за містом (використовуй $elemMatch)"
+        description: "Населений пункт з адрес (fallback)"
+        usage: "Фільтр за містом"
       source_updated_at:
         type: "datetime"
         description: "Дата оновлення в джерелі"
@@ -1458,6 +1501,93 @@ collections:
       computed_at:
         type: "datetime"
         description: "Час обчислення"
+
+  analytics_extracts:
+    description: "Виокремлені дані з оголошень для швидких агрегацій. Заповнюється під час перерахунку аналітики з unified_listings. Плоскі поля: region, city, city_district, price_per_m2_uah, price_per_ha_uah тощо."
+    mongo_collection: "analytics_extracts"
+    indexes:
+      - field: ["source", "source_id"]
+        unique: true
+        description: "Унікальна комбінація джерела та ID"
+      - field: ["region", "city", "city_district"]
+        unique: false
+        description: "Для агрегацій по району міста"
+    fields:
+      source:
+        type: "string"
+        description: "Джерело (olx, prozorro)"
+      source_id:
+        type: "string"
+        description: "ID в джерелі"
+      listing_url:
+        type: "string"
+        description: "Посилання на оголошення"
+      property_type:
+        type: "string"
+        description: "Тип (земля, нерухомість)"
+      source_date:
+        type: "string"
+        description: "Дата з джерела (YYYY-MM-DD)"
+      region:
+        type: "string"
+        description: "Область"
+      oblast_raion:
+        type: "string"
+        description: "Район області"
+      settlement_type:
+        type: "string"
+        description: "Тип населеного пункту (м., с., смт.)"
+      settlement:
+        type: "string"
+        description: "Населений пункт"
+      city:
+        type: "string"
+        description: "Місто"
+      city_district:
+        type: "string"
+        description: "Район міста (доповнюється геокодуванням для великих міст)"
+      geocode_formatted_address:
+        type: "string"
+        required: false
+        description: "Відформатована адреса з Google Geocoding (при доповненні)"
+      geocode_latitude:
+        type: "number"
+        required: false
+        description: "Широта з геокодування"
+      geocode_longitude:
+        type: "number"
+        required: false
+        description: "Довгота з геокодування"
+      street_type:
+        type: "string"
+        description: "Тип вулиці"
+      street:
+        type: "string"
+        description: "Назва вулиці"
+      building:
+        type: "string"
+        description: "Номер будинку"
+      floor:
+        type: "number"
+        description: "Поверх"
+      land_area_sqm:
+        type: "number"
+        description: "Площа землі (м²). Відображення для землі: сотки = land_area_sqm/100."
+      price_per_ha_uah:
+        type: "number"
+        description: "Ціна землі за га (грн). Відображення для землі: ціна за сотку = price_per_ha_uah/100 (грн/с)."
+      price_per_ha_usd:
+        type: "number"
+        description: "Ціна землі за га (дол)"
+      building_area_sqm:
+        type: "number"
+        description: "Площа нерухомості (м²)"
+      price_per_m2_uah:
+        type: "number"
+        description: "Ціна нерухомості за м² (грн)"
+      price_per_m2_usd:
+        type: "number"
+        description: "Ціна нерухомості за м² (дол)"
 
 # Допоміжні типи та константи
 field_types:

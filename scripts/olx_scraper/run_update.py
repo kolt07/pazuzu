@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -28,6 +28,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from config.settings import Settings
 from data.database.connection import MongoDBConnection
 from data.repositories.olx_listings_repository import OlxListingsRepository
+from data.repositories.raw_olx_listings_repository import RawOlxListingsRepository
 from business.services.olx_llm_extractor_service import OlxLLMExtractorService
 from business.services.unified_listings_service import UnifiedListingsService
 from business.services.geocoding_service import GeocodingService
@@ -35,7 +36,7 @@ from business.services.currency_rate_service import CurrencyRateService
 from utils.price_metrics import compute_price_metrics
 from scripts.olx_scraper import config as scraper_config
 from scripts.olx_scraper.fetcher import fetch_page, get_session
-from scripts.olx_scraper.parser import parse_listings_page, parse_detail_page
+from scripts.olx_scraper.parser import parse_listings_page, parse_detail_page, detect_antibot_page
 
 from scripts.olx_scraper.helpers import (
     search_data_from_listing,
@@ -43,6 +44,32 @@ from scripts.olx_scraper.helpers import (
     _collect_and_geocode_locations,
     _address_line_from_llm_address,
 )
+from utils.hash_utils import calculate_search_data_hash
+from business.services.llm_processing_regions_service import is_region_enabled_for_llm
+
+
+def _fetch_detail_page(
+    url: str,
+    session: Optional[Any] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> Any:
+    """
+    Завантажує сторінку оголошення з більшим таймаутом (is_detail=True).
+    При виявленні ознак антиботу — одна повторна спроба через 8 с.
+    """
+    log = log_fn or (lambda s: None)
+    resp = fetch_page(url, delay_before=False, session=session, is_detail=True)
+    antibot = detect_antibot_page(resp.text)
+    if antibot.get("is_antibot") and antibot.get("hints"):
+        log(f"[OLX] Ознаки антиботу/перевірки: {', '.join(antibot['hints'])}. Повтор через 8 с...")
+        time.sleep(8)
+        resp = fetch_page(url, delay_before=False, session=session, is_detail=True)
+    return resp
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 
 def _parse_listed_at_iso(iso_str: Optional[str]) -> Optional[datetime]:
@@ -68,13 +95,15 @@ def _process_category(
     cutoff_utc: Optional[datetime] = None,
     usd_rate: Optional[float] = None,
     session: Optional[Any] = None,
-) -> Tuple[int, int, set]:
+    region_name: Optional[str] = None,
+) -> Tuple[int, int, set, List[str]]:
     """
     Обробляє одну категорію OLX у два етапи:
-    1) Прохід по сторінках пошуку — збір повного списку оголошень, визначення обсягу.
-    2) Опрацювання списку — завантаження деталей, LLM, геокодування, збереження в БД.
-    Зупинка по даті (cutoff_utc) або по max_pages лише на етапі 1.
-    Повертає (total_listings, total_detail_fetches, search_urls).
+    1) Прохід по сторінках пошуку — збір повного списку оголошень.
+    2) Завантаження деталей (сирі дані) — без LLM. Оголошення, що потребують LLM, додаються в pending.
+    LLM-обробка виконується окремо в Phase 2 (після збору всіх сирих даних).
+    region_name: область пошуку OLX (фільтр сторінки); якщо не в переліку увімкнених — LLM не викликається.
+    Повертає (total_listings, total_detail_fetches, search_urls, pending_llm_urls).
     """
     def log(msg: str) -> None:
         if log_fn:
@@ -198,16 +227,19 @@ def _process_category(
     log(f"[OLX] {category_label}: всього оголошень до опрацювання: {total_count}")
 
     if total_count == 0:
-        return 0, 0, search_urls
+        return 0, 0, search_urls, []
 
-    # ——— Етап 2: опрацювання кожного оголошення зі списку ———
+    # ——— Етап 2: завантаження деталей (сирі дані, без LLM). LLM — у Phase 2. ———
     total_detail_fetches = 0
+    pending_llm_urls: List[str] = []
     for idx, item in enumerate(all_listings, start=1):
         listing_url = item.get("url")
         if not listing_url:
             continue
         log(f"[OLX] {category_label}: опрацювання {idx}/{total_count}")
         search_data = search_data_from_listing(item)
+        if region_name:
+            search_data["region_filter"] = region_name
         existing = repo.find_by_url(listing_url)
 
         need_detail = False
@@ -221,8 +253,10 @@ def _process_category(
         if need_detail:
             time.sleep(scraper_config.get_delay_detail_seconds())
             try:
-                detail_response = fetch_page(listing_url, delay_before=False, session=session)
+                detail_response = _fetch_detail_page(listing_url, session=session, log_fn=log)
                 detail_data = parse_detail_page(detail_response.text)
+                if detail_data.get("_inactive"):
+                    detail_data.pop("_inactive", None)
 
                 # --- Хеш ключових полів оголошення для контролю повторних викликів LLM ---
                 old_detail = (existing or {}).get("detail") or {}
@@ -245,87 +279,96 @@ def _process_category(
                 except Exception:
                     new_hash = None
 
-                reused_llm = False
                 if old_llm and old_hash and new_hash and old_hash == new_hash:
-                    # Ключова інформація не змінилась — перевикористовуємо попередній результат LLM
+                    # Ключова інформація не змінилась — перевикористовуємо попередній результат LLM (Phase 1)
                     detail_data["llm"] = old_llm
                     detail_data["llm_content_hash"] = old_hash
-                    reused_llm = True
                 else:
-                    llm_data = llm_extractor.extract_structured_data(search_data, detail_data)
-                    if llm_data:
-                        detail_data["llm"] = llm_data
+                    # Потребує LLM — зберігаємо сирі дані, LLM у Phase 2 (лише якщо область увімкнена для LLM)
                     if new_hash:
                         detail_data["llm_content_hash"] = new_hash
+                    detail_data["llm_pending"] = True
+                    if region_name is None or is_region_enabled_for_llm(region_name):
+                        pending_llm_urls.append(listing_url)
 
-                # Імпортуємо GeographyService якщо доступний
-                geography_service = None
-                try:
-                    from business.services.geography_service import GeographyService
-                    geography_service = GeographyService()
-                except ImportError:
-                    pass
-                
-                result = _collect_and_geocode_locations(
-                    search_data, detail_data, geocoding_service, geography_service
-                )
-                if len(result) == 3:
-                    geocode_hashes, resolved_locations, address_refs_list = result
+                # Геокодування, метрики, formatted_address — лише коли є LLM (reuse). Інакше — у Phase 2.
+                if "llm" in detail_data:
+                    geography_service = None
+                    try:
+                        from business.services.geography_service import GeographyService
+                        geography_service = GeographyService()
+                    except ImportError:
+                        pass
+
+                    result = _collect_and_geocode_locations(
+                        search_data, detail_data, geocoding_service, geography_service
+                    )
+                    if len(result) == 3:
+                        geocode_hashes, resolved_locations, address_refs_list = result
+                    else:
+                        geocode_hashes, resolved_locations = result
+                        address_refs_list = []
+
+                    detail_data["geocode_query_hashes"] = geocode_hashes
+                    detail_data["resolved_locations"] = resolved_locations
+                    if address_refs_list:
+                        detail_data["address_refs"] = address_refs_list
+
+                    price_value = search_data.get("price_value")
+                    llm_struct = (detail_data.get("llm") or {}) if isinstance(detail_data, dict) else {}
+                    total_area_m2 = llm_struct.get("total_area_m2")
+                    if total_area_m2 is None:
+                        total_area_m2 = search_data.get("area_m2")
+                    land_area_sqm = llm_struct.get("land_area_sqm")
+                    if land_area_sqm is None and llm_struct.get("land_area_ha") is not None:
+                        try:
+                            land_area_sqm = float(llm_struct["land_area_ha"]) * 10000.0
+                        except (TypeError, ValueError):
+                            land_area_sqm = None
+                    metrics = compute_price_metrics(
+                        total_price_uah=price_value,
+                        building_area_sqm=total_area_m2,
+                        land_area_sqm=land_area_sqm,
+                        uah_per_usd=usd_rate,
+                    )
+                    detail_data["price_metrics"] = metrics
+
+                    if price_value is not None:
+                        currency = (search_data.get("currency") or "UAH").strip().upper() or "UAH"
+                        if currency not in ("UAH", "USD", "EUR"):
+                            currency = "UAH"
+                        detail_data["price"] = {"value": float(price_value) if not isinstance(price_value, float) else price_value, "currency": currency}
+
+                    formatted_address = ""
+                    if address_refs_list and geography_service:
+                        parts = []
+                        for refs in address_refs_list:
+                            if isinstance(refs, dict):
+                                addr = geography_service.format_address(refs)
+                                if addr and addr not in parts:
+                                    parts.append(addr)
+                        formatted_address = "; ".join(parts) if parts else ""
+                    if not formatted_address:
+                        for addr in (detail_data.get("llm") or {}).get("addresses") or []:
+                            if isinstance(addr, dict):
+                                line = _address_line_from_llm_address(addr)
+                                if line:
+                                    formatted_address = line
+                                    break
+                    if not formatted_address:
+                        formatted_address = (search_data.get("location") or "").strip()
+                    if formatted_address:
+                        if "llm" not in detail_data:
+                            detail_data["llm"] = {}
+                        detail_data["llm"]["parsed_address"] = {"formatted_address": formatted_address}
                 else:
-                    geocode_hashes, resolved_locations = result
-                    address_refs_list = []
-                
-                detail_data["geocode_query_hashes"] = geocode_hashes
-                detail_data["resolved_locations"] = resolved_locations
-                if address_refs_list:
-                    detail_data["address_refs"] = address_refs_list
-
-                # --- Цінові метрики (UAH / USD, за м² та за гектар) ---
-                price_value = search_data.get("price_value")
-                llm_struct = (detail_data.get("llm") or {}) if isinstance(detail_data, dict) else {}
-                total_area_m2 = llm_struct.get("total_area_m2")
-                if total_area_m2 is None:
-                    total_area_m2 = search_data.get("area_m2")
-                land_area_ha = llm_struct.get("land_area_ha")
-
-                metrics = compute_price_metrics(
-                    total_price_uah=price_value,
-                    building_area_sqm=total_area_m2,
-                    land_area_ha=land_area_ha,
-                    uah_per_usd=usd_rate,
-                )
-                detail_data["price_metrics"] = metrics
-
-                # detail.price (value, currency) для відображення та агента
-                if price_value is not None:
-                    currency = (search_data.get("currency") or "UAH").strip().upper() or "UAH"
-                    if currency not in ("UAH", "USD", "EUR"):
-                        currency = "UAH"
-                    detail_data["price"] = {"value": float(price_value) if not isinstance(price_value, float) else price_value, "currency": currency}
-
-                # detail.llm.parsed_address.formatted_address — повна адреса
-                formatted_address = ""
-                if address_refs_list and geography_service:
-                    parts = []
-                    for refs in address_refs_list:
-                        if isinstance(refs, dict):
-                            addr = geography_service.format_address(refs)
-                            if addr and addr not in parts:
-                                parts.append(addr)
-                    formatted_address = "; ".join(parts) if parts else ""
-                if not formatted_address:
-                    for addr in (detail_data.get("llm") or {}).get("addresses") or []:
-                        if isinstance(addr, dict):
-                            line = _address_line_from_llm_address(addr)
-                            if line:
-                                formatted_address = line
-                                break
-                if not formatted_address:
-                    formatted_address = (search_data.get("location") or "").strip()
-                if formatted_address:
-                    if "llm" not in detail_data:
-                        detail_data["llm"] = {}
-                    detail_data["llm"]["parsed_address"] = {"formatted_address": formatted_address}
+                    # llm_pending — базові поля з search_data
+                    price_value = search_data.get("price_value")
+                    if price_value is not None:
+                        currency = (search_data.get("currency") or "UAH").strip().upper() or "UAH"
+                        if currency not in ("UAH", "USD", "EUR"):
+                            currency = "UAH"
+                        detail_data["price"] = {"value": float(price_value) if not isinstance(price_value, float) else price_value, "currency": currency}
 
                 repo.upsert_listing(listing_url, search_data, detail=detail_data, is_active=True)
                 total_detail_fetches += 1
@@ -350,10 +393,375 @@ def _process_category(
                         log(f"[OLX] Помилка синхронізації в unified: {sync_err}")
         else:
             # Дані з пошуку не змінились — оновлюємо лише olx_listings (search_data, updated_at).
-            # sync_olx_listing і process_listing (ОНМ) не потрібні — контент той самий.
             repo.upsert_listing(listing_url, search_data, detail=existing.get("detail"), is_active=True)
 
-    return total_count, total_detail_fetches, search_urls
+    return total_count, total_detail_fetches, search_urls, pending_llm_urls
+
+
+def _process_category_raw_only(
+    get_list_url: Callable[[int], str],
+    max_pages: Optional[int],
+    category_label: str,
+    raw_repo: RawOlxListingsRepository,
+    log_fn: Optional[Callable[[str], None]] = None,
+    cutoff_utc: Optional[datetime] = None,
+    session: Optional[Any] = None,
+    region_name: Optional[str] = None,
+    browser_fetcher: Optional[Any] = None,
+) -> Tuple[int, List[str]]:
+    """
+    Phase 1 (raw pipeline): лише завантаження сирих даних у raw_olx_listings.
+    Фільтрація та зупинка пагінації — як у _process_category: 0 результатів (рекламні), cutoff по даті, ретраї, 404.
+    Сторінки пошуку — завжди через прямі HTTP-запити (session). Деталі оголошень: якщо browser_fetcher задано — через клікер (один потік), інакше — requests.
+    Повертає (total_count, loaded_urls).
+    """
+    def log(msg: str) -> None:
+        if log_fn:
+            log_fn(msg)
+        else:
+            print(msg, flush=True)
+
+    all_listings: List[Dict[str, Any]] = []
+    stop_pages = False
+    page = 1
+
+    # ——— Етап 1: сторінки пошуку — та сама логіка що в _process_category ———
+    while True:
+        if stop_pages:
+            break
+        if max_pages is not None and page > max_pages:
+            break
+        url = get_list_url(page)
+        if page == 1:
+            log(f"[OLX raw] {category_label}: URL пошуку (перша сторінка): {url}")
+        page_label = f"{page}" if max_pages is None else f"{page}/{max_pages}"
+        log(f"[OLX raw] {category_label}: сторінка пошуку {page_label}")
+        listings = []
+        retry_count = getattr(scraper_config, "RETRY_EMPTY_PAGE_COUNT", 2)
+        fetch_failed = False
+        for attempt in range(max(1, retry_count + 1)):
+            response_text = ""
+            status_code = 200
+            try:
+                # Сторінки пошуку — завжди прямі HTTP-запити (requests)
+                response = fetch_page(
+                    url,
+                    delay_before=(attempt == 0),
+                    delay_after=True,
+                    session=session,
+                )
+                response_text = response.text
+                status_code = getattr(response, "status_code", 200)
+                if status_code == 404:
+                    log(f"[OLX raw] {category_label}: 404 на сторінці {page} — кінець результатів")
+                    stop_pages = True
+                    break
+                if status_code >= 500:
+                    raise RuntimeError(f"HTTP {status_code}")
+            except Exception as e:
+                err_str = str(e)
+                is_404 = "404" in err_str
+                is_server_error = "502" in err_str or "503" in err_str or "504" in err_str
+                log(f"[OLX raw] Помилка запиту {url}: {e}")
+                if is_404:
+                    log(f"[OLX raw] {category_label}: 404 на сторінці {page} — кінець результатів")
+                    stop_pages = True
+                    break
+                if attempt < retry_count:
+                    delay_sec = scraper_config.get_delay_seconds()
+                    if is_server_error:
+                        delay_sec = max(delay_sec, 10)
+                    time.sleep(delay_sec)
+                    continue
+                log(f"[OLX raw] {category_label}: пропускаємо сторінку {page} після {retry_count + 1} спроб")
+                fetch_failed = True
+                page += 1
+                break
+            import re
+            html_lower = response_text.lower()
+            html_norm = html_lower.replace("\u00a0", " ").replace("\u202f", " ")
+            has_explicit_zero = (
+                "знайшли 0 оголошень" in html_lower
+                or "ми знайшли 0 оголошень" in html_lower
+            )
+            m = re.search(r"знайшли\s+(?:понад\s+)?([\d\s]+)оголошень", html_norm)
+            found_n = int(m.group(1).replace(" ", "")) if m and m.group(1).replace(" ", "").isdigit() else None
+            has_reklamni = "ми нічого не знайшли, тому підібрали рекламні" in html_lower
+            should_stop = has_explicit_zero or (has_reklamni and found_n == 0)
+            if should_stop:
+                log(f"[OLX raw] {category_label}: сторінка показує 0 результатів — зупинка (OLX підставляє ліві оголошення)")
+                stop_pages = True
+                break
+            listings = parse_listings_page(response_text)
+            log(f"[OLX raw] Оголошень на сторінці: {len(listings)}")
+            if listings:
+                break
+            if attempt < retry_count:
+                delay_sec = getattr(scraper_config, "DELAY_AFTER_PAGE_LOAD", 3)
+                log(f"[OLX raw] 0 оголошень — повторна спроба через {delay_sec:.0f} с...")
+                time.sleep(delay_sec)
+        if fetch_failed:
+            continue
+        if not listings:
+            break
+
+        # Топові (платні) оголошення OLX вставляються на сторінку без урахування сортування.
+        # Зупиняємось лише якщо більше половини оголошень на сторінці старші за граничну дату (cutoff).
+        count_older_than_cutoff = 0
+        for item in listings:
+            listing_url = item.get("url")
+            if cutoff_utc is not None:
+                listed_at = _parse_listed_at_iso(item.get("listed_at_iso"))
+                if listed_at is not None and listed_at < cutoff_utc:
+                    count_older_than_cutoff += 1
+                    continue
+            if listing_url:
+                all_listings.append(item)
+
+        if cutoff_utc is not None and count_older_than_cutoff > len(listings) / 2:
+            log(f"[OLX raw] {category_label}: більше половини оголошень на сторінці старші за граничну дату ({count_older_than_cutoff}/{len(listings)}) — зупинка")
+            stop_pages = True
+
+        if cutoff_utc is not None and page == 1 and listings:
+            with_iso = sum(1 for it in listings if it.get("listed_at_iso"))
+            log(f"[OLX raw] {category_label}: на сторінці {with_iso}/{len(listings)} оголошень з розпарсеною датою (listed_at_iso)")
+
+        last_on_page = listings[-1] if listings else None
+        if last_on_page:
+            last_date = last_on_page.get("date_text") or last_on_page.get("listed_at_iso") or "—"
+            log(f"[OLX raw] {category_label}: дата останнього оголошення на сторінці: {last_date}")
+
+        if stop_pages:
+            break
+        page += 1
+
+    total_count = len(all_listings)
+    log(f"[OLX raw] {category_label}: всього оголошень до опрацювання: {total_count}")
+
+    if total_count == 0:
+        return 0, []
+
+    # ——— Етап 2: завантаження деталей і запис у raw (без LLM) ———
+    loaded_urls: List[str] = []
+    fetch_filters: Dict[str, Any] = {"category_label": category_label}
+    if region_name:
+        fetch_filters["region_filter"] = region_name
+    approximate_region = region_name
+
+    for idx, item in enumerate(all_listings, start=1):
+        listing_url = item.get("url")
+        if not listing_url:
+            continue
+        log(f"[OLX raw] {category_label}: опрацювання {idx}/{total_count}")
+        search_data = search_data_from_listing(item)
+        new_hash = calculate_search_data_hash(search_data)
+        existing_raw = raw_repo.find_by_url(listing_url)
+        if existing_raw and existing_raw.get("search_data_hash") == new_hash:
+            continue
+        if not browser_fetcher:
+            time.sleep(scraper_config.get_delay_detail_seconds())
+        try:
+            if browser_fetcher:
+                detail_result = browser_fetcher.get_detail_page(listing_url)
+                detail_html = detail_result.text
+            else:
+                detail_response = _fetch_detail_page(listing_url, session=session, log_fn=log_fn)
+                detail_html = detail_response.text
+            detail_data = parse_detail_page(detail_html)
+            if detail_data.get("_inactive"):
+                detail_data.pop("_inactive", None)
+            raw_repo.upsert_raw(
+                url=listing_url,
+                search_data=search_data,
+                detail=detail_data or None,
+                fetch_filters=fetch_filters,
+                approximate_region=approximate_region,
+            )
+            loaded_urls.append(listing_url)
+        except Exception as e:
+            log(f"[OLX raw] Помилка деталей {listing_url[:50]}...: {e}")
+
+    return total_count, loaded_urls
+
+
+def _process_region_raw_only(
+    region_name: str,
+    categories: List[Dict[str, Any]],
+    raw_repo: RawOlxListingsRepository,
+    log_fn: Optional[Callable[[str], None]],
+    cutoff_utc: Optional[datetime],
+    max_pages_override: Optional[int] = None,
+    browser_fetcher: Optional[Any] = None,
+) -> Tuple[int, List[str]]:
+    """Phase 1: одна область — усі категорії, запис лише в raw. Список — requests, деталі — browser_fetcher якщо задано. Повертає (total_count, loaded_urls)."""
+    session = get_session()
+    total_count = 0
+    loaded_urls: List[str] = []
+    for cat in categories:
+        get_list_url = cat.get("get_list_url")
+        if not callable(get_list_url):
+            continue
+        max_pages = (
+            max_pages_override
+            if max_pages_override is not None
+            else min(int(cat.get("max_pages", scraper_config.MAX_SEARCH_PAGES)), scraper_config.MAX_SEARCH_PAGES)
+        )
+        n_listings, urls = _process_category_raw_only(
+            get_list_url,
+            max_pages,
+            cat.get("label", "?"),
+            raw_repo,
+            log_fn=log_fn,
+            cutoff_utc=cutoff_utc,
+            session=session,
+            region_name=region_name,
+            browser_fetcher=browser_fetcher,
+        )
+        total_count += n_listings
+        loaded_urls.extend(urls)
+    return total_count, loaded_urls
+
+
+def _filter_regions_with_categories(
+    regions_with_cats: List[Tuple[str, List[Dict[str, Any]]]],
+    regions_filter: Optional[List[str]] = None,
+    listing_types_filter: Optional[List[str]] = None,
+) -> List[Tuple[str, List[Dict[str, Any]]]]:
+    """
+    Фільтрує список (region_name, categories) за областями та/або типами оголошень.
+    regions_filter: лише ці області (назви як у olx_region_slugs).
+    listing_types_filter: лише категорії, у яких label містить один із рядків (напр. «Нежитлова», «Земля»).
+    """
+    if not regions_filter and not listing_types_filter:
+        return regions_with_cats
+    result = []
+    for region_name, cats in regions_with_cats:
+        if regions_filter and region_name not in regions_filter:
+            continue
+        if listing_types_filter:
+            filtered_cats = [
+                c for c in cats
+                if any(lt.strip() in (c.get("label") or "") for lt in listing_types_filter if lt and lt.strip())
+            ]
+            if not filtered_cats:
+                continue
+            cats = filtered_cats
+        result.append((region_name, cats))
+    return result
+
+
+def run_olx_update_raw_only(
+    settings: Optional[Settings] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+    days: Optional[int] = None,
+    regions: Optional[List[str]] = None,
+    listing_types: Optional[List[str]] = None,
+    use_browser: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """
+    Phase 1 pipeline: завантаження сирих даних OLX лише в raw_olx_listings (без LLM, без olx_listings).
+
+    regions: якщо задано — обробляються лише ці області (назви з olx_region_slugs).
+    listing_types: якщо задано — лише категорії, чий label містить один із рядків (напр. «Нежитлова», «Земля»).
+    use_browser: якщо задано — використовувати браузер (Playwright); інакше береться з settings.olx_use_browser, потім з env (OLX_SCRAPER_USE_BROWSER).
+    Повертає success, total_listings, loaded_urls.
+    """
+    settings = settings or Settings()
+    MongoDBConnection.initialize(settings)
+    raw_repo = RawOlxListingsRepository()
+    raw_repo.ensure_index()
+
+    # Єдине джерело: явний параметр → settings.olx_use_browser → env (scraper_config.USE_BROWSER)
+    if use_browser is None:
+        use_browser = getattr(settings, "olx_use_browser", None)
+    if use_browser is None:
+        use_browser = getattr(scraper_config, "USE_BROWSER", False)
+
+    cutoff_utc: Optional[datetime] = None
+    if days is not None and days >= 1:
+        now_utc = datetime.now(timezone.utc)
+        start_of_today_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff_utc = start_of_today_utc - timedelta(days=days)
+    max_pages_override = scraper_config.MAX_SEARCH_PAGES
+
+    log_lock = threading.Lock()
+
+    def log(msg: str) -> None:
+        with log_lock:
+            if log_fn:
+                log_fn(msg)
+            else:
+                print(msg, flush=True)
+
+    regions_with_cats = _build_regions_with_categories()
+    regions_with_cats = _filter_regions_with_categories(
+        regions_with_cats,
+        regions_filter=regions,
+        listing_types_filter=listing_types,
+    )
+    if not regions_with_cats:
+        log("[OLX raw] Phase 1: після фільтрації областей/типів немає категорій для обробки.")
+        return {"success": True, "total_listings": 0, "loaded_urls": []}
+    all_loaded_urls: List[str] = []
+    total_listings = 0
+
+    if use_browser:
+        log("[OLX raw] Phase 1: сторінки пошуку — прямі запити; деталі оголошень — клікер (одним потоком). Області обробляються послідовно.")
+        try:
+            from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
+            with BrowserPageFetcher(headless=True, log_fn=log) as browser_fetcher:
+                for region_name, cats in regions_with_cats:
+                    try:
+                        n_list, urls = _process_region_raw_only(
+                            region_name,
+                            cats,
+                            raw_repo,
+                            log,
+                            cutoff_utc,
+                            max_pages_override,
+                            browser_fetcher=browser_fetcher,
+                        )
+                        total_listings += n_list
+                        all_loaded_urls.extend(urls)
+                    except Exception as e:
+                        log(f"[OLX raw] Помилка області {region_name}: {e}")
+        except RuntimeError as e:
+            log(f"[OLX raw] Браузер недоступний: {e}")
+        except Exception as e:
+            log(f"[OLX raw] Помилка браузера: {e}")
+    else:
+        max_workers = min(len(regions_with_cats), getattr(scraper_config, "MAX_PARALLEL_REGIONS", 25))
+        log(f"[OLX raw] Phase 1: паралельна обробка {len(regions_with_cats)} областей, до {max_workers} потоків")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _process_region_raw_only,
+                    region_name,
+                    cats,
+                    raw_repo,
+                    log,
+                    cutoff_utc,
+                    max_pages_override,
+                    None,  # browser_fetcher
+                ): region_name
+                for region_name, cats in regions_with_cats
+            }
+            for future in as_completed(futures):
+                region_name = futures[future]
+                try:
+                    n_list, urls = future.result()
+                    total_listings += n_list
+                    all_loaded_urls.extend(urls)
+                except Exception as e:
+                    log(f"[OLX raw] Помилка області {region_name}: {e}")
+
+    loaded_urls = list(dict.fromkeys(all_loaded_urls))
+    log(f"[OLX raw] Phase 1 готово. Оголошень: {total_listings}, завантажено/оновлено URL: {len(loaded_urls)}")
+    return {
+        "success": True,
+        "total_listings": total_listings,
+        "loaded_urls": loaded_urls,
+    }
 
 
 def _process_region(
@@ -367,16 +775,17 @@ def _process_region(
     cutoff_utc: Optional[datetime],
     usd_rate: Optional[float],
     max_pages_override: Optional[int] = None,
-) -> Tuple[int, int, List[Dict[str, Any]], set]:
+) -> Tuple[int, int, List[Dict[str, Any]], set, List[str]]:
     """
     Обробляє одну область: 2 категорії (нежитлова + земля) з одним HTTP-сеансом.
-    Повертає (total_listings, total_detail_fetches, by_category, search_urls).
+    Повертає (total_listings, total_detail_fetches, by_category, search_urls, pending_llm_urls).
     """
     session = get_session()
     total_listings = 0
     total_detail_fetches = 0
     by_category: List[Dict[str, Any]] = []
     all_search_urls: set = set()
+    pending_llm_urls: List[str] = []
 
     for cat in categories:
         label = cat.get("label", "?")
@@ -391,7 +800,7 @@ def _process_region(
                 scraper_config.MAX_SEARCH_PAGES,
             )
         )
-        n_listings, n_details, cat_urls = _process_category(
+        n_listings, n_details, cat_urls, cat_pending = _process_category(
             get_list_url,
             max_pages,
             label,
@@ -403,13 +812,152 @@ def _process_region(
             cutoff_utc=cutoff_utc,
             usd_rate=usd_rate,
             session=session,
+            region_name=region_name,
         )
         total_listings += n_listings
         total_detail_fetches += n_details
         all_search_urls.update(cat_urls or set())
+        pending_llm_urls.extend(cat_pending or [])
         by_category.append({"label": label, "listings": n_listings, "detail_fetches": n_details})
 
-    return total_listings, total_detail_fetches, by_category, all_search_urls
+    return total_listings, total_detail_fetches, by_category, all_search_urls, pending_llm_urls
+
+
+def _process_llm_pending(
+    pending_urls: List[str],
+    raw_repo: Union[RawOlxListingsRepository, OlxListingsRepository],
+    main_repo: OlxListingsRepository,
+    llm_extractor: OlxLLMExtractorService,
+    geocoding_service: GeocodingService,
+    unified_service: Optional[UnifiedListingsService],
+    usd_rate: Optional[float],
+    log_fn: Optional[Callable[[str], None]],
+    skip_activity_check: bool = False,
+) -> int:
+    """
+    Phase 2: обробка оголошень через LLM; дані беруться з raw/main, після LLM — запис у olx_listings та sync у unified.
+    Актуальність оголошення не перевіряється — усі зберігаються як активні (is_active=True).
+    skip_activity_check збережено для сумісності викликів, не використовується.
+    Повертає кількість успішно оброблених.
+    """
+    def log(msg: str) -> None:
+        if log_fn:
+            log_fn(msg)
+        else:
+            print(msg, flush=True)
+
+    if not pending_urls:
+        return 0
+
+    geography_service = None
+    try:
+        from business.services.geography_service import GeographyService
+        geography_service = GeographyService()
+    except ImportError:
+        pass
+
+    processed = 0
+    iterator = pending_urls
+    if tqdm:
+        iterator = tqdm(
+            pending_urls,
+            desc="[OLX] LLM-обробка",
+            unit="оголош.",
+            ncols=100,
+            disable=False,
+        )
+
+    for listing_url in iterator:
+        try:
+            doc = raw_repo.find_by_url(listing_url)
+            if not doc:
+                continue
+            search_data = doc.get("search_data") or {}
+            detail_data = (doc.get("detail") or {}).copy()
+            if detail_data.get("_inactive"):
+                detail_data.pop("_inactive", None)
+
+            llm_data = llm_extractor.extract_structured_data(search_data, detail_data)
+            if llm_data:
+                detail_data["llm"] = llm_data
+            new_hash = detail_data.get("llm_content_hash")
+            if new_hash:
+                detail_data["llm_content_hash"] = new_hash
+
+            result = _collect_and_geocode_locations(
+                search_data, detail_data, geocoding_service, geography_service
+            )
+            if len(result) == 3:
+                geocode_hashes, resolved_locations, address_refs_list = result
+            else:
+                geocode_hashes, resolved_locations = result
+                address_refs_list = []
+
+            detail_data["geocode_query_hashes"] = geocode_hashes
+            detail_data["resolved_locations"] = resolved_locations
+            if address_refs_list:
+                detail_data["address_refs"] = address_refs_list
+
+            price_value = search_data.get("price_value")
+            llm_struct = (detail_data.get("llm") or {}) if isinstance(detail_data, dict) else {}
+            total_area_m2 = llm_struct.get("total_area_m2")
+            if total_area_m2 is None:
+                total_area_m2 = search_data.get("area_m2")
+            land_area_sqm = llm_struct.get("land_area_sqm")
+            if land_area_sqm is None and llm_struct.get("land_area_ha") is not None:
+                try:
+                    land_area_sqm = float(llm_struct["land_area_ha"]) * 10000.0
+                except (TypeError, ValueError):
+                    land_area_sqm = None
+            metrics = compute_price_metrics(
+                total_price_uah=price_value,
+                building_area_sqm=total_area_m2,
+                land_area_sqm=land_area_sqm,
+                uah_per_usd=usd_rate,
+            )
+            detail_data["price_metrics"] = metrics
+
+            if price_value is not None:
+                currency = (search_data.get("currency") or "UAH").strip().upper() or "UAH"
+                if currency not in ("UAH", "USD", "EUR"):
+                    currency = "UAH"
+                detail_data["price"] = {"value": float(price_value) if not isinstance(price_value, float) else price_value, "currency": currency}
+
+            formatted_address = ""
+            if address_refs_list and geography_service:
+                parts = []
+                for refs in address_refs_list:
+                    if isinstance(refs, dict):
+                        addr = geography_service.format_address(refs)
+                        if addr and addr not in parts:
+                            parts.append(addr)
+                formatted_address = "; ".join(parts) if parts else ""
+            if not formatted_address:
+                for addr in (detail_data.get("llm") or {}).get("addresses") or []:
+                    if isinstance(addr, dict):
+                        line = _address_line_from_llm_address(addr)
+                        if line:
+                            formatted_address = line
+                            break
+            if not formatted_address:
+                formatted_address = (search_data.get("location") or "").strip()
+            if formatted_address:
+                if "llm" not in detail_data:
+                    detail_data["llm"] = {}
+                detail_data["llm"]["parsed_address"] = {"formatted_address": formatted_address}
+
+            main_repo.upsert_listing(listing_url, search_data, detail=detail_data, is_active=True)
+            processed += 1
+
+            if unified_service:
+                try:
+                    unified_service.sync_olx_listing(listing_url)
+                except Exception as sync_err:
+                    log(f"[OLX] Помилка синхронізації в unified: {sync_err}")
+        except Exception as e:
+            log(f"[OLX] Помилка LLM для {listing_url[:50]}...: {e}")
+
+    return processed
 
 
 # Базові категорії: нежитлова нерухомість + земля по типах (без с/г).
@@ -558,6 +1106,7 @@ def run_olx_update(
         total_detail_fetches = 0
         by_category = []
         all_search_urls: set = set()
+        pending_llm_urls: List[str] = []
         for cat in categories:
             label = cat.get("label", "?")
             get_list_url = cat.get("get_list_url")
@@ -568,26 +1117,43 @@ def run_olx_update(
             if not callable(get_list_url):
                 log(f"[OLX] Пропуск категорії {label}: немає get_list_url")
                 continue
-            n_listings, n_details, cat_urls = _process_category(
+            n_listings, n_details, cat_urls, cat_pending = _process_category(
                 get_list_url, max_pages, label, repo, llm_extractor, geocoding_service,
                 unified_service=unified_service, log_fn=log, cutoff_utc=cutoff_utc,
-                usd_rate=usd_rate, session=None,
+                usd_rate=usd_rate, session=None, region_name=None,
             )
             total_listings += n_listings
             total_detail_fetches += n_details
             all_search_urls.update(cat_urls or set())
+            pending_llm_urls.extend(cat_pending or [])
             by_category.append({"label": label, "listings": n_listings, "detail_fetches": n_details})
+
+        # Phase 2 для sequential режиму
+        pending_llm_urls = list(dict.fromkeys(pending_llm_urls))
+        if pending_llm_urls:
+            log(f"[OLX] Phase 2: LLM-обробка {len(pending_llm_urls)} оголошень")
+        llm_processed = _process_llm_pending(
+            pending_llm_urls,
+            repo,
+            repo,
+            llm_extractor,
+            geocoding_service,
+            unified_service,
+            usd_rate,
+            log,
+        ) if pending_llm_urls else 0
     else:
-        # Паралельна обробка по областях: один потік на область, session повторно в межах потоку
+        # Phase 1: паралельна обробка по областях — завантаження сирих даних
         total_listings = 0
         total_detail_fetches = 0
         by_category = []
         all_search_urls = set()
+        pending_llm_urls: List[str] = []
         max_workers = min(
             len(regions_with_cats),
             getattr(scraper_config, "MAX_PARALLEL_REGIONS", 25),
         )
-        log(f"[OLX] Паралельна обробка: {len(regions_with_cats)} областей, {max_workers} потоків")
+        log(f"[OLX] Phase 1: паралельна обробка {len(regions_with_cats)} областей, {max_workers} потоків")
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -609,19 +1175,37 @@ def run_olx_update(
             for future in as_completed(futures):
                 region_name = futures[future]
                 try:
-                    n_list, n_detail, by_cat, cat_urls = future.result()
+                    n_list, n_detail, by_cat, cat_urls, cat_pending = future.result()
                     total_listings += n_list
                     total_detail_fetches += n_detail
                     by_category.extend(by_cat)
                     all_search_urls.update(cat_urls or set())
+                    pending_llm_urls.extend(cat_pending or [])
                 except Exception as e:
                     log(f"[OLX] Помилка області {region_name}: {e}")
 
-    log(f"[OLX] Готово. Всього оголошень: {total_listings}, запитів деталей: {total_detail_fetches}")
+        # Phase 2: LLM-обробка одним потоком з прогрес-баром
+        pending_llm_urls = list(dict.fromkeys(pending_llm_urls))
+        llm_processed = 0
+        if pending_llm_urls:
+            log(f"[OLX] Phase 2: LLM-обробка {len(pending_llm_urls)} оголошень (один потік)")
+            llm_processed = _process_llm_pending(
+                pending_llm_urls,
+                repo,
+                repo,
+                llm_extractor,
+                geocoding_service,
+                unified_service,
+                usd_rate,
+                log,
+            )
+
+    log(f"[OLX] Готово. Оголошень: {total_listings}, деталей: {total_detail_fetches}, LLM: {llm_processed}")
     return {
         "success": True,
         "total_listings": total_listings,
         "total_detail_fetches": total_detail_fetches,
+        "llm_processed": llm_processed,
         "by_category": by_category,
     }
 

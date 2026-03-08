@@ -99,8 +99,15 @@ class PriceAnalyticsService:
         Повністю перераховує аналітику з unified_listings.
         Викликається після оновлення даних з джерел.
         """
-        counts = {"aggregates": 0, "indicators": 0}
+        counts = {"aggregates": 0, "indicators": 0, "extracts": 0}
         try:
+            # 1. Перезаповнення analytics_extracts (виокремлені дані для агрегацій)
+            try:
+                from business.services.analytics_extracts_populator import rebuild_analytics_extracts
+                counts["extracts"] = rebuild_analytics_extracts()
+            except Exception as e:
+                logger.warning("Помилка перезаповнення analytics_extracts: %s", e)
+
             self.repo.clear_indicators()
             self.repo.clear_aggregates(period_type=None)
             counts["indicators"] = self._compute_indicators()
@@ -113,15 +120,15 @@ class PriceAnalyticsService:
     def _listing_type_match(self, listing_type: str) -> Dict[str, Any]:
         """Повертає $match для типу оголошення: land, real_estate, mixed, general."""
         if listing_type == LISTING_TYPE_LAND:
-            return {"land_area_ha": {"$gt": 0}, "$or": [{"building_area_sqm": {"$exists": False}}, {"building_area_sqm": {"$lte": 0}}]}
+            return {"land_area_sqm": {"$gt": 0}, "$or": [{"building_area_sqm": {"$exists": False}}, {"building_area_sqm": {"$lte": 0}}]}
         if listing_type == LISTING_TYPE_REAL_ESTATE:
-            return {"building_area_sqm": {"$gt": 0}, "$or": [{"land_area_ha": {"$exists": False}}, {"land_area_ha": {"$lte": 0}}]}
+            return {"building_area_sqm": {"$gt": 0}, "$or": [{"land_area_sqm": {"$exists": False}}, {"land_area_sqm": {"$lte": 0}}]}
         if listing_type == LISTING_TYPE_MIXED:
-            return {"building_area_sqm": {"$gt": 0}, "land_area_ha": {"$gt": 0}}
+            return {"building_area_sqm": {"$gt": 0}, "land_area_sqm": {"$gt": 0}}
         if listing_type == LISTING_TYPE_GENERAL:
             return {"$or": [
-                {"land_area_ha": {"$gt": 0}, "$or": [{"building_area_sqm": {"$exists": False}}, {"building_area_sqm": {"$lte": 0}}]},
-                {"building_area_sqm": {"$gt": 0}, "$or": [{"land_area_ha": {"$exists": False}}, {"land_area_ha": {"$lte": 0}}]},
+                {"land_area_sqm": {"$gt": 0}, "$or": [{"building_area_sqm": {"$exists": False}}, {"building_area_sqm": {"$lte": 0}}]},
+                {"building_area_sqm": {"$gt": 0}, "$or": [{"land_area_sqm": {"$exists": False}}, {"land_area_sqm": {"$lte": 0}}]},
             ]}
         return {}
 
@@ -244,7 +251,7 @@ class PriceAnalyticsService:
                 "status": "активне",
                 "$or": [
                     {"building_area_sqm": {"$not": {"$gt": 0}}},
-                    {"land_area_ha": {"$not": {"$gt": 0}}},
+                    {"land_area_sqm": {"$not": {"$gt": 0}}},
                 ],
             }},
             {"$unwind": {"path": "$addresses", "preserveNullAndEmptyArrays": False}},
@@ -324,7 +331,7 @@ class PriceAnalyticsService:
     def _listing_type_from_item(self, item: Dict[str, Any]) -> str:
         """Визначає тип оголошення: land, real_estate, mixed."""
         b = item.get("building_area_sqm") or 0
-        l = item.get("land_area_ha") or 0
+        l = item.get("land_area_sqm") or 0
         if (b and b > 0) and (l and l > 0):
             return LISTING_TYPE_MIXED
         if l and l > 0:
@@ -414,7 +421,7 @@ class PriceAnalyticsService:
         """
         Повертає індикатори для списку оголошень.
         items мають містити: city/settlement, region, price_uah, price_per_m2_uah, price_per_ha_uah,
-        building_area_sqm, land_area_ha (для визначення типу).
+        building_area_sqm, land_area_sqm (для визначення типу).
         Логіка: settlement 5+ → локальний розподіл, інакше — область.
         Returns: composite_id -> {indicator, source} де source = "city" | "region"
         """

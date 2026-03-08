@@ -28,11 +28,12 @@ def _build_context_from_unified(doc: Dict[str, Any]) -> str:
     if doc.get("price_per_m2_uah") is not None:
         parts.append(f"Ціна за м²: {doc['price_per_m2_uah']} грн/м²")
     if doc.get("price_per_ha_uah") is not None:
-        parts.append(f"Ціна за га: {doc['price_per_ha_uah']} грн/га")
+        parts.append(f"Ціна за сотку: {doc['price_per_ha_uah'] / 100} грн/с")
     if doc.get("building_area_sqm") is not None:
         parts.append(f"Площа будівлі: {doc['building_area_sqm']} м²")
-    if doc.get("land_area_ha") is not None:
-        parts.append(f"Площа землі: {doc['land_area_ha']} га")
+    if doc.get("land_area_sqm") is not None:
+        sotky = doc["land_area_sqm"] / 100.0
+        parts.append(f"Площа землі: {sotky:.1f} с")
     addresses = doc.get("addresses", [])
     if addresses and isinstance(addresses, list):
         addr_parts = []
@@ -80,12 +81,18 @@ def _build_context_from_olx(doc: Dict[str, Any]) -> str:
     if pm.get("price_per_m2_uah") is not None:
         parts.append(f"Ціна за м²: {pm['price_per_m2_uah']} грн/м²")
     if pm.get("price_per_ha_uah") is not None:
-        parts.append(f"Ціна за га: {pm['price_per_ha_uah']} грн/га")
+        parts.append(f"Ціна за сотку: {pm['price_per_ha_uah'] / 100} грн/с")
     llm = detail.get("llm") or {}
     if llm.get("building_area_sqm") is not None:
         parts.append(f"Площа будівлі: {llm['building_area_sqm']} м²")
-    if llm.get("land_area_ha") is not None:
-        parts.append(f"Площа землі: {llm['land_area_ha']} га")
+    land_sqm = llm.get("land_area_sqm")
+    if land_sqm is None and llm.get("land_area_ha") is not None:
+        try:
+            land_sqm = float(llm["land_area_ha"]) * 10000.0
+        except (TypeError, ValueError):
+            land_sqm = None
+    if land_sqm is not None:
+        parts.append(f"Площа землі: {land_sqm / 100:.1f} с")
     if detail.get("description"):
         desc = str(detail["description"])[:1500]
         if len(str(detail.get("description", ""))) > 1500:
@@ -202,7 +209,7 @@ class ListingAnalyticsService:
                     "price_per_m2_uah": unified_doc.get("price_per_m2_uah"),
                     "price_per_ha_uah": unified_doc.get("price_per_ha_uah"),
                     "building_area_sqm": unified_doc.get("building_area_sqm"),
-                    "land_area_ha": unified_doc.get("land_area_ha"),
+                    "land_area_sqm": unified_doc.get("land_area_sqm"),
                 }
             elif doc and source == "olx":
                 search = doc.get("search_data", {}) or {}
@@ -220,7 +227,7 @@ class ListingAnalyticsService:
                     "price_per_m2_uah": pm.get("price_per_m2_uah"),
                     "price_per_ha_uah": pm.get("price_per_ha_uah"),
                     "building_area_sqm": llm.get("building_area_sqm"),
-                    "land_area_ha": llm.get("land_area_ha"),
+                    "land_area_sqm": llm.get("land_area_sqm") or (float(llm["land_area_ha"]) * 10000.0 if llm.get("land_area_ha") not in (None, "") else None),
                 }
             elif doc and source == "prozorro":
                 ad = doc.get("auction_data", {}) or {}
@@ -234,11 +241,17 @@ class ListingAnalyticsService:
                         region = r["region"].get("name")
                 pm = ad.get("price_metrics") or {}
                 items = ad.get("items", [])
-                b_sqm = l_ha = None
+                b_sqm = l_sqm = None
                 if items and isinstance(items[0], dict):
                     ip = items[0].get("itemProps") or {}
                     b_sqm = ip.get("totalBuildingArea") or ip.get("totalObjectArea") or ip.get("usableArea")
-                    l_ha = ip.get("landArea")
+                    raw = ip.get("landArea")
+                    if raw is not None:
+                        try:
+                            v = float(raw)
+                            l_sqm = v * 10000.0 if v < 10000 else v
+                        except (TypeError, ValueError):
+                            l_sqm = None
                 item = {
                     "source": "prozorro",
                     "source_id": source_id,
@@ -248,7 +261,7 @@ class ListingAnalyticsService:
                     "price_per_m2_uah": pm.get("price_per_m2_uah"),
                     "price_per_ha_uah": pm.get("price_per_ha_uah"),
                     "building_area_sqm": b_sqm,
-                    "land_area_ha": l_ha,
+                    "land_area_sqm": l_sqm,
                 }
 
             if not item:
@@ -399,15 +412,15 @@ class ListingAnalyticsService:
                     analytics_context=analytics_context or "Ринковий контекст відсутній.",
                 )
             else:
-                prompt = f"""Зроби детальний аналіз оголошення нерухомості.
+                prompt = f"""Produce a short analysis of the real-estate listing. The analysis must be written in Ukrainian.
 
-Дані оголошення:
+Listing data:
 {context}
 
-Ринковий контекст:
-{analytics_context or "Відсутній."}
+Market context:
+{analytics_context or "None."}
 
-Напиши аналіз у 3 частинах: 1) Ціна (порівняння за одиницю площі — грн/м² або грн/га); 2) Місцезнаходження; 3) Оточення. Стисло, українською. Використовуй ринковий контекст для порівняння."""
+Write the analysis in 3 parts: 1) Price (comparison per unit area — UAH/m² or UAH/ha); 2) Location; 3) Surroundings. Be concise. Use the market context for comparison. Output in Ukrainian only."""
 
             raw = self.llm_service.generate_text(prompt, temperature=0.3)
             if not raw or not raw.strip():

@@ -42,15 +42,20 @@ class SourceFieldMapper:
             "region_fallback": "search_data.location",
         },
         "unified_listings": {
-            "city": "addresses.settlement",
-            "region": "addresses.region",
+            "city": "city",
+            "region": "region",
+            "oblast_raion": "oblast_raion",
+            "city_district": "city_district",
+            "district": "city_district",  # Аліас: район міста (Солом'янський, Шевченківський)
+            "source": "source",
+            "property_type": "property_type",
             # price завжди означає price_uah (ціна в грн), якщо не вказано інакше
             "price": "price_uah",
             "date": "source_updated_at",
             "status": "status",
             "area": "building_area_sqm",
             "building_area_sqm": "building_area_sqm",
-            "land_area_ha": "land_area_ha",
+            "land_area_sqm": "land_area_sqm",
             "floor": "floor",
             "price_per_m2": "price_per_m2_uah",
             "price_per_m2_uah": "price_per_m2_uah",
@@ -63,6 +68,16 @@ class SourceFieldMapper:
             "source": "source",
             "source_id": "source_id",
             "date": "analysis_at",
+            "city_fallback": None,
+            "region_fallback": None,
+        },
+        "analytics_extracts": {
+            "city": "city",
+            "region": "region",
+            "city_district": "city_district",
+            "district": "city_district",
+            "price": "price_per_m2_uah",
+            "date": "source_date",
             "city_fallback": None,
             "region_fallback": None,
         },
@@ -121,12 +136,17 @@ class SourceFieldMapper:
     @classmethod
     def get_geo_match_keys(cls, source: str) -> tuple:
         """
-        Повертає (region_key, city_key) для $elemMatch.
-        unified_listings: region, settlement (flat); prozorro/olx: region.name, city.name.
+        Повертає (region_key, city_key) для $elemMatch або root.
+        unified_listings: root region, city; prozorro/olx: region.name, city.name.
         """
         if source == "unified_listings":
-            return ("region", "settlement")
+            return ("region", "city")
         return ("region.name", "city.name")
+
+    @classmethod
+    def uses_root_geo(cls, source: str) -> bool:
+        """Чи використовує колекція root geo (без $unwind по addresses)."""
+        return source == "unified_listings"
     
     @classmethod
     def get_price_field(cls, source: str) -> str:

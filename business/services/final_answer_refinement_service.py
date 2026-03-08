@@ -85,30 +85,30 @@ class FinalAnswerRefinementService:
         data_sample = (execution_result.get("data") or [])[:3]
 
         parts = [
-            "Тобі необхідно сформувати цілісну, людяну відповідь користувачу на основі запиту, наміру та результатів вибірки.",
+            "Form a coherent, human-like answer to the user based on the query, intent and selection results. The final answer must be in Ukrainian.",
             "",
-            "## Запит користувача:",
+            "## User query:",
             user_query,
             "",
-            "## Визначений намір:",
+            "## Detected intent:",
             json.dumps(intent_info, ensure_ascii=False, indent=2),
             "",
-            "## Результати:",
-            f"- Кількість знайдених записів: {row_count}",
-            f"- Застосовані фільтри: {filter_info}",
+            "## Results:",
+            f"- Rows found: {row_count}",
+            f"- Filters applied: {filter_info}",
             "",
-            "## Поточна чернетка відповіді:",
+            "## Current draft:",
             draft_summary,
             "",
         ]
 
         if data_sample and row_count > 0:
-            parts.append("## Приклад даних (перші записи):")
+            parts.append("## Sample data (first records):")
             parts.append(json.dumps(data_sample, ensure_ascii=False, indent=2, default=str)[:1500])
             parts.append("")
 
         if row_count == 0 and diagnostic_info:
-            parts.append("## Діагностика:")
+            parts.append("## Diagnostics:")
             parts.append(json.dumps(diagnostic_info, ensure_ascii=False, indent=2, default=str)[:500])
             parts.append("")
 
@@ -124,20 +124,18 @@ class FinalAnswerRefinementService:
             )
         )
         instruction_lines = [
-            "## Закріплення завдання — інструкції:",
-            "1. Якщо запит про кількість — відповідь має містити одне число.",
-            "2. Якщо результатів 0 — поясни чому (фільтри, період) та що можна спробувати.",
-            "3. Якщо багато результатів — дай короткий підсумок (кількість, ключові цифри).",
-            "4. Відповідь має бути українською, стислою, без зайвих деталей.",
-            "5. Для звичайних підсумків — не дублюй повністю структуровані списки.",
+            "## Task:",
+            "1. If the query is about count — the answer must contain one number.",
+            "2. If 0 results — explain why (filters, period) and what to try.",
+            "3. If many results — give a short summary (count, key figures).",
+            "4. The answer must be in Ukrainian, concise, no extra detail.",
+            "5. For normal summaries — do not repeat full structured lists.",
         ]
         if is_list_query and data_sample:
             instruction_lines.append(
-                "6. ВАЖЛИВО: для запитів типу «топ-N», «найвигідніші», «найдорожчі» — "
-                "відповідь ОБОВ'ЯЗКОВО має містити список з коротким описом кожного об'єкта "
-                "(локація, ціна, посилання). НЕ замінюй список фразою «знайшов X, готові до ознайомлення» — користувач має побачити дані."
+                "6. IMPORTANT: for 'top-N', 'найвигідніші', 'найдорожчі' — the answer MUST contain a list with a short description of each item (location, price, link). Do not replace the list with 'found X, ready to view' — the user must see the data."
             )
-        instruction_lines.extend(["", "Поверни ТІЛЬКИ текст фінальної відповіді, без додаткових пояснень:"])
+        instruction_lines.extend(["", "Return ONLY the final answer text, no extra explanations. Answer in Ukrainian."])
         parts.extend(instruction_lines)
 
         return "\n".join(parts)

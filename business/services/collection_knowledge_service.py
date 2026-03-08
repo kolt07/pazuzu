@@ -25,7 +25,7 @@ FIELD_PROFILE_CONFIG: Dict[str, List[Tuple[str, str]]] = {
     "unified_listings": [
         ("price_uah", "numeric"),
         ("building_area_sqm", "numeric"),
-        ("land_area_ha", "numeric"),
+        ("land_area_sqm", "numeric"),
         ("property_type", "categorical"),
         ("status", "categorical"),
         ("addresses.region", "categorical"),
@@ -42,14 +42,14 @@ FIELD_PROFILE_CONFIG: Dict[str, List[Tuple[str, str]]] = {
         ("detail.price", "numeric"),
         ("search_data.price", "numeric"),
         ("detail.llm.building_area_sqm", "numeric"),
-        ("detail.llm.land_area_ha", "numeric"),
+        ("detail.llm.land_area_sqm", "numeric"),
         ("detail.llm.property_type", "categorical"),
         ("detail.llm.tags", "categorical"),  # масив — кожен тег окремо
         ("search_data.location", "categorical"),
     ],
     "llm_cache": [
         ("result.building_area_sqm", "numeric"),
-        ("result.land_area_ha", "numeric"),
+        ("result.land_area_sqm", "numeric"),
         ("result.property_type", "categorical"),
         ("result.addresses.region", "categorical"),
         ("result.addresses.city", "categorical"),

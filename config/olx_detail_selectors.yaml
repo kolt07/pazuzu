@@ -1,0 +1,18 @@
+version: 1
+
+# Конфіг селекторів для парсингу сторінки деталей OLX.
+# Поле description використовується в scripts/olx_scraper/parser.py.
+
+description:
+  # Селектори перевіряються зверху вниз. Перший, що дасть достатньо довгий текст, буде використано.
+  selectors:
+    - '[data-cy="ad_description"]'
+    - '[data-cy="ad_description_content"]'
+    - '[data-testid="ad-description"]'
+    - '[data-testid="ad_description"]'
+    - '[data-testid="ad-description-content"]'
+    - '[data-testid="ad_description_content"]'
+  # Мінімальна та максимальна довжина опису (символи), щоб відфільтрувати випадковий текст.
+  min_length: 50
+  max_length: 50000
+

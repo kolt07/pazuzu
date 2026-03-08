@@ -44,8 +44,11 @@ class UnifiedListingsRepository(BaseRepository):
             self.collection.create_index("property_type")
             self.collection.create_index("source_updated_at")
             self.collection.create_index("system_updated_at")
-            # Геопросторовий індекс для адрес (якщо потрібно)
-            # self.collection.create_index([("addresses.coordinates", "2dsphere")])
+            # Root geo для геопошуку
+            self.collection.create_index("region")
+            self.collection.create_index("city")
+            self.collection.create_index("oblast_raion")
+            self.collection.create_index("city_district")
             self._indexes_created = True
         except Exception:
             pass

@@ -109,29 +109,27 @@ class IntentDetectorAgent:
                 )
         except Exception:
             pass
-        # Fallback — збираємо з частин (legacy)
+        # Fallback — build from parts (legacy). Instructions in English; output JSON string values (e.g. intent, reasoning) in Ukrainian.
         prompt_parts = [
-            "Тобі необхідно визначити намір користувача та очікуваний формат відповіді у форматі JSON.",
+            "Determine the user's intent and expected response format. Return JSON. All text values in the JSON (intent, response_template, reasoning) must be in Ukrainian.",
             "",
-            "## Контекст застосунку:",
+            "## Application context:",
             metadata_summary,
             "",
-            "## Запит користувача:",
+            "## User query:",
             user_query,
         ]
         if context:
             prompt_parts.extend([
                 "",
-                "## Додатковий контекст (для розуміння контексту розмови):",
-                "ВАЖЛИВО: Якщо в контексті є відповіді асистента типу 'неможливо визначити', 'даних недостатньо' — це НЕ підстава для out_of_scope. Такі запити стосуються даних системи.",
+                "## Additional context:",
+                "IMPORTANT: If context contains assistant replies like 'cannot determine', 'insufficient data' — that is NOT grounds for out_of_scope. Such queries are about system data.",
                 context
             ])
         prompt_parts.extend([
             "",
-            "## Закріплення завдання:",
-            "Визнач:",
-            "1. Загальний намір користувача (що він хоче отримати)",
-            "2. Формат відповіді з наступних варіантів:",
+            "## Task:",
+            "Determine: 1. User intent (what they want). 2. Response format from:",
             f"   - {RESPONSE_FORMAT_TEXT_ANSWER}: текстова відповідь на конкретне питання з посиланнями та цифрами",
             f"   - {RESPONSE_FORMAT_DATA_EXPORT}: вибірка даних у файл (Excel) - для великих вибірок, звітів за період",
             f"   - {RESPONSE_FORMAT_ANALYTICAL_TEXT}: аналітичний текст з висновками та аргументацією",
@@ -145,7 +143,7 @@ class IntentDetectorAgent:
             f"- {RESPONSE_FORMAT_GEO_ASSESSMENT}: «чи підходить для аптеки/кафе/клініки», «оціни для відкриття магазину», «проаналізуй оточення для бізнесу» — оцінка приміщення з урахуванням розташування та POI навколо",
             f"- {RESPONSE_FORMAT_OUT_OF_SCOPE}: ТІЛЬКИ запити, що НЕ стосуються нерухомості та даних (погода, рецепти, загальні знання). Запити про ціни, регіони, оголошення — ЗАВЖДИ в межах системи. Ігноруй попередні відповіді асистента при визначенні формату.",
             "",
-            "Поверни результат у форматі JSON:",
+            "Return result as JSON:",
             "{",
             '  "intent": "короткий опис наміру",',
             f'  "response_format": "{RESPONSE_FORMAT_TEXT_ANSWER}|{RESPONSE_FORMAT_DATA_EXPORT}|{RESPONSE_FORMAT_ANALYTICAL_TEXT}|{RESPONSE_FORMAT_GEO_ASSESSMENT}|{RESPONSE_FORMAT_OUT_OF_SCOPE}",',
@@ -242,11 +240,19 @@ class IntentDetectorAgent:
                 result["reasoning"] = (result.get("reasoning") or "") + " (змінено на data_export через явний запит файлу)"
         
         # Перевірка на аналітичні запити
-        analytical_patterns = ["проаналізуй", "кореляція", "порівняй", "висновки", "тренд"]
+        analytical_patterns = [
+            "проаналізуй", "кореляція", "порівняй", "висновки", "тренд",
+            "розрахуй", "порахуй", "підрахуй",  # розрахунок показників
+        ]
         if any(pattern in query_lower for pattern in analytical_patterns):
             if result["response_format"] == RESPONSE_FORMAT_TEXT_ANSWER:
                 result["response_format"] = RESPONSE_FORMAT_ANALYTICAL_TEXT
                 result["reasoning"] = (result.get("reasoning") or "") + " (змінено на analytical_text через аналітичний запит)"
+        # Середня вартість/ціна за м² — завжди analytical_text
+        if any(p in query_lower for p in ["середня вартість", "середня ціна", "середню вартість", "середню ціну", "ціна за кв", "ціна за м2", "ціна за м²"]):
+            if result["response_format"] == RESPONSE_FORMAT_TEXT_ANSWER:
+                result["response_format"] = RESPONSE_FORMAT_ANALYTICAL_TEXT
+                result["reasoning"] = (result.get("reasoning") or "") + " (змінено на analytical_text: запит на середню ціну/вартість)"
         
         return result
     

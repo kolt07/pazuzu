@@ -55,8 +55,13 @@ class Settings:
         # Налаштування LLM (ініціалізуємо перед завантаженням конфігурації)
         self.llm_provider = os.getenv('LLM_PROVIDER', 'gemini')
         self.llm_model_name = os.getenv('LLM_MODEL_NAME', 'gemini-2.5-flash')  # Актуальна модель Gemini
+        # Окремо: асистент (діалог, tools) — Gemini; парсинг описів — Ollama
+        self.llm_assistant_provider = os.getenv('LLM_ASSISTANT_PROVIDER', 'gemini')
+        self.llm_assistant_model_name = os.getenv('LLM_ASSISTANT_MODEL_NAME', 'gemini-2.5-flash')
+        self.llm_parsing_provider = os.getenv('LLM_PARSING_PROVIDER', 'ollama')
+        self.llm_parsing_model_name = os.getenv('LLM_PARSING_MODEL_NAME', 'gemma3:27b')
         # Для безкоштовного тарифу Gemini ліміт 5 запитів/хвилину, тому використовуємо 4 для безпеки
-        self.llm_rate_limit_calls_per_minute = int(os.getenv('LLM_RATE_LIMIT_CALLS_PER_MINUTE', '4'))
+        self.llm_rate_limit_calls_per_minute = int(os.getenv('LLM_RATE_LIMIT_CALLS_PER_MINUTE', '0'))  # 0 = без обмежень
         self.llm_api_keys = {
             'gemini': os.getenv('LLM_API_KEY_GEMINI', ''),
             'openai': os.getenv('LLM_API_KEY_OPENAI', ''),
@@ -99,6 +104,10 @@ class Settings:
             os.getenv('BACKGROUND_UPDATE_INTERVAL_MINUTES', '10')
         )
 
+        # OLX скрапер: використовувати браузер (Playwright) замість HTTP-запитів для сторінок пошуку та деталей
+        self.olx_use_browser = (
+            os.getenv('OLX_SCRAPER_USE_BROWSER', '').strip().lower() in ('1', 'true', 'yes')
+        )
 
         # Telegram Mini App (веб-застосунок у Telegram)
         self.mini_app_port = int(os.getenv('MINI_APP_PORT', '8000'))
@@ -112,7 +121,7 @@ class Settings:
         self.routing_ask_on_low_confidence = os.getenv('ROUTING_ASK_ON_LOW_CONFIDENCE', 'false').lower() in ('true', '1', 'yes')
 
         # Security layer: rate limit та max complexity запиту
-        self.rate_limit_requests_per_minute = int(os.getenv('RATE_LIMIT_REQUESTS_PER_MINUTE', '30'))
+        self.rate_limit_requests_per_minute = int(os.getenv('RATE_LIMIT_REQUESTS_PER_MINUTE', '0'))  # 0 = без обмежень
         self.max_query_complexity_length = int(os.getenv('MAX_QUERY_COMPLEXITY_LENGTH', '8000'))
 
         # Ліміти експорту та артефактів
@@ -144,6 +153,22 @@ class Settings:
                                 self.llm_provider = llm_config['provider']
                             if 'model_name' in llm_config:
                                 self.llm_model_name = llm_config['model_name']
+                            # Окремо асистент (Gemini) та парсинг (Ollama)
+                            if 'assistant' in llm_config:
+                                a = llm_config['assistant']
+                                if 'provider' in a:
+                                    self.llm_assistant_provider = a['provider']
+                                if 'model_name' in a:
+                                    self.llm_assistant_model_name = a['model_name']
+                            else:
+                                self.llm_assistant_provider = self.llm_provider
+                                self.llm_assistant_model_name = self.llm_model_name
+                            if 'parsing' in llm_config:
+                                p = llm_config['parsing']
+                                if 'provider' in p:
+                                    self.llm_parsing_provider = p['provider']
+                                if 'model_name' in p:
+                                    self.llm_parsing_model_name = p['model_name']
                             if 'rate_limit' in llm_config and 'calls_per_minute' in llm_config['rate_limit']:
                                 self.llm_rate_limit_calls_per_minute = llm_config['rate_limit']['calls_per_minute']
                             if 'api_keys' in llm_config:
@@ -233,6 +258,12 @@ class Settings:
                                 self.rate_limit_requests_per_minute = int(sl['rate_limit_requests_per_minute'])
                             if 'max_query_complexity_length' in sl:
                                 self.max_query_complexity_length = int(sl['max_query_complexity_length'])
+
+                        # OLX скрапер (клікер: браузер замість requests)
+                        if 'olx' in config:
+                            olx_cfg = config['olx']
+                            if 'use_browser' in olx_cfg:
+                                self.olx_use_browser = bool(olx_cfg['use_browser'])
 
                         if 'limits' in config:
                             lim = config['limits']

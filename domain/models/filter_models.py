@@ -26,18 +26,21 @@ class FilterOperator(str, Enum):
     LTE = "lte"         # менше або дорівнює
     IN = "in"           # міститься в списку
     NIN = "nin"         # не міститься в списку
-    CONTAINS = "contains"  # містить (рядок)
+    CONTAINS = "contains"   # містить (рядок)
+    NOT_CONTAINS = "not_contains"  # не містить (рядок)
     FILLED = "filled"   # заповнено
     EMPTY = "empty"     # не заповнено
     COUNT = "count"     # кількість (для масивів)
 
 
 class GeoFilterOperator(str, Enum):
-    """Оператори для геофільтрів."""
+    """Оператори для геофільтрів. Топонім — до району міста."""
+    INSIDE = "inside"       # в межах топоніму
+    NOT_INSIDE = "not_inside"  # не в межах топоніму
+    IN_RADIUS = "in_radius"  # в радіусі (км) — від меж топоніму/координат
     IN_HIERARCHY = "in_hierarchy"  # в ієрархії (міста області, вулиці міста)
-    EQ = "eq"           # дорівнює
-    NE = "ne"           # не дорівнює (напр. «не в Києві»)
-    IN_RADIUS = "in_radius"  # в радіусі (км) — тільки для координат
+    EQ = "eq"               # дорівнює (зворотна сумісність)
+    NE = "ne"               # не дорівнює (зворотна сумісність)
 
 
 @dataclass

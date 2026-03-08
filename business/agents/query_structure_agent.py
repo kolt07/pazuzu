@@ -105,10 +105,10 @@ class QueryStructureAgent:
         """Формує промпт для аналізу структури запиту."""
         metadata_summary = self.metadata_service.get_metadata_for_llm(max_length=2000)
         intent_info_str = json.dumps(intent_info, ensure_ascii=False, indent=2)
-        context_block = ("\n\n## Додатковий контекст:\n" + context) if context else ""
+        context_block = ("\n\n## Additional context:\n" + context) if context else ""
         listing_context_block = ""
         if listing_context and isinstance(listing_context, dict):
-            listing_context_block = "\n\n## ВАЖЛИВО — аналіз конкретного оголошення:\nКористувач запитує про КОНКРЕТНЕ оголошення (є посилання в контексті).\nНЕ додавай filter_metrics.property_type — оголошення може мати тип 'інше' або інший.\nВикористовуй лише region/city з контексту для порівняння з іншими оголошеннями в цьому регіоні."
+            listing_context_block = "\n\n## IMPORTANT — single listing analysis:\nThe user is asking about a SPECIFIC listing (there is a link in context). Do NOT add filter_metrics.property_type — the listing may have type 'інше' or other. Use only region/city from context to compare with other listings in that region. Output JSON field values (e.g. region, city) in Ukrainian."
         try:
             from config.config_loader import get_config_loader
             template = get_config_loader().get_prompt("query_structure")
@@ -122,79 +122,45 @@ class QueryStructureAgent:
                 )
         except Exception:
             pass
-        # Fallback — збираємо з частин (legacy)
+        # Fallback — build from parts (legacy). Instructions in English; output JSON string values (region, city, etc.) in Ukrainian.
         prompt_parts = [
-            "Тобі необхідно визначити структурні елементи запиту для вибірки даних (джерела, метрики, фільтри, сортування) у форматі JSON.",
+            "Determine the structural elements of the query for data selection (sources, metrics, filters, sorting). Return only JSON. All string values in the JSON (e.g. region, city, property_type) must be in Ukrainian.",
             "",
-            "## Контекст застосунку:",
+            "## Application context:",
             metadata_summary,
             "",
-            "## Запит користувача:",
+            "## User query:",
             user_query,
             "",
-            "## Визначений намір:",
+            "## Detected intent:",
             intent_info_str,
         ]
         if context:
             prompt_parts.extend([
                 "",
-                "## Додатковий контекст:",
+                "## Additional context:",
                 context
             ])
         if listing_context and isinstance(listing_context, dict):
             prompt_parts.extend([
                 "",
-                "## ВАЖЛИВО — аналіз конкретного оголошення:",
-                "Користувач запитує про КОНКРЕТНЕ оголошення (є посилання в контексті).",
-                "НЕ додавай filter_metrics.property_type — оголошення може мати тип 'інше' або інший.",
-                "Використовуй лише region/city з контексту для порівняння з іншими оголошеннями в цьому регіоні.",
+                "## IMPORTANT — single listing analysis:",
+                "User is asking about a SPECIFIC listing (link in context). Do NOT add filter_metrics.property_type. Use only region/city from context.",
             ])
         prompt_parts.extend([
             "",
-            "## Закріплення завдання:",
-            "Визнач структурні елементи запиту:",
+            "## Task:",
+            "Define structural elements. Return JSON with:",
             "",
-            "1. **Джерела даних (sources)**: ОБОВ'ЯЗКОВО unified_listings.",
-            "   Пайплайн підтримує ТІЛЬКИ unified_listings (зведена таблиця з OLX та ProZorro).",
-            "   olx_listings та prozorro_auctions як sources — ЗАБОРОНЕНО для пайплайну.",
-            "   Щоб отримати лише OLX: sources=['unified_listings'], filter_metrics: {source: 'olx'}.",
-            "   Щоб отримати лише ProZorro: filter_metrics: {source: 'prozorro'}.",
+            "1. sources: MUST be unified_listings. Pipeline supports only unified_listings. For OLX only: filter_metrics: {source: 'olx'}. For ProZorro only: filter_metrics: {source: 'prozorro'}.",
+            "2. response_metrics: which fields in the response (e.g. price, area, region, city, date, property_type, bids_count).",
+            "3. filter_metrics: logical fields only (city, region, price, date, status, source, property_type, area). No address_refs or dot-paths. Relative periods: date_range: {period: 'last_7_days'}. Geography: Kyiv oblast without Kyiv -> region: 'Київська', exclude_city: 'Київ'. Kyiv and oblast -> {region: 'Київська', city: 'Київ'}. For 'нерухомість' (buildings only): filter_metrics.property_type: ['Комерційна нерухомість', 'Земельна ділянка з нерухомістю']. For 'земля'/'ділянка' do NOT add this filter.",
+            "4. sort_metrics: [{field, order}].",
+            "5. join_metrics: optional.",
+            "6. aggregation_needed, aggregation_group_by, aggregation_metrics (avg|sum|min|max|count).",
+            "7. limit: max results.",
             "",
-            "2. **Метрики для відповіді (response_metrics)**: які поля/метрики потрібні у відповіді?",
-            "   Приклади: price, area, region, city, date, property_type, bids_count тощо",
-            "",
-            "3. **Метрики для фільтрації (filter_metrics)**: які умови фільтрації?",
-            "   Формат: {field: {operator: value}}. ТІЛЬКИ логічні поля: city, region, price, date, status, source, property_type, area.",
-            "   Заборонено: address_refs, addresses.settlement, будь-які шляхи з крапкою.",
-            "   Для ВІДНОСНИХ періодів (останній тиждень, за 7 днів, за місяць) — використовуй date_range:",
-            "   {period: 'last_7_days'} або {type: 'relative', value: 'last_week'}.",
-            "   Заборонено шаблони: {{LAST_WEEK_START_DATE}}, {{TODAY}} тощо.",
-            "   Для абсолютних дат: {date: {gte: '2026-02-01'}}. Приклади: {region: 'Київська'}, {price: {lt: 1000000}}",
-            "   ВАЖЛИВО для географії:",
-            "   - 'Київської області', 'Київська область' (БЕЗ «Київ та») — region: 'Київська', exclude_city: 'Київ'. Київ НЕ входить до Київської області.",
-            "   - 'Київ та область', 'в Києві та області' — OR: додай {region: 'Київська', city: 'Київ'}.",
-            "   Система обробить city+region як OR (місто або область).",
-            "   ВАЖЛИВО для property_type: якщо користувач каже 'нерухомість', 'найдорожча нерухомість', 'оголошення про нерухомість' —",
-            "   це стосується лише ОБ'ЄКТІВ НЕРУХОМОСТІ (будівлі, приміщення), а НЕ земельних ділянок.",
-            "   Додай filter_metrics: {property_type: ['Комерційна нерухомість', 'Земельна ділянка з нерухомістю']},",
-            "   щоб виключити тип 'Земельна ділянка' (лише земля без будівель).",
-            "   Якщо користувач явно каже 'земля', 'ділянка', 'земельна ділянка' — НЕ додавай цей фільтр.",
-            "",
-            "4. **Метрики для сортування (sort_metrics)**: як сортувати результати?",
-            "   Формат: [{field: 'price', order: 'desc'}, {field: 'date', order: 'asc'}]",
-            "",
-            "5. **Метрики для поєднання (join_metrics)**: чи потрібно об'єднати дані з різних джерел?",
-            "   Опціонально, якщо потрібно порівняти ProZorro та OLX",
-            "",
-            "6. **Агрегація (aggregation_needed, aggregation_group_by, aggregation_metrics)**:",
-            "   Якщо запит про «середня ціна по областях», «найдорожчий регіон», «ціна за кв.м. по регіонах» —",
-            "   aggregation_needed: true, aggregation_group_by: ['region'],",
-            "   aggregation_metrics: [{field: 'price_per_m2_uah', aggregation: 'avg'}].",
-            "   aggregation: avg|sum|min|max|count.",
-            "",
-            "7. **Обмеження (limit)**: максимальна кількість результатів (якщо вказано топ-N, то N)",
-            "",
-            "Поверни результат у форматі JSON:",
+            "Return JSON (example):",
             "{",
             '  "sources": ["unified_listings"],',
             '  "response_metrics": ["price", "area", "region"],',
@@ -355,11 +321,25 @@ class QueryStructureAgent:
                 normalized["property_type"] = property_type
         
         # Додаємо явні фільтри з результату LLM (без date, вже оброблено)
-        normalized.update(filters_copy)
+        # Тільки дозволені логічні поля — ігноруємо невідомі та фізичні ключі з LLM
+        from domain.validators import ALLOWED_LOGICAL_FILTER_KEYS, validate_logical_filters
+        for k, v in filters_copy.items():
+            if "." not in k and k in ALLOWED_LOGICAL_FILTER_KEYS:
+                normalized[k] = v
         # При аналізі конкретного оголошення — прибираємо property_type з LLM,
         # щоб не виключити оголошення з типом "інше"
         if has_listing_context and "property_type" in normalized:
             normalized.pop("property_type", None)
+
+        # Розділення city+district: LLM іноді повертає "Київ, Солом'янський" в одному полі city
+        if "city" in normalized and normalized["city"] and "district" not in normalized:
+            from utils.district_normalizer import split_city_and_district
+            city_val = str(normalized["city"])
+            city_only, district_only = split_city_and_district(city_val)
+            if city_only is not None:
+                normalized["city"] = city_only
+            if district_only is not None:
+                normalized["district"] = district_only
         
         # Київської області / Київська область — тільки region, не city
         if "city" in normalized and "region" in normalized:
@@ -380,9 +360,17 @@ class QueryStructureAgent:
             n = normalize_settlement(normalized["city"])
             if n:
                 normalized["city"] = n
-        
+
+        # Нормалізація району міста (Київ: Соломянський/Солом'янський → канонічна назва)
+        if "district" in normalized and normalized["district"]:
+            from utils.district_normalizer import extract_district_from_query, normalize_district_for_kyiv
+            city_val = str(normalized.get("city", "")).strip()
+            if "київ" in city_val.lower():
+                canonical = extract_district_from_query(user_query, "Київ") or normalize_district_for_kyiv(normalized["district"])
+                if canonical:
+                    normalized["district"] = canonical
+
         # Валідація: тільки логічні поля, заборонено фізичні (address_refs.city, addresses.settlement)
-        from domain.validators import validate_logical_filters
         validate_logical_filters(normalized, context="QueryStructureAgent._normalize_filters")
         
         return normalized

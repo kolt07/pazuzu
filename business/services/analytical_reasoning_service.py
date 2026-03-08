@@ -51,7 +51,7 @@ class AnalyticalReasoningService:
         try:
             raw = self.llm_service.generate_text(
                 prompt,
-                system_prompt="Ти планувальник аналітики. Поверни тільки валідний JSON з полем steps (масив кроків). Без пояснень.",
+                system_prompt="You are an analytics planner. Return only valid JSON with field steps (array of steps). No explanations. Step descriptions/labels may be in Ukrainian.",
                 temperature=0.0,
             )
         except Exception as e:
@@ -81,21 +81,21 @@ class AnalyticalReasoningService:
             return None
 
     def _create_plan_prompt(self, user_query: str, analysis_intent: Dict[str, Any]) -> str:
-        return f"""Тобі необхідно сформувати план кроків для виконання аналітичного запиту у форматі JSON.
+        return f"""Form a step-by-step plan to execute the analytical query. Return JSON. Text in steps (e.g. labels) may be in Ukrainian.
 
-## Запит користувача: {user_query[:1500]}
+## User query: {user_query[:1500]}
 
-## Поточний analysis_intent: {json.dumps(analysis_intent, ensure_ascii=False)[:500]}
+## Current analysis_intent: {json.dumps(analysis_intent, ensure_ascii=False)[:500]}
 
-## Закріплення завдання:
-Поверни JSON з одним полем:
-- steps: масив об'єктів. Дозволені типи кроків:
+## Task:
+Return JSON with one field:
+- steps: array of objects. Allowed step types:
   - {{ "step": "aggregate", "source": "olx_listings"|"prozorro_auctions", "metric": "avg_price", "group_by": "region"|"city" }}
-  - {{ "step": "join_by_region" }} — об'єднати два попередні результати по регіону
-  - {{ "step": "compute_difference", "field": "avg" }} — різниця значень по регіону
+  - {{ "step": "join_by_region" }} — join two previous results by region
+  - {{ "step": "compute_difference", "field": "avg" }} — difference of values by region
   - {{ "step": "sort", "field": "difference", "order": "desc" }}
 
-Максимум {MAX_STEPS} кроків. Поверни тільки JSON з полем steps, без коментарів."""
+Max {MAX_STEPS} steps. Return only JSON with field steps, no comments."""
 
     def validate_plan(self, plan: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         """Dry-run: перевірка плану на дозволені операції та max_steps."""

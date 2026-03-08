@@ -1,5 +1,355 @@
 # Історія розробки
 
+## 2026-03-06 — Скрипт очищення колекцій OLX та кешу LLM
+
+- **Запит**: Очистити всі колекції, повʼязані з OLX, та повʼязані дані з кешів LLM.
+
+- **Дії**:
+  - **scripts/clear_olx_data.py**: Скрипт видаляє: raw_olx_listings (усі документи), olx_listings (усі), unified_listings (де source="olx"), listing_analytics (де source="olx"), у real_estate_objects прибирає посилання на OLX з source_listing_ids і видаляє документи з порожнім масивом. Опція --clear-llm-cache очищає колекцію llm_cache (спільна з ProZorro; окремо по OLX не зберігається). Запуск: `py scripts/clear_olx_data.py`, `--dry-run`, `--clear-llm-cache`.
+
+## 2026-03-06 — OLX: прибрано логіку оновлення актуальності оголошення
+
+- **Запит**: Прибрати логіку оновлення актуальності оголошення OLX; помічати за замовчуванням усі як активні.
+
+- **Дії**:
+  - **_process_category**: Видалено гілку для неактивних оголошень (is_active=False, continue без LLM). Якщо parse_detail_page повертає _inactive — лише прибираємо прапорець з detail, далі оголошення обробляється як звичайне та зберігається з is_active=True.
+  - **_process_llm_pending**: Прибрано повторну перевірку активності (recheck fetch + is_active=False). Усі оголошення зберігаються з is_active=True. Параметр skip_activity_check залишено в сигнатурі для сумісності.
+  - У unified_listings статус OLX як і раніше береться з olx_listings.is_active; оскільки ми більше не виставляємо is_active=False, усі будуть «активне». Джерело: scripts/olx_scraper/run_update.py.
+
+## 2026-03-06 — OLX Phase 1: список через requests, деталі через клікер
+
+- **Запит**: Обробка сторінок пошуку — старим способом (прямі запити); деталі оголошень — одним потоком через клікер.
+
+- **Дії**:
+  - **Сторінки пошуку**: у _process_category_raw_only завжди використовується fetch_page(session=session) — браузер для списку більше не використовується.
+  - **Деталі**: якщо передано browser_fetcher — завантаження сторінки оголошення лише через browser_fetcher.get_detail_page(); інакше — _fetch_detail_page(session).
+  - **_process_region_raw_only**: session = get_session() завжди (для запитів списку); browser_fetcher передається лише для етапу деталей.
+  - При use_browser області обробляються послідовно, один екземпляр BrowserPageFetcher для всіх деталей. Джерело: scripts/olx_scraper/run_update.py.
+
+## 2026-03-06 — Повний опис оголошення для LLM: очікування блоку опису в браузері та діагностика
+
+- **Запит**: Повні тексти оголошень не потрапляють у запит до LLM на витягування ОНМ навіть при використанні клікера; провести дослідження етапів завантаження та порівняти один URL старим способом і клікером.
+
+- **Дії**:
+  - **BrowserPageFetcher.get_detail_page**: Після `page.goto(..., wait_until="domcontentloaded")` додано очікування появи одного з селекторів опису (`[data-cy="ad_description"]`, `ad_description_content`, `[data-testid="ad-description"]`, `ad_description`) з таймаутом 15 с перед викликом `page.content()`. Так контент сторінки знімається після JS-рендеру блоку опису OLX, і парсер отримує заповнений HTML. Джерело: scripts/olx_scraper/browser_fetcher.py.
+  - **Діагностичний скрипт**: scripts/diagnose_olx_detail_description.py — приймає URL сторінки оголошення OLX, завантажує її двома способами (requests та Playwright), викликає parse_detail_page для обох HTML, виводить довжину опису, параметри та фрагмент тексту для LLM; опція `--save-html` зберігає HTML у scripts/temp/olx_detail_diagnostic/ для ручного огляду. Запуск: `py scripts/diagnose_olx_detail_description.py "URL" [--save-html] [--no-browser]`.
+
+## 2026-03-06 — Підключення клікера до основного скрапера OLX (опційно)
+
+- **Запит**: Замінити в основному скрапері отримання сторінки пошуку та сторінки оголошення на клікер, не видаляючи стару логіку.
+
+- **Дії**:
+  - **BrowserPageFetcher**: scripts/olx_scraper/browser_fetcher.py — клас-контекстний менеджер з get_list_page(url) та get_detail_page(url). Повертає PageResult(.text, .status_code), сумісний з використанням response.text у run_update. Затримки та антибот-повтор як у старому fetcher.
+  - **Конфіг**: OLX_SCRAPER_USE_BROWSER (env 1/true/yes) — у config.py змінна USE_BROWSER. При True Phase 1 використовує браузер; області обробляються послідовно (один браузер на run).
+  - **run_update**: _process_category_raw_only приймає browser_fetcher=None. Якщо browser_fetcher задано — list/detail HTML беруться з browser_fetcher.get_list_page / get_detail_page; інакше — fetch_page та _fetch_detail_page (стара логіка). _process_region_raw_only приймає browser_fetcher, передає його в _process_category_raw_only; session не створюється при browser_fetcher. run_olx_update_raw_only: при USE_BROWSER — цикл по областях у контексті BrowserPageFetcher; інакше — як раніше ThreadPoolExecutor з get_session у кожному потоці. Старий код не видалено, лише додано гілки.
+
+## 2026-03-06 — Експериментальний OLX-скрапер на основі клікера (Playwright)
+
+- **Запит**: Зробити скрапер OLX на основі клікера — замість введення в оману сервера запитами працювати під виглядом фізичного користувача. Запуск через міні-апп з панелі адміністрування; не змінювати основні флоу.
+
+- **Дії**:
+  - **Playwright**: Додано залежність playwright>=1.40.0 у requirements.txt. Після встановлення потрібно виконати `playwright install chromium`.
+  - **Скрапер-клікер**: Новий модуль scripts/olx_scraper/clicker_scraper.py — run_olx_clicker_scraper(settings, max_pages, max_listings, headless, log_fn, progress_callback). Відкриває Chromium, переходить на сторінку пошуку нежитлової нерухомості OLX, отримує HTML (page.content()), парсить parse_listings_page; для кожного оголошення (до max_listings) переходить на сторінку деталей, парсить parse_detail_page, зберігає через RawOlxListingsRepository.upsert_raw з fetch_filters={"source": "clicker"}. Використовує існуючі парсери та helpers (search_data_from_listing).
+  - **Admin API**: POST /api/admin/olx-clicker-scraper/start (max_pages, max_listings), GET /api/admin/olx-clicker-scraper/status?task_id=... — запуск у фоновому потоці, збереження статусу в _olx_clicker_tasks. Джерело: telegram_mini_app/routes/admin.py.
+  - **Mini App**: У вкладці «Дані та аналітика» додано блок «OLX скрапер (клікер) — експеримент»: поля «Сторінок пошуку» (1–10) та «Макс. оголошень для збереження» (5–100), кнопка «Запустити клікер», відображення статусу з опитуванням. Джерело: telegram_mini_app/static/index.html, app.js.
+  - **Глосарій**: Термін «OLX скрапер (клікер)» у docs/developer_glossary.md.
+
+## 2026-03-06 — Точкове оновлення даних: по джерелах, областях та типах оголошень
+
+- **Запит**: Окрім ручного запуску за 1/7 днів — додати можливість оновлювати окремо по джерелам, а в рамках джерела — по областях і типах оголошень.
+
+- **Дії**:
+  - **OLX Phase 1**: У `run_olx_update_raw_only` додано параметри `regions` (список областей) та `listing_types` (типи оголошень); допоміжна `_filter_regions_with_categories` фільтрує список (region, categories) перед паралельною обробкою. Джерело: scripts/olx_scraper/run_update.py.
+  - **Pipeline**: `run_full_pipeline` приймає `regions` та `listing_types`; передає їх у `run_olx_update_raw_only`; для ProZorro після Phase 1 список `loaded_auction_ids` фільтрується по `approximate_region` (normalize_region_name) — у Phase 2 promote/LLM/sync лише для обраних областей. Джерело: business/services/source_data_load_service.py.
+  - **Опції для UI**: `get_targeted_update_options()` повертає `regions` (з olx_region_slugs / get_all_region_names) та `olx_listing_types` (з _get_base_categories у run_update).
+  - **Admin API**: GET /api/admin/data-update/options — опції для точкового оновлення. POST /api/admin/data-update — додано query-параметри `source` (olx|prozorro|both), `regions` (рядок через кому), `listing_types` (рядок через кому). При наявності regions або listing_types використовується єдиний run_full_pipeline з фільтрами (без режиму full_olx/full_prozorro). Джерело: telegram_mini_app/routes/admin.py.
+  - **Планувальник**: У SchedulerService._execute_data_update payload підтримує `regions` та `listing_types` (список або рядок через кому); вони передаються в run_full_pipeline.
+  - **MCP**: trigger_olx_update приймає `regions` та `listing_types`; додано інструмент get_targeted_update_options. Джерело: mcp_servers/data_update_mcp_server.py.
+  - **LangChain**: _trigger_data_update та tool trigger_data_update приймають `regions` та `listing_types` і передають їх у run_full_pipeline.
+  - **Mini-app**: Секція «Точкове оновлення» в адмінці: вибір джерела (OLX / ProZorro / обидва), період (1/7/30 днів), чекбокси областей та типів оголошень OLX (опції з GET /api/admin/data-update/options), кнопка «Запустити точкове оновлення». Джерело: telegram_mini_app/static/index.html, app.js, styles.css.
+
+## 2026-03-03 — Ollama для парсингу/ОНМ, Gemini для асистента; переобробка недооброблених OLX; діагностика пошуку
+
+- **Запит**: Використовувати Ollama для парсингу даних та отримання сутностей (ОНМ); Gemini лишати для елементів, пов’язаних із LLM-агентами та помічником. Перезапустити обробку даних з фінальних колекцій, де немає опису та нормальних атрибутів (повний пайплайн: оновлення з джерела → LLM → перенос у вищі колекції). З’ясувати, чому після оновлення даних зміни не відображаються в пошуку.
+
+- **Дії**:
+  - **Розділення провайдерів**: У config (config.example.yaml) та Settings за замовчуванням: `llm.parsing` — Ollama (парсинг описів OLX/ProZorro, витягування ОНМ); `llm.assistant` — Gemini (діалог, intent, tools). LLMService.parse_real_estate_objects тепер використовує провайдер парсингу (Ollama), а не асистента: виклик `provider.generate_text()` з логуванням у llm_exchange з provider=llm_parsing_provider.
+  - **Переобробка OLX без/з порожнім detail.llm**: OlxListingsRepository.find_urls_needing_llm_reprocess(limit) — повертає URL, де detail.llm відсутній, null або {}. Скрипт scripts/reprocess_olx_underprocessed.py: вибирає ці URL, викликає _process_llm_pending(..., skip_activity_check=True) (без повторного fetch сторінки OLX), оновлює olx_listings та sync у unified_listings. Запуск: `py scripts/reprocess_olx_underprocessed.py`, `--limit N`, `--dry-run`.
+  - **_process_llm_pending**: Додано параметр skip_activity_check=False; при True перевірка активності оголошення (fetch_page) не виконується — для переобробки вже збережених даних без навантаження на джерело.
+  - **Діагностика «оновлення не в пошуку»**: Пошук читає з unified_listings; записи потрапляють туди лише після Phase 2 (LLM) та sync_olx_listing. Якщо Phase 2 OLX обробив 0 оголошень (наприклад, urls_for_llm порожній через llm_processing_regions або approximate_region у raw), у unified нічого не з’явиться. Покращено лог при пропуску Phase 2: виводиться кількість завантажених URL та підказка перевірити llm_processing_regions.yaml та approximate_region у raw. Для вже збережених оголошень з порожнім detail.llm — запустити scripts/reprocess_olx_underprocessed.py.
+
+## 2026-03-02 — OLX: колекції джерела та unified лише після LLM; хеш даних пошуку в raw
+
+- **Запит**: Для OLX дані не повинні потрапляти в колекцію джерела (olx_listings) та unified_listings до обробки LLM. У сирих даних перевіряти хеш даних зі сторінки пошуку — якщо не змінились, не оновлювати сирі дані і не запускати LLM.
+
+- **Дії**:
+  - **Хеш search_data**: utils/hash_utils.py — calculate_search_data_hash(search_data) за полями title, price_text, price_value, currency, location, area_m2. raw_olx_listings зберігає search_data_hash при upsert_raw.
+  - **Пропуск без змін**: У _process_category_raw_only перед завантаженням деталей — existing_raw = raw_repo.find_by_url(url); якщо existing_raw.search_data_hash == hash(search_data), пропускаємо (не fetch detail, не upsert, не додаємо в loaded_urls). Тому Phase 2 отримує лише URL з реально змінившимися даними.
+  - **OLX без promote до LLM**: Прибрано _promote_raw_olx_to_main та масовий sync усіх olx_loaded_urls у unified. Phase 2 OLX: лише _process_llm_pending(pending_list, raw_olx, main_olx, ...). _process_llm_pending читає дані з raw_repo, після LLM пише в main_repo (olx_listings) і викликає sync_olx_listing у unified. У olx_listings та unified потрапляють тільки оголошення, опрацьовані LLM.
+  - **Сигнатура _process_llm_pending**: (pending_urls, raw_repo, main_repo, ...); для run_full_pipeline — raw_olx, main_olx; для run_olx_update — repo, repo (дані вже в olx_listings).
+  - **Документація**: source_data_load_pipeline.md — опис search_data_hash, OLX без підняття в main до LLM.
+
+## 2026-03-02 — Окрема колекція llm_exchange_logs; логування Gemini та Ollama
+
+- **Запит**: Логувати запити до LLM (і Gemini, і Ollama) в окрему колекцію.
+
+- **Дії**:
+  - **Нова колекція**: llm_exchange_logs — повні запити/відповіді, хеші, токени, поле provider (gemini, ollama).
+  - **LLMExchangeLogsRepository**: data/repositories/llm_exchange_logs_repository.py — метод add(), індекси timestamp, source, provider.
+  - **LoggingService**: використовує llm_exchange_repo замість logs; log_llm_exchange() приймає опційний параметр provider.
+  - **LogsRepository**: видалено create_llm_exchange_log та індекс llm_exchange (логи обміну більше не пишуться в logs).
+  - **OllamaLLMProvider**: додано _last_usage, _last_request_text, _last_response_text; заповнення в parse_auction_description та generate_text; _usage_from_ollama_response() з prompt_eval_count/eval_count.
+  - **LLMService / LangChainAgentService**: при виклику log_llm_exchange передається provider (llm_parsing_provider для parse, llm_assistant_provider для intent/generate/langchain).
+  - **Міграція 043**: створення колекції llm_exchange_logs та індексів.
+
+## 2026-03-02 — Логування повних запитів/відповідей LLM з хешами та токенами
+
+- **Запит**: Логувати повні запити та відповіді від LLM із збереженням хешів та повних текстів вхідних/вихідних (формат запит–відповідь), плюс кількість вхідних та вихідних токенів на кожен запит.
+
+- **Дії**:
+  - **LogsRepository**: додано `create_llm_exchange_log(request_text, response_text, input_tokens, output_tokens, source, request_id, initiator)` — зберігає документ з event_type=llm_exchange, полями request_text, response_text, metadata (request_hash, response_hash — SHA256, input_tokens, output_tokens, source, request_id). Індекс для event_type+timestamp.
+  - **LoggingService**: додано `log_llm_exchange(...)` — викликає репозиторій для запису обміну.
+  - **LLMService**: у провайдері Gemini збереження _last_request_text та _last_response_text у parse_auction_description та generate_text; після parse_auction_description, extract_intent_for_routing та generate_text — виклик log_llm_exchange з текстами та токенами з провайдера.
+  - **LangChainAgentService**: допоміжні функції _message_content_to_str, _messages_to_request_text, _aimessage_to_response_text для серіалізації повідомлень у текст; після кожного invoke (summarize, main loop, fallback) — log_llm_exchange з request_text (серіалізована історія) та response_text (вміст AIMessage).
+  - **docs/developer_glossary.md**: термін «лог обміну LLM (llm_exchange)».
+
+## 2026-03-02 — Pipeline завантаження даних: raw → main → LLM → аналітика
+
+- **Запит**: Завантаження з джерел має йти в три етапи: (1) отримання сирих даних без обробки в колекції сирих даних джерела, паралельно по потоках (тип/область), з фіксацією fetch_filters та приблизної географії (мінімум область); (2) після завершення завантаження — визначення за налаштуваннями, які оголошення опрацювати через LLM, їх парсинг і запис у колекцію джерела + unified; (3) перерахунок аналітики та побудова гео-індексу.
+
+- **Дії**:
+  - **Документація**: docs/source_data_load_pipeline.md — опис етапів (Phase 1 raw, Phase 2 LLM + promote, Phase 3 аналітика + гео).
+  - **Колекції сирих даних**: Міграція 042 — raw_olx_listings, raw_prozorro_auctions з індексами (url/auction_id, loaded_at, approximate_region, fetch_filters/fetch_context). Репозиторії RawOlxListingsRepository, RawProzorroAuctionsRepository (upsert_raw, get_by_urls/get_by_auction_ids).
+  - **OLX Phase 1**: run_olx_update_raw_only() — паралельна обробка по областях, запис лише в raw_olx_listings (fetch_filters: region_filter, category_label; approximate_region з фільтра пошуку), повертає loaded_urls. Функції _process_category_raw_only, _process_region_raw_only.
+  - **ProZorro Phase 1**: ProZorroService.fetch_and_save_to_raw_only(days) — отримання аукціонів з API (в т.ч. тиждень паралельно по днях), запис у raw_prozorro_auctions (fetch_context: date_from/date_to; approximate_region з _get_region_from_auction_data), повертає loaded_auction_ids.
+  - **Оркестратор**: business/services/source_data_load_service.py — run_full_pipeline(sources, days): Phase 1 — run_olx_update_raw_only + fetch_and_save_to_raw_only; Phase 2 — promote raw → olx_listings/prozorro_auctions, sync усіх у unified, вибір за llm_processing_regions → _process_llm_pending (OLX) та _process_auction_with_llm + _sync_auction_to_unified (ProZorro); Phase 3 — refresh_knowledge_after_sources, price_analytics.rebuild_all(), rebuild_analytics_extracts(), опційно CadastralLocationIndexService.build_index_from_parcels.
+  - **Планувальник**: У scheduler_service подія data_update при payload.use_raw_pipeline=True викликає run_full_pipeline замість окремих fetch_and_save та run_olx_update.
+
+## 2026-03-01 — Geo-фільтр з екранованою лапкою; рядок фільтра на всю площу
+
+- **Запит**: Рядок з geo('Район міста' INSIDE 'Солом\'янський район') не працював; розгорнути вью формування рядка фільтра на всю робочу площу.
+
+- **Дії**:
+  - **filter_string_service.py**: У _parse_geo_element підтримка екранованих лапок у гео-значеннях: патерн для quoted-рядків змінено на '((?:[^'\\]|\\.)*)' (дозволено \' та \\\\ всередині), додано _unescape_quoted() для розекрановування значень. Райони типу Солом'янський тепер коректно парсяться.
+  - **styles.css**: Екран пошуку (#screen-search) — flex-column; вкладка «Фільтри та сортування» (#search-tab-settings.active) займає flex:1, блок #search-filters і .filter-string-group — flex:1, textarea .filter-string-input — flex:1 і min-height: 12rem для розгортання на всю доступну площу.
+  - **index.html**: textarea #filter-string — rows="10" замість 3.
+
+## 2026-03-01 — Пошук лише за рядком фільтрів; конструктор фільтрів
+
+- **Запит**: Прибрати окремі поля фільтрів (Джерело, Період, Регіон, Місто, Тип, Ціна, Площі, Заголовок/Опис) і кнопки «Застосувати»/«Очистити». Залишити виключно механізм «Рядок фільтрів»: можна вставити рядок відборів вручну або натиснути «Створити фільтри» і зібрати умови в конструкторі, після чого вони перетворюються на рядок.
+
+- **Дії**:
+  - **index.html**: Блок фільтрів пошуку замінено на один блок «Рядок фільтрів»: textarea, кнопки «Шукати за рядком», «Створити фільтри», «Очистити»; додано модалку конструктора (умови за полями + гео).
+  - **Backend**: GET /api/search/filter-fields — конфіг полів та гео для конструктора (get_builder_config). POST /api/search/filter-string-from-structure — приймає filters + geo, повертає filter_string (filter_string_service: structure_to_filter_models, filter_string_from_structure). ExportSearchRequest та експорт/send-export-via-bot підтримують filter_string: при наявності використовується find_by_filter_string.
+  - **app.js**: performSearch завжди викликає POST /api/search/query з filter_string з textarea та sort/limit/skip. Видалено обробники та DOM для окремих фільтрів (region, city, source, apply, clear). Додано openFilterBuilderModal() (fetch filter-fields, рендер рядків з полем/оператором/значенням, гео), обробники «Створити фільтри», «Вставити рядок», «Скасувати». buildSearchExportBody та openReportConstructorFromSearch переходять на filter_string + sort.
+  - **filter_string_service**: get_builder_config(), structure_to_filter_models(), filter_string_from_structure() для UI конструктора.
+  - **styles.css**: .filter-string-actions, .filter-builder-row, .modal-filter-builder, .filter-builder-geo.
+
+## 2026-03-01 — Окремо Gemini для асистента та Ollama для парсингу
+
+- **Запит**: Використовувати для LLM-асистента Gemini; для парсингу описів — локальну модель через Ollama.
+
+- **Дії**:
+  - **config/settings.py**: додано `llm_assistant_provider`, `llm_assistant_model_name` (за замовчуванням gemini, gemini-2.5-flash) та `llm_parsing_provider`, `llm_parsing_model_name` (за замовчуванням ollama, gemma3:27b). У `_load_config` читаються секції `llm.assistant` та `llm.parsing`; при їх відсутності асистент береться з `llm.provider`/`llm.model_name`, парсинг лишається за замовчуванням (ollama).
+  - **config/config.example.yaml**: додано блоки `llm.assistant` (provider: gemini, model_name: gemini-2.5-flash) та `llm.parsing` (provider: ollama, model_name: gemma3:27b).
+  - **business/services/llm_service.py**: `_create_provider()` використовує `llm_parsing_provider` та `llm_parsing_model_name` для парсингу описів (parse_auction_description, parse_real_estate_objects тощо). Додано `_create_assistant_provider()` та `_assistant_provider` для extract_intent_for_routing та generate_text (Gemini за замовчуванням).
+  - **business/services/langchain_agent_service.py**: `_create_llm_internal`, умова для `llm_assistant` (thinking) та embeddings використовують `llm_assistant_provider` та `llm_assistant_model_name`.
+  - **business/services/llm_agent_service.py**: модель асистента — `llm_assistant_model_name`. **telegram_mini_app/routes/admin.py**: відображення моделі асистента — `llm_assistant_model_name`.
+  - **scripts/benchmark_parsing_methods.py**: переключення на `llm_parsing_provider` / `llm_parsing_model_name` при бенчмарку ollama/gemini.
+  - **docs/developer_glossary.md**: термін «LLM асистент vs парсинг».
+
+## 2026-03-01 — Інтеграція фільтрів на сторінку пошуку, звіти та LLM-генерація рядка пошуку
+
+- **Запит**: Фільтри мають бути інтегровані і на сторінку пошуку, і в звіти. LLM-помічник має обробляти запити користувача та вміти генерувати рядок пошуку відповідно до запиту.
+
+- **Дії**:
+  - **Сторінка пошуку та звіти**: Рядок фільтрів (filter_string) та flat-параметри (title_contains, description_contains, region, city, price_min/max тощо) вже підключені в routes/search.py та report_templates.py (unified_search). Звіти використовують find_by_filter_string або build_query_from_flat_params + find(); у шаблоні можна передавати filter_string.
+  - **LLM-інструменти**: У langchain_agent_service додано реалізації _generate_search_filter_string та _search_unified_listings. generate_search_filter_string приймає flat-параметри (region, city, source, property_type, price_min, price_max, date_filter_days, title_contains, description_contains) і повертає filter_string через filter_string_from_flat_params. search_unified_listings приймає або filter_string (пошук за рядком), або ті самі flat-параметри; повертає items, total, при flat-параметрах також filter_string.
+  - **Маршрути та run_tool**: Інструменти generate_search_filter_string та search_unified_listings додані в TOOL_ROUTES для query_export та analytics; у run_tool додано обробники для обох назв.
+  - **Системний промпт**: Додано блок «Зведений пошук оголошень (unified_listings)» — коли використовувати generate_search_filter_string та search_unified_listings, формат рядка фільтрів, приклади запитів («підбери фільтри», «згенеруй рядок пошуку за Києвом», «зроби пошук за …»).
+
+## 2026-03-01 — Менше вихідних токенів LLM, аналітика по токенах та вартість Gemini
+
+- **Запит**: Прибрати політику «запит–контекст–запит» у промптах; скоротити вихідні токени без втрати якості. В аналітиці зберігати вхідні/вихідні токени замість кількості запитів. У адмін-панелі показувати токени та приблизні витрати на LLM (прайсинг Gemini).
+
+- **Дії**:
+  - **.cursor/rules/prompt-design.mdc**: прибрано обов'язкову тріаду «завдання–контекст–закріплення»; рекомендовано стислі промпти, одна чітка інструкція, опційне закріплення; додано практики зменшення вихідних токенів.
+  - **config/prompts.yaml**: скорочено intent_detection, query_structure, real_estate_objects_parsing, listing_analytics — менше повторень, без зайвих блоків «Закріплення завдання».
+  - **data/repositories/logs_repository.py**: sum_llm_tokens_by_day, sum_llm_tokens_total, sum_llm_tokens_last_month — агрегація metadata.input_tokens, metadata.output_tokens для api_usage (service=llm).
+  - **business/services/llm_service.py**: GeminiLLMProvider — _last_usage після generate_content, _usage_from_response(); логування api_usage після виклику з input_tokens, output_tokens (parse_auction_description, extract_intent_for_routing, generate_text).
+  - **business/services/langchain_agent_service.py**: _extract_usage_from_aimessage() для AIMessage; лог api_usage після invoke з токенами (main loop, fallback, summarize).
+  - **config/llm_pricing.py**: прайсинг Gemini (за 1M токенів): Flash 0.30/2.50, Pro 1.25/10, Flash-Lite 0.10/0.40; estimate_gemini_cost_usd().
+  - **telegram_mini_app/routes/admin.py**: get_usage_stats повертає для LLM токени (by_day, total, last_month), estimated_cost_usd, estimated_cost_usd_last_month, model; _fill_days_with_zeros_tokens().
+  - **telegram_mini_app/static/app.js**: адмін-панель — відображення вхідних/вихідних токенів, орієнтовної вартості USD, графік «Токени LLM (вх+вих)».
+  - **docs/llm_output_tokens_research.md**: дослідження та практики зменшення вихідних токенів; посилання на джерела.
+  - **docs/developer_glossary.md**: термін «токени (аналітика LLM)».
+
+## 2026-03-01 — Налаштування областей для LLM-обробки (OLX + ProZorro)
+
+- **Запит**: Додати в панель адміністрування налаштування: які області проганяти через LLM при обробці. Сирі дані з джерел зберігати в колекцію, максимально використовуючи парсинг без LLM. Якщо область або м. Київ не в переліку увімкнених — лишати сирі дані без LLM в колекції джерела та unified. Користувач може вмикати/вимикати області; при включенні пропонувати оновлення на глибину 1/7/30 днів та чи оброблювати неактивні. Перед LLM додатково перевіряти оголошення в джерелах (OLX: пуста сторінка або повідомлення про неактивність; ProZorro — за статусом).
+
+- **Дії**:
+  - **config/llm_processing_regions.yaml**: конфіг списку увімкнених областей (enabled_regions). Порожній = усі області увімкнені (backward compatibility).
+  - **business/services/llm_processing_regions_service.py**: get_all_region_names() з olx_region_slugs; get_enabled_regions() / set_enabled_regions(); is_region_enabled_for_llm(); normalize_region_name() для збігу з ProZorro.
+  - **OLX**: У run_update зберігається search_data.region_filter (область пошуку). Якщо область не в увімкнених — сирі дані зберігаються, sync в unified без LLM; pending_llm_urls лише для увімкнених областей. Парсер parser.is_detail_page_inactive(html) — визначення неактивної сторінки (типові фрази OLX); при _inactive зберігаємо з is_active=False. Перед Phase 2 LLM — повторне завантаження сторінки деталей і перевірка неактивності.
+  - **ProZorro**: _get_region_from_auction_data() з address_refs / items[].address; перед кожним _process_auction_with_llm перевірка is_region_enabled_for_llm(region). fetch_and_save_real_estate_auctions та _fetch_and_save_week_optimized приймають llm_only_for_active для опції «обробляти неактивні».
+  - **UnifiedListingsService**: статус OLX з olx_doc.is_active (активне/неактивне).
+  - **Admin API**: GET/PUT /api/admin/llm-processing-regions; POST /api/admin/llm-processing-regions/backfill (days, process_inactive) з опитуванням статусу через data-update/status.
+  - **Admin UI**: блок «Області для LLM-обробки» — чекбокси областей, кнопка Зберегти; модалка «Оновити вже завантажені дані?» з глибиною 1/7/30 днів та опцією «Обробляти неактивні».
+
+## 2026-03-01 — Площа землі в м², відображення в сотках та ціна за сотку
+
+- **Запит**: Змінити використання одиниць площі для земельних ділянок: зберігати всюди в м², для зручності відображати землю в сотках (с) та ціну за сотку замість гектара. Нерухомість — без змін (м², грн/м²).
+
+- **Дії**:
+  - **Зберігання**: У колекціях (unified_listings, olx_listings detail.llm, llm_cache result, analytics_extracts) площа землі тепер **land_area_sqm** (м²). Поле land_area_ha видалено з unified_listings після міграції.
+  - **utils/price_metrics.py**: compute_price_metrics приймає land_area_sqm; price_per_ha рахується як price / (land_sqm/10000). Константи SQM_PER_HECTARE, SQM_PER_SOTKA.
+  - **UnifiedListingsService**: _extract_area_info повертає land_area_sqm; для OLX читає land_area_sqm або конвертує land_area_ha*10000; для ProZorro земля накопичується в м².
+  - **LLM (llm_service)**: _normalize_result додає land_area_sqm = land_area_ha*10000; olx_scraper/run_update та listing_reformat використовують land_area_sqm для compute_price_metrics.
+  - **Міграція 041_land_area_sqm.py**: unified_listings land_area_ha→land_area_sqm; olx_listings detail.llm.land_area_sqm; llm_cache result.land_area_sqm; перезаповнення analytics_extracts.
+  - **API/UI**: Фільтр площі землі приймає значення в сотках (land_area_ha_value), перетворюється на land_area_sqm = value*100. Відповідь містить land_area_sqm та land_area_sotky (для відображення). Ціна за сотку в UI: price_per_ha_uah/100 (грн/с).
+  - **telegram_mini_app/static/app.js**: Відображення землі в сотках; ціна за сотку (₴/с); таблиці та деталі — лейбли «Ціна за сотку», «Земля: X с».
+  - **data_dictionary.yaml, price-metrics-rules.mdc, developer_glossary.md**: оновлено описи полів та правила; додано термін «площа землі (одиниці)».
+
+## 2026-03-01 — Єдиний механізм фільтрів пошуку (дерево фільтрів, рядок, гео)
+
+- **Запит**: Змінити підхід до фільтрів на сторінці пошуку: елементи (поле, тип порівняння, значення), групи І/АБО, геопошук окремо (в межах, не в межах, в радіусі). Додати пошук за заголовком і описом. Рядок фільтрів для редагування; парсинг з рядка. Централізувати пошук для сторінки пошуку та звітів.
+
+- **Дії**:
+  - **domain/models/filter_models.py**: додано FilterOperator.NOT_CONTAINS; GeoFilterOperator — INSIDE, NOT_INSIDE, IN_RADIUS (разом з існуючими EQ, NE).
+  - **domain/managers/collection_manager.py**: _filter_element_to_mongo — обробка NOT_CONTAINS; _geo_filter_to_mongo — INSIDE/NOT_INSIDE для region, settlement, city_district; винесено _query_to_mongo_filter, get_count(query).
+  - **config/search_fields.yaml**: конфіг полів пошуку для unified_listings (лейбли, value_type, allowed_operators), секція geo (toponym_precision, operators).
+  - **domain/services/filter_string_service.py**: серіалізація FilterGroup + GeoFilter у рядок; парсинг рядка → FilterGroup + GeoFilter (filter_group_to_string, filter_string_to_models); маппінг лейблів з конфігу.
+  - **domain/services/unified_search_service.py**: find(filter_group, geo_filter, sort, limit, skip), find_by_filter_string(filter_string, ...), build_query_from_flat_params(...), get_search_fields_config; за замовчуванням status=активне.
+  - **telegram_mini_app/routes/search.py**: у _build_unified_filters додано title_contains, description_contains; у GET /unified — query-параметри title_contains, description_contains; POST /api/search/query — пошук за filter_string (тіло SearchByFilterRequest).
+  - **docs/geo_distance_index_design.md**: опис дизайну індексу відстаней до топонімів (поки не реалізований; IN_RADIUS від центру bounds).
+  - **docs/developer_glossary.md**: терміни «дерево фільтрів», «рядок фільтрів», «UnifiedSearchService».
+
+## 2026-02-26 — Відновлення позиції скролу на сторінці пошуку при поверненні з оголошення
+
+- **Запит**: При поверненні на сторінку пошуку після перегляду оголошення повертати користувача на те саме місце у списку, звідки відкривали картку.
+
+- **Дії**:
+  - **telegram_mini_app/static/app.js**: У `searchState` додано поле `searchScrollTop`. При кліку по картці оголошення перед викликом `showDetail()` зберігається `scrollTop` контейнера `#screen-search`. Після повернення викликається `performSearch()`, який перемальовує список; в кінці `renderSearchResults()` при наявності збереженої позиції виконується відновлення скролу через `requestAnimationFrame` і скидання `searchScrollTop`.
+
+## 2026-02-26 — Відповідь на запит «середня вартість за кв. м. у Соломянському районі Києва»
+
+- **Запит**: ЛЛМ помічник не міг сформувати відповідь на «Розрахуй середню вартість за кв. м. нерухомості у Соломянському районі Києва». Потрібно перевірити доступ агентів до аналітичних даних та заповнення районів міст (зокрема Солом'янського).
+- **Причина**: (1) У _try_analytics_extracts місто визначалося лише за «київ»/«києві»; у формулюванні «районі Києва» є родові відмінки «києва», тому city не встановлювався. (2) Запити «розрахуй середню вартість» не завжди класифікувалися як analytical_text.
+- **Дії**: MultiAgentService._try_analytics_extracts — додано родові відмінки міст (києва, львова, харкова, одеси, дніпра). IntentDetectorAgent._refine_format_with_rules — патерни «розрахуй»/«порахуй»/«підрахуй» та фрази «середня/середню вартість/ціна», «ціна за кв/м²» для analytical_text. Якщо по району немає записів у analytics_extracts — shortcut повертає середнє по місту з приміткою «дані по району відсутні». Заповнення city_district: rebuild_analytics_extracts з unified_listings; опційно enrich_analytics_extracts_city_districts.py (геокодування за вулицями).
+
+## 2026-02-26 — Опис стеку технологій та оцінка складності для резюме
+
+- **Запит**: Створити опис стека технологій проекту для додавання в резюме; приблизно оцінити складність реалізованих фіч та рівень проектування.
+
+- **Дії**:
+  - **docs/tech_stack_and_complexity.md**: додано документ з розділами: (1) стек технологій (backend, LLM/MCP, джерела даних, клієнт, міграції); (2) архітектура та рівень проектування (шари, мультиагентна система, MCP як domain API); (3) таблиця складності фіч по категоріях; (4) підсумкова оцінка та готові формулювання для резюме (короткий та розширений опис).
+
+## 2026-02-26 — Контекст оголошення та аналіз місцезнаходження з листингу
+
+- **Запит**: 1) Асистент не розумів, що питання стосується саме оголошення, з якого він викликаний — потрібен повноцінний контекст при першому запиті. 2) По опрацюванню конкретного оголошення помічник має проводити вивчення даних листингу та сирих даних, розбір тексту, виклик геоінструментів для спроби визначення місцеположення та інтерпретацію результатів.
+
+- **Дії**:
+  - **Контекст оголошення**: У `_get_context_summary`, при формуванні `effective_context` у `_process_query_new_flow` та у SystemMessage для LangChain додано явні формулювання: «Користувач пише в контексті ОДНОГО оголошення. Фрази «оголошення», «в оголошенні», «місцезнаходження», «розташування», «адреса» стосуються САМЕ цього оголошення. Посилання вже надано — НЕ проси його.»
+  - **Маршрут listing_detail**: Якщо є `listing_context` і запит містить ключові слова про локацію (місцезнаходження, розташування, адреса ділянки, координати тощо), запит направляється в LangChain з `route=listing_detail` замість пайплайну.
+  - **Інструмент get_listing_details**: У LangChain додано інструмент, який повертає повні дані оголошення (зведені + сирі): опис, location.raw, llm.addresses, регіон/місто. Викликається без аргументів для поточного оголошення (з `_current_listing_context`) або з `source` та `source_id`. Агент може витягувати топоніми з опису та викликати `geocode_address` для визначення координат.
+  - **TOOL_ROUTES["listing_detail"]**: набір інструментів `get_listing_details`, `geocode_address`, `get_collection_info`. Для маршруту додано підказку: спочатку get_listing_details, потім витягнути топоніми, geocode_address, інтерпретувати результати.
+
+## 2026-02-26 — OLX: фільтр «усі оголошення крім бізнес-центрів»
+
+- **Запит**: Додати для нерухомості фільтр на OLX — всі оголошення крім бізнес-центрів (Тип об'єкта: виключити «Бізнес центр»).
+
+- **Дії**:
+  - **config/olx_commercial_object_type_slugs.yaml**: список slug типів об'єкта для включення (other, shopping_and_office_center, administrative_building, non_residential_in_residential_fund, residential_fund, hotel); бізнес-центр (business_center) виключено.
+  - **scripts/olx_scraper/config.py**: шлях _OLX_COMM_OBJECT_TYPE_SLUGS_PATH, функція get_olx_comm_re_object_type_slugs_include(); у get_commercial_real_estate_list_url додано пари search[filter_enum_comm_re_object_type]=<slug> для кожного slug з конфігу.
+
+## 2026-02-26 — OLX: додаткові фільтри на ресурсі (площа, поверх, земля)
+
+- **Запит**: Додати при завантаженні оголошень з OLX фільтри на самому сайті. Для нерухомості: площа більше 200 м², поверх 1–2. Для земельних ділянок: більше 15 соток.
+
+- **Дії**:
+  - **scripts/olx_scraper/config.py**: константи фільтрів (FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2=200, FILTER_REAL_ESTATE_FLOOR_FROM/TO=1/2, FILTER_LAND_AREA_FROM_SOTOK=15), опційно змінні середовища OLX_FILTER_*; `_build_category_url` приймає `extra_query_pairs` і збирає query через `urlencode`; `get_commercial_real_estate_list_url` додає `search[filter_float_total_area:from]`, `search[filter_float_floor:from]`, `search[filter_float_floor:to]`; `get_land_list_url` додає `search[filter_float_land_area:from]`.
+
+## 2026-02-25 — Бенчмарк парсингу OLX без LLM
+
+- **Запит**: Перевірити можливість отримання структурованої інформації зі сторінки OLX без LLM; порівняти інструменти парсингу; зосередитись на нежитловій нерухомості (площа, поверх, адреси, призначення) та земельних ділянках (кадастровий номер, площа, місцезнаходження, призначення, будинок на ділянці).
+
+- **Дії**:
+  - **scripts/olx_html_parsing_benchmark.py**: бенчмарк — завантаження HTML за URL, парсинг через BeautifulSoup, lxml, Selectolax, Parsel; екстракція з параметрів (ad_parameters) + regex (listing_regex_extractor) + блок «Місцезнаходження»; порівняння з detail.llm.
+  - **requirements.txt**: додано selectolax, parsel.
+  - **docs/olx_parsing_benchmark_report.md**: звіт — огляд інструментів, методологія, результати по полях, аналіз для нежитлової нерухомості та землі, висновки.
+  - **Висновки**: Парсери дають однакову якість; lxml/Parsel найшвидші. Поверх і кадастровий номер — 100% за параметрами; площі — 40–60%; адреси та призначення — обмежено без LLM.
+
+## 2026-02-25 — OLX: Phase 1 (сирі дані) + Phase 2 (LLM одним потоком)
+
+- **Запит**: Спочатку завантажити сирі дані по всім областям і типам, потім обробити LLM одним потоком з прогрес-баром.
+
+- **Дії**:
+  - **run_update.py**: Phase 1 — паралельна обробка по областях: завантаження сторінок пошуку та деталей, збереження в БД без LLM. Оголошення з новим/зміненим контентом позначаються `llm_pending=True`, URL додаються в `pending_llm_urls`.
+  - **run_update.py**: Phase 2 — після завершення Phase 1: обробка `pending_llm_urls` одним потоком через `_process_llm_pending` з прогрес-баром (tqdm). LLM, геокодування, price_metrics, sync у unified.
+  - **llm_service.py**: прибрано `_llm_api_lock` — LLM тепер викликається лише з одного потоку в Phase 2.
+
+## 2026-02-25 — Серіалізація LLM та retry при 429 (замінено на Phase 1+2)
+
+- **Дії**:
+  - **llm_service.py**: при 429 після вичерпання retry для моделі — очікування `retry_delay` перед переходом на наступну модель.
+
+## 2026-02-25 — Виправлення: 404 при парсингу через Gemini (gemini-pro застаріла)
+
+- **Запит**: Помилка при парсингу — `models/gemini-pro is not found for API version v1beta`. Використовується лише Gemini Flash, Pro не потрібен.
+
+- **Дії**:
+  - **llm_service.py**: видалено `gemini-pro` та `gemini-2.5-pro` з fallback-списку в `GeminiLLMProvider._validate_model`. Залишено лише Flash-моделі: preferred_model, gemini-2.5-flash, gemini-2.5-flash-lite.
+  - **llm_service.py**: дефолт для Gemini при `_create_provider` змінено з `gemini-1.5-flash` на `gemini-2.5-flash`.
+
+## 2026-02-24 — Shortcut analytics_extracts для середньої ціни за м² з районом
+
+- **Запит**: Агент не міг обробити «середня вартість за кв. м. комерційної нерухомості в м. Київ в Соломянському районі» — хоча дані є.
+
+- **Дії**:
+  - **utils/district_normalizer.py**: нормалізація назв районів Києва (Соломянський/Солом'янський), extract_district_from_query, get_district_filter_value ($regex з опціональним апострофом).
+  - **MultiAgentService._try_analytics_extracts**: shortcut для запитів «середня вартість/ціна за кв. м.» + місто (Київ, Львів, тощо) + опціонально район. Викликає analytics_extracts_aggregate, формує відповідь. Викликається перед _try_analytics_aggregation_by_city.
+  - **AnalystAgent**: додано analytics_extracts_aggregate до _action_to_tool.
+  - **Промпти**: приклад для «в Соломянському районі» з city_district regex; список районів Києва в prompts.yaml та langchain_agent_service.
+
+## 2026-02-24 — Колекція analytics_extracts та доменний шар для агрегацій
+
+- **Запит**: Створити додаткову колекцію з доменним шаром над нею, доступну для MCP агентів. Реалізувати методи агрегації по метриках, пошуку з логічними умовами, створення метрик на базі існуючих. Запит «Знайди район міста Києва, де середня ціна за квадратний метр нерухомості найвища» має виконуватись чисто за рахунок агрегації з цієї колекції.
+
+- **Дії**:
+  - **Міграція 040**: колекція `analytics_extracts` з індексами (source+source_id, region, city, city_district, source_date).
+  - **AnalyticsExtractsRepository**: upsert_extract, upsert_many, clear_all.
+  - **AnalyticsExtractsService** (domain/services): aggregate_by_metric (avg/sum/min/max), search з логічними умовами ($and, $or, $not, eq, gt, gte, lt, lte, in, regex), get_distinct_values, get_available_metrics, get_group_by_fields.
+  - **analytics_extracts_populator**: rebuild_analytics_extracts() — витягує плоскі поля з unified_listings (listing_url, property_type, source, source_date, region, oblast_raion, settlement_type, settlement, city, city_district, street_type, street, building, floor, land_area_sqm, price_per_ha_uah/usd, building_area_sqm, price_per_m2_uah/usd).
+  - **PriceAnalyticsService.rebuild_all()**: викликає rebuild_analytics_extracts() перед compute_indicators/aggregates.
+  - **MCP tools** (LangChain agent): analytics_extracts_aggregate, analytics_extracts_search, analytics_extracts_list_metrics, analytics_extracts_list_dimensions, analytics_extracts_get_distinct. Опис інструментів містить логічні умови.
+  - **data_dictionary.yaml**: analytics_extracts з полями та індексами.
+  - **SourceFieldMapper**: analytics_extracts.
+  - **Промпт агента**: пріоритет analytics_extracts для гео-агрегацій («район міста з найвищою ціною за м²»).
+
+## 2026-02-24 — Доповнення analytics_extracts районами міста через Google Maps
+
+- **Запит**: З analytics_extracts вибрати унікальні комбінації Область/місто/вулиця для Києва, Одеси, Львова, Миколаєва, Харкова; для кожної виконати геокодування в Google Maps і доповнити city_district.
+
+- **Дії**:
+  - **scripts/enrich_analytics_extracts_city_districts.py**: скрипт — агрегація унікальних (region, city, street), геокодування через GeocodingService, оновлення city_district, oblast_raion, geocode_formatted_address, geocode_latitude, geocode_longitude. Опції --dry-run, --limit.
+  - **data_dictionary.yaml**: поля geocode_formatted_address, geocode_latitude, geocode_longitude для analytics_extracts.
+
+## 2026-02-24 — Геопошук: root geo та райони міста в unified_listings
+
+- **Запит**: (1) Додавати до адрес у великих містах (обласні, районні центри) додаткові геометрики — райони міста (city_district), визначаються при наявності вулиці; (2) В корені unified_listings — базові географічні поля: region, oblast_raion, city, city_district; заповнювати з addresses — якщо не суперечать, інакше більшість або точна адреса.
+
+- **Дії**:
+  - **unified_listings_service**: `_normalize_address_from_geocode` — додано city_district з sublocality (Google Maps); `_compute_root_geo_from_addresses` — обчислення root geo з addresses (majority vote, пріоритет точній адресі).
+  - **unified_listings**: root поля region, oblast_raion, city, city_district; заповнюються при sync з OLX/ProZorro.
+  - **data_dictionary.yaml**: root geo поля, city_district в addresses.nested_fields.
+  - **SourceFieldMapper**: unified_listings — city, region, oblast_raion, city_district на root; get_geo_match_keys → (region, city); uses_root_geo().
+  - **GeoFilterBuilder**: для unified_listings — root geo без $unwind.
+  - **CollectionManager**: _geo_filter_to_mongo — root city/region з fallback на addresses; без $unwind.
+  - **UnifiedListing entity**: get_region, get_settlement — root з fallback; get_oblast_raion, get_city_district; _format_addresses_for_export — city_district.
+  - **Міграція 039**: backfill root geo з addresses для існуючих записів.
+  - **UnifiedListingsRepository**: індекси region, city, oblast_raion, city_district.
+
 ## 2026-02-24 — Фільтрація землі OLX за типами (без с/г, без LLM)
 
 - **Запит**: При завантаженні земельних ділянок з OLX завантажувати всі, окрім сільськогосподарського призначення — через фільтри OLX (як області й типи оголошень), без використання LLM.
@@ -28,6 +378,13 @@
   - **Покращення 1 — Error recovery hint**: при `success=false` у результаті tool додається `[ПОМИЛКА ІНСТРУМЕНТУ]` з інструкцією само-корекції (проаналізуй причину, спробуй інший підхід). `langchain_agent_service.py`.
   - **Покращення 2 — ReAct/антиципаторне міркування**: у `config/prompts.yaml` (langchain_system) додано блок «МІРКУВАННЯ ТА ПЕРЕВІРКИ» — перед викликом інструменту формулювати, що шукаєш і чому; перевіряти параметри; мати на увазі альтернативи (ProZorro→OLX); при помилці — аналізувати і пробувати інший підхід.
   - **scripts/review_ai_assistant_flow.py**: скрипт для прогону тестових запитів через LangChainAgentService, збір метрик (ітерації, тривалість), порівняння флоу. Запуск: `py scripts/review_ai_assistant_flow.py` (опції: --filter, --limit).
+
+## 2026-02-27 — Перехід парсингу оголошень на локальну Gemma3 12B через Ollama
+
+- **Запит**: Переключити обробку парсингу оголошень на локальну модель gemma3 12B.
+- **Дії**:
+  - **config/config.yaml**: змінено LLM-провайдера на `ollama` та модель на `gemma3:12b`, додано секцію `api_keys.ollama`. Це переводить парсинг оголошень (OLX, ProZorro) та інші виклики `LLMService` на локальну модель через Ollama (за наявності моделі `gemma3:12b` у середовищі).
+  - **config/config.example.yaml**: оновлено коментарі щодо підтримки `ollama` та переліку моделей (gemma3:12b, gemma3:27b).
 
 ## 2026-02-24 — Фільтр області в пошуку: Київська замість Житомирської
 

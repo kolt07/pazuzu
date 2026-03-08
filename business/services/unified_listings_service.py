@@ -4,6 +4,7 @@
 """
 
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 import logging
@@ -17,6 +18,80 @@ from utils.price_metrics import compute_price_metrics
 from utils.address_parser import parse_prozorro_item_address
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_root_geo_from_addresses(
+    addresses: List[Dict[str, Any]],
+) -> Dict[str, Optional[str]]:
+    """
+    Обчислює базові географічні поля в корені документа з масиву адрес.
+    
+    Логіка:
+    - Якщо всі адреси збігаються — беремо спільне значення.
+    - Якщо є суперечності — беремо значення з більшості адрес.
+    - Якщо є точна адреса (is_complete=True) — пріоритет її значенням.
+    
+    Returns:
+        {region, oblast_raion, city, city_district}
+    """
+    result: Dict[str, Optional[str]] = {
+        "region": None,
+        "oblast_raion": None,
+        "city": None,
+        "city_district": None,
+    }
+    if not addresses:
+        return result
+
+    def _norm(v: Any) -> Optional[str]:
+        if v is None or not isinstance(v, str):
+            return None
+        s = v.strip()
+        return s if s else None
+
+    # Збираємо значення з кожної адреси
+    # oblast_raion = district в адресі (район області)
+    # city = settlement в адресі
+    fields_map = {
+        "region": "region",
+        "oblast_raion": "district",
+        "city": "settlement",
+        "city_district": "city_district",
+    }
+
+    # Шукаємо точну адресу (до будинку)
+    exact_addr: Optional[Dict[str, Any]] = None
+    for addr in addresses:
+        if isinstance(addr, dict) and addr.get("is_complete"):
+            exact_addr = addr
+            break
+
+    for root_key, addr_key in fields_map.items():
+        values: List[str] = []
+        for addr in addresses:
+            if not isinstance(addr, dict):
+                continue
+            v = _norm(addr.get(addr_key))
+            if v:
+                values.append(v)
+
+        if not values:
+            continue
+
+        # Якщо є точна адреса (до будинку) і вона має значення — пріоритет
+        if exact_addr:
+            exact_val = _norm(exact_addr.get(addr_key))
+            if exact_val:
+                result[root_key] = exact_val
+                continue
+
+        # Більшість: найчастіше значення серед усіх адрес
+        counter = Counter(values)
+        most_common = counter.most_common(1)
+        if most_common:
+            result[root_key] = most_common[0][0]
+
+    return result
 
 
 class UnifiedListingsService:
@@ -102,10 +177,13 @@ class UnifiedListingsService:
         if location_type == "APPROXIMATE" and not is_complete:
             is_complete = False
         
+        # district = район області (administrative_area_level_2)
+        # city_district = район міста (sublocality) — для великих міст при наявності вулиці
         address = {
             "region": address_structured.get("region"),
             "settlement": address_structured.get("city") or address_structured.get("sublocality"),
             "district": address_structured.get("administrative_area_level_2"),
+            "city_district": address_structured.get("sublocality"),
             "street": address_structured.get("street"),
             "building": address_structured.get("street_number"),
             "apartment": None,  # Не витягується з геокодування
@@ -516,24 +594,11 @@ class UnifiedListingsService:
             return float(value) * 100.0
         return float(value)  # припускаємо м²
 
-    def _convert_to_hectares(self, value: float, unit_ua: str) -> float:
-        """Конвертує площу в га. unit_ua — одиниця з item.unit.name.uk_UA."""
-        if not value:
-            return 0.0
-        u = (unit_ua or "").lower()
-        if any(x in u for x in ["гектар", "hectare", "га"]):
-            return float(value)
-        if any(x in u for x in ["м²", "м2", "кв.м", "кв м", "квадратний метр"]):
-            return float(value) * 0.0001
-        if any(x in u for x in ["сотка", "соток", "ar"]):
-            return float(value) * 0.01
-        return float(value) * 0.0001  # припускаємо м²
-
-    def _extract_area_info(self, doc: Dict[str, Any], source: str) -> Dict[str, float]:
-        """Витягує інформацію про площі."""
+    def _extract_area_info(self, doc: Dict[str, Any], source: str) -> Dict[str, Any]:
+        """Витягує інформацію про площі. Усі площі повертаються в м² (land_area_sqm)."""
         area_info = {
             "building_area_sqm": None,
-            "land_area_ha": None,
+            "land_area_sqm": None,
         }
         
         if source == "olx":
@@ -542,7 +607,9 @@ class UnifiedListingsService:
             llm = detail.get("llm", {})
             
             building_area = llm.get("building_area_sqm")
-            land_area = llm.get("land_area_ha")
+            # Джерело може зберігати land_area_ha або вже land_area_sqm
+            land_ha = llm.get("land_area_ha")
+            land_sqm_from_llm = llm.get("land_area_sqm")
             
             if building_area:
                 try:
@@ -550,18 +617,23 @@ class UnifiedListingsService:
                 except (ValueError, TypeError):
                     pass
             
-            if land_area:
+            if land_sqm_from_llm is not None:
                 try:
-                    area_info["land_area_ha"] = float(land_area)
+                    area_info["land_area_sqm"] = float(land_sqm_from_llm)
+                except (ValueError, TypeError):
+                    pass
+            elif land_ha is not None:
+                try:
+                    area_info["land_area_sqm"] = float(land_ha) * 10000.0
                 except (ValueError, TypeError):
                     pass
 
-            # Fallback: area_m2 як building_area — тільки якщо немає land_area_ha.
+            # Fallback: area_m2 як building_area — тільки якщо немає land_area.
             # Для земельних ділянок area_m2 часто є площею землі в м², тому не
             # використовуємо її як building_area — це дало б хибну price_per_m2.
             if (
                 not area_info["building_area_sqm"]
-                and not area_info["land_area_ha"]
+                and not area_info["land_area_sqm"]
                 and search_data.get("area_m2") is not None
             ):
                 try:
@@ -574,7 +646,7 @@ class UnifiedListingsService:
             items = auction_data.get("items", [])
             
             total_building_sqm = 0.0
-            total_land_ha = 0.0
+            total_land_sqm = 0.0
             
             for item in items:
                 if not isinstance(item, dict):
@@ -598,14 +670,14 @@ class UnifiedListingsService:
                     elif isinstance(unit, str):
                         unit_ua = unit.lower()
                     
-                    # Земля: landArea
+                    # Земля: landArea — зберігаємо в м²
                     if item_props_type == "land" or (class_id and class_id.startswith("06")):
                         land_area = item_props.get("landArea")
                         if land_area is not None:
                             try:
                                 val = float(land_area)
                                 if val > 0:
-                                    total_land_ha += self._convert_to_hectares(val, unit_ua)
+                                    total_land_sqm += self._convert_to_sqm(val, unit_ua)
                             except (ValueError, TypeError):
                                 pass
                         continue
@@ -652,9 +724,9 @@ class UnifiedListingsService:
                                 if "м²" in unit_ua or "кв.м" in unit_ua:
                                     total_building_sqm += qty_float
                                 elif "га" in unit_ua or "гектар" in unit_ua:
-                                    total_land_ha += qty_float
+                                    total_land_sqm += qty_float * 10000.0
                             elif qty_float > 1000:
-                                total_land_ha += qty_float / 10000.0
+                                total_land_sqm += qty_float
                             else:
                                 total_building_sqm += qty_float
                     except (ValueError, TypeError):
@@ -662,8 +734,8 @@ class UnifiedListingsService:
             
             if total_building_sqm > 0:
                 area_info["building_area_sqm"] = total_building_sqm
-            if total_land_ha > 0:
-                area_info["land_area_ha"] = total_land_ha
+            if total_land_sqm > 0:
+                area_info["land_area_sqm"] = total_land_sqm
         
         return area_info
 
@@ -754,8 +826,11 @@ class UnifiedListingsService:
         elif not isinstance(source_updated_at, datetime):
             source_updated_at = datetime.now(timezone.utc)
         
-        # Статус: всі оголошення OLX вважаються активними
-        status = "активне"
+        # Статус: з поля is_active (неактивне = зняте з публікації OLX або сторінка «оголошення неактивне»)
+        if olx_doc.get("is_active") is False:
+            status = "неактивне"
+        else:
+            status = "активне"
         
         # Заголовок та опис
         title = search_data.get("title", "")
@@ -793,9 +868,12 @@ class UnifiedListingsService:
         price_metrics = compute_price_metrics(
             total_price_uah=price_info["price_uah"],
             building_area_sqm=area_info["building_area_sqm"],
-            land_area_ha=area_info["land_area_ha"],
+            land_area_sqm=area_info["land_area_sqm"],
             uah_per_usd=self._usd_rate,
         )
+        
+        # Базові географічні поля в корені (з addresses)
+        root_geo = _compute_root_geo_from_addresses(addresses)
         
         unified_doc = {
             "source": "olx",
@@ -807,10 +885,14 @@ class UnifiedListingsService:
             "property_type": property_type,
             "title": title,
             "description": description,
+            "region": root_geo["region"],
+            "oblast_raion": root_geo["oblast_raion"],
+            "city": root_geo["city"],
+            "city_district": root_geo["city_district"],
             "addresses": addresses,
             "cadastral_numbers": cadastral_numbers,
             "building_area_sqm": area_info["building_area_sqm"],
-            "land_area_ha": area_info["land_area_ha"],
+            "land_area_sqm": area_info["land_area_sqm"],
             "floor": floor,
             "tags": tags,
             "price_uah": price_info["price_uah"],
@@ -897,9 +979,12 @@ class UnifiedListingsService:
         price_metrics = compute_price_metrics(
             total_price_uah=price_info["price_uah"],
             building_area_sqm=area_info["building_area_sqm"],
-            land_area_ha=area_info["land_area_ha"],
+            land_area_sqm=area_info["land_area_sqm"],
             uah_per_usd=self._usd_rate,
         )
+        
+        # Базові географічні поля в корені (з addresses)
+        root_geo = _compute_root_geo_from_addresses(addresses)
         
         unified_doc = {
             "source": "prozorro",
@@ -911,10 +996,14 @@ class UnifiedListingsService:
             "property_type": property_type,
             "title": title,
             "description": description,
+            "region": root_geo["region"],
+            "oblast_raion": root_geo["oblast_raion"],
+            "city": root_geo["city"],
+            "city_district": root_geo["city_district"],
             "addresses": addresses,
             "cadastral_numbers": cadastral_numbers,
             "building_area_sqm": area_info["building_area_sqm"],
-            "land_area_ha": area_info["land_area_ha"],
+            "land_area_sqm": area_info["land_area_sqm"],
             "floor": floor,
             "tags": tags,
             "price_uah": price_info["price_uah"],

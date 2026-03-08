@@ -5,6 +5,7 @@
 
 from typing import Optional, Dict, Any
 from data.repositories.logs_repository import LogsRepository
+from data.repositories.llm_exchange_logs_repository import LLMExchangeLogsRepository
 
 
 class LoggingService:
@@ -19,6 +20,7 @@ class LoggingService:
     def __init__(self):
         """Ініціалізація сервісу логування."""
         self.repository = LogsRepository()
+        self.llm_exchange_repo = LLMExchangeLogsRepository()
     
     def log_api_exchange(
         self,
@@ -166,3 +168,49 @@ class LoggingService:
             metadata=usage_metadata,
             error=None
         )
+
+    def log_llm_exchange(
+        self,
+        request_text: str,
+        response_text: str,
+        input_tokens: int,
+        output_tokens: int,
+        source: str,
+        request_id: Optional[str] = None,
+        initiator: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> str:
+        """
+        Логує повний обмін запит–відповідь LLM у колекцію llm_exchange_logs (Gemini, Ollama тощо).
+
+        Args:
+            request_text: Повний текст запиту (промпт або серіалізовані повідомлення).
+            response_text: Повний текст відповіді LLM.
+            input_tokens: Кількість вхідних токенів.
+            output_tokens: Кількість вихідних токенів.
+            source: Джерело виклику (напр. langchain_agent_main, llm_service.parse_auction_description).
+            request_id: Ідентифікатор запиту (correlation id).
+            initiator: Ініціатор (user_id або 'system').
+            provider: Провайдер LLM: 'gemini', 'ollama' тощо (опційно).
+
+        Returns:
+            ID створеного запису.
+        """
+        import logging
+        log = logging.getLogger(__name__)
+        try:
+            doc_id = self.llm_exchange_repo.add(
+                request_text=request_text or "",
+                response_text=response_text or "",
+                input_tokens=int(input_tokens or 0),
+                output_tokens=int(output_tokens or 0),
+                source=source,
+                request_id=request_id,
+                initiator=initiator,
+                provider=provider,
+            )
+            log.info("LLM exchange записано: source=%s, provider=%s, request_id=%s, id=%s", source, provider, request_id, doc_id)
+            return doc_id
+        except Exception as e:
+            log.warning("Не вдалося записати llm_exchange (source=%s): %s", source, e)
+            return ""

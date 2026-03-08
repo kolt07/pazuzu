@@ -191,4 +191,4 @@ class PipelineService:
                 for k in fields_dict.keys():
                     if not k.startswith("_") and k not in ("source", "source_id"):
                         fields.add(k)
-        return fields or {"price_uah", "addresses", "region", "city", "property_type", "building_area_sqm", "land_area_ha", "status"}
+        return fields or {"price_uah", "addresses", "region", "city", "property_type", "building_area_sqm", "land_area_sqm", "status"}

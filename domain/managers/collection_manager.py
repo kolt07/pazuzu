@@ -181,6 +181,12 @@ class BaseCollectionManager:
             ]}
         if op == FilterOperator.CONTAINS:
             return {field: {"$regex": str(value), "$options": "i"}}
+        if op == FilterOperator.NOT_CONTAINS:
+            return {"$or": [
+                {field: {"$exists": False}},
+                {field: None},
+                {field: {"$not": {"$regex": str(value), "$options": "i"}}}
+            ]}
 
         # Для полів дат: конвертуємо ISO-рядки в datetime (BSON Date)
         if op in (FilterOperator.GTE, FilterOperator.LTE, FilterOperator.GT, FilterOperator.LT):
@@ -219,6 +225,16 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
     def _is_date_field(self, field: str) -> bool:
         return field in self.DATE_FIELDS
 
+    def _filter_element_to_mongo(self, elem: FilterElement) -> Dict[str, Any]:
+        """Перетворює FilterElement на MongoDB умову з використанням фізичних шляхів полів."""
+        from utils.source_field_mapper import SourceFieldMapper
+        physical_field = SourceFieldMapper.get_field_path(elem.field, self.COLLECTION_NAME)
+        value = elem.value
+        if physical_field == "source" and isinstance(value, str) and value.strip():
+            value = value.strip().lower()
+        elem_mapped = FilterElement(field=physical_field, operator=elem.operator, value=value)
+        return super()._filter_element_to_mongo(elem_mapped)
+
     def __init__(self):
         super().__init__()
         from data.repositories.unified_listings_repository import UnifiedListingsRepository
@@ -243,11 +259,11 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
         return False
 
     def _fetch_field_values(self, field: str) -> List[Dict[str, Any]]:
-        """Отримує унікальні значення поля через aggregation або distinct."""
+        """Отримує унікальні значення поля. region, city — root поля."""
         from utils.source_field_mapper import SourceFieldMapper
         path = field
-        if field in ("region", "city"):
-            path = SourceFieldMapper.get_region_field(self.COLLECTION_NAME) if field == "region" else SourceFieldMapper.get_city_field(self.COLLECTION_NAME)
+        if field in ("region", "city", "oblast_raion", "city_district"):
+            path = SourceFieldMapper.get_field_path(field, self.COLLECTION_NAME)
         
         try:
             if "." in path:
@@ -295,23 +311,9 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
         from utils.source_field_mapper import SourceFieldMapper
         
         qb = QueryBuilder()
-        mongo_filter: Dict[str, Any] = {}
-        
-        # Звичайні фільтри
-        if query.filters:
-            mongo_filter = self._filter_group_to_mongo(query.filters)
-        
-        # Геофільтри — перетворюємо GeoFilter на MongoDB
-        if query.geo_filters:
-            geo_mongo = self._geo_filter_to_mongo(query.geo_filters)
-            if geo_mongo:
-                mongo_filter = {"$and": [mongo_filter, geo_mongo]} if mongo_filter else geo_mongo
+        mongo_filter = self._query_to_mongo_filter(query)
         
         pipeline: List[Dict[str, Any]] = []
-        
-        # $unwind для addresses (гео-пошук) — має бути перед $match
-        if query.geo_filters and self.COLLECTION_NAME == "unified_listings":
-            pipeline.append({"$unwind": {"path": "$addresses", "preserveNullAndEmptyArrays": True}})
         
         # $match
         if mongo_filter:
@@ -356,6 +358,26 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
         data = result.get("results", result.get("data", []))
         return pd.DataFrame(data) if data else pd.DataFrame()
 
+    def _query_to_mongo_filter(self, query: FindQuery) -> Dict[str, Any]:
+        """Збирає MongoDB $match з звичайних фільтрів та геофільтрів."""
+        mongo_filter: Dict[str, Any] = {}
+        if query.filters:
+            mongo_filter = self._filter_group_to_mongo(query.filters)
+        if query.geo_filters:
+            geo_mongo = self._geo_filter_to_mongo(query.geo_filters)
+            if geo_mongo:
+                mongo_filter = {"$and": [mongo_filter, geo_mongo]} if mongo_filter else geo_mongo
+        return mongo_filter
+
+    def get_count(self, query: FindQuery) -> int:
+        """Повертає кількість документів за умовами FindQuery (без skip/limit)."""
+        mongo_filter = self._query_to_mongo_filter(query)
+        try:
+            return self._repo.collection.count_documents(mongo_filter)
+        except Exception as e:
+            logger.warning("UnifiedListingsCollectionManager.get_count: %s", e)
+            return 0
+
     def get_total_count(self) -> Optional[int]:
         """Повертає загальну кількість документів у колекції."""
         try:
@@ -371,24 +393,48 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
         root = geo_filter.root
         
         def process_element(elem: GeoFilterElement) -> Dict[str, Any]:
-            if elem.operator == GeoFilterOperator.EQ:
-                if elem.geo_type == "settlement":
-                    # Підтримка "Київ" та "м. Київ"
-                    escaped = re.escape(str(elem.value))
-                    pattern = f"^(м\\.\\s*)?{escaped}"
-                    return {"addresses.settlement": {"$regex": pattern, "$options": "i"}}
-                if elem.geo_type == "region":
-                    escaped = re.escape(str(elem.value))
-                    return {"addresses.region": {"$regex": f"^{escaped}", "$options": "i"}}
-            if elem.operator == GeoFilterOperator.NE:
-                # «Не в місті» / «Не в області» — документи, де жодна адреса не відповідає
+            # INSIDE / EQ — в межах топоніму (область, місто, район міста)
+            if elem.operator in (GeoFilterOperator.INSIDE, GeoFilterOperator.EQ):
                 if elem.geo_type == "settlement":
                     escaped = re.escape(str(elem.value))
                     pattern = f"^(м\\.\\s*)?{escaped}"
-                    return {"addresses": {"$not": {"$elemMatch": {"settlement": {"$regex": pattern, "$options": "i"}}}}}
+                    return {"$or": [
+                        {"city": {"$regex": pattern, "$options": "i"}},
+                        {"addresses": {"$elemMatch": {"settlement": {"$regex": pattern, "$options": "i"}}}},
+                    ]}
                 if elem.geo_type == "region":
                     escaped = re.escape(str(elem.value))
-                    return {"addresses": {"$not": {"$elemMatch": {"region": {"$regex": f"^{escaped}", "$options": "i"}}}}}
+                    return {"$or": [
+                        {"region": {"$regex": f"^{escaped}", "$options": "i"}},
+                        {"addresses": {"$elemMatch": {"region": {"$regex": f"^{escaped}", "$options": "i"}}}},
+                    ]}
+                if elem.geo_type == "city_district":
+                    escaped = re.escape(str(elem.value))
+                    return {"$or": [
+                        {"city_district": {"$regex": f"^{escaped}", "$options": "i"}},
+                        {"addresses": {"$elemMatch": {"city_district": {"$regex": f"^{escaped}", "$options": "i"}}}},
+                    ]}
+            # NOT_INSIDE / NE — не в межах топоніму
+            if elem.operator in (GeoFilterOperator.NOT_INSIDE, GeoFilterOperator.NE):
+                if elem.geo_type == "settlement":
+                    escaped = re.escape(str(elem.value))
+                    pattern = f"^(м\\.\\s*)?{escaped}"
+                    return {"$and": [
+                        {"$or": [{"city": {"$exists": False}}, {"city": None}, {"city": {"$not": {"$regex": pattern, "$options": "i"}}}]},
+                        {"addresses": {"$not": {"$elemMatch": {"settlement": {"$regex": pattern, "$options": "i"}}}}},
+                    ]}
+                if elem.geo_type == "region":
+                    escaped = re.escape(str(elem.value))
+                    return {"$and": [
+                        {"$or": [{"region": {"$exists": False}}, {"region": None}, {"region": {"$not": {"$regex": f"^{escaped}", "$options": "i"}}}]},
+                        {"addresses": {"$not": {"$elemMatch": {"region": {"$regex": f"^{escaped}", "$options": "i"}}}}},
+                    ]}
+                if elem.geo_type == "city_district":
+                    escaped = re.escape(str(elem.value))
+                    return {"$and": [
+                        {"$or": [{"city_district": {"$exists": False}}, {"city_district": None}, {"city_district": {"$not": {"$regex": f"^{escaped}", "$options": "i"}}}]},
+                        {"addresses": {"$not": {"$elemMatch": {"city_district": {"$regex": f"^{escaped}", "$options": "i"}}}}},
+                    ]}
             if elem.operator == GeoFilterOperator.IN_RADIUS and elem.geo_type == "coordinates":
                 # $geoWithin $centerSphere
                 lat = elem.value.get("latitude")

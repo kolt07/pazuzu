@@ -243,29 +243,25 @@ class ResultValidatorService:
         sample_results = results[:5]  # Беремо перші 5 результатів для аналізу
         
         prompt_parts = [
-            "Тобі необхідно перевірити, чи результати виконання запиту відповідають очікуванням користувача, і повернути JSON з полями valid, issues, should_retry.",
+            "Check whether the query results match the user's expectations and return JSON with fields valid, issues, should_retry. All text values (e.g. issue messages, retry_reason) must be in Ukrainian.",
             "",
-            "## Запит користувача:",
+            "## User query:",
             user_query,
             "",
-            "## Структурний опис запиту:",
+            "## Query structure:",
             json.dumps(query_structure, ensure_ascii=False, indent=2, default=json_serializer),
             "",
-            "## Результати (перші 5):",
+            "## Results (first 5):",
             json.dumps(sample_results, ensure_ascii=False, indent=2, default=json_serializer),
             "",
-            "## Закріплення завдання:",
-            "Визнач, чи результати відповідають запиту користувача.",
-            "Перевір:",
-            "- Чи є результати, які не повинні бути (наприклад, заборонені регіони)",
-            "- Чи відсутні очікувані результати",
-            "- Чи відповідають результати фільтрам",
+            "## Task:",
+            "Decide if results match the query. Check: unwanted results (e.g. wrong regions), missing expected results, filter compliance.",
             "",
-            "Поверни JSON з полями:",
-            "- valid: чи результати валідні (bool)",
-            "- issues: список проблем (масив об'єктів з полями type, message, severity)",
-            "- should_retry: чи потрібно повторити виконання (bool)",
-            "- retry_reason: причина повторного виконання (string, опціонально)"
+            "Return JSON with:",
+            "- valid: whether results are valid (bool)",
+            "- issues: list of issues (array of objects with type, message, severity). message in Ukrainian.",
+            "- should_retry: whether to retry (bool)",
+            "- retry_reason: reason for retry (string, optional, in Ukrainian)"
         ]
         
         return "\n".join(prompt_parts)

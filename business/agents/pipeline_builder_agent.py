@@ -184,13 +184,17 @@ class PipelineBuilderAgent:
         return results
     
     def _get_field_path_for_filter(self, collection: str, field: str) -> Optional[str]:
-        """Повертає шлях до поля для фільтрації залежно від колекції. Агент працює з addresses (unified_listings)."""
+        """Повертає шлях до поля для фільтрації. unified_listings: root geo (region, city)."""
         if collection != "unified_listings":
             return None
         if field == "region":
-            return "addresses.region"
+            return "region"
         if field == "city":
-            return "addresses.settlement"
+            return "city"
+        if field == "oblast_raion":
+            return "oblast_raion"
+        if field == "city_district":
+            return "city_district"
         return None
     
     def _build_pipeline_with_llm(
@@ -238,32 +242,32 @@ class PipelineBuilderAgent:
         metadata_summary = self.metadata_service.get_metadata_for_llm(max_length=1500)
         
         prompt_parts = [
-            "Тобі необхідно сконструювати пайплайн обробки даних у форматі JSON на основі структурного опису запиту.",
+            "Construct a data processing pipeline as JSON from the structural query description. Return only JSON. Parameter values in the pipeline (e.g. region, city labels) may be in Ukrainian where they represent user-facing filters.",
             "",
-            "## Контекст застосунку:",
+            "## Application context:",
             metadata_summary,
             "",
-            "## Запит користувача:",
+            "## User query:",
             user_query,
             "",
-            "## Структурний опис запиту:",
+            "## Query structure:",
             json.dumps(query_structure, ensure_ascii=False, indent=2),
             "",
-            "## Результати дослідження даних:",
+            "## Data exploration results:",
             json.dumps(exploration_results, ensure_ascii=False, indent=2),
         ]
         
         if intent_info:
             prompt_parts.extend([
                 "",
-                "## Визначений намір:",
+                "## Detected intent:",
                 json.dumps(intent_info, ensure_ascii=False, indent=2)
             ])
         
         prompt_parts.extend([
             "",
-            "## Закріплення завдання — формат пайплайну:",
-            "Пайплайн має бути ПАРАМЕТРИЗОВАНИМ ШАБЛОНОМ у форматі JSON з полем 'steps' (масив кроків).",
+            "## Task — pipeline format:",
+            "The pipeline must be a PARAMETERISED TEMPLATE in JSON with field 'steps' (array of steps).",
             "ВАЖЛИВО: Пайплайн НЕ має містити конкретні значення (регіони, міста, дати), а використовувати ПАРАМЕТРИ.",
             "",
             "Параметри позначаються як $param_name або {{param_name}}.",
@@ -315,7 +319,7 @@ class PipelineBuilderAgent:
                 ]
             }, ensure_ascii=False, indent=2),
             "",
-            "Поверни тільки JSON з ПАРАМЕТРИЗОВАНИМ пайплайном без коментарів."
+            "Return only JSON with the PARAMETERISED pipeline, no comments."
         ])
         
         return "\n".join(prompt_parts)

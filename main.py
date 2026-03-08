@@ -46,7 +46,7 @@ logging.getLogger('langchain_google_genai').setLevel(logging.WARNING)
 from business.services import ProZorroService
 from business.services.telegram_bot_service import TelegramBotService
 from business.services.scheduler_service import SchedulerService, TelegramSchedulerNotifier
-from scripts.olx_scraper.run_update import run_olx_update
+from business.services.source_data_load_service import run_full_pipeline
 from business.services.logging_service import LoggingService
 from data.database.connection import MongoDBConnection
 from business.services.currency_rate_service import CurrencyRateService
@@ -116,7 +116,8 @@ class Application:
     ):
         """
         Запуск застосунку.
-        
+        Pipeline: Phase 1 — сирі дані в raw-колекції (без LLM), Phase 2 — promote + LLM для обраних, Phase 3 — аналітика.
+
         Args:
             days: Кількість днів для виборки. Якщо не вказано, використовується значення з налаштувань
         """
@@ -126,13 +127,28 @@ class Application:
         self.initialize()
         self._running = True
         print("Застосунок запущено")
-        
-        # Отримання та збереження аукціонів про нерухомість (ProZorro)
-        self.fetch_real_estate_auctions(
+
+        # Єдиний pipeline: raw → main + LLM для обраних → аналітика (без LLM на етапі збору сирих даних)
+        result = run_full_pipeline(
+            settings=self.settings,
+            sources=["olx", "prozorro"],
             days=days,
         )
-        # Оновлення оголошень OLX: нежитлова нерухомість + земельні ділянки
-        self.run_olx_data_update()
+        if result.get("phase1"):
+            p1 = result["phase1"]
+            if p1.get("olx"):
+                print(f"✓ OLX raw: {p1['olx'].get('total_listings', 0)} оголошень, {len(p1['olx'].get('loaded_urls') or [])} завантажено/оновлено")
+            if p1.get("prozorro"):
+                print(f"✓ ProZorro raw: {p1['prozorro'].get('count', 0)} аукціонів")
+        if result.get("phase2"):
+            p2 = result["phase2"]
+            print(f"✓ Phase 2: OLX LLM — {p2.get('olx_llm_processed', 0)}, ProZorro LLM — {p2.get('prozorro_llm_processed', 0)}")
+
+        try:
+            from business.services.domain_cache_service import invalidate_domain_caches
+            invalidate_domain_caches(["olx", "prozorro"])
+        except Exception as e:
+            print(f"  Попередження: інвалідація кешів — {e}")
 
     def fetch_real_estate_auctions(
         self,
@@ -147,9 +163,34 @@ class Application:
         if not self.prozorro_service:
             print("Помилка: сервіс ProZorro не ініціалізовано")
             return
-        
+
+        # Простий прогрес у терміналі для LLM-обробки ProZorro
+        start_ts = time.time()
+        last_print_ts = 0.0
+
+        def _cli_progress(p: dict) -> None:
+            nonlocal last_print_ts
+            now = time.time()
+            # Обмежуємося оновленням раз на ~1 сек, щоб не засмічувати вивід
+            if now - last_print_ts < 1.0:
+                return
+            last_print_ts = now
+            current = p.get("current") or 0
+            total = p.get("total") or 0
+            msg = p.get("message") or ""
+            elapsed = now - start_ts
+            rate_txt = ""
+            if elapsed > 1 and current > 0:
+                per_min = current / (elapsed / 60.0)
+                rate_txt = f" | ~{per_min:.1f} об/хв"
+            if total:
+                print(f"[ProZorro LLM] {current}/{total}{rate_txt} — {msg}", flush=True)
+            else:
+                print(f"[ProZorro LLM] {msg}", flush=True)
+
         result = self.prozorro_service.fetch_and_save_real_estate_auctions(
             days=days,
+            progress_callback=_cli_progress,
         )
         if result['success']:
             print(f"✓ {result['message']}")
@@ -169,24 +210,21 @@ class Application:
             print(f"✗ Помилка: {result['message']}")
 
     def run_olx_data_update(self, days: int = None) -> None:
-        """Оновлює оголошення OLX (нежитлова нерухомість + земельні ділянки). days=1 або 7 — зупинка по даті (минула добу/тиждень); None — обмеження лише max_pages."""
+        """Оновлює оголошення OLX через pipeline raw → LLM (Phase 1 без LLM). days=1 або 7 — зупинка по даті."""
         try:
-            result = run_olx_update(settings=self.settings, days=days)
-            if result.get("success"):
-                print(f"✓ OLX: оброблено {result.get('total_listings', 0)} оголошень, "
-                      f"завантажено деталей: {result.get('total_detail_fetches', 0)}")
-                try:
-                    from business.services.collection_knowledge_service import refresh_knowledge_after_sources
-                    refresh_knowledge_after_sources(["olx"])
-                except Exception as e:
-                    print(f"  Попередження: оновлення знань про колекції — {e}")
-                try:
-                    from business.services.domain_cache_service import invalidate_domain_caches
-                    invalidate_domain_caches(["olx"])
-                except Exception as e:
-                    print(f"  Попередження: інвалідація кешів домен-шару — {e}")
-            else:
-                print("✗ OLX: помилка оновлення")
+            result = run_full_pipeline(
+                settings=self.settings,
+                sources=["olx"],
+                days=days or 1,
+            )
+            p1 = result.get("phase1", {}).get("olx", {})
+            p2 = result.get("phase2", {})
+            print(f"✓ OLX: raw {p1.get('total_listings', 0)} огол., LLM оброблено: {p2.get('olx_llm_processed', 0)}")
+            try:
+                from business.services.domain_cache_service import invalidate_domain_caches
+                invalidate_domain_caches(["olx"])
+            except Exception as e:
+                print(f"  Попередження: інвалідація кешів — {e}")
         except Exception as e:
             print(f"✗ OLX: {e}")
 
@@ -204,14 +242,12 @@ class Application:
             if not self._running:
                 break
             try:
-                logger.info("Фонове оновлення даних: старт (минула добу)")
-                self.fetch_real_estate_auctions(days=1)
-                self.run_olx_data_update(days=1)
-                try:
-                    from business.services.collection_knowledge_service import refresh_knowledge_after_sources
-                    refresh_knowledge_after_sources(["prozorro", "olx"])
-                except Exception as e:
-                    logger.debug("Оновлення знань про колекції після фонового оновлення: %s", e)
+                logger.info("Фонове оновлення даних: старт (минула добу, pipeline raw → LLM)")
+                run_full_pipeline(
+                    settings=self.settings,
+                    sources=["olx", "prozorro"],
+                    days=1,
+                )
                 try:
                     from business.services.domain_cache_service import invalidate_domain_caches
                     invalidate_domain_caches(["prozorro", "olx"])

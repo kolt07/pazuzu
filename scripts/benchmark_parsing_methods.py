@@ -142,8 +142,11 @@ def _run_llm(
     try:
         settings = Settings()
         if provider_name == "ollama":
-            settings.llm_provider = "ollama"
-            settings.llm_model_name = ollama_model
+            settings.llm_parsing_provider = "ollama"
+            settings.llm_parsing_model_name = ollama_model
+        elif provider_name == "gemini":
+            settings.llm_parsing_provider = "gemini"
+            settings.llm_parsing_model_name = getattr(settings, "llm_assistant_model_name", "gemini-2.5-flash")
         llm = LLMService(settings)
         result = llm.parse_auction_description(description)
         if use_cache and provider_name == "gemini":

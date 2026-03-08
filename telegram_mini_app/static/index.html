@@ -48,9 +48,15 @@
             </div>
           </section>
         </div>
-      <div id="screen-admin" class="hidden">
+        <div id="screen-admin" class="hidden">
         <h2>Адміністрування</h2>
-        <div class="admin-block">
+        <nav class="admin-subtabs" role="tablist" aria-label="Розділи адміністрування">
+          <button type="button" class="admin-subtab active" data-tab="overview" role="tab" aria-selected="true">Огляд</button>
+          <button type="button" class="admin-subtab" data-tab="data" role="tab" aria-selected="false">Дані та аналітика</button>
+          <button type="button" class="admin-subtab" data-tab="cadastral" role="tab" aria-selected="false">Кадастр</button>
+          <button type="button" class="admin-subtab" data-tab="config" role="tab" aria-selected="false">Конфігурація</button>
+        </nav>
+        <div class="admin-block" data-admin-tab="overview">
           <h3>Використання API</h3>
           <p class="admin-hint">Запити LLM та виклики Google Geocoding по днях, загальна кількість та за останній місяць.</p>
           <div id="admin-usage-stats-summary" class="admin-usage-summary"></div>
@@ -65,7 +71,7 @@
             </div>
           </div>
         </div>
-        <div class="admin-block">
+        <div class="admin-block" data-admin-tab="overview">
           <h3>Додати користувача / адміністратора</h3>
           <input type="number" id="admin-add-user-id" placeholder="Telegram ID" />
           <input type="text" id="admin-add-nickname" placeholder="Псевдонім" />
@@ -75,14 +81,18 @@
           </select>
           <button type="button" id="admin-add-btn" class="btn">Додати</button>
         </div>
-        <div class="admin-block">
+        <div class="admin-block" data-admin-tab="overview">
           <h3>Заблокувати користувача</h3>
           <input type="number" id="admin-block-user-id" placeholder="Telegram ID" />
           <button type="button" id="admin-block-btn" class="btn btn-danger">Заблокувати</button>
         </div>
-        <div class="admin-block">
+        <div class="admin-block" data-admin-tab="data">
           <h3>Оновлення даних</h3>
           <p class="admin-hint">Запустити оновлення з ProZorro та OLX. Прогрес відображається нижче.</p>
+          <div class="filter-group">
+            <label><input type="checkbox" id="admin-data-update-use-browser-olx" /> OLX через браузер (клікер)</label>
+            <span class="admin-hint"> Увімкнути для цього запуску — отримання сторінок через Playwright замість HTTP. Спрацьовує для будь-якого оновлення з OLX (у т.ч. точкове).</span>
+          </div>
           <div class="admin-data-update-actions">
             <button type="button" id="admin-data-update-1" class="btn" data-days="1">Оновити за 1 день</button>
             <button type="button" id="admin-data-update-7" class="btn" data-days="7">Оновити за 7 днів</button>
@@ -90,9 +100,66 @@
             <button type="button" id="admin-data-update-full-olx" class="btn btn-primary" data-mode="full_olx">Оновити OLX повністю</button>
             <button type="button" id="admin-data-update-full-prozorro" class="btn btn-primary" data-mode="full_prozorro">Оновити ProZorro повністю</button>
           </div>
+          <div class="admin-block admin-collapsible" style="margin-top: 1rem;">
+            <h4 class="admin-collapsible-header">
+              <button type="button" class="btn-toggle admin-collapsible-toggle" id="admin-targeted-update-toggle" aria-expanded="false">▼</button>
+              Точкове оновлення (по джерелах, областях, типах)
+            </h4>
+            <div id="admin-targeted-update-content" class="admin-collapsible-content collapsed">
+              <p class="admin-hint">Оберіть джерело, області та/або типи оголошень — оновлення виконається лише для обраного. Якщо області/типи не обрані — оновлюються всі.</p>
+              <div class="filter-group">
+                <label>Джерело:</label>
+                <select id="admin-targeted-source" class="filter-select">
+                  <option value="both">OLX + ProZorro</option>
+                  <option value="olx">Тільки OLX</option>
+                  <option value="prozorro">Тільки ProZorro</option>
+                </select>
+              </div>
+              <div class="filter-group">
+                <label>Період (дні):</label>
+                <select id="admin-targeted-days" class="filter-select">
+                  <option value="1">1 день</option>
+                  <option value="7" selected>7 днів</option>
+                  <option value="30">30 днів</option>
+                </select>
+              </div>
+              <div class="filter-group">
+                <label>Області (опційно):</label>
+                <div id="admin-targeted-regions" class="admin-targeted-checkbox-group"></div>
+              </div>
+              <div class="filter-group">
+                <label>Типи оголошень OLX (опційно):</label>
+                <div id="admin-targeted-listing-types" class="admin-targeted-checkbox-group"></div>
+              </div>
+              <button type="button" id="admin-data-update-targeted" class="btn">Запустити точкове оновлення</button>
+            </div>
+          </div>
           <div id="admin-data-update-status" class="admin-data-update-status hidden"></div>
         </div>
-        <div class="admin-block">
+        <div class="admin-block" data-admin-tab="data">
+          <h3>Стан скрапера OLX</h3>
+          <p class="admin-hint">Оцінка того, наскільки повно парситься опис та параметри оголошень.</p>
+          <button type="button" id="admin-olx-scraper-health" class="btn">Перевірити стан скрапера</button>
+          <div id="admin-olx-scraper-health-status" class="admin-data-update-status hidden"></div>
+        </div>
+        <div class="admin-block" data-admin-tab="data">
+          <h3>OLX скрапер (клікер) — експеримент</h3>
+          <p class="admin-hint">Запуск браузерного скрапера: імітація користувача (Playwright), збір даних у raw_olx_listings. Не змінює основний флоу оновлення.</p>
+          <div id="admin-olx-clicker-stats" class="admin-hint" style="margin-bottom: 0.5rem;"></div>
+          <button type="button" id="admin-olx-clicker-refresh-stats" class="btn btn-ghost btn-small">Оновити результати</button>
+          <div class="filter-group">
+            <label>Сторінок пошуку:</label>
+            <input type="number" id="admin-olx-clicker-max-pages" min="1" max="10" value="3" class="filter-input" style="width: 4rem;" />
+          </div>
+          <div class="filter-group">
+            <label>Макс. оголошень для збереження:</label>
+            <input type="number" id="admin-olx-clicker-max-listings" min="5" max="100" value="30" class="filter-input" style="width: 5rem;" />
+          </div>
+          <button type="button" id="admin-olx-clicker-start" class="btn btn-primary">Запустити клікер</button>
+          <div id="admin-olx-clicker-status" class="admin-data-update-status hidden"></div>
+          <div id="admin-olx-clicker-recent" class="admin-olx-clicker-recent hidden"></div>
+        </div>
+        <div class="admin-block" data-admin-tab="cadastral">
           <h3>Скрапер кадастру</h3>
           <p class="admin-hint">Збір ділянок з kadastrova-karta.com. Center-first: спочатку Київ, потім решта України.</p>
           <div id="admin-cadastral-stats" class="admin-hint"></div>
@@ -113,19 +180,19 @@
           <div id="admin-cadastral-index-status" class="admin-data-update-status hidden"></div>
           <div id="admin-cadastral-clusters-status" class="admin-data-update-status hidden"></div>
         </div>
-        <div class="admin-block">
+        <div class="admin-block" data-admin-tab="data">
           <h3>Аналітика цін</h3>
           <p class="admin-hint">Перерахувати зведену аналітику (квартилі, середні ціни по містах). Виконується автоматично після оновлення даних.</p>
           <button type="button" id="admin-rebuild-analytics" class="btn">Перерахувати аналітику</button>
           <span id="admin-analytics-status" class="admin-hint"></span>
         </div>
-        <div class="admin-block">
+        <div class="admin-block" data-admin-tab="data">
           <h3>Обробка аномальних цін</h3>
           <p class="admin-hint">Виявлення оголошень з аномальними цінами (глобально, потім по місцевості). Результат — список для перевірки.</p>
           <button type="button" id="admin-process-anomalous-prices" class="btn">Знайти аномальні ціни</button>
           <span id="admin-anomalous-prices-status" class="admin-hint"></span>
         </div>
-        <div class="admin-block admin-collapsible">
+        <div class="admin-block admin-collapsible" data-admin-tab="data">
           <h3 class="admin-collapsible-header">
             <button type="button" class="btn-toggle admin-collapsible-toggle" id="admin-scheduler-toggle" aria-expanded="false">▼</button>
             Планувальник
@@ -168,7 +235,7 @@
             </div>
           </div>
         </div>
-        <div class="admin-block admin-collapsible">
+        <div class="admin-block admin-collapsible" data-admin-tab="data">
           <h3 class="admin-collapsible-header">
             <button type="button" class="btn-toggle admin-collapsible-toggle" id="admin-feedback-toggle" aria-expanded="false">▼</button>
             Фідбек (дизлайки)
@@ -178,13 +245,43 @@
             <div id="admin-feedback-list" class="admin-feedback-list"></div>
           </div>
         </div>
-        <div class="admin-block">
+        <div class="admin-block" data-admin-tab="config">
           <h3>ProZorro: налаштування</h3>
           <button type="button" id="admin-download-prozorro" class="btn">Отримати файл конфігурації</button>
           <input type="file" id="admin-upload-prozorro" accept=".yaml,.yml" class="hidden" />
           <button type="button" id="admin-upload-prozorro-btn" class="btn">Завантажити YAML</button>
         </div>
-        <div class="admin-block">
+        <div class="admin-block" data-admin-tab="data">
+          <h3>Області для LLM-обробки (OLX + ProZorro)</h3>
+          <p class="admin-hint">Увімкніть області, для яких потрібна обробка оголошень через LLM. Якщо область вимкнена — сирі дані зберігаються в колекцію джерела та зведену без LLM.</p>
+          <div id="admin-llm-regions-list" class="admin-llm-regions-list"></div>
+          <div class="admin-llm-regions-actions">
+            <button type="button" id="admin-llm-regions-save" class="btn btn-primary">Зберегти</button>
+          </div>
+          <div id="admin-llm-regions-status" class="admin-hint" style="margin-top: 0.5rem;"></div>
+        </div>
+        <div id="admin-llm-backfill-modal" class="modal hidden">
+          <div class="modal-content">
+            <h3>Оновити вже завантажені дані?</h3>
+            <p class="admin-hint">При включенні областей можна перезапустити обробку за обраний період.</p>
+            <div class="filter-group">
+              <label>Глибина оновлення:</label>
+              <select id="admin-llm-backfill-days" class="filter-select">
+                <option value="1">1 день</option>
+                <option value="7" selected>7 днів</option>
+                <option value="30">30 днів</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label><input type="checkbox" id="admin-llm-backfill-inactive" /> Обробляти неактивні оголошення</label>
+            </div>
+            <div class="modal-actions" style="margin-top: 1rem;">
+              <button type="button" id="admin-llm-backfill-run" class="btn btn-primary">Запустити оновлення</button>
+              <button type="button" id="admin-llm-backfill-skip" class="btn">Пропустити</button>
+            </div>
+          </div>
+        </div>
+        <div class="admin-block" data-admin-tab="config">
           <h3>Конфігурація та дані</h3>
           <p class="admin-hint">Експорт/імпорт конфігу (промпти, налаштування, схема) та даних. Конфіг застосується після перезапуску.</p>
           <div class="admin-export-actions">
@@ -323,117 +420,72 @@
       </div>
       <div id="screen-search" class="hidden">
         <p class="intro intro-search">Зведений пошук оголошень з OLX та ProZorro</p>
-        <div class="search-filters-header">
+        <nav class="search-subtabs" role="tablist" aria-label="Підвкладки пошуку">
+          <button type="button" id="search-subtab-results" class="search-subtab active" role="tab" aria-selected="true" aria-controls="search-tab-results" data-tab="results">Результати</button>
+          <button type="button" id="search-subtab-settings" class="search-subtab" role="tab" aria-selected="false" aria-controls="search-tab-settings" data-tab="settings">Фільтри та сортування</button>
+        </nav>
+        <div id="search-tab-results" class="search-tab-pane active" role="tabpanel" aria-labelledby="search-subtab-results">
+          <div class="search-results-toolbar">
+            <div class="search-filter-summary">
+              <span id="search-filter-summary-text" class="search-filter-summary-text">Рядок відборів не задано</span>
+              <button type="button" id="search-run-from-results" class="btn btn-primary">Шукати</button>
+              <button type="button" id="search-open-settings-tab" class="btn btn-ghost">Налаштування фільтрів</button>
+            </div>
+            <div class="search-sort-summary">
+              <span id="search-sort-summary-text" class="search-sort-summary-text">За датою, новіші</span>
+              <button type="button" id="search-edit-sort-tab" class="btn btn-ghost btn-small">Змінити</button>
+            </div>
+            <div class="search-actions-row">
+              <button type="button" id="search-save-to-file" class="btn btn-primary btn-small">У файл</button>
+              <button type="button" id="search-save-as-template" class="btn btn-secondary btn-small">Як шаблон</button>
+            </div>
+          </div>
+          <div id="search-results" class="search-results">
+            <div id="search-loading" class="hidden">Завантаження...</div>
+            <div id="search-results-count" class="search-results-count hidden"></div>
+            <div id="search-items" class="search-items"></div>
+            <div id="search-pagination" class="search-pagination"></div>
+          </div>
+        </div>
+        <div id="search-tab-settings" class="search-tab-pane" role="tabpanel" aria-labelledby="search-subtab-settings">
+          <div id="search-filters" class="search-filters search-filter-string-block">
+            <p class="search-filter-hint">Вставте рядок відборів або зберіть умови кнопкою «Створити фільтри».</p>
+            <div class="filter-group filter-string-group">
+              <label for="filter-string" class="filter-string-label">Рядок відборів</label>
+              <textarea id="filter-string" class="filter-textarea filter-string-input" rows="10" placeholder='Наприклад: "Джерело" = olx AND "Активність" = True AND geo(\'Область\' INSIDE \'Київська\')'></textarea>
+              <div class="filter-string-actions">
+                <button type="button" id="search-by-filter-string" class="btn btn-primary">Шукати</button>
+                <button type="button" id="search-build-filters" class="btn btn-secondary">Створити фільтри</button>
+                <button type="button" id="search-clear-filter-string" class="btn btn-ghost">Очистити</button>
+              </div>
+              <span id="filter-string-error" class="filter-string-error hidden" role="alert"></span>
+            </div>
+          </div>
+          <div class="search-controls-row search-settings-controls">
+            <div class="search-sort-header">
+              <label>Сортування:</label>
+              <select id="search-sort-field" class="filter-select">
+                <option value="source_updated_at">За датою</option>
+                <option value="price">За ціною</option>
+                <option value="title">За назвою</option>
+              </select>
+              <select id="search-sort-order" class="filter-select">
+                <option value="desc">Новіші</option>
+                <option value="asc">Старіші</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="filter-builder-modal" class="modal-overlay hidden">
+        <div class="modal-content modal-filter-builder">
           <h3>Фільтри</h3>
-          <button type="button" id="search-filters-toggle" class="btn-toggle">▼</button>
-        </div>
-        <div id="search-filters" class="search-filters search-filters-compact">
-          <div class="filter-group">
-            <label>Джерело:</label>
-            <select id="filter-source" class="filter-select">
-              <option value="">Всі (OLX + ProZorro)</option>
-              <option value="olx" selected>OLX</option>
-              <option value="prozorro">ProZorro</option>
-            </select>
+          <p class="modal-hint">Дерево умов: рядки — елементи або гео, гілки — групи І/АБО.</p>
+          <div id="filter-builder-tree" class="filter-tree"></div>
+          <div class="modal-actions">
+            <button type="button" id="filter-builder-insert" class="btn btn-primary">Вставити рядок</button>
+            <button type="button" id="filter-builder-cancel" class="btn btn-secondary">Скасувати</button>
           </div>
-          <div class="filter-group">
-            <label>Період:</label>
-            <select id="filter-date" class="filter-select">
-              <option value="">Всі</option>
-              <option value="1">За добу</option>
-              <option value="7">За тиждень</option>
-              <option value="30">За 30 днів</option>
-            </select>
-          </div>
-          <div class="filter-group">
-            <label>Регіон:</label>
-            <div class="filter-input-wrapper">
-              <input type="text" id="filter-region" class="filter-input" placeholder="Область або м. Київ..." />
-              <div id="filter-region-dropdown" class="filter-dropdown hidden"></div>
-            </div>
-          </div>
-          <div class="filter-group">
-            <label>Місто:</label>
-            <div class="filter-input-wrapper">
-              <input type="text" id="filter-city" class="filter-input" placeholder="Місто..." />
-              <div id="filter-city-dropdown" class="filter-dropdown hidden"></div>
-            </div>
-          </div>
-          <div class="filter-group">
-            <label>Тип:</label>
-            <select id="filter-property-type" class="filter-select">
-              <option value="kommercheska_ta_zd" selected>Комерційна нерухомість та ЗД</option>
-              <option value="">Всі</option>
-              <option value="neruhomist">Нерухомість</option>
-              <option value="zemelna_dilyanka">ЗД</option>
-              <option value="zemelna_dilyanka_z_neruhomistyu">ЗД+нерухомість</option>
-              <option value="inshe">інше</option>
-            </select>
-          </div>
-          <div class="filter-group filter-inline">
-            <label>Ціна:</label>
-            <div class="filter-inline-row">
-              <select id="filter-price-op" class="filter-select filter-select-narrow">
-                <option value="">--</option>
-                <option value="eq">=</option>
-                <option value="gte">≥</option>
-                <option value="lte">≤</option>
-              </select>
-              <input type="number" id="filter-price-value" class="filter-input filter-input-narrow" placeholder="0" min="0" step="0.01" />
-            </div>
-          </div>
-          <div class="filter-group filter-inline">
-            <label>Площа (м²):</label>
-            <div class="filter-inline-row">
-              <select id="filter-building-area-op" class="filter-select filter-select-narrow">
-                <option value="">--</option>
-                <option value="eq">=</option>
-                <option value="gte">≥</option>
-                <option value="lte">≤</option>
-              </select>
-              <input type="number" id="filter-building-area-value" class="filter-input filter-input-narrow" placeholder="0" min="0" step="0.01" />
-            </div>
-          </div>
-          <div class="filter-group filter-inline">
-            <label>Площа (га):</label>
-            <div class="filter-inline-row">
-              <select id="filter-land-area-op" class="filter-select filter-select-narrow">
-                <option value="">--</option>
-                <option value="eq">=</option>
-                <option value="gte">≥</option>
-                <option value="lte">≤</option>
-              </select>
-              <input type="number" id="filter-land-area-value" class="filter-input filter-input-narrow" placeholder="0" min="0" step="0.01" />
-            </div>
-          </div>
-          <div class="filter-group filter-actions">
-            <button type="button" id="search-apply-filters" class="btn btn-primary btn-small">Застосувати</button>
-            <button type="button" id="search-clear-filters" class="btn btn-secondary btn-small">Очистити</button>
-          </div>
-        </div>
-        <div class="search-controls-row">
-          <div class="search-sort-header">
-            <label>Сортування:</label>
-            <select id="search-sort-field" class="filter-select">
-              <option value="source_updated_at">За датою</option>
-              <option value="price">За ціною</option>
-              <option value="title">За назвою</option>
-            </select>
-            <select id="search-sort-order" class="filter-select">
-              <option value="desc">Новіші</option>
-              <option value="asc">Старіші</option>
-            </select>
-          </div>
-          <div class="search-actions-row">
-            <button type="button" id="search-save-to-file" class="btn btn-primary btn-small">У файл</button>
-            <button type="button" id="search-save-as-template" class="btn btn-secondary btn-small">Як шаблон</button>
-          </div>
-        </div>
-        <div id="search-results" class="search-results">
-          <div id="search-loading" class="hidden">Завантаження...</div>
-          <div id="search-results-count" class="search-results-count hidden"></div>
-          <div id="search-items" class="search-items"></div>
-          <div id="search-pagination" class="search-pagination"></div>
         </div>
       </div>
       <div id="screen-detail" class="hidden">

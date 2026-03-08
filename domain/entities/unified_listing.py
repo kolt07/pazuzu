@@ -74,14 +74,28 @@ class UnifiedListing(BaseEntity):
         return addresses[0] if addresses else None
 
     def get_region(self) -> Optional[str]:
-        """Область з першої адреси."""
+        """Область (root або з першої адреси)."""
+        v = self.get_property("region")
+        if v:
+            return v
         addr = self.get_first_address()
         return addr.get("region") if isinstance(addr, dict) else None
 
     def get_settlement(self) -> Optional[str]:
-        """Населений пункт з першої адреси."""
+        """Місто/населений пункт (root city або з першої адреси)."""
+        v = self.get_property("city")
+        if v:
+            return v
         addr = self.get_first_address()
         return addr.get("settlement") if isinstance(addr, dict) else None
+
+    def get_oblast_raion(self) -> Optional[str]:
+        """Район області (root)."""
+        return self.get_property("oblast_raion")
+
+    def get_city_district(self) -> Optional[str]:
+        """Район міста (root, для великих міст)."""
+        return self.get_property("city_district")
 
     def get_cadastral_numbers(self) -> List[str]:
         """Масив кадастрових номерів."""
@@ -95,10 +109,29 @@ class UnifiedListing(BaseEntity):
         return float(val) if val is not None else None
 
     @property
-    def land_area_ha(self) -> Optional[float]:
-        """Площа земельної ділянки (га)."""
-        val = self.get_property("land_area_ha")
+    def land_area_sqm(self) -> Optional[float]:
+        """Площа земельної ділянки в м². Для відображення в сотках: land_area_sqm / 100."""
+        val = self.get_property("land_area_sqm")
         return float(val) if val is not None else None
+
+    @property
+    def land_area_sotky(self) -> Optional[float]:
+        """Площа земельної ділянки в сотках (для відображення). 1 сотка = 100 м²."""
+        sqm = self.land_area_sqm
+        if sqm is None or sqm <= 0:
+            return None
+        return sqm / 100.0
+
+    @property
+    def price_per_sotka_uah(self) -> Optional[float]:
+        """Ціна за сотку в гривнях (для відображення землі). price_per_ha_uah / 100."""
+        ha = self.get_property("price_per_ha_uah")
+        if ha is None:
+            return None
+        try:
+            return float(ha) / 100.0
+        except (TypeError, ValueError):
+            return None
 
     @property
     def price_uah(self) -> Optional[float]:
@@ -150,6 +183,8 @@ class UnifiedListing(BaseEntity):
                 p.append(addr["settlement"])
             if addr.get("district"):
                 p.append(addr["district"])
+            if addr.get("city_district"):
+                p.append(addr["city_district"])
             if addr.get("street"):
                 p.append(addr["street"])
             if addr.get("building"):
@@ -171,7 +206,7 @@ class UnifiedListing(BaseEntity):
             "status",
             "property_type",
             "building_area_sqm",
-            "land_area_ha",
+            "land_area_sqm",
             "title",
             "description",
             "page_url",

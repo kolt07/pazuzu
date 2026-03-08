@@ -7,8 +7,10 @@
 
 - **Один запит за раз** — без паралельних/конкурентних запитів.
 - **Затримка перед запитом** — 2–5 с (випадкова), налаштовується через `OLX_SCRAPER_DELAY_MIN`, `OLX_SCRAPER_DELAY_MAX`.
-- **Заголовки як у браузера** — User-Agent (Chrome), Accept-Language: uk, Accept тощо.
-- **Таймаут** — один запит не довше 25 с (`OLX_SCRAPER_TIMEOUT`).
+- **Заголовки як у браузера** — User-Agent (Chrome), Accept-Language: uk, Sec-Ch-Ua тощо.
+- **Таймаут** — запит пошуку до 25 с (`OLX_SCRAPER_TIMEOUT`); сторінка оголошення — до 45 с (`OLX_SCRAPER_DETAIL_TIMEOUT`).
+- **Підміна куків** — опційно куки з браузера через `OLX_SCRAPER_COOKIES` (JSON) або `OLX_SCRAPER_COOKIES_FILE`.
+- **Виявлення антиботу** — на сторінці шукаються ознаки капчі/Cloudflare/перевірки; при виявленні — одна повторна спроба через 8 с.
 
 ## Запуск
 
@@ -48,6 +50,9 @@ py scripts/olx_scraper/run_prototype.py
 | `OLX_SCRAPER_OUTPUT_DIR` | Каталог виводу | `output` |
 | `OLX_SCRAPER_OUTPUT_FILE` | Ім’я файлу JSON | `olx_nedvizhimost_page1.json` |
 | `OLX_SCRAPER_DELAY_DETAIL_MIN` / `OLX_SCRAPER_DELAY_DETAIL_MAX` | Затримка перед запитом сторінки оголошення (с) | 2, 10 |
+| `OLX_SCRAPER_DETAIL_TIMEOUT` | Таймаут запиту сторінки оголошення (с) | 45 |
+| `OLX_SCRAPER_COOKIES` | JSON-рядок куків `[{"name":"...","value":"..."}]` (підміна з браузера) | — |
+| `OLX_SCRAPER_COOKIES_FILE` | Шлях до файлу з JSON куків | — |
 | `OLX_SCRAPER_MAX_PAGES` | Кількість сторінок пошуку (прототип) | 5 |
 
 ## Телефони продавця

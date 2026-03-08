@@ -85,21 +85,21 @@ class GeoFilterBuilder:
             "geo_filter_applied": True
         }
         
-        # Крок 2: Автоматичний $unwind якщо address_refs - масив
-        if address_refs_info["is_array"] and address_refs_info["has_address_refs"]:
-            unwind_path = address_refs_info["path"]
-            # MongoDB вимагає шлях з префіксом $
-            unwind_path_mongo = unwind_path if unwind_path.startswith("$") else f"${unwind_path}"
-            # Перевіряємо, чи вже є $unwind для цього шляху
-            has_unwind = any(
-                stage.get("$unwind") == unwind_path_mongo or
-                stage.get("$unwind") == unwind_path or
-                (isinstance(stage.get("$unwind"), dict) and stage["$unwind"].get("path") in (unwind_path, unwind_path_mongo))
-                for stage in pipeline
-            )
-            if not has_unwind:
-                pipeline.insert(0, {"$unwind": unwind_path_mongo})
-                logger.info("GeoFilterBuilder: Додано $unwind для %s", unwind_path_mongo)
+        # Крок 2: $unwind тільки якщо не використовуємо root geo
+        # unified_listings має root region, city — без $unwind
+        if not SourceFieldMapper.uses_root_geo(collection):
+            if address_refs_info["is_array"] and address_refs_info["has_address_refs"]:
+                unwind_path = address_refs_info["path"]
+                unwind_path_mongo = unwind_path if unwind_path.startswith("$") else f"${unwind_path}"
+                has_unwind = any(
+                    stage.get("$unwind") == unwind_path_mongo or
+                    stage.get("$unwind") == unwind_path or
+                    (isinstance(stage.get("$unwind"), dict) and stage["$unwind"].get("path") in (unwind_path, unwind_path_mongo))
+                    for stage in pipeline
+                )
+                if not has_unwind:
+                    pipeline.insert(0, {"$unwind": unwind_path_mongo})
+                    logger.info("GeoFilterBuilder: Додано $unwind для %s", unwind_path_mongo)
         
         # Крок 3: Будуємо фільтр з regex
         match_filter = self._build_regex_filter(
@@ -169,12 +169,13 @@ class GeoFilterBuilder:
                 "path": str  # Шлях до масиву адрес
             }
         """
-        # unified_listings використовує addresses, не address_refs
+        # unified_listings: root geo (region, city) — без $unwind
         if collection == "unified_listings":
             return {
                 "has_address_refs": True,
-                "is_array": True,
-                "path": "addresses"
+                "is_array": False,
+                "path": "",
+                "use_root_geo": True,
             }
         
         # Отримуємо шлях до address_refs через SourceFieldMapper
@@ -234,24 +235,18 @@ class GeoFilterBuilder:
         # Якщо є і city, і region - це означає OR (або місто, або область)
         or_conditions = []
         
-        # Умови для міста. Після $unwind шлях—прямий (addresses.settlement), не $elemMatch
+        # Умови для міста
+        prefix = f"{refs_path}." if refs_path else ""
         if city_variants:
             for variant in city_variants:
                 regex_pattern = self._build_regex_pattern(variant)
-                if address_refs_info["is_array"]:
-                    or_conditions.append({
-                        f"{refs_path}.{city_key}": {
-                            "$regex": regex_pattern,
-                            "$options": "i"
-                        }
-                    })
-                else:
-                    or_conditions.append({
-                        f"{refs_path}.{city_key}": {
-                            "$regex": regex_pattern,
-                            "$options": "i"
-                        }
-                    })
+                field_path = f"{prefix}{city_key}" if prefix else city_key
+                or_conditions.append({
+                    field_path: {
+                        "$regex": regex_pattern,
+                        "$options": "i"
+                    }
+                })
                 
                 # Fallback поля (unified_listings не має fallback)
                 city_fallback = SourceFieldMapper.get_city_fallback_field(collection)
@@ -285,24 +280,17 @@ class GeoFilterBuilder:
                             }
                         })
         
-        # Умови для регіону. Після $unwind шлях—прямий (addresses.region), не $elemMatch
+        # Умови для регіону
         if region_variants:
             for variant in region_variants:
                 regex_pattern = self._build_regex_pattern(variant)
-                if address_refs_info["is_array"]:
-                    or_conditions.append({
-                        f"{refs_path}.{region_key}": {
-                            "$regex": regex_pattern,
-                            "$options": "i"
-                        }
-                    })
-                else:
-                    or_conditions.append({
-                        f"{refs_path}.{region_key}": {
-                            "$regex": regex_pattern,
-                            "$options": "i"
-                        }
-                    })
+                field_path = f"{prefix}{region_key}" if prefix else region_key
+                or_conditions.append({
+                    field_path: {
+                        "$regex": regex_pattern,
+                        "$options": "i"
+                    }
+                })
                 
                 # Fallback поля (unified_listings не має fallback)
                 region_fallback = SourceFieldMapper.get_region_fallback_field(collection)

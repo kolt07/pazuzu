@@ -161,20 +161,20 @@ class AgentTestRunnerService:
         try:
             from langchain_core.messages import HumanMessage
             response_preview = (response_text or "")[:2500]
-            prompt = f"""Тобі необхідно оцінити, чи відповідь помічника була успішною, і повернути JSON з полями success та reason.
+            prompt = f"""Evaluate whether the assistant's response was successful and return JSON with fields success and reason.
 
-## Запит користувача: «{user_query}»
+## User query: «{user_query}»
 
-## Відповідь помічника (фрагмент):
+## Assistant response (excerpt):
 «««
 {response_preview}
 »»»
 
-## Факти з бази даних: за вказаний період у БД є {total_expected} записів (по колекціях: {expected_counts}). Тип очікуваної відповіді: {verification_type}. Файлів у відповіді: {file_count}.
+## Facts from DB: for the given period there are {total_expected} records (by collections: {expected_counts}). Expected response type: {verification_type}. Files in response: {file_count}.
 
-## Закріплення завдання:
-Визнач, чи була відповідь помічника успішною (чи помічник реально використав дані або коректно пояснив результат). Поверни ТІЛЬКИ один JSON-об'єкт без markdown та без іншого тексту:
-{{"success": true або false, "reason": "одне коротке речення українською"}}"""
+## Task:
+Decide if the assistant's response was successful (whether the assistant actually used the data or correctly explained the result). Return ONLY one JSON object, no markdown, no other text. The "reason" value must be one short sentence in Ukrainian:
+{{"success": true or false, "reason": "одне коротке речення українською"}}"""
 
             response = llm.invoke([HumanMessage(content=prompt)])
             text = getattr(response, "content", "") or str(response)
@@ -199,31 +199,26 @@ class AgentTestRunnerService:
             from business.services.langchain_agent_service import LangChainAgentService
             lc = LangChainAgentService(self.settings)
             llm = lc._get_llm()
-            prompt = """Тобі необхідно згенерувати рівно 5 тест-кейсів для перевірки LLM-помічника, що працює з даними ProZorro (аукціони) та OLX (оголошення), у форматі JSON.
+            prompt = """Generate exactly 5 test cases to verify the LLM assistant that works with ProZorro (auctions) and OLX (listings) data. Return JSON. Each user_query in the JSON must be a natural query in Ukrainian as a user would say it.
 
-Складність: від простої виборки з одним фільтром (наприклад «за останню добу») до складних агрегацій.
+Complexity: from simple selection with one filter (e.g. "last day") to complex aggregations.
 
-## Закріплення завдання:
-Поверни ТІЛЬКИ один JSON-об'єкт без markdown та без пояснень, у такому форматі:
+## Task:
+Return ONLY one JSON object, no markdown, no explanations. Format:
 {
   "cases": [
     {
-      "id": "унікальний_ідентифікатор",
-      "user_query": "Текст запиту українською, як би сказав користувач",
+      "id": "unique_id",
+      "user_query": "Natural query in Ukrainian as a user would say",
       "complexity": "low" | "medium" | "high",
       "verification_type": "count_in_text" | "report_with_files" | "aggregation_or_text" | "no_export",
-      "expected_collections": ["unified_listings"] або ["prozorro_auctions"] або ["olx_listings"] або кілька або [],
-      "expected_period_days": 1 або 7 або null
+      "expected_collections": ["unified_listings"] or ["prozorro_auctions"] or ["olx_listings"] or several or [],
+      "expected_period_days": 1 or 7 or null
     }
   ]
 }
 
-Умови:
-- id — короткий латиницею (наприклад simple_count_day, report_week).
-- user_query — один природний запит українською.
-- verification_type: count_in_text — очікуємо число в тексті відповіді; report_with_files — очікуємо файли звіту; aggregation_or_text — агрегація або текст з числами; no_export — без вибірки/експорту.
-- expected_collections — unified_listings (основне джерело), prozorro_auctions, olx_listings або комбінація, якщо запит стосується даних.
-- Рівно 5 елементів у cases."""
+Rules: id — short Latin (e.g. simple_count_day, report_week). user_query — one natural query in Ukrainian. verification_type: count_in_text — expect a number in the reply; report_with_files — expect report files; aggregation_or_text — aggregation or text with numbers; no_export — no selection/export. expected_collections — unified_listings, prozorro_auctions, olx_listings or combination. Exactly 5 elements in cases."""
 
             response = llm.invoke([HumanMessage(content=prompt)])
             text = getattr(response, "content", "") or str(response)

@@ -152,7 +152,9 @@ class MultiAgentService:
             return f"Запит занадто довгий (макс. {max_len} символів). Скоротьте його."
         if not user_id:
             return None
-        limit = getattr(self.settings, "rate_limit_requests_per_minute", 30)
+        limit = getattr(self.settings, "rate_limit_requests_per_minute", 0)
+        if limit <= 0:
+            return None
         now = time.time()
         with self._rate_limit_lock:
             q = self._rate_limit_timestamps.get(user_id)
@@ -165,6 +167,114 @@ class MultiAgentService:
                 return f"Забагато запитів за хвилину (ліміт {limit}). Зачекайте, будь ласка."
             q.append(now)
         return None
+
+    def _try_analytics_extracts(
+        self,
+        user_query: str,
+        intent_info: Dict[str, Any],
+        request_id: str,
+        status_callback: Optional[Callable[[str], None]],
+    ) -> Optional[str]:
+        """
+        Для запитів «середня вартість/ціна за кв. м.» з містом та опціонально районом —
+        використовує analytics_extracts_aggregate (ціни вже в UAH).
+        """
+        if intent_info.get("response_format") not in ("analytical_text", "text_answer"):
+            return None
+        q = (user_query or "").strip().lower()
+        is_avg_price_sqm = any(
+            p in q for p in ["середня вартість", "середня ціна", "ціна за кв", "ціна за м²", "ціна за м2"]
+        )
+        if not is_avg_price_sqm:
+            return None
+
+        # Визначаємо місто (враховуємо родові відмінки: "районі Києва", "у Львові")
+        city = None
+        if "києві" in q or "київ" in q or "києва" in q:
+            city = "Київ"
+        elif "львові" in q or "львів" in q or "львова" in q:
+            city = "Львів"
+        elif "харкові" in q or "харків" in q or "харкова" in q:
+            city = "Харків"
+        elif "одесі" in q or "одеса" in q or "одеси" in q:
+            city = "Одеса"
+        elif "дніпрі" in q or "дніпро" in q or "дніпра" in q:
+            city = "Дніпро"
+        if not city:
+            return None
+
+        # Район (поки лише для Києва)
+        district_normalized = None
+        if city == "Київ":
+            from utils.district_normalizer import extract_district_from_query, get_district_filter_value
+            district_normalized = extract_district_from_query(user_query, city)
+
+        if status_callback:
+            try:
+                status_callback("Аналітика з виокремлених даних...")
+            except Exception:
+                pass
+
+        try:
+            filters = {"city": city}
+            if district_normalized:
+                filters["city_district"] = get_district_filter_value(district_normalized)
+            if "комерційн" in q:
+                filters["property_type"] = "Комерційна нерухомість"
+
+            result = self.langchain_service.run_tool(
+                "analytics_extracts_aggregate",
+                {
+                    "metric": "price_per_m2_uah",
+                    "aggregation": "avg",
+                    "group_by": [],
+                    "filters": filters,
+                    "limit": 1,
+                },
+            )
+            if not result.get("success"):
+                logger.info("[request_id=%s] analytics_extracts_aggregate: %s", request_id, result.get("error"))
+                return None
+            results = result.get("results") or []
+            # Якщо з фільтром по району немає результатів — пробуємо без району (по місту)
+            used_district_fallback = False
+            if not results and district_normalized:
+                filters_fallback = {"city": city}
+                if "комерційн" in q:
+                    filters_fallback["property_type"] = "Комерційна нерухомість"
+                result = self.langchain_service.run_tool(
+                    "analytics_extracts_aggregate",
+                    {
+                        "metric": "price_per_m2_uah",
+                        "aggregation": "avg",
+                        "group_by": [],
+                        "filters": filters_fallback,
+                        "limit": 1,
+                    },
+                )
+                results = result.get("results") or [] if result.get("success") else []
+                used_district_fallback = bool(results)
+                district_normalized = None
+            if not results:
+                return None
+            row = results[0]
+            value = row.get("value")
+            count = row.get("count", 0)
+            if value is None or count == 0:
+                return None
+
+            district_part = f" (район {district_normalized})" if district_normalized else ""
+            if used_district_fallback:
+                district_part = " (дані по району відсутні, наведено по місту)"
+            type_part = "комерційної нерухомості" if "комерційн" in q else "нерухомості"
+            answer = (
+                f"Середня вартість {type_part} за кв. м. у м. {city}{district_part}: "
+                f"{float(value):,.0f} грн/м² (за {count} оголошень)."
+            )
+            return answer
+        except Exception as e:
+            logger.debug("_try_analytics_extracts: %s", e)
+            return None
 
     def _try_analytics_aggregation_by_city(
         self,
@@ -495,7 +605,10 @@ class MultiAgentService:
         except Exception as e:
             logger.debug("collection knowledge for context: %s", e)
         if listing_context and isinstance(listing_context, dict):
-            focus_parts = ["ВАЖЛИВО: Розмова ведеться про КОНКРЕТНЕ оголошення. Усі відповіді мають стосуватися саме цього об'єкта."]
+            focus_parts = [
+                "ВАЖЛИВО: Розмова ведеться про КОНКРЕТНЕ оголошення. Усі відповіді мають стосуватися саме цього об'єкта.",
+                "Користувач пише в контексті ОДНОГО оголошення. Фрази «оголошення», «в оголошенні», «це оголошення», «ділянка в оголошенні», «місцезнаходження», «розташування», «адреса» стосуються САМЕ цього оголошення. Посилання вже надано нижче — НЕ проси його.",
+            ]
             if listing_context.get("page_url"):
                 focus_parts.append(f"Посилання: {listing_context['page_url']}")
             if listing_context.get("summary"):
@@ -517,7 +630,10 @@ class MultiAgentService:
                     service_data = session.get("service_data") or {}
                     if not listing_context and service_data.get("listing_context"):
                         lc = service_data["listing_context"]
-                        focus_parts = ["ВАЖЛИВО: Розмова ведеться про КОНКРЕТНЕ оголошення. Усі відповіді мають стосуватися саме цього об'єкта."]
+                        focus_parts = [
+                            "ВАЖЛИВО: Розмова ведеться про КОНКРЕТНЕ оголошення. Усі відповіді мають стосуватися саме цього об'єкта.",
+                            "Користувач пише в контексті ОДНОГО оголошення. Фрази «оголошення», «в оголошенні», «це оголошення» стосуються САМЕ цього оголошення. Посилання вже надано — НЕ проси його.",
+                        ]
                         if lc.get("page_url"):
                             focus_parts.append(f"Посилання: {lc['page_url']}")
                         if lc.get("summary"):
@@ -927,7 +1043,10 @@ class MultiAgentService:
         effective_context = context_summary or ""
         listing_analysis_text = ""
         if listing_context and isinstance(listing_context, dict):
-            parts = ["Контекст оголошення (предзапит):"]
+            parts = [
+                "Контекст оголошення (предзапит):",
+                "Користувач пише в контексті ОДНОГО оголошення. Фрази «оголошення», «в оголошенні», «місцезнаходження», «розташування», «адреса» стосуються САМЕ цього оголошення. Посилання вже надано — НЕ проси його.",
+            ]
             if listing_context.get("page_url"):
                 parts.append(f"Посилання: {listing_context['page_url']}")
             if listing_context.get("summary"):
@@ -997,6 +1116,45 @@ class MultiAgentService:
                 self.langchain_service._current_user_id = None
                 self.langchain_service._current_chat_id = None
 
+        # listing_detail: питання про місцезнаходження/адресу/локацію КОНКРЕТНОГО оголошення — LangChain з get_listing_details + geocode_address
+        query_lower = (user_query or "").strip().lower()
+        listing_location_keywords = (
+            "місцезнаходження", "розташування", "де знаходиться", "адреса ділянки",
+            "адреса оголошення", "локація", "координати", "точне місце", "де це", "знаходження земельної", "знаходження ділянки"
+        )
+        if (
+            listing_context
+            and isinstance(listing_context, dict)
+            and any(kw in query_lower for kw in listing_location_keywords)
+        ):
+            _status("Аналіз даних оголошення...")
+            logger.info("%s Маршрутизація: запит про локацію оголошення → LangChain (route=listing_detail)", log_ctx)
+            self.langchain_service._current_request_id = request_id
+            self.langchain_service._current_user_id = user_id
+            self.langchain_service._current_chat_id = chat_id
+            try:
+                return self.langchain_service.process_query(
+                    user_query=user_query,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    listing_context=listing_context,
+                    stream_callback=stream_callback,
+                    thinking_callback=thinking_callback,
+                    reply_to_text=None,
+                    request_id=request_id,
+                    route="listing_detail",
+                )
+            finally:
+                self.langchain_service._current_request_id = None
+                self.langchain_service._current_user_id = None
+                self.langchain_service._current_chat_id = None
+
+        # Для analytical_text: спроба analytics_extracts (середня ціна за м² + місто + район)
+        analytics_result = self._try_analytics_extracts(
+            user_query, intent_info, request_id, status_callback
+        )
+        if analytics_result is not None:
+            return analytics_result
         # Для analytical_text: спроба execute_analytics для агрегації
         analytics_result = self._try_analytics_aggregation_by_city(
             user_query, intent_info, request_id, status_callback

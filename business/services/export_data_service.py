@@ -52,7 +52,7 @@ DEFAULT_FIELDS_UNIFIED = [
     "status",
     "property_type",
     "building_area_sqm",
-    "land_area_ha",
+    "land_area_sqm",
     "title",
     "description",
     "page_url",

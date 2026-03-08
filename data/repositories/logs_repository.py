@@ -64,7 +64,7 @@ class LogsRepository(BaseRepository):
         }
         
         return self.create(document)
-    
+
     def get_logs(
         self,
         event_type: Optional[str] = None,
@@ -251,3 +251,95 @@ class LogsRepository(BaseRepository):
             return list(cursor)
         except Exception:
             return []
+
+    def sum_llm_tokens_by_day(self, days: int = 60) -> List[Dict[str, Any]]:
+        """
+        Агрегація вхідних/вихідних токенів LLM (api_usage, service=llm) по днях.
+        Повертає: [{"date": "YYYY-MM-DD", "input_tokens": N, "output_tokens": M}, ...]
+        """
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            pipeline = [
+                {
+                    "$match": {
+                        "event_type": "api_usage",
+                        "metadata.service": "llm",
+                        "timestamp": {"$gte": cutoff},
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}},
+                        "input_tokens": {"$sum": {"$ifNull": ["$metadata.input_tokens", 0]}},
+                        "output_tokens": {"$sum": {"$ifNull": ["$metadata.output_tokens", 0]}},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+                {
+                    "$project": {
+                        "date": "$_id",
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "_id": 0,
+                    }
+                },
+            ]
+            cursor = self.collection.aggregate(pipeline)
+            return list(cursor)
+        except Exception:
+            return []
+
+    def sum_llm_tokens_total(self) -> Dict[str, int]:
+        """Сума вхідних та вихідних токенів LLM за всі часи. Повертає {"input_tokens": N, "output_tokens": M}."""
+        self._ensure_indexes()
+        try:
+            pipeline = [
+                {
+                    "$match": {
+                        "event_type": "api_usage",
+                        "metadata.service": "llm",
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": None,
+                        "input_tokens": {"$sum": {"$ifNull": ["$metadata.input_tokens", 0]}},
+                        "output_tokens": {"$sum": {"$ifNull": ["$metadata.output_tokens", 0]}},
+                    }
+                },
+                {"$project": {"_id": 0, "input_tokens": 1, "output_tokens": 1}},
+            ]
+            cursor = self.collection.aggregate(pipeline)
+            row = next(cursor, None)
+            return row or {"input_tokens": 0, "output_tokens": 0}
+        except Exception:
+            return {"input_tokens": 0, "output_tokens": 0}
+
+    def sum_llm_tokens_last_month(self) -> Dict[str, int]:
+        """Сума вхідних/вихідних токенів LLM за останні 30 днів."""
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            pipeline = [
+                {
+                    "$match": {
+                        "event_type": "api_usage",
+                        "metadata.service": "llm",
+                        "timestamp": {"$gte": cutoff},
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": None,
+                        "input_tokens": {"$sum": {"$ifNull": ["$metadata.input_tokens", 0]}},
+                        "output_tokens": {"$sum": {"$ifNull": ["$metadata.output_tokens", 0]}},
+                    }
+                },
+                {"$project": {"_id": 0, "input_tokens": 1, "output_tokens": 1}},
+            ]
+            cursor = self.collection.aggregate(pipeline)
+            row = next(cursor, None)
+            return row or {"input_tokens": 0, "output_tokens": 0}
+        except Exception:
+            return {"input_tokens": 0, "output_tokens": 0}

@@ -156,6 +156,28 @@ class OlxListingsRepository(BaseRepository):
         docs = list(cursor)
         return [_normalize_doc(d) for d in docs]
 
+    def find_urls_needing_llm_reprocess(self, limit: Optional[int] = None) -> List[str]:
+        """
+        Повертає URL оголошень з колекції olx_listings, у яких немає або недостатньо
+        LLM-даних (detail.llm відсутній, порожній або без корисних атрибутів).
+        Використовується для повторної обробки по повному пайплайну (LLM → unified).
+        """
+        # Оголошення без detail.llm або з порожнім llm (недооброблені)
+        cursor = self.collection.find(
+            {
+                "url": {"$exists": True, "$ne": ""},
+                "$or": [
+                    {"detail.llm": {"$exists": False}},
+                    {"detail.llm": None},
+                    {"detail.llm": {}},
+                ],
+            },
+            {"url": 1},
+        )
+        if limit is not None:
+            cursor = cursor.limit(limit)
+        return [d["url"] for d in cursor if d.get("url")]
+
     def get_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
         """
         Повертає оголошення за списком ідентифікаторів.

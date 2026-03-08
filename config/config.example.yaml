@@ -6,9 +6,9 @@
 #   confidence_threshold: 0.7   # при confidence < порогу: уточнення або fallback у LangChain
 #   ask_on_low_confidence: false # true = повернути уточнююче питання; false = fallback у вільний агент
 
-# Security layer: rate limit та max complexity
+# Security layer: rate limit та max complexity (0 = без обмежень)
 # security_layer:
-#   rate_limit_requests_per_minute: 30
+#   rate_limit_requests_per_minute: 0
 #   max_query_complexity_length: 8000
 
 # Ліміти експорту та артефактів
@@ -21,19 +21,23 @@
 
 # Налаштування LLM провайдерів
 llm:
-  # Провайдер за замовчуванням: gemini, openai, anthropic, ollama
-  # ollama — локальна LLM через Ollama (gemma3:27b), без API ключа
+  # Загальні (fallback для старих конфігів). Краще задавати assistant та parsing окремо.
   provider: gemini
-  
-  # Назва моделі:
-  # - Gemini: gemini-2.5-flash, gemini-2.5-pro, gemini-2.5-flash-lite
-  # - Ollama: gemma3:27b, gemma3:12b, llama3.2 тощо
   model_name: gemini-2.5-flash
-  
-  # Обмеження швидкості запитів
-  # Для безкоштовного тарифу Gemini ліміт 5 запитів/хвилину, тому використовуємо 4 для безпеки
+
+  # AI-асистент (діалог, tool-calling) — за замовчуванням Gemini
+  assistant:
+    provider: gemini
+    model_name: gemini-2.5-flash
+
+  # Парсинг описів оголошень (ProZorro, OLX) — за замовчуванням локальна модель через Ollama
+  parsing:
+    provider: ollama
+    model_name: gemma3:27b
+
+  # Обмеження швидкості запитів (0 = без обмежень; стосується провайдерів з API)
   rate_limit:
-    calls_per_minute: 4
+    calls_per_minute: 0
   
   # Параметри циклу агента (опційно)
   # agent:
@@ -59,6 +63,12 @@ llm:
     
     # Ollama — локальна LLM, ключ не потрібен (порожній рядок)
     ollama: ""
+
+# OLX скрапер: отримання сторінок пошуку та деталей через браузер (Playwright) замість HTTP
+# true = клікер (області обробляються послідовно); false або відсутнє = requests (паралельно)
+# Також можна задати змінною середовища OLX_SCRAPER_USE_BROWSER=1
+# olx:
+#   use_browser: false
 
 # Регламентне фонове оновлення даних (ProZorro + OLX за минулу добу)
 # Працює лише при запуску Telegram бота. Інтервал у хвилинах; 0 = вимкнено

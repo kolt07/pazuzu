@@ -20,6 +20,35 @@ if str(_PROJECT_ROOT) not in sys.path:
 # Базовий URL для абсолютних посилань
 _BASE_URL = "https://www.olx.ua"
 
+# Конфіг селекторів для сторінки деталей OLX (опис, параметри тощо).
+_OLX_SELECTORS_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "olx_detail_selectors.yaml"
+_OLX_SELECTORS_CACHE: Optional[Dict[str, Any]] = None
+
+
+def _load_olx_detail_selectors() -> Dict[str, Any]:
+    """
+    Завантажує YAML з конфігурацією селекторів для сторінки деталей OLX.
+    Повертає словник або порожній dict при помилці/відсутності файлу.
+    """
+    global _OLX_SELECTORS_CACHE
+    if _OLX_SELECTORS_CACHE is not None:
+        return _OLX_SELECTORS_CACHE
+    if not _OLX_SELECTORS_PATH.exists():
+        _OLX_SELECTORS_CACHE = {}
+        return _OLX_SELECTORS_CACHE
+    try:
+        import yaml
+
+        with open(_OLX_SELECTORS_PATH, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if isinstance(data, dict):
+            _OLX_SELECTORS_CACHE = data
+        else:
+            _OLX_SELECTORS_CACHE = {}
+    except Exception:
+        _OLX_SELECTORS_CACHE = {}
+    return _OLX_SELECTORS_CACHE
+
 
 def _format_phone(num: str) -> str:
     """Нормалізує номер: 0993316424 -> 099 331 62 44."""
@@ -321,11 +350,101 @@ def parse_listings_page(html: str, use_llm: bool = False) -> List[Dict[str, Any]
     return parse_listing_cards(html)
 
 
+def detect_antibot_page(html: str) -> Dict[str, Any]:
+    """
+    Шукає на сторінці ознаки антиботу / перевірки браузера / капчі.
+    Повертає {"is_antibot": bool, "hints": [str]} — список підказок для логу.
+    """
+    if not html or not html.strip():
+        return {"is_antibot": True, "hints": ["empty_response"]}
+    text = html.replace("\u00a0", " ").replace("\u202f", " ")
+    lower = text.lower()
+    hints: List[str] = []
+
+    # Текстові ознаки перевірки / капчі / Cloudflare
+    antibot_phrases = [
+        ("captcha", "captcha"),
+        ("cloudflare", "cloudflare"),
+        ("перевірка браузера", "browser_check"),
+        ("перевірте, що ви не робот", "robot_check"),
+        ("please wait", "please_wait"),
+        ("just a moment", "just_a_moment"),
+        ("enable javascript", "enable_js"),
+        ("увімкніть javascript", "enable_js_uk"),
+        ("ddos protection", "ddos_protection"),
+        ("checking your browser", "browser_check_en"),
+        ("ray id", "cloudflare_ray"),
+    ]
+    for phrase, key in antibot_phrases:
+        if phrase in lower:
+            hints.append(key)
+
+    # Елементи DOM, типові для сторінок перевірки
+    if "cf-browser-verification" in lower or "challenge-running" in lower:
+        hints.append("cf_challenge")
+    if re.search(r"iframe[^>]*captcha|recaptcha|hcaptcha|turnstile", lower):
+        hints.append("captcha_iframe")
+    if re.search(r"data-cy=\"(captcha|challenge|verification)", lower):
+        hints.append("data_cy_challenge")
+
+    # Сторінка дуже коротка і без контенту оголошення — можливо заглушка антиботу
+    soup = BeautifulSoup(html, "lxml")
+    body = soup.find("body")
+    if body:
+        body_text = body.get_text(separator=" ", strip=True)
+        has_ad_content = "ad_description" in html or "ad_description_content" in html or "data-cy=\"ad-price\"" in html
+        if len(body_text) < 200 and not has_ad_content:
+            if "script" in lower and ("challenge" in lower or "captcha" in lower or "cloudflare" in lower):
+                hints.append("short_page_with_script")
+            elif len(body_text) < 80:
+                hints.append("very_short_body")
+
+    return {"is_antibot": len(hints) > 0, "hints": hints}
+
+
+def is_detail_page_inactive(html: str) -> bool:
+    """
+    Визначає, чи сторінка деталей оголошення відповідає неактивному/знятому оголошенню:
+    пуста сторінка або повідомлення про неактивність.
+    Орієнтир: типові фрази OLX для знятих/незнайдених оголошень.
+    """
+    if not html or not html.strip():
+        return True
+    text = html.replace("\u00a0", " ").replace("\u202f", " ")
+    lower = text.lower()
+    # Типові ознаки неактивного оголошення на OLX
+    inactive_phrases = [
+        "оголошення неактивне",
+        "прибрано з публікації",
+        "знято з публікації",
+        "оголошення не знайдено",
+        "ми не знайшли оголошення",
+        "таке оголошення не знайдено",
+        "об'єкт не знайдено",
+        "сторінку не знайдено",
+        "404",
+    ]
+    for phrase in inactive_phrases:
+        if phrase in lower:
+            return True
+    # Дуже мало контенту — можливо порожня/помилкова сторінка
+    soup = BeautifulSoup(html, "lxml")
+    body = soup.find("body")
+    if body:
+        body_text = body.get_text(separator=" ", strip=True)
+        if len(body_text) < 100 and "data-cy=\"ad_description\"" not in html and "ad_description" not in html:
+            return True
+    return False
+
+
 def parse_detail_page(html: str) -> Dict[str, Any]:
     """
     Парсить HTML сторінки оголошення (деталі): ціна, опис, параметри.
     Повертає словник: price_text, price_value, currency, description, parameters, location, contact, fetched_at.
     """
+    if is_detail_page_inactive(html):
+        return {"_inactive": True, "fetched_at": datetime.now(timezone.utc).isoformat()}
+
     soup = BeautifulSoup(html, "lxml")
     result: Dict[str, Any] = {
         "price_text": None,
@@ -368,15 +487,56 @@ def parse_detail_page(html: str) -> Dict[str, Any]:
             elif "€" in price_text:
                 result["currency"] = "EUR"
 
-    # Опис оголошення: data-cy="ad_description" або схожий блок
-    desc_el = (
-        soup.select_one('[data-cy="ad_description"]')
-        or soup.select_one('[data-cy="ad_description_content"]')
-        or soup.find("div", {"id": re.compile(r"description|content", re.I)})
-        or soup.find("div", class_=re.compile(r"description|content|text", re.I))
-    )
-    if desc_el:
-        result["description"] = desc_el.get_text(separator="\n", strip=True) or None
+    # Опис оголошення: конфігуровані селектори + розширені data-testid, потім fallback за старою логікою
+    desc_text: Optional[str] = None
+
+    # 1) Конфіг з YAML (config/olx_detail_selectors.yaml)
+    try:
+        selectors_cfg = _load_olx_detail_selectors().get("description")  # type: ignore[union-attr]
+    except Exception:
+        selectors_cfg = None
+    selectors: List[str] = []
+    min_len = 0
+    max_len = 50000
+    if isinstance(selectors_cfg, dict):
+        selectors = list(selectors_cfg.get("selectors") or [])
+        try:
+            min_len = int(selectors_cfg.get("min_length", 0) or 0)
+        except Exception:
+            min_len = 0
+        try:
+            max_len = int(selectors_cfg.get("max_length", 50000) or 50000)
+        except Exception:
+            max_len = 50000
+
+    for css_selector in selectors:
+        try:
+            el = soup.select_one(css_selector)
+        except Exception:
+            el = None
+        if el:
+            txt = el.get_text(separator="\n", strip=True) or ""
+            if txt and len(txt) >= min_len and len(txt) <= max_len:
+                desc_text = txt
+                break
+
+    # 2) Вбудовані селектори (оновлені під актуальну розмітку OLX)
+    if desc_text is None:
+        desc_el = (
+            soup.select_one('[data-cy="ad_description"]')
+            or soup.select_one('[data-cy="ad_description_content"]')
+            or soup.select_one('[data-testid="ad-description"]')
+            or soup.select_one('[data-testid="ad_description"]')
+            or soup.select_one('[data-testid="ad-description-content"]')
+            or soup.select_one('[data-testid="ad_description_content"]')
+            or soup.find("div", {"id": re.compile(r"description|content", re.I)})
+            or soup.find("div", class_=re.compile(r"description|content|text", re.I))
+        )
+        if desc_el:
+            desc_text = desc_el.get_text(separator="\n", strip=True) or None
+
+    if desc_text:
+        result["description"] = desc_text
 
     # Параметри: пари лейбл/значення (наприклад Площа, Поверх)
     def _parse_param_item(text: str) -> Optional[Dict[str, str]]:
@@ -424,6 +584,7 @@ def parse_detail_page(html: str) -> Dict[str, Any]:
         result["parameters"] = [{"label": k, "value": v} for k, v in params_by_label.items()]
 
     # Локація (місто/область) – блок «Місцезнаходження»
+    full_text = ""
     try:
         loc_label = soup.find(string=re.compile(r"Місцезнаходження", re.I))
         if loc_label:
@@ -511,5 +672,78 @@ def parse_detail_page(html: str) -> Dict[str, Any]:
             if t and len(t) > 50 and len(t) < 50000:
                 result["description"] = t
                 break
+
+    # Додатковий fallback: парсимо повний текст сторінки.
+    if not full_text:
+        full_text = soup.get_text(separator="\n", strip=True)
+
+    # 1) Опис між заголовком "Опис" і службовими блоками (ID, контакти тощо).
+    if not result["description"] and full_text:
+        lines = [ln for ln in full_text.splitlines()]
+        start_idx = None
+        for i, ln in enumerate(lines):
+            if ln.strip().lower().startswith("опис"):
+                start_idx = i
+                break
+        if start_idx is not None:
+            tail = lines[start_idx + 1 :]
+            stop_markers = [
+                "ID:",
+                "ID ",
+                "Поскаржитися",
+                "Зв’язатися з продавцем",
+                "Зв'язатися з продавцем",
+                "Опубліковано ",
+            ]
+            stop_idx = len(tail)
+            for j, ln in enumerate(tail):
+                for m in stop_markers:
+                    if m in ln:
+                        stop_idx = min(stop_idx, j)
+                        break
+                if j >= stop_idx:
+                    break
+            body_lines = [ln.strip() for ln in tail[:stop_idx] if ln.strip()]
+            desc_text = "\n".join(body_lines).strip()
+            if desc_text and len(desc_text) > 50:
+                result["description"] = desc_text
+
+    # 2) Параметри з повного тексту (рядки "Лейбл: значення" до секції "Опис").
+    if not result["parameters"] and full_text:
+        lines = [ln.strip() for ln in full_text.splitlines()]
+        params_section: Dict[str, str] = {}
+        for ln in lines:
+            if not ln:
+                continue
+            lower_ln = ln.lower()
+            if lower_ln.startswith("опис"):
+                break
+            parsed = _parse_param_item(ln)
+            if parsed and parsed["label"]:
+                existing = params_section.get(parsed["label"])
+                if existing is None or len(parsed.get("value", "")) > len(existing):
+                    params_section[parsed["label"]] = parsed.get("value", "")
+        if params_section:
+            result["parameters"] = [{"label": k, "value": v} for k, v in params_section.items()]
+
+    # 3) Локація з повного тексту: блок після "Місцезнаходження".
+    if not result["location"] and full_text:
+        lines = [ln.strip() for ln in full_text.splitlines()]
+        loc_idx = None
+        for i, ln in enumerate(lines):
+            if re.search(r"Місцезнаходження", ln, re.I):
+                loc_idx = i
+                break
+        if loc_idx is not None:
+            tail = lines[loc_idx + 1 :]
+            city = tail[0] if len(tail) >= 1 else None
+            region = tail[1] if len(tail) >= 2 else None
+            raw = " | ".join([t for t in tail if t])
+            if city or region:
+                result["location"] = {
+                    "city": city,
+                    "region": region,
+                    "raw": raw or None,
+                }
 
     return result

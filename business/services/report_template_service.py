@@ -132,7 +132,7 @@ class ReportTemplateService:
         try:
             raw = self.llm_service.generate_text(
                 prompt,
-                system_prompt="Ти допомагаєш формувати короткі назви шаблонів звітів українською. Поверни тільки назву без лапок, максимум 6-8 слів.",
+                system_prompt="You help generate short report template names. Return only the name, no quotes, 6-8 words. The name must be in Ukrainian.",
                 temperature=0.3,
             )
             if raw and raw.strip():
@@ -178,7 +178,7 @@ class ReportTemplateService:
         elif prop_type == "zemelna_dilyanka_z_neruhomistyu":
             parts.append("ЗД з нерухомістю")
 
-        return f"Тобі необхідно згенерувати коротку назву шаблону звіту українською (максимум 6-8 слів). Параметри звіту: {', '.join(parts)}. Поверни тільки назву без лапок."
+        return f"Generate a short report template name (max 6-8 words). Report parameters: {', '.join(parts)}. Return only the name, no quotes. The name must be in Ukrainian."
 
     def _fallback_template_name(self, params: Dict[str, Any]) -> str:
         """Формує просту назву без LLM."""
