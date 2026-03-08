@@ -597,16 +597,16 @@ def parse_detail_page(html: str) -> Dict[str, Any]:
             container = loc_label.find_parent()
             if container:
                 texts = [t.strip() for t in container.stripped_strings if t.strip()]
-                # Очікуваний формат:
-                # ["Місцезнаходження", "Коломия", "Івано-Франківська область", "Переглянути розташування на карті"]
+                # Очікуваний формат: місто та область; контейнер може містити також текст віджету карти
+                # (кнопки, копірайт Google) — не зберігаємо його в raw, лише city + region.
                 if len(texts) >= 2:
                     city = texts[1] if len(texts) >= 2 else None
                     region = texts[2] if len(texts) >= 3 else None
-                    raw = " | ".join(texts[1:])
+                    raw_parts = [p for p in (city, region) if p]
                     result["location"] = {
                         "city": city,
                         "region": region,
-                        "raw": raw,
+                        "raw": ", ".join(raw_parts) if raw_parts else None,
                     }
     except Exception:
         # Не ламаємо парсинг, якщо структура сторінки інша
@@ -744,12 +744,12 @@ def parse_detail_page(html: str) -> Dict[str, Any]:
             tail = lines[loc_idx + 1 :]
             city = tail[0] if len(tail) >= 1 else None
             region = tail[1] if len(tail) >= 2 else None
-            raw = " | ".join([t for t in tail if t])
+            raw_parts = [p for p in (city, region) if p]
             if city or region:
                 result["location"] = {
                     "city": city,
                     "region": region,
-                    "raw": raw or None,
+                    "raw": ", ".join(raw_parts) if raw_parts else None,
                 }
 
     return result

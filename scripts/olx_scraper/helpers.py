@@ -15,6 +15,31 @@ def _has_region_in_text(text: str) -> bool:
     return bool(re.search(r"область|обл\.|обл\b", t))
 
 
+def _is_map_ui_or_unsafe_raw(raw: str) -> bool:
+    """
+    Чи виглядає рядок як текст віджету карти / копірайт / кнопки (не адреса).
+    Такі рядки не показувати в UI і не відправляти в Google Geocoding API.
+    """
+    if not raw or not isinstance(raw, str) or len(raw.strip()) < 10:
+        return False
+    s = raw.strip().lower()
+    markers = (
+        "перемістити",
+        "наблизити",
+        "віддалити",
+        "картографічні дані",
+        "дані карт",
+        "©",
+        "google",
+        "умови",
+        "приватність",
+        "переглянути розташування на карті",
+        "ноте",
+        "натисніть, щоб переключитись",
+    )
+    return any(m in s for m in markers)
+
+
 def _should_skip_ambiguous_short_location(short: str, existing_queries: list) -> bool:
     """
     Пропускати короткі неоднозначні топоніми (наприклад "Іванівка"), якщо вже є
@@ -104,11 +129,11 @@ def _collect_and_geocode_locations(
             seen.add(line)
             query_strings.append(line)
 
-    # 2. detail.location.raw
+    # 2. detail.location.raw — не відправляти в API текст віджету карти (кнопки, копірайт Google)
     loc = detail_data.get("location") or {}
     if isinstance(loc, dict):
         raw = (loc.get("raw") or "").strip()
-        if raw and raw not in seen:
+        if raw and raw not in seen and not _is_map_ui_or_unsafe_raw(raw):
             seen.add(raw)
             query_strings.append(raw)
 

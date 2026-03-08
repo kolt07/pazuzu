@@ -205,6 +205,7 @@ def start_data_update(
     regions: Optional[str] = Query(None, description="Точкове оновлення: області через кому (напр. Київська,Львівська)"),
     listing_types: Optional[str] = Query(None, description="Точкове оновлення OLX: типи оголошень через кому (напр. Нежитлова,Земля)"),
     use_browser_olx: Optional[str] = Query(None, description="1/true = OLX через браузер (клікер) для цього запуску"),
+    olx_phase1_max_threads: Optional[int] = Query(None, description="Кількість потоків Phase 1 OLX (пул завдань область+категорія); за замовчуванням з конфігу (5); 0 = legacy по області"),
 ):
     """
     Запускає оновлення даних. Повертає task_id для перевірки статусу.
@@ -303,6 +304,7 @@ def start_data_update(
                     regions=regions_list,
                     listing_types=listing_types_list,
                     use_browser_olx=olx_use_browser,
+                    olx_phase1_max_threads=olx_phase1_max_threads,
                 )
                 if run_prozorro:
                     result_prozorro = result.get("phase1", {}).get("prozorro", {})
@@ -356,6 +358,7 @@ def start_data_update(
                             sources=["olx"],
                             days=None if olx_full else effective_days,
                             use_browser_olx=olx_use_browser,
+                            olx_phase1_max_threads=olx_phase1_max_threads,
                         )
                         p1 = result_olx.get("phase1", {}).get("olx", {})
                         p2 = result_olx.get("phase2", {})
@@ -386,7 +389,10 @@ def start_data_update(
             _data_update_tasks[task_id]["message"] = f"Помилка: {e!s}"
 
     threading.Thread(target=run_update, daemon=True, name="DataUpdate").start()
-    return {"task_id": task_id, "status": "started", "days": days}
+    out = {"task_id": task_id, "status": "started", "days": days}
+    if olx_phase1_max_threads is not None:
+        out["olx_phase1_max_threads"] = olx_phase1_max_threads
+    return out
 
 
 @router.post("/reformat-listing")
@@ -518,6 +524,7 @@ def start_llm_processing_backfill(request: Request, body: LlmProcessingBackfillR
                 settings=settings,
                 sources=["olx", "prozorro"],
                 days=body.days,
+                olx_phase1_max_threads=None,
             )
             p1 = result.get("phase1", {})
             p2 = result.get("phase2", {})

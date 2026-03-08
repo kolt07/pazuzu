@@ -138,6 +138,7 @@ def run_full_pipeline(
     regions: Optional[List[str]] = None,
     listing_types: Optional[List[str]] = None,
     use_browser_olx: Optional[bool] = None,
+    olx_phase1_max_threads: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Запускає повний pipeline: Phase 1 (raw) → Phase 2 (promote + LLM для обраних) → Phase 3 (аналітика + гео).
@@ -150,6 +151,7 @@ def run_full_pipeline(
         regions: точкове оновлення — лише ці області (для OLX — обмеження Phase 1; для ProZorro — фільтр Phase 2 по approximate_region).
         listing_types: точкове оновлення OLX — лише категорії, чий label містить один із рядків (напр. «Нежитлова», «Земля»).
         use_browser_olx: якщо задано (True/False) — перевизначає settings.olx_use_browser для цього запуску (напр. з адмінки).
+        olx_phase1_max_threads: кількість потоків Phase 1 OLX (пул завдань область+категорія); None = з конфігу; 0 = legacy (по області).
 
     Returns:
         Словник з результатами по фазах та джерелах.
@@ -194,6 +196,7 @@ def run_full_pipeline(
             regions=regions,
             listing_types=listing_types,
             use_browser=olx_use_browser,
+            max_workers=olx_phase1_max_threads,
         )
         result["phase1"]["olx"] = r
         olx_loaded_urls = r.get("loaded_urls") or []

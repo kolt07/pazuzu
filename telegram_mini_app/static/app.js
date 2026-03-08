@@ -2599,6 +2599,11 @@
     }
     var useBrowserOlxEl = document.getElementById("admin-data-update-use-browser-olx");
     if (useBrowserOlxEl && useBrowserOlxEl.checked) params.set("use_browser_olx", "1");
+    var olxPhase1ThreadsEl = document.getElementById("admin-data-update-olx-phase1-threads");
+    if (olxPhase1ThreadsEl && olxPhase1ThreadsEl.value !== "" && olxPhase1ThreadsEl.value !== null) {
+      var v = parseInt(olxPhase1ThreadsEl.value, 10);
+      if (!isNaN(v) && v >= 0) params.set("olx_phase1_max_threads", String(v));
+    }
     var url = "/api/admin/data-update" + (params.toString() ? "?" + params.toString() : "");
     fetch(url, { method: "POST", headers: apiHeaders() })
       .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
@@ -3604,6 +3609,22 @@
   // Тимчасово приховано: аналітика рахується, але не показується в UI (недостатньо даних)
   var SHOW_ANALYTICS_UI = true;
 
+  // Детальна локація: показувати лише місто та область; не показувати raw з текстом віджету карти (Google Maps).
+  function formatDetailLocation(value) {
+    if (value == null) return "";
+    if (typeof value === "object") {
+      var city = (value.city && String(value.city).trim()) || "";
+      var region = (value.region && String(value.region).trim()) || "";
+      var parts = [];
+      if (city) parts.push("Місто: " + city);
+      if (region) parts.push("Область: " + region);
+      return parts.length ? parts.join(", ") : "";
+    }
+    var s = String(value);
+    if (s.length > 200 || /перемістити|наблизити|картографічні|©|google|умови|приватність/i.test(s)) return "";
+    return s;
+  }
+
   // Конфігурація вкладок та полів для деталей (hero показує назву, ціну, статус, локацію)
   var TAB_FIELD_CONFIG_BASE = {
     prozorro: {
@@ -3677,7 +3698,7 @@
           { path: "detail.parameters", label: "Параметри", isArray: true, arrayFormatter: function(item) {
             return formatParameterItem(item);
           }},
-          { path: "detail.location", label: "Детальна локація" },
+          { path: "detail.location", label: "Детальна локація", formatter: formatDetailLocation },
           { path: "search_data.currency", label: "Валюта" }
         ]
       },
@@ -3722,7 +3743,7 @@
         { path: "detail.parameters", label: "Параметри", priority: 12, description: "Додаткові характеристики", isArray: true, arrayFormatter: function(item) {
           return formatParameterItem(item);
         }},
-        { path: "detail.location", label: "Детальна локація", priority: 13, description: "Повна адреса" },
+        { path: "detail.location", label: "Детальна локація", priority: 13, description: "Повна адреса", formatter: formatDetailLocation },
         { path: "detail.contact", label: "Контакти", priority: 14, description: "Інформація про продавця" },
         { path: "search_data.date_text", label: "Дата публікації", priority: 15, description: "Коли опубліковано оголошення" },
         { path: "search_data.currency", label: "Валюта", priority: 16, description: "Валюта ціни" },

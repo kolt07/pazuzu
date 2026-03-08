@@ -93,6 +93,11 @@
             <label><input type="checkbox" id="admin-data-update-use-browser-olx" /> OLX через браузер (клікер)</label>
             <span class="admin-hint"> Увімкнути для цього запуску — отримання сторінок через Playwright замість HTTP. Спрацьовує для будь-якого оновлення з OLX (у т.ч. точкове).</span>
           </div>
+          <div class="filter-group">
+            <label for="admin-data-update-olx-phase1-threads">OLX Phase 1 — потоки (пул завдань область+категорія):</label>
+            <input type="number" id="admin-data-update-olx-phase1-threads" min="0" max="25" placeholder="за замовч. 5" class="filter-input" style="width: 5rem;" title="0 = legacy (по області), 1–25 = кількість потоків" />
+            <span class="admin-hint"> Порожньо = з конфігу (5). Кожен потік бере наступне завдання з пулу; коли пул порожній — Phase 2.</span>
+          </div>
           <div class="admin-data-update-actions">
             <button type="button" id="admin-data-update-1" class="btn" data-days="1">Оновити за 1 день</button>
             <button type="button" id="admin-data-update-7" class="btn" data-days="7">Оновити за 7 днів</button>

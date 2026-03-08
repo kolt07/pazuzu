@@ -63,8 +63,14 @@ if BROWSER_DETAIL_WAIT_UNTIL not in ("load", "domcontentloaded", "networkidle"):
 # перейти далі — обмеження платформи. Для більшого обсягу використовуємо пошук по областях.
 MAX_SEARCH_PAGES = int(os.getenv("OLX_SCRAPER_MAX_PAGES", "25"))
 
+# Якщо на сторінці пошуку менше оголошень — вважаємо її останньою, далі пагінацію не робимо.
+MIN_LISTINGS_PER_FULL_PAGE = int(os.getenv("OLX_SCRAPER_MIN_LISTINGS_FULL_PAGE", "15"))
+
 # Максимальна кількість областей, що обробляються паралельно (потоки). По одному потоку на область.
 MAX_PARALLEL_REGIONS = int(os.getenv("OLX_SCRAPER_MAX_PARALLEL_REGIONS", "25"))
+
+# Кількість потоків Phase 1: пул завдань (область + категорія), кожен потік бере наступне завдання з пулу; 0 = використати MAX_PARALLEL_REGIONS замість пулу.
+OLX_PHASE1_MAX_THREADS = int(os.getenv("OLX_SCRAPER_PHASE1_MAX_THREADS", "5"))
 
 # Таймаут одного запиту (секунди)
 REQUEST_TIMEOUT = int(os.getenv("OLX_SCRAPER_TIMEOUT", "25"))
