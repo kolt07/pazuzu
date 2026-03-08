@@ -51,6 +51,14 @@ DELAY_DETAIL_MAX = float(os.getenv("OLX_SCRAPER_DELAY_DETAIL_MAX", "10"))
 # 1/true/yes — клікер; інакше — стара логіка (requests). При увімкненні області обробляються послідовно (один браузер).
 USE_BROWSER = (os.getenv("OLX_SCRAPER_USE_BROWSER", "").strip().lower() in ("1", "true", "yes"))
 
+# Браузер: використовувати встановлений Chrome замість bundled Chromium (краще схожість із звичайним відкриттям).
+BROWSER_USE_CHROME = (os.getenv("OLX_SCRAPER_BROWSER_USE_CHROME", "").strip().lower() in ("1", "true", "yes"))
+
+# Чекати повного завантаження detail-сторінки: "load" (рекомендовано — JS відрендерить контент) або "domcontentloaded".
+BROWSER_DETAIL_WAIT_UNTIL = os.getenv("OLX_SCRAPER_BROWSER_DETAIL_WAIT", "load").strip().lower() or "load"
+if BROWSER_DETAIL_WAIT_UNTIL not in ("load", "domcontentloaded", "networkidle"):
+    BROWSER_DETAIL_WAIT_UNTIL = "load"
+
 # Кількість сторінок пошуку на один пошуковий запит. OLX перенаправляє на 25-ту сторінку при спробі
 # перейти далі — обмеження платформи. Для більшого обсягу використовуємо пошук по областях.
 MAX_SEARCH_PAGES = int(os.getenv("OLX_SCRAPER_MAX_PAGES", "25"))

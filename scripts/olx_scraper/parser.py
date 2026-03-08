@@ -402,17 +402,16 @@ def detect_antibot_page(html: str) -> Dict[str, Any]:
     return {"is_antibot": len(hints) > 0, "hints": hints}
 
 
-def is_detail_page_inactive(html: str) -> bool:
+def get_detail_page_inactive_reason(html: str) -> Optional[str]:
     """
-    Визначає, чи сторінка деталей оголошення відповідає неактивному/знятому оголошенню:
-    пуста сторінка або повідомлення про неактивність.
-    Орієнтир: типові фрази OLX для знятих/незнайдених оголошень.
+    Повертає причину, чому сторінка вважається неактивною, або None якщо активна.
+    Для діагностики: "empty", "phrase: ...", "body_too_short".
     """
     if not html or not html.strip():
-        return True
+        return "empty"
     text = html.replace("\u00a0", " ").replace("\u202f", " ")
     lower = text.lower()
-    # Типові ознаки неактивного оголошення на OLX
+    # Тільки явні тексти OLX про неактивність; не "404" окремо — зустрічається в скриптах/URL і дає false positive
     inactive_phrases = [
         "оголошення неактивне",
         "прибрано з публікації",
@@ -422,19 +421,26 @@ def is_detail_page_inactive(html: str) -> bool:
         "таке оголошення не знайдено",
         "об'єкт не знайдено",
         "сторінку не знайдено",
-        "404",
     ]
     for phrase in inactive_phrases:
         if phrase in lower:
-            return True
-    # Дуже мало контенту — можливо порожня/помилкова сторінка
+            return f"phrase:{phrase!r}"
     soup = BeautifulSoup(html, "lxml")
     body = soup.find("body")
     if body:
         body_text = body.get_text(separator=" ", strip=True)
         if len(body_text) < 100 and "data-cy=\"ad_description\"" not in html and "ad_description" not in html:
-            return True
-    return False
+            return f"body_too_short(len={len(body_text)})"
+    return None
+
+
+def is_detail_page_inactive(html: str) -> bool:
+    """
+    Визначає, чи сторінка деталей оголошення відповідає неактивному/знятому оголошенню:
+    пуста сторінка або повідомлення про неактивність.
+    Орієнтир: типові фрази OLX для знятих/незнайдених оголошень.
+    """
+    return get_detail_page_inactive_reason(html) is not None
 
 
 def parse_detail_page(html: str) -> Dict[str, Any]:

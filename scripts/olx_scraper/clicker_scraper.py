@@ -75,6 +75,7 @@ def run_olx_clicker_scraper(
     from data.database.connection import MongoDBConnection
     from data.repositories.raw_olx_listings_repository import RawOlxListingsRepository
     from scripts.olx_scraper import config as scraper_config
+    from scripts.olx_scraper.browser_fetcher import _add_olx_cookies_to_context
     from scripts.olx_scraper.parser import parse_listings_page, parse_detail_page, detect_antibot_page
     from scripts.olx_scraper.helpers import search_data_from_listing
     from utils.hash_utils import calculate_search_data_hash
@@ -100,18 +101,26 @@ def run_olx_clicker_scraper(
             })
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        launch_options: dict = {
+            "headless": headless,
+            "args": ["--disable-blink-features=AutomationControlled"],
+            "ignore_default_args": ["--enable-automation"],
+        }
+        if getattr(scraper_config, "BROWSER_USE_CHROME", False):
+            launch_options["channel"] = "chrome"
+        browser = p.chromium.launch(**launch_options)
         context = browser.new_context(
             viewport={"width": 1280, "height": 720},
             user_agent=scraper_config.USER_AGENT,
             locale="uk-UA",
+            java_script_enabled=True,
         )
-        context.set_extra_http_headers({
-            "Accept-Language": "uk,en;q=0.9",
-        })
+        context.set_extra_http_headers({"Accept-Language": "uk,en;q=0.9"})
+        _add_olx_cookies_to_context(context, scraper_config)
         page = context.new_page()
-        page.set_default_timeout(30000)
-        page.set_default_navigation_timeout(45000)
+        detail_timeout_ms = max(45000, getattr(scraper_config, "REQUEST_DETAIL_TIMEOUT", 90) * 1000)
+        page.set_default_timeout(min(30000, detail_timeout_ms))
+        page.set_default_navigation_timeout(detail_timeout_ms)
 
         try:
             # Стартова сторінка — нежитлова нерухомість (продаж), сортування нові
@@ -166,8 +175,22 @@ def run_olx_clicker_scraper(
 
                     time.sleep(random.uniform(2, 6))  # затримка між відкриттям оголошень
                     try:
-                        page.goto(url, wait_until="domcontentloaded")
-                        time.sleep(1 + random.uniform(0.5, 2))
+                        wait_until = getattr(scraper_config, "BROWSER_DETAIL_WAIT_UNTIL", "load")
+                        page.goto(url, wait_until=wait_until)
+                        time.sleep(1.5 + random.uniform(0.5, 2.5))
+                        for sel in (
+                            '[data-cy="ad_description"]',
+                            '[data-cy="ad_description_content"]',
+                            '[data-testid="ad-description"]',
+                            '[data-testid="ad_description"]',
+                        ):
+                            try:
+                                page.wait_for_selector(sel, timeout=20000)
+                                break
+                            except Exception:
+                                continue
+                        else:
+                            time.sleep(2)
                         detail_html = page.content()
                         detail_data = parse_detail_page(detail_html)
                         if detail_data.get("_inactive"):
