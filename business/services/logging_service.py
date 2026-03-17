@@ -209,7 +209,6 @@ class LoggingService:
                 initiator=initiator,
                 provider=provider,
             )
-            log.info("LLM exchange записано: source=%s, provider=%s, request_id=%s, id=%s", source, provider, request_id, doc_id)
             return doc_id
         except Exception as e:
             log.warning("Не вдалося записати llm_exchange (source=%s): %s", source, e)

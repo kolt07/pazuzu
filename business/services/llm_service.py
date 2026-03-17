@@ -1020,17 +1020,8 @@ class LLMService:
         """
         log_svc = self._get_logging()
 
-        # Короткий лог у консоль, щоб було видно живу активність при викликах LLM
-        preview = (description or "").strip()
-        if len(preview) > 80:
-            preview = preview[:80] + "…"
-        start_ts = time.time()
-        logger.info("LLM parse_auction_description: start (len=%d, preview=%r)", len(description or ""), preview)
-
         result = self.provider.parse_auction_description(description)
 
-        elapsed = time.time() - start_ts
-        logger.info("LLM parse_auction_description: done in %.1fs", elapsed)
         if log_svc:
             try:
                 usage = getattr(self.provider, "_last_usage", None)

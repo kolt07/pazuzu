@@ -823,15 +823,8 @@ class ProZorroService:
             return 0
         
         try:
-            # Невеликий прогрес для CLI / логів: показуємо, що почалася реальна LLM-обробка
-            start_ts = time.time()
-            print("LLM: початок обробки опису аукціону...", flush=True)
-
             # Викликаємо LLM
             llm_result = self.llm_service.parse_auction_description(description)
-
-            elapsed = time.time() - start_ts
-            print(f"LLM: опис аукціону оброблено за {elapsed:.1f} с", flush=True)
             # Зберігаємо результат в кеш
             self.llm_cache_service.save_result(description, llm_result)
             # Повертаємо 1, оскільки був реальний виклик LLM
