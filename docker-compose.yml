@@ -1,20 +1,46 @@
-# -*- coding: utf-8 -*-
-version: '3.8'
+version: "3.9"
 
 services:
-  prozzorro-parser:
+  mongodb:
+    image: mongo:7
+    container_name: pazuzu-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - pazuzu_mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  pazuzu-app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: prozzorro-parser
+    container_name: pazuzu-app
     restart: unless-stopped
-    # Розкоментуйте, якщо потрібно монтувати том для даних
-    # volumes:
-    #   - ./data:/app/data
-    # Змінні середовища (розкоментуйте та налаштуйте за потреби)
-    # environment:
-    #   - PYTHONUNBUFFERED=1
-    #   - ENV_VAR=value
-    # Якщо потрібно відкрити порти
-    # ports:
-    #   - "8000:8000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./config/config.yaml:/app/config/config.yaml:ro
+      - ./data:/app/data
+      - ./temp:/app/temp
+    command: ["python", "main.py"]
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: pazuzu-ngrok
+    restart: unless-stopped
+    depends_on:
+      - pazuzu-app
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    command: ["http", "pazuzu-app:8000"]
+    ports:
+      - "4040:4040"
+
+volumes:
+  pazuzu_mongo_data:
