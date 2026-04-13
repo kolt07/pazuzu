@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 
 import yaml
 
-from config.config.config_loader import get_config_loader, compute_bundle_checksum, PLATFORM_VERSION
+from config.config_loader import get_config_loader, compute_bundle_checksum, PLATFORM_VERSION
 
 
 def _get_config_path() -> Path:
@@ -166,7 +166,7 @@ def build_data_zip(limit_per_collection: int = 10000) -> Tuple[bytes, str]:
         (zip_bytes, suggested_filename)
     """
     from bson import json_util
-    from config.config.settings import Settings
+    from config.settings import Settings
     from data.database.connection import MongoDBConnection
 
     MongoDBConnection.initialize(Settings())
