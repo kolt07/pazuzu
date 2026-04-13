@@ -7,7 +7,7 @@ ConfigMigrationRunner — застосування міграцій конфіг
 import logging
 from pathlib import Path
 
-from config.config.config_loader import get_config_loader, PLATFORM_VERSION
+from config.config_loader import get_config_loader, PLATFORM_VERSION
 
 logger = logging.getLogger(__name__)
 

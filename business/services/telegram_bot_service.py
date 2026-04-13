@@ -1135,6 +1135,7 @@ class TelegramBotService:
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=False,  # Не скидаємо очікуючі оновлення
                 close_loop=False,  # Не закриваємо event loop при помилках
+                stop_signals=None,  # У контейнері бот запускається з non-main thread
             )
         except KeyboardInterrupt:
             print("\nОтримано сигнал переривання, зупиняємо бота...")
