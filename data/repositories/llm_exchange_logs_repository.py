@@ -41,6 +41,9 @@ class LLMExchangeLogsRepository(BaseRepository):
         request_id: Optional[str] = None,
         initiator: Optional[str] = None,
         provider: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        gpu_seconds: Optional[float] = None,
+        gpu_cost_usd: Optional[float] = None,
     ) -> str:
         """
         Зберігає один запис обміну запит–відповідь LLM.
@@ -79,6 +82,12 @@ class LLMExchangeLogsRepository(BaseRepository):
         }
         if provider:
             document["provider"] = provider
+        if duration_ms is not None:
+            document["duration_ms"] = int(duration_ms)
+        if gpu_seconds is not None:
+            document["gpu_seconds"] = float(gpu_seconds)
+        if gpu_cost_usd is not None:
+            document["gpu_cost_usd"] = float(gpu_cost_usd)
         result = self.collection.insert_one(document)
         return str(result.inserted_id)
 

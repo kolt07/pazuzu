@@ -67,6 +67,7 @@ class Settings:
             'openai': os.getenv('LLM_API_KEY_OPENAI', ''),
             'anthropic': os.getenv('LLM_API_KEY_ANTHROPIC', ''),
             'ollama': os.getenv('LLM_API_KEY_OLLAMA', ''),  # Для Ollama не потрібен, залишається порожнім
+            'vllm_remote': os.getenv('LLM_API_KEY_VLLM_REMOTE', ''),
         }
         # Параметри циклу агента (ітерації, токени, температура, time budget)
         self.llm_agent_max_iterations = int(os.getenv('LLM_AGENT_MAX_ITERATIONS', '10'))
@@ -184,6 +185,8 @@ class Settings:
                                     self.llm_api_keys['anthropic'] = api_keys['anthropic']
                                 if 'ollama' in api_keys:
                                     self.llm_api_keys['ollama'] = api_keys['ollama']
+                                if 'vllm_remote' in api_keys:
+                                    self.llm_api_keys['vllm_remote'] = api_keys['vllm_remote']
                             if 'agent' in llm_config:
                                 agent_config = llm_config['agent']
                                 if 'max_iterations' in agent_config:

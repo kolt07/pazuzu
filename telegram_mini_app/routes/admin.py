@@ -6,7 +6,7 @@ API: адміністрування (додати/заблокувати кор�
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -496,6 +496,30 @@ class LlmProcessingBackfillRequest(BaseModel):
     process_inactive: bool = False
 
 
+class VastRuntimeSettingsUpdate(BaseModel):
+    is_enabled: Optional[bool] = None
+    vast_api_key: Optional[str] = None
+    max_hourly_usd: Optional[float] = None
+    min_gpu_ram_gb: Optional[int] = None
+    min_reliability: Optional[float] = None
+    target_cuda: Optional[str] = None
+    gpu_name_like: Optional[str] = None
+    region_like: Optional[str] = None
+    datacenter_like: Optional[str] = None
+    disk_gb: Optional[int] = None
+    image: Optional[str] = None
+    vllm_model: Optional[str] = None
+    vllm_host: Optional[str] = None
+    vllm_port: Optional[int] = None
+    vllm_max_model_len: Optional[int] = None
+    vllm_api_key: Optional[str] = None
+    boot_timeout_sec: Optional[int] = None
+    ready_timeout_sec: Optional[int] = None
+    idle_grace_sec: Optional[int] = None
+    hard_budget_usd: Optional[float] = None
+    fallback_provider: Optional[str] = None
+
+
 @router.post("/llm-processing-regions/backfill")
 def start_llm_processing_backfill(request: Request, body: LlmProcessingBackfillRequest):
     """
@@ -546,6 +570,33 @@ def start_llm_processing_backfill(request: Request, body: LlmProcessingBackfillR
 
     threading.Thread(target=run_update, daemon=True, name="LLMRegionsBackfill").start()
     return {"task_id": task_id, "status": "started", "days": body.days}
+
+
+@router.get("/vast-runtime-settings")
+def get_vast_runtime_settings(request: Request):
+    """Повертає актуальні налаштування Vast.ai/vLLM (секрети масковані)."""
+    _get_admin_user(request)
+    try:
+        from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
+
+        svc = VastRuntimeSettingsService()
+        return svc.get_public_settings()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/vast-runtime-settings")
+def update_vast_runtime_settings(request: Request, body: VastRuntimeSettingsUpdate):
+    """Оновлює runtime налаштування Vast.ai/vLLM."""
+    _get_admin_user(request)
+    try:
+        from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
+
+        svc = VastRuntimeSettingsService()
+        payload = body.dict(exclude_none=True)
+        return {"success": True, "settings": svc.update_settings(payload)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/cadastral-scraper/start")
@@ -1236,6 +1287,27 @@ def get_usage_stats(
             service="geocoding", from_cache_only=True
         )
         geocode_by_day = _fill_days_with_zeros(geocode_api_by_day, days)
+        gpu_by_day_raw = logs_repo.sum_gpu_runtime_by_day(days=days)
+        gpu_total = logs_repo.sum_gpu_runtime_total()
+        gpu_last_month = logs_repo.sum_gpu_runtime_last_month()
+        gpu_by_day: List[Dict[str, Any]] = []
+        gpu_by_date = {d.get("date"): d for d in gpu_by_day_raw}
+        from datetime import datetime, timedelta
+
+        today = datetime.utcnow().date()
+        for i in range(days - 1, -1, -1):
+            day = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+            row = gpu_by_date.get(day) or {}
+            sec = float(row.get("active_seconds") or 0.0)
+            gpu_by_day.append(
+                {
+                    "date": day,
+                    "active_seconds": sec,
+                    "active_minutes": round(sec / 60.0, 3),
+                    "estimated_cost_usd": float(row.get("estimated_cost_usd") or 0.0),
+                    "sessions": int(row.get("sessions") or 0),
+                }
+            )
 
         return {
             "llm": {
@@ -1258,11 +1330,23 @@ def get_usage_stats(
                 "last_month": geocode_api_last_month,
                 "cache_hits_total": geocode_cache_total,
             },
+            "gpu_runtime": {
+                "by_day": gpu_by_day,
+                "active_seconds_total": float(gpu_total.get("active_seconds") or 0.0),
+                "active_minutes_total": round(float(gpu_total.get("active_seconds") or 0.0) / 60.0, 3),
+                "estimated_cost_usd_total": round(float(gpu_total.get("estimated_cost_usd") or 0.0), 6),
+                "sessions_total": int(gpu_total.get("sessions") or 0),
+                "active_seconds_last_month": float(gpu_last_month.get("active_seconds") or 0.0),
+                "active_minutes_last_month": round(float(gpu_last_month.get("active_seconds") or 0.0) / 60.0, 3),
+                "estimated_cost_usd_last_month": round(float(gpu_last_month.get("estimated_cost_usd") or 0.0), 6),
+                "sessions_last_month": int(gpu_last_month.get("sessions") or 0),
+            },
         }
     except Exception as e:
         return {
             "llm": {"by_day": [], "input_tokens_total": 0, "output_tokens_total": 0, "total": 0, "last_month": 0, "estimated_cost_usd": 0, "estimated_cost_usd_last_month": 0},
             "geocoding": {"by_day": [], "total": 0, "last_month": 0},
+            "gpu_runtime": {"by_day": [], "active_seconds_total": 0, "estimated_cost_usd_total": 0, "sessions_total": 0},
             "error": str(e),
         }
 

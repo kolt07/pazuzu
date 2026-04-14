@@ -58,7 +58,7 @@
         </nav>
         <div class="admin-block" data-admin-tab="overview">
           <h3>Використання API</h3>
-          <p class="admin-hint">Запити LLM та виклики Google Geocoding по днях, загальна кількість та за останній місяць.</p>
+          <p class="admin-hint">Запити LLM, виклики Google Geocoding та runtime орендованих GPU по днях, загальна кількість та за останній місяць.</p>
           <div id="admin-usage-stats-summary" class="admin-usage-summary"></div>
           <div class="admin-usage-charts">
             <div class="admin-chart-wrap">
@@ -69,7 +69,44 @@
               <h4>Виклики Google Geocoding по днях</h4>
               <canvas id="admin-chart-geocoding"></canvas>
             </div>
+            <div class="admin-chart-wrap">
+              <h4>GPU runtime (хв/день)</h4>
+              <canvas id="admin-chart-gpu-runtime"></canvas>
+            </div>
           </div>
+        </div>
+        <div class="admin-block" data-admin-tab="config">
+          <h3>Vast.ai / vLLM (parsing pipeline)</h3>
+          <p class="admin-hint">Параметри оренди GPU для LLM-парсингу джерел. Секрети зберігаються сервером, у UI маскуються.</p>
+          <div class="filter-group">
+            <label><input type="checkbox" id="admin-vast-enabled" /> Увімкнути cloud GPU runtime</label>
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-api-key">Vast API key:</label>
+            <input type="password" id="admin-vast-api-key" placeholder="Введіть новий ключ (опційно)" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-vllm-model">Модель vLLM:</label>
+            <input type="text" id="admin-vast-vllm-model" placeholder="google/gemma-2-9b-it" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-min-gpu-ram">Min GPU RAM (GB):</label>
+            <input type="number" id="admin-vast-min-gpu-ram" min="8" max="192" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-max-hourly-usd">Max $/hour:</label>
+            <input type="number" id="admin-vast-max-hourly-usd" min="0" step="0.01" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-idle-grace-sec">Idle grace (sec):</label>
+            <input type="number" id="admin-vast-idle-grace-sec" min="10" max="3600" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-hard-budget-usd">Hard budget (USD):</label>
+            <input type="number" id="admin-vast-hard-budget-usd" min="0" step="0.1" class="filter-input" />
+          </div>
+          <button type="button" id="admin-vast-settings-save" class="btn btn-primary">Зберегти Vast/vLLM параметри</button>
+          <div id="admin-vast-settings-status" class="admin-hint" style="margin-top: 0.5rem;"></div>
         </div>
         <div class="admin-block" data-admin-tab="overview">
           <h3>Додати користувача / адміністратора</h3>

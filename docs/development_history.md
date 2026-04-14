@@ -1,5 +1,37 @@
 # Історія розробки
 
+## 2026-04-13 — Vast.ai + vLLM runtime для parsing pipeline
+
+- **Запит**: Додати cloud оренду GPU (Vast.ai), автоматичне розгортання vLLM з моделлю Gemma, обробку pooled LLM задач тільки для parsing джерел, керування параметрами через Mini App Admin та облік часу/вартості оренди.
+
+- **Дії**:
+  - **Нові модулі orchestration/domain**:
+    - `business/services/vast_ai_client.py`: REST-клієнт Vast.ai (`search_offers`, `create/start/stop/destroy instance`).
+    - `business/services/vast_ai_runtime_settings_service.py`: runtime-параметри Vast/vLLM з маскуванням секретів.
+    - `business/services/vllm_runtime_orchestrator.py`: lifecycle оренди + readiness probe (`/v1/models`) + idle-grace teardown.
+    - `data/repositories/vast_runtime_settings_repository.py`: зберігання налаштувань runtime.
+    - `data/repositories/gpu_runtime_sessions_repository.py`: журнал сесій оренди GPU.
+  - **LLM провайдер**:
+    - `business/services/llm_service.py`: додано parsing-провайдер `vllm_remote` (OpenAI-compatible endpoint), без змін assistant-контуру.
+    - Для parsing-викликів додано runtime metadata (`duration_ms`, endpoint/provider) в `api_usage` та `llm_exchange`.
+    - Додано fallback на локальний `ollama` при недоступності remote runtime (за налаштуванням).
+  - **Інтеграція в pipeline/pool policy**:
+    - `business/services/source_data_load_service.py`: перед LLM phase для OLX/ProZorro запускається runtime, після завершення застосовується policy `pool empty -> idle wait -> recheck -> teardown`.
+    - `scripts/olx_scraper/run_update.py`: аналогічний контроль runtime для standalone OLX flow.
+  - **Адмінка Mini App (керування параметрами)**:
+    - API: `telegram_mini_app/routes/admin.py` — нові ендпоїнти `GET/PUT /api/admin/vast-runtime-settings`.
+    - UI: `telegram_mini_app/static/index.html` + `telegram_mini_app/static/app.js` — форма налаштувань Vast/vLLM.
+  - **Телеметрія та витрати**:
+    - `data/repositories/logs_repository.py`: агрегації `sum_gpu_runtime_*` (час/сесії/estimated_cost_usd).
+    - `telegram_mini_app/routes/admin.py` (`/usage-stats`): додано блок `gpu_runtime`.
+    - `telegram_mini_app/static/index.html` + `telegram_mini_app/static/app.js`: додано summary та графік GPU runtime.
+  - **Конфіг та міграції**:
+    - `config/settings.py`: ключ `LLM_API_KEY_VLLM_REMOTE` + YAML mapping `llm.api_keys.vllm_remote`.
+    - `config/config.example.yaml`: приклади для `vllm_remote` і `vast_runtime`.
+    - `scripts/migrations/044_vast_gpu_runtime_collections.py`: нові колекції runtime settings/sessions.
+  - **Глосарій**:
+    - `docs/developer_glossary.md`: додано терміни `cloud GPU runtime (Vast.ai)` і `LLM work pool (parsing)`.
+
 ## 2026-04-13 — Виправлення 500 у експорті/імпорті конфігу через бота
 
 - **Запит**: Актуалізувати механіку вивантаження/завантаження конфіга/даних через бота, бо при використанні з'являлась 500 помилка.

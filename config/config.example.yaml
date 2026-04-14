@@ -34,6 +34,9 @@ llm:
   parsing:
     provider: ollama
     model_name: gemma3:27b
+    # Для cloud parsing через Vast.ai + vLLM:
+    # provider: vllm_remote
+    # model_name: google/gemma-2-9b-it
 
   # Обмеження швидкості запитів (0 = без обмежень; стосується провайдерів з API)
   rate_limit:
@@ -63,6 +66,24 @@ llm:
     
     # Ollama — локальна LLM, ключ не потрібен (порожній рядок)
     ollama: ""
+    # API key для vLLM OpenAI-compatible endpoint (опційно)
+    vllm_remote: ""
+
+# Vast.ai runtime налаштування для parsing-only LLM batch
+# vast_runtime:
+#   is_enabled: false
+#   vast_api_key: ""
+#   max_hourly_usd: 0.85
+#   min_gpu_ram_gb: 20
+#   min_reliability: 0.98
+#   disk_gb: 40
+#   image: "vllm/vllm-openai:latest"
+#   vllm_model: "google/gemma-2-9b-it"
+#   vllm_port: 8000
+#   boot_timeout_sec: 900
+#   ready_timeout_sec: 600
+#   idle_grace_sec: 60
+#   hard_budget_usd: 20.0
 
 # OLX скрапер: отримання сторінок пошуку та деталей через браузер (Playwright) замість HTTP
 # true = клікер (області обробляються послідовно); false або відсутнє = requests (паралельно)

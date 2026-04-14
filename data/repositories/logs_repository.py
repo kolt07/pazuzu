@@ -27,6 +27,7 @@ class LogsRepository(BaseRepository):
             self.collection.create_index('initiator')
             self.collection.create_index([('event_type', 1), ('metadata.action', 1), ('timestamp', 1)])
             self.collection.create_index([('event_type', 1), ('metadata.service', 1), ('timestamp', 1)])
+            self.collection.create_index([('event_type', 1), ('metadata.service', 1), ('metadata.source', 1), ('timestamp', 1)])
             self._indexes_created = True
         except Exception:
             # Якщо не вдалося створити індекси (наприклад, MongoDB не ініціалізовано), просто пропускаємо
@@ -343,3 +344,91 @@ class LogsRepository(BaseRepository):
             return row or {"input_tokens": 0, "output_tokens": 0}
         except Exception:
             return {"input_tokens": 0, "output_tokens": 0}
+
+    def sum_gpu_runtime_by_day(self, days: int = 60) -> List[Dict[str, Any]]:
+        """
+        Агрегація часу GPU runtime (сек) і estimated_cost_usd по днях.
+        Беруться лише події teardown (metadata.source='gpu_teardown').
+        """
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            pipeline = [
+                {
+                    "$match": {
+                        "event_type": "api_usage",
+                        "metadata.service": "gpu_runtime",
+                        "metadata.source": "gpu_teardown",
+                        "timestamp": {"$gte": cutoff},
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}},
+                        "active_seconds": {"$sum": {"$ifNull": ["$metadata.active_seconds", 0]}},
+                        "estimated_cost_usd": {"$sum": {"$ifNull": ["$metadata.estimated_cost_usd", 0]}},
+                        "sessions": {"$sum": 1},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+                {"$project": {"date": "$_id", "active_seconds": 1, "estimated_cost_usd": 1, "sessions": 1, "_id": 0}},
+            ]
+            return list(self.collection.aggregate(pipeline))
+        except Exception:
+            return []
+
+    def sum_gpu_runtime_total(self) -> Dict[str, Any]:
+        """Сумарний GPU runtime і cost за всі часи."""
+        self._ensure_indexes()
+        try:
+            pipeline = [
+                {
+                    "$match": {
+                        "event_type": "api_usage",
+                        "metadata.service": "gpu_runtime",
+                        "metadata.source": "gpu_teardown",
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": None,
+                        "active_seconds": {"$sum": {"$ifNull": ["$metadata.active_seconds", 0]}},
+                        "estimated_cost_usd": {"$sum": {"$ifNull": ["$metadata.estimated_cost_usd", 0]}},
+                        "sessions": {"$sum": 1},
+                    }
+                },
+                {"$project": {"_id": 0, "active_seconds": 1, "estimated_cost_usd": 1, "sessions": 1}},
+            ]
+            row = next(self.collection.aggregate(pipeline), None)
+            return row or {"active_seconds": 0, "estimated_cost_usd": 0, "sessions": 0}
+        except Exception:
+            return {"active_seconds": 0, "estimated_cost_usd": 0, "sessions": 0}
+
+    def sum_gpu_runtime_last_month(self) -> Dict[str, Any]:
+        """Сумарний GPU runtime і cost за останні 30 днів."""
+        self._ensure_indexes()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            pipeline = [
+                {
+                    "$match": {
+                        "event_type": "api_usage",
+                        "metadata.service": "gpu_runtime",
+                        "metadata.source": "gpu_teardown",
+                        "timestamp": {"$gte": cutoff},
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": None,
+                        "active_seconds": {"$sum": {"$ifNull": ["$metadata.active_seconds", 0]}},
+                        "estimated_cost_usd": {"$sum": {"$ifNull": ["$metadata.estimated_cost_usd", 0]}},
+                        "sessions": {"$sum": 1},
+                    }
+                },
+                {"$project": {"_id": 0, "active_seconds": 1, "estimated_cost_usd": 1, "sessions": 1}},
+            ]
+            row = next(self.collection.aggregate(pipeline), None)
+            return row or {"active_seconds": 0, "estimated_cost_usd": 0, "sessions": 0}
+        except Exception:
+            return {"active_seconds": 0, "estimated_cost_usd": 0, "sessions": 0}

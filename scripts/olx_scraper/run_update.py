@@ -1228,6 +1228,14 @@ def run_olx_update(
     llm_extractor = OlxLLMExtractorService(settings)
     geocoding_service = GeocodingService(settings)
     unified_service = UnifiedListingsService(settings)
+    runtime_orchestrator = None
+    if (getattr(settings, "llm_parsing_provider", "") or "").strip().lower() == "vllm_remote":
+        try:
+            from business.services.vllm_runtime_orchestrator import VllmRuntimeOrchestrator
+
+            runtime_orchestrator = VllmRuntimeOrchestrator()
+        except Exception as e:
+            log_fn and log_fn(f"[OLX] Попередження: vLLM runtime оркестратор недоступний: {e}")
 
     # Курс продажу USD з Ощадбанку (може бути None, тоді просто не рахуємо USD-метрики)
     try:
@@ -1289,6 +1297,8 @@ def run_olx_update(
         pending_llm_urls = list(dict.fromkeys(pending_llm_urls))
         if pending_llm_urls:
             log(f"[OLX] Phase 2: LLM-обробка {len(pending_llm_urls)} оголошень")
+            if runtime_orchestrator:
+                runtime_orchestrator.ensure_runtime_ready()
         llm_processed = _process_llm_pending(
             pending_llm_urls,
             repo,
@@ -1346,6 +1356,8 @@ def run_olx_update(
         llm_processed = 0
         if pending_llm_urls:
             log(f"[OLX] Phase 2: LLM-обробка {len(pending_llm_urls)} оголошень (один потік)")
+            if runtime_orchestrator:
+                runtime_orchestrator.ensure_runtime_ready()
             llm_processed = _process_llm_pending(
                 pending_llm_urls,
                 repo,
@@ -1356,6 +1368,12 @@ def run_olx_update(
                 usd_rate,
                 log,
             )
+
+    if runtime_orchestrator:
+        try:
+            runtime_orchestrator.handle_pool_drain(lambda: repo.count({"detail.llm_pending": True}) > 0)
+        except Exception as e:
+            log(f"[OLX] Попередження: помилка завершення runtime GPU: {e}")
 
     log(f"[OLX] Готово. Оголошень: {total_listings}, деталей: {total_detail_fetches}, LLM: {llm_processed}")
     return {

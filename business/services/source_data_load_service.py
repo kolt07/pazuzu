@@ -181,6 +181,7 @@ def run_full_pipeline(
         "phase2": {"olx_llm_processed": 0, "prozorro_llm_processed": 0},
         "phase3": {},
     }
+    runtime_orchestrator = None
 
     # ---------- Phase 1: завантаження сирих даних ----------
     log("[Source load] Phase 1: завантаження сирих даних з джерел (без LLM).")
@@ -224,12 +225,21 @@ def run_full_pipeline(
     main_prozorro = ProZorroAuctionsRepository()
     main_olx.ensure_index()
     main_prozorro._ensure_indexes()
+    if (getattr(st, "llm_parsing_provider", "") or "").strip().lower() == "vllm_remote":
+        try:
+            from business.services.vllm_runtime_orchestrator import VllmRuntimeOrchestrator
+
+            runtime_orchestrator = VllmRuntimeOrchestrator()
+        except Exception as e:
+            logger.warning("Не вдалося ініціалізувати оркестратор vLLM runtime: %s", e)
 
     if "olx" in sources and olx_loaded_urls:
         urls_for_llm = set(_select_olx_urls_for_llm(raw_olx, olx_loaded_urls))
         if urls_for_llm:
             pending_list = [u for u in olx_loaded_urls if u in urls_for_llm]
             log(f"[Source load] Phase 2 OLX: LLM-обробка для {len(pending_list)} оголошень (дані в olx_listings та unified тільки після LLM).")
+            if runtime_orchestrator and pending_list:
+                runtime_orchestrator.ensure_runtime_ready()
             unified_olx = UnifiedListingsService(st)
             geocoding = GeocodingService(st)
             llm_extractor = OlxLLMExtractorService(st)
@@ -271,6 +281,8 @@ def run_full_pipeline(
         ids_for_llm = _select_prozorro_ids_for_llm(raw_prozorro, prozorro_loaded_ids)
         if ids_for_llm:
             log(f"[Source load] Phase 2 ProZorro: LLM-обробка для {len(ids_for_llm)} аукціонів...")
+            if runtime_orchestrator:
+                runtime_orchestrator.ensure_runtime_ready()
             prozorro_svc = ProZorroService(st)
             if prozorro_svc.llm_service:
                 for auction_id in ids_for_llm:
@@ -288,6 +300,23 @@ def run_full_pipeline(
         else:
             log("[Source load] Phase 2 ProZorro: LLM пропущено (0 кандидатів за регіонами).")
         log("[Source load] Phase 2 ProZorro завершено.")
+
+    if runtime_orchestrator:
+        try:
+            def _has_new_llm_tasks() -> bool:
+                try:
+                    pending_olx = raw_olx.count({"detail.llm_pending": True}) > 0
+                except Exception:
+                    pending_olx = False
+                try:
+                    pending_prozorro = main_prozorro.count({"llm": {"$exists": False}, "auction_data.description": {"$exists": True}}) > 0
+                except Exception:
+                    pending_prozorro = False
+                return pending_olx or pending_prozorro
+
+            runtime_orchestrator.handle_pool_drain(_has_new_llm_tasks)
+        except Exception as e:
+            logger.warning("Помилка завершення vLLM runtime сесії: %s", e)
 
     # Зберігаємо дату оновлення ProZorro для get_auctions_from_db_by_period / generate_excel_from_db
     if "prozorro" in sources and days is not None:
