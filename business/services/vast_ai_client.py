@@ -28,15 +28,36 @@ class VastAiClient:
     def _request(self, method: str, path: str, **kwargs: Any) -> Dict[str, Any]:
         url = f"{self.BASE_URL}{path}"
         response = self.session.request(method=method, url=url, timeout=self.timeout_sec, **kwargs)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            details = ""
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    details = str(body.get("msg") or body.get("error") or body)
+                else:
+                    details = str(body)
+            except Exception:
+                details = (response.text or "").strip()
+            if details:
+                raise requests.HTTPError(f"{e} | vast_response={details}", response=response) from e
+            raise
         data = response.json() if response.content else {}
         return data if isinstance(data, dict) else {"data": data}
 
-    def search_offers(self, query: Optional[str] = None) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {}
-        if query:
-            params["q"] = query
-        data = self._request("GET", "/bundles/", params=params)
+    def search_offers(
+        self,
+        query: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        if filters:
+            data = self._request("POST", "/bundles/", json=filters)
+        else:
+            params: Dict[str, Any] = {}
+            if query:
+                params["q"] = query
+            data = self._request("GET", "/bundles/", params=params)
         offers = data.get("offers") or data.get("results") or data.get("data") or []
         return offers if isinstance(offers, list) else []
 

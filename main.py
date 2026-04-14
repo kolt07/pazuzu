@@ -48,6 +48,7 @@ from business.services.telegram_bot_service import TelegramBotService
 from business.services.scheduler_service import SchedulerService, TelegramSchedulerNotifier
 from business.services.source_data_load_service import run_full_pipeline
 from business.services.logging_service import LoggingService
+from business.services.vast_runtime_supervisor_service import VastRuntimeSupervisorService
 from data.database.connection import MongoDBConnection
 from business.services.currency_rate_service import CurrencyRateService
 
@@ -72,6 +73,7 @@ class Application:
         self._mcp_processes = []
         self.scheduler_service = None
         self.currency_rate_service = None
+        self.runtime_supervisor_service = None
         
         # Ініціалізуємо MongoDB підключення ПЕРЕД створенням сервісів, які його використовують
         try:
@@ -110,6 +112,15 @@ class Application:
         """Ініціалізація компонентів застосунку."""
         self.prozorro_service = ProZorroService(self.settings)
 
+    def _start_runtime_supervisor(self) -> None:
+        if self.runtime_supervisor_service is not None:
+            return
+        try:
+            self.runtime_supervisor_service = VastRuntimeSupervisorService(self.settings)
+            self.runtime_supervisor_service.start()
+        except Exception as e:
+            print(f"Попередження: не вдалося запустити runtime supervisor: {e}")
+
     def run(
         self,
         days: int = None,
@@ -126,6 +137,7 @@ class Application:
 
         self.initialize()
         self._running = True
+        self._start_runtime_supervisor()
         print("Застосунок запущено")
 
         # Єдиний pipeline: raw → main + LLM для обраних → аналітика (без LLM на етапі збору сирих даних)
@@ -265,6 +277,7 @@ class Application:
 
         self.initialize()
         self._running = True
+        self._start_runtime_supervisor()
 
         # Тимчасово вимкнено: оновлення даних — через меню адміністратора (за добу / за тиждень)
         # if self.settings.background_update_interval_minutes > 0:
@@ -357,6 +370,14 @@ class Application:
         if self.scheduler_service:
             self.scheduler_service.shutdown(wait=True)
             self.scheduler_service = None
+
+        # Зупиняємо supervisor Vast runtime
+        if self.runtime_supervisor_service:
+            try:
+                self.runtime_supervisor_service.stop()
+            except Exception:
+                pass
+            self.runtime_supervisor_service = None
         
         # Зупиняємо Telegram бота
         if self.telegram_bot_service:

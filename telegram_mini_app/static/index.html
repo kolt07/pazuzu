@@ -86,8 +86,31 @@
             <input type="password" id="admin-vast-api-key" placeholder="Введіть новий ключ (опційно)" class="filter-input" />
           </div>
           <div class="filter-group">
-            <label for="admin-vast-vllm-model">Модель vLLM:</label>
-            <input type="text" id="admin-vast-vllm-model" placeholder="google/gemma-2-9b-it" class="filter-input" />
+            <label for="admin-vast-hf-token">Hugging Face token:</label>
+            <input type="password" id="admin-vast-hf-token" placeholder="Введіть токен для завантаження моделі (опційно)" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-image">Docker image / template:</label>
+            <input type="text" id="admin-vast-image" placeholder="ollama/ollama:latest" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-vllm-model">Модель (vLLM/Ollama):</label>
+            <input type="text" id="admin-vast-vllm-model" placeholder="ggml-org/gemma-4-E4B-it-GGUF" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-vllm-max-len">Max model len (KV; менше — менше VRAM):</label>
+            <input type="number" id="admin-vast-vllm-max-len" min="512" max="131072" step="256" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-vllm-gpu-mem">GPU memory utilization (0.05–0.99):</label>
+            <input type="number" id="admin-vast-vllm-gpu-mem" min="0.05" max="0.99" step="0.01" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label for="admin-vast-vllm-max-seqs">Max num seqs (менше — менше VRAM):</label>
+            <input type="number" id="admin-vast-vllm-max-seqs" min="1" max="256" step="1" class="filter-input" />
+          </div>
+          <div class="filter-group">
+            <label><input type="checkbox" id="admin-vast-vllm-enforce-eager" /> Enforce eager (без CUDA graphs, економніше VRAM)</label>
           </div>
           <div class="filter-group">
             <label for="admin-vast-min-gpu-ram">Min GPU RAM (GB):</label>

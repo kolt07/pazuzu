@@ -512,7 +512,11 @@ class VastRuntimeSettingsUpdate(BaseModel):
     vllm_host: Optional[str] = None
     vllm_port: Optional[int] = None
     vllm_max_model_len: Optional[int] = None
+    vllm_gpu_memory_utilization: Optional[float] = None
+    vllm_enforce_eager: Optional[bool] = None
+    vllm_max_num_seqs: Optional[int] = None
     vllm_api_key: Optional[str] = None
+    hf_token: Optional[str] = None
     boot_timeout_sec: Optional[int] = None
     ready_timeout_sec: Optional[int] = None
     idle_grace_sec: Optional[int] = None

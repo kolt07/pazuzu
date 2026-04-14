@@ -69,19 +69,41 @@ llm:
     # API key для vLLM OpenAI-compatible endpoint (опційно)
     vllm_remote: ""
 
+# Локальний smoke vLLM (змінні середовища, не YAML): py -m unittest scripts.test_vllm_local_deployment -v
+#   PAZUZU_LOCAL_VLLM_SMOKE=1 — увімкнути HTTP-тести до вже запущеного vllm serve
+#   PAZUZU_LOCAL_VLLM_URL=http://127.0.0.1:8000 — за потреби
+#   PAZUZU_LOCAL_VLLM_API_KEY або LLM_API_KEY_VLLM_REMOTE — якщо сервер з --api-key
+
 # Vast.ai runtime налаштування для parsing-only LLM batch
 # vast_runtime:
 #   is_enabled: false
 #   vast_api_key: ""
 #   max_hourly_usd: 0.85
-#   min_gpu_ram_gb: 20
+#   min_gpu_ram_gb: 24
 #   min_reliability: 0.98
 #   disk_gb: 40
-#   image: "vllm/vllm-openai:latest"
-#   vllm_model: "google/gemma-2-9b-it"
+#   # Template/image candidates for "CUDA 11.8 + PyTorch 2.1":
+#   # - ollama/ollama:latest (для GGUF через Ollama)
+#   # - imroc/vllm-openai:cuda-11.8.0 (готовий vLLM сервер)
+#   # - pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime (база для кастомного шаблону)
+#   # - pytorch/pytorch:2.1.2-cuda11.8-cudnn8-devel (база для build/SDK)
+#   image: "ollama/ollama:latest"
+#   vllm_model: "ggml-org/gemma-4-E4B-it-GGUF"
+#   vllm_max_model_len: 4096
+#   vllm_gpu_memory_utilization: 0.9
+#   vllm_enforce_eager: true    # --enforce-eager: без CUDA graphs, менший пік VRAM
+#   vllm_max_num_seqs: 4        # --max-num-seqs (паралельні послідовності)
+#   hf_token: ""  # HF User Access Token: у контейнері перед vllm виконується `hf auth login --token` (див. HF Hub CLI)
 #   vllm_port: 8000
-#   boot_timeout_sec: 900
-#   ready_timeout_sec: 600
+#   # Network preference for Vast search offers (Mbps):
+#   min_inet_down_mbps: 700         # hard floor
+#   preferred_inet_down_mbps: 1000  # ranking target
+#   enable_ssh_tunnel: true         # піднімати локальний SSH tunnel одразу після старту інстанса
+#   ssh_tunnel_local_port: 8000     # локальний порт tunnel (якщо зайнятий, буде обрано сусідній вільний)
+#   ssh_instance_log_stream: true   # stream stdout/stderr логів інстанса через SSH у app logs
+#   endpoint_timeout_sec: 240  # скільки чекаємо саме публікацію зовнішнього endpoint (ssh/port-forward), далі failover на інший офер
+#   boot_timeout_sec: 1200
+#   ready_timeout_sec: 1200
 #   idle_grace_sec: 60
 #   hard_budget_usd: 20.0
 

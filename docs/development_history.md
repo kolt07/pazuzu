@@ -1,5 +1,115 @@
 # Історія розробки
 
+## 2026-04-14 — Smoke test: видимість SSH та логів інстанса
+
+- **Запит**: Актуалізувати smoke test, щоб у консолі було видно стан SSH-підключення та логи інстанса.
+- **Дії**: У `VllmRuntimeOrchestrator` додано `get_observability_status()` (effective/public/local endpoint, status SSH tunnel, status log stream, recent observability lines). `scripts/smoke_vast_runtime.py` тепер після `ensure_runtime_ready()` виводить ці стани й останні рядки `vast_ssh_tunnel`/`vast_instance_log`.
+
+## 2026-04-14 — SSH tunnel + stream логів інстанса в runtime оркестраторі
+
+- **Запит**: Одразу після підйому інстанса будувати прямий SSH-тунель і бачити у своїх логах, що відбувається на інстансі.
+- **Дії**: У `VllmRuntimeOrchestrator` додано best-effort SSH observability: автоматичний `ssh -L` тунель на локальний порт після публікації endpoint, та фоновий стрім логів інстанса через SSH (docker logs) у telemetry події (`vast_ssh_tunnel`, `vast_instance_log`, `gpu_ssh_tunnel_*`). Для цього додано runtime-параметри `enable_ssh_tunnel`, `ssh_tunnel_local_port`, `ssh_instance_log_stream`.
+
+## 2026-04-14 — Швидкий failover при проблемах SSH/port-forward на Vast
+
+- **Запит**: У логах інстанса повторюється `remote port forwarding failed for listen port ...`, що блокує публікацію endpoint.
+- **Дії**: Додано окремий таймаут `endpoint_timeout_sec` (дефолт 240с) для очікування саме мережевого endpoint у `VllmRuntimeOrchestrator`. Якщо endpoint не опубліковано в цей час — оркестратор швидко teardown-ить невдалий інстанс і переходить до наступного кандидата (не чекаючи весь `boot_timeout_sec`).
+
+## 2026-04-14 — Пріоритет оферів Vast за швидкістю мережі
+
+- **Запит**: Додати відбір серверів Vast за мережевим з'єднанням з пріоритетом близько 1 Gbps (700–800+ також прийнятно).
+- **Дії**: У `VllmRuntimeOrchestrator` додано фільтр `inet_down >= 700` (Mbps, згідно з Vast `search offers`) і ранжування кандидатів за близькістю до `preferred_inet_down_mbps=1000`, далі за вартістю та reliability. Оновлено unit-тести відбору оферів.
+
+## 2026-04-14 — Runtime supervisor як окремий фоновий процес застосунку
+
+- **Запит**: Оркестратор має стартувати разом із застосунком, працювати як єдиний незалежний процес і сам вирішувати, коли прогрівати/зупиняти Vast на основі черги LLM.
+- **Дії**: Додано `business/services/vast_runtime_supervisor_service.py` (daemon-loop): перевіряє `llm_parsing_provider`, стан Vast runtime, чергу LLM (`detail.llm_pending`, ProZorro без `llm`) і викликає `ensure_runtime_ready()` або `handle_pool_drain()`. У `main.py` supervisor стартує при запуску `Application` і коректно зупиняється в `stop()`. Локальні ручні виклики warmup/drain прибрано з `source_data_load_service` та `scripts/olx_scraper/run_update` — керування runtime централізовано.
+
+## 2026-04-14 — Єдиний shared оркестратор Vast runtime (single-process)
+
+- **Запит**: При запуску оновлення по двох джерелах створювались 2 інстанси Vast.
+- **Дії**: У `vllm_runtime_orchestrator` додано process-level singleton `get_shared_vllm_runtime_orchestrator()`. `source_data_load_service`, `run_update` і `llm_service` переведено на цей shared оркестратор, щоб у межах одного процесу використовувався один lifecycle runtime instance і не виникало дублювання оренди GPU.
+
+## 2026-04-14 — 2-фазне розгортання Ollama runtime
+
+- **Запит**: Змінити алгоритм: спочатку піднімати endpoint готовності сервера, потім запускати завантаження моделі зі зворотним зв'язком через цей endpoint.
+- **Дії**: У `VllmRuntimeOrchestrator` для Ollama введено дві стадії: (1) чек `control endpoint` (`/api/tags`) після публікації мережевого endpoint, (2) асинхронне завантаження моделі через `POST /api/pull` зі stream-прогресом у telemetry (`gpu_model_pull_*`), з фінальною валідацією моделі через `POST /api/show`. `onstart` для Ollama спрощено до `ollama serve` без блокуючого `ollama pull`.
+
+## 2026-04-14 — Прогрів runtime під час Phase 1 + таймаути 20 хв
+
+- **Запит**: Дати до 20 хв на старт сервера і стільки ж на появу endpoint; запускати оркестратор паралельно з обміном/парсингом сирих даних.
+- **Дії**: Дефолти `boot_timeout_sec` та `ready_timeout_sec` піднято до `1200` у runtime settings. У `run_full_pipeline` (`source_data_load_service`) і standalone `run_olx_update` додано background warmup (`ensure_runtime_ready`) на старті Phase 1, щоб підготовка GPU-інстанса йшла паралельно з raw exchange; перед Phase 2 лишається лише дочекатися готовності. Оновлено unit-тест дефолтів runtime settings.
+
+## 2026-04-14 — Backoff на Vast 429 (asks API)
+
+- **Запит**: Smoke падав через `429 Too Many Requests` на `PUT /asks/{id}/`.
+- **Дії**: У `ensure_runtime_ready` додано retry/backoff для `create_instance` (до 3 спроб на один ask з паузами), з окремим telemetry евентом `gpu_rent_rate_limited`.
+
+## 2026-04-14 — Перехід на GGUF + Ollama template
+
+- **Запит**: Використовувати модель `ggml-org/gemma-4-E4B-it-GGUF` і шукати template з Ollama.
+- **Дії**: Дефолт `vast_runtime.image` змінено на `ollama/ollama:latest`, `vllm_model` — на `ggml-org/gemma-4-E4B-it-GGUF`. В оркестратор додано автоматичний Ollama-режим для `image`/`model` з `gguf`: `onstart` запускає `ollama serve`, тягне модель через `ollama pull`, readiness перевіряється через `/api/tags` (з fallback на `/v1/models`). У адмінці додано поле Docker image/template.
+
+## 2026-04-14 — Фікс параметрів запуску vLLM
+
+- **Запит**: Використовувати параметри `--dtype float16`, `--gpu-memory-utilization 0.9`, `--max-model-len 4096`.
+- **Дії**: В `vllm_runtime_orchestrator` `onstart` доповнено `--dtype float16`; дефолти `vllm_max_model_len` та `vllm_gpu_memory_utilization` встановлено на `4096` і `0.9`. Оновлено значення за замовчуванням у UI та прикладі конфігурації.
+
+## 2026-04-14 — Перехід стеку на CUDA 11.8
+
+- **Запит**: Знизити runtime stack до CUDA 11.8 і підібрати темплейти "CUDA 11.8 + PyTorch 2.1".
+- **Дії**: Дефолти Vast runtime змінено на `target_cuda=11.8` і image `imroc/vllm-openai:cuda-11.8.0`. У `config.example.yaml` додано перелік шаблонів/образів для цього стеку: `imroc/vllm-openai:cuda-11.8.0`, `pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime`, `pytorch/pytorch:2.1.2-cuda11.8-cudnn8-devel`.
+
+## 2026-04-14 — Автопідвищення VRAM floor для Gemma-2-9B
+
+- **Запит**: Після memory-тюнінгу інколи все ще орендувався інстанс ~21.5 GB і vLLM падав з OOM.
+- **Дії**: В `VllmRuntimeOrchestrator` додано `_effective_min_gpu_ram_gb`: для `gemma-2-9b*` мінімум GPU RAM автоматично піднімається до **24 GB** незалежно від нижчого значення в конфігу. Дефолт `min_gpu_ram_gb` у runtime settings також змінено на 24.
+
+## 2026-04-14 — Фільтр несумісних GPU архітектур
+
+- **Запит**: Після фіксу OOM старт падіння з `cudaErrorNoKernelImageForDevice` на `Tesla P40 (sm_61)`.
+- **Дії**: У виборі офера Vast додано `_is_offer_gpu_compatible` і відсікання legacy GPU, які часто не підтримуються сучасним PyTorch/vLLM (`Tesla P40/P100/K80/M40/M60`, `Quadro P*`). При наявності сумісних карт обирається найкраща з них.
+
+## 2026-04-14 — Retry startup по кількох оферах Vast
+
+- **Запит**: Навіть після фільтрів окремі хости падали на ініціалізації CUDA/EngineCore.
+- **Дії**: `ensure_runtime_ready` переведено на стратегію кількох кандидатів (`_select_offer_candidates`): при `startup_failed` оркестратор teardown-ить інстанс і автоматично пробує наступний сумісний офер (до 5 спроб) перед фінальним падінням.
+
+## 2026-04-14 — Обробка 400 на create_instance (asks/{id})
+
+- **Запит**: Smoke падав на `400 Bad Request` під час `PUT /asks/{id}/`.
+- **Дії**: `ensure_runtime_ready` тепер не падає на першому `create_instance` 400 — сесія маркується `failed`, пишеться telemetry `gpu_rent_failed`, і оркестратор переходить до наступного кандидата. У `VastAiClient` додано розширений текст HTTP-помилки з `vast_response=...`.
+
+## 2026-04-14 — Hard filter `compute_cap >= 700` для Vast оферів
+
+- **Запит**: Повторні падіння `cudaGetDeviceCount Error 804` (non-supported HW / sm_61).
+- **Дії**: До фільтра оферів Vast додано обмеження `compute_cap >= 700`, щоб запит не повертав офери класу Pascal (P40/P100) і старіші для поточного vLLM/PyTorch image.
+
+## 2026-04-14 — HF Hub auth перед vLLM на Vast
+
+- **Запит**: Після додавання HF токена все ще помилка доступу до моделі; узгодити з офіційною практикою (`hf auth login`).
+- **Дії**: У `vllm_runtime_orchestrator._build_create_payload` перед `vllm serve` додано bash-префікс: за наявності `HF_TOKEN` викликається `hf auth login --token "$HF_TOKEN"` або fallback `huggingface-cli login`; у `env` лишається лише рекомендований `HF_TOKEN` (без застарілого `HUGGING_FACE_HUB_TOKEN`). Оновлено unit-тести payload.
+
+## 2026-04-14 — VRAM / OOM для Gemma-2-9B на Vast (vLLM)
+
+- **Запит**: `torch.OutOfMemoryError` при старті EngineCore (~21.5 GiB GPU, max_model_len 8192).
+- **Дії**: Дефолт `vllm_max_model_len` 4096, новий параметр `vllm_gpu_memory_utilization` (дефолт 0.88) → у `onstart` додано `--gpu-memory-utilization`; у `env` контейнера — `PYTORCH_ALLOC_CONF=expandable_segments:True`. Адмінка Mini App: поля max len та GPU utilization; API `VastRuntimeSettingsUpdate`.
+
+## 2026-04-14 — Додатковий захист OOM (vLLM)
+
+- **Запит**: OOM лишається на ~21.5 GiB після 4096 / 0.88.
+- **Дії**: Дефолти зміщено на **max_model_len 3072**, **gpu_memory_utilization 0.72**; у `onstart` додано **`--max-num-seqs`** (дефолт 4) та опційно **`--enforce-eager`** (дефолт увімкнено). Нові поля в Mongo/адмінці: `vllm_enforce_eager`, `vllm_max_num_seqs`.
+
+## 2026-04-14 — Локальні тести vLLM на машині розробника
+
+- **Запит**: Тести розгортання vLLM на цій машині (без Vast).
+- **Дії**: Додано `scripts/test_vllm_local_deployment.py` — opt-in через `PAZUZU_LOCAL_VLLM_SMOKE=1`, опційно `PAZUZU_LOCAL_VLLM_URL`, `PAZUZU_LOCAL_VLLM_API_KEY` або `LLM_API_KEY_VLLM_REMOTE`; перевірки `GET /v1/models`, узгодженість з `VllmRuntimeOrchestrator._is_vllm_ready`, мінімальний `POST /v1/chat/completions`.
+
+## 2026-04-14 — vLLM `--hf-token` для gated Hub
+
+- **Запит**: У логах vLLM `GatedRepoError` / 403 на `google/gemma-2-9b-it`.
+- **Дії (оновлення)**: `--hf-token true` давало в логах `hf_token: 'true'` і **401** (рядок `"true"` як bearer). Замінено на `--hf-token "$HF_TOKEN"` поруч із `HF_TOKEN` у `env` та `hf auth login`. Для gated моделей на Hub додатково потрібен accept умов тим самим акаунтом, що й токен.
+
 ## 2026-04-13 — Vast.ai + vLLM runtime для parsing pipeline
 
 - **Запит**: Додати cloud оренду GPU (Vast.ai), автоматичне розгортання vLLM з моделлю Gemma, обробку pooled LLM задач тільки для parsing джерел, керування параметрами через Mini App Admin та облік часу/вартості оренди.
@@ -2575,3 +2685,18 @@
 - Додано запит деталей `GET /tenders/{id}` для кожного `id` зі списку.
 - Детальні дані зберігаються в **один** JSON файл у `temp/` з `metadata` та `data`.
 - Додано паузу 0.5s між запитами деталей для уникнення блокувань/rate-limit.
+
+## 2026-04-13 — OLX: перевірка фільтрів і клікер-режиму
+- Запит: перевірити, чому на сторінках OLX видно замало оголошень, та прогнати тест по нежитловій нерухомості Київської області за 1 день.
+- Підтверджено, що невелика кількість оголошень пояснюється бізнес-фільтрами пошуку в URL (площа/поверх/типи об'єктів), які залишаються активними за задумом.
+- Виконано тестовий запуск OLX через browser-клікер (raw-only): для Київської області отримано 43 картки на першій сторінці, 13 релевантних за 1 день, завантажено/оновлено 12 URL.
+
+## 2026-04-13 — Vast runtime: безпечний teardown і фікс endpoint detection
+- Запит: зупинити дублювання інстансів Vast.ai під час тестового бенчмарку нового vLLM пайплайну.
+- Очищено активні інстанси Vast.ai та закрито завислі `gpu_runtime_sessions` у стані `starting`.
+- У `business/services/vllm_runtime_orchestrator.py` додано teardown при `startup_failed`, мітку `label: pazuzu-vllm-runtime` для інстансів, перехід `onstart` на `python3`, а також виправлено визначення endpoint для відповіді `show_instance` з вкладеним `instances` і некоректним `direct_port_start=65535`.
+
+## 2026-04-13 — Vast/vLLM: додано HF token в Admin UI
+- Запит: додати параметр токена Hugging Face у Mini App Admin для завантаження моделі на Vast.
+- Додано `hf_token` у runtime settings (service + API model + UI), з маскуванням у публічному представленні.
+- `VllmRuntimeOrchestrator` тепер прокидає токен у `env` як `HF_TOKEN` і `HUGGING_FACE_HUB_TOKEN`.

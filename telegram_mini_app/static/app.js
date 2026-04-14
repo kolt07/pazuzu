@@ -2247,12 +2247,17 @@
       .then(function (cfg) {
         var byId = function (id) { return document.getElementById(id); };
         if (byId("admin-vast-enabled")) byId("admin-vast-enabled").checked = !!cfg.is_enabled;
+        if (byId("admin-vast-image")) byId("admin-vast-image").value = cfg.image || "";
         if (byId("admin-vast-vllm-model")) byId("admin-vast-vllm-model").value = cfg.vllm_model || "";
+        if (byId("admin-vast-vllm-max-len")) byId("admin-vast-vllm-max-len").value = cfg.vllm_max_model_len != null ? cfg.vllm_max_model_len : "";
+        if (byId("admin-vast-vllm-gpu-mem")) byId("admin-vast-vllm-gpu-mem").value = cfg.vllm_gpu_memory_utilization != null ? cfg.vllm_gpu_memory_utilization : "";
+        if (byId("admin-vast-vllm-max-seqs")) byId("admin-vast-vllm-max-seqs").value = cfg.vllm_max_num_seqs != null ? cfg.vllm_max_num_seqs : "";
+        if (byId("admin-vast-vllm-enforce-eager")) byId("admin-vast-vllm-enforce-eager").checked = cfg.vllm_enforce_eager !== false;
         if (byId("admin-vast-min-gpu-ram")) byId("admin-vast-min-gpu-ram").value = cfg.min_gpu_ram_gb != null ? cfg.min_gpu_ram_gb : "";
         if (byId("admin-vast-max-hourly-usd")) byId("admin-vast-max-hourly-usd").value = cfg.max_hourly_usd != null ? cfg.max_hourly_usd : "";
         if (byId("admin-vast-idle-grace-sec")) byId("admin-vast-idle-grace-sec").value = cfg.idle_grace_sec != null ? cfg.idle_grace_sec : "";
         if (byId("admin-vast-hard-budget-usd")) byId("admin-vast-hard-budget-usd").value = cfg.hard_budget_usd != null ? cfg.hard_budget_usd : "";
-        if (statusEl) statusEl.textContent = "Поточний ключ Vast: " + (cfg.vast_api_key || "не задано");
+        if (statusEl) statusEl.textContent = "Поточний ключ Vast: " + (cfg.vast_api_key || "не задано") + " | HF token: " + (cfg.hf_token || "не задано");
       })
       .catch(function (e) {
         if (statusEl) statusEl.textContent = "Помилка: " + (e.message || "не вдалося завантажити налаштування");
@@ -2264,15 +2269,24 @@
     var byId = function (id) { return document.getElementById(id); };
     var payload = {
       is_enabled: !!(byId("admin-vast-enabled") && byId("admin-vast-enabled").checked),
+      image: byId("admin-vast-image") ? byId("admin-vast-image").value : "",
       vllm_model: byId("admin-vast-vllm-model") ? byId("admin-vast-vllm-model").value : "",
+      vllm_max_model_len: byId("admin-vast-vllm-max-len") ? parseInt(byId("admin-vast-vllm-max-len").value || "4096", 10) : 4096,
+      vllm_gpu_memory_utilization: byId("admin-vast-vllm-gpu-mem") ? parseFloat(byId("admin-vast-vllm-gpu-mem").value || "0.9") : 0.9,
+      vllm_max_num_seqs: byId("admin-vast-vllm-max-seqs") ? parseInt(byId("admin-vast-vllm-max-seqs").value || "4", 10) : 4,
+      vllm_enforce_eager: !!(byId("admin-vast-vllm-enforce-eager") && byId("admin-vast-vllm-enforce-eager").checked),
       min_gpu_ram_gb: byId("admin-vast-min-gpu-ram") ? parseInt(byId("admin-vast-min-gpu-ram").value || "0", 10) : 0,
       max_hourly_usd: byId("admin-vast-max-hourly-usd") ? parseFloat(byId("admin-vast-max-hourly-usd").value || "0") : 0,
       idle_grace_sec: byId("admin-vast-idle-grace-sec") ? parseInt(byId("admin-vast-idle-grace-sec").value || "60", 10) : 60,
       hard_budget_usd: byId("admin-vast-hard-budget-usd") ? parseFloat(byId("admin-vast-hard-budget-usd").value || "0") : 0,
     };
     var apiKeyInput = byId("admin-vast-api-key");
+    var hfTokenInput = byId("admin-vast-hf-token");
     if (apiKeyInput && apiKeyInput.value && apiKeyInput.value.trim()) {
       payload.vast_api_key = apiKeyInput.value.trim();
+    }
+    if (hfTokenInput && hfTokenInput.value && hfTokenInput.value.trim()) {
+      payload.hf_token = hfTokenInput.value.trim();
     }
     if (statusEl) statusEl.textContent = "Збереження...";
     fetch("/api/admin/vast-runtime-settings", {
@@ -2286,6 +2300,7 @@
       })
       .then(function () {
         if (apiKeyInput) apiKeyInput.value = "";
+        if (hfTokenInput) hfTokenInput.value = "";
         if (statusEl) statusEl.textContent = "Збережено.";
         loadAdminVastRuntimeSettings();
       })

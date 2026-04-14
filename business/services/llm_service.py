@@ -15,16 +15,10 @@ from config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-_VLLM_ORCHESTRATOR = None
-
-
 def _get_vllm_orchestrator():
-    global _VLLM_ORCHESTRATOR
-    if _VLLM_ORCHESTRATOR is None:
-        from business.services.vllm_runtime_orchestrator import VllmRuntimeOrchestrator
+    from business.services.vllm_runtime_orchestrator import get_shared_vllm_runtime_orchestrator
 
-        _VLLM_ORCHESTRATOR = VllmRuntimeOrchestrator()
-    return _VLLM_ORCHESTRATOR
+    return get_shared_vllm_runtime_orchestrator()
 
 
 class RateLimiter:
