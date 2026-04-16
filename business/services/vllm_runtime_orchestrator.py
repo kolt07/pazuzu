@@ -9,6 +9,7 @@ import json
 import socket
 import shutil
 import subprocess
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,7 @@ import requests
 from business.services.logging_service import LoggingService
 from business.services.vast_ai_client import VastAiClient
 from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
+from data.repositories.gpu_runtime_coordination_repository import GpuRuntimeCoordinationRepository
 from data.repositories.gpu_runtime_sessions_repository import GpuRuntimeSessionsRepository
 
 _SHARED_ORCHESTRATOR_LOCK = threading.Lock()
@@ -40,6 +42,8 @@ class VllmRuntimeOrchestrator:
         self._settings_svc = VastRuntimeSettingsService()
         self._logging = LoggingService()
         self._sessions = GpuRuntimeSessionsRepository()
+        self._coord = GpuRuntimeCoordinationRepository()
+        self._owner_id = f"pid:{os.getpid()}"
         self._instance_id: Optional[str] = None
         self._session_id: Optional[str] = None
         self._endpoint: Optional[str] = None
@@ -51,6 +55,9 @@ class VllmRuntimeOrchestrator:
         self._recent_observability_logs: List[str] = []
         self._started_at: Optional[datetime] = None
         self._last_activity_ts: float = 0.0
+        self._instance_paused: bool = False
+        self._empty_queue_since_ts: float = 0.0
+        self._paused_since_ts: float = 0.0
 
     def is_enabled(self) -> bool:
         cfg = self._settings_svc.get_settings()
@@ -61,7 +68,15 @@ class VllmRuntimeOrchestrator:
             cfg = self._settings_svc.get_settings()
             if not cfg.get("is_enabled"):
                 return None
+            self._empty_queue_since_ts = 0.0
+            self._paused_since_ts = 0.0
+            if self._instance_id and self._instance_paused:
+                self._resume_instance_locked(cfg)
+                if self._endpoint and self._is_runtime_ready(self._endpoint, cfg, timeout_sec=8):
+                    self._last_activity_ts = time.time()
+                    return self._endpoint
             if self._endpoint and self._is_runtime_ready(self._endpoint, cfg, timeout_sec=5):
+                self._coord_renew_lease(cfg, state="running")
                 self._last_activity_ts = time.time()
                 return self._endpoint
 
@@ -69,8 +84,14 @@ class VllmRuntimeOrchestrator:
                 raise RuntimeError("Vast.ai API key is not configured.")
 
             client = VastAiClient(api_key=cfg["vast_api_key"], timeout_sec=min(60, cfg["boot_timeout_sec"]))
+            if not self._coord_try_acquire(cfg, state="starting"):
+                shared_endpoint = self._wait_for_shared_runtime_or_acquire(cfg)
+                if shared_endpoint:
+                    self._last_activity_ts = time.time()
+                    return shared_endpoint
             ask_ids = self._select_offer_candidates(client, cfg, limit=5)
             if not ask_ids:
+                self._coord_release(state="idle", last_error="No Vast.ai offers matched the configured constraints.")
                 raise RuntimeError("No Vast.ai offers matched the configured constraints.")
 
             payload = self._build_create_payload(cfg)
@@ -127,26 +148,54 @@ class VllmRuntimeOrchestrator:
                     if self._session_id:
                         self._sessions.finish_session(self._session_id, "failed")
                     last_error = "Vast.ai did not return instance id."
+                    self._coord_update_state(state="failed", last_error=last_error)
                     continue
+                self._coord_update_state(state="starting", instance_id=self._instance_id, endpoint=None, public_endpoint=None)
                 try:
                     endpoint_timeout_sec = int(
                         cfg.get("endpoint_timeout_sec")
-                        or min(300, int(cfg.get("boot_timeout_sec") or 900))
+                        or min(1200, int(cfg.get("boot_timeout_sec") or 1200))
                     )
-                    network_info = self._wait_for_network_endpoint_info(client, self._instance_id, endpoint_timeout_sec)
+                    network_info = self._wait_for_network_endpoint_info(
+                        client,
+                        self._instance_id,
+                        endpoint_timeout_sec,
+                        int(cfg.get("vllm_port") or 8000),
+                        heartbeat_fn=lambda: self._coord_renew_lease(cfg, state="starting"),
+                    )
                     public_endpoint = network_info["endpoint"]
                     instance_payload = network_info["payload"]
                     self._public_endpoint = public_endpoint
+                    self._coord_update_state(
+                        state="network_ready",
+                        instance_id=self._instance_id,
+                        public_endpoint=public_endpoint,
+                        endpoint=None,
+                    )
+                    self._log_gpu_usage(
+                        "gpu_instance_booted",
+                        {
+                            "instance_id": self._instance_id,
+                            "public_endpoint": public_endpoint,
+                            "attempt": idx,
+                        },
+                    )
                     self._start_instance_observability(public_endpoint, instance_payload, cfg)
-                    endpoint = self._ssh_local_endpoint or public_endpoint
                     if self._use_ollama_runtime(cfg):
-                        self._wait_for_ollama_control_readiness(endpoint, cfg["boot_timeout_sec"])
-                        self._ensure_ollama_model_ready(endpoint, cfg["ready_timeout_sec"], cfg)
+                        endpoint = self._wait_for_ollama_control_readiness(public_endpoint, cfg["boot_timeout_sec"], cfg)
+                        endpoint = self._ensure_ollama_model_ready(endpoint, public_endpoint, cfg["ready_timeout_sec"], cfg)
                     else:
-                        self._wait_for_runtime_readiness(endpoint, cfg["ready_timeout_sec"], cfg)
+                        endpoint = self._wait_for_runtime_readiness(public_endpoint, cfg["ready_timeout_sec"], cfg)
                     self._endpoint = endpoint
                     self._started_at = datetime.now(timezone.utc)
                     self._last_activity_ts = time.time()
+                    self._coord_update_state(
+                        state="running",
+                        instance_id=self._instance_id,
+                        endpoint=endpoint,
+                        public_endpoint=public_endpoint,
+                        last_error="",
+                    )
                     self._sessions.update_session(
                         self._session_id,
                         {
@@ -171,33 +220,101 @@ class VllmRuntimeOrchestrator:
                     return self._endpoint
                 except Exception as e:
                     last_error = str(e)
+                    startup_stage = "endpoint_publish"
+                    lowered_error = last_error.lower()
+                    if "ollama" in lowered_error and ("loadable" in lowered_error or "pull" in lowered_error or "model" in lowered_error):
+                        startup_stage = "model_ready"
+                    elif "readiness" in lowered_error or "control endpoint" in lowered_error or "/v1/models" in lowered_error:
+                        startup_stage = "runtime_ready"
+                    self._log_gpu_usage(
+                        "gpu_startup_failed",
+                        {
+                            "instance_id": self._instance_id,
+                            "attempt": idx,
+                            "stage": startup_stage,
+                            "error": last_error,
+                        },
+                    )
+                    self._coord_update_state(
+                        state="failed",
+                        instance_id=self._instance_id,
+                        endpoint=self._endpoint,
+                        public_endpoint=self._public_endpoint,
+                        last_error=last_error,
+                    )
                     # Не залишаємо інстанс завислим при помилці старту/ready-check.
                     self._teardown_locked(reason=f"startup_failed_attempt_{idx}")
                     continue
+            self._coord_release(state="failed", last_error=last_error)
             raise RuntimeError(f"All Vast startup attempts failed. Last error: {last_error}")
 
     def mark_processing_activity(self, metadata: Optional[Dict[str, Any]] = None) -> None:
         with self._lock:
             self._last_activity_ts = time.time()
+            self._empty_queue_since_ts = 0.0
+            self._paused_since_ts = 0.0
+            cfg = self._settings_svc.get_settings()
+            self._coord_renew_lease(cfg, state="running")
             self._log_gpu_usage("gpu_processing", metadata or {})
 
-    def handle_pool_drain(self, has_new_tasks_fn) -> None:
-        """Політика shutdown: empty -> wait idle_grace -> recheck -> stop."""
+    def handle_pool_drain(self, has_new_tasks_fn, has_active_initiators_fn=None) -> None:
+        """Політика idle: active(10m)->pause(10m)->destroy(if no initiators)."""
         with self._lock:
             if not self._instance_id:
+                self._empty_queue_since_ts = 0.0
+                self._paused_since_ts = 0.0
+                self._instance_paused = False
                 return
             cfg = self._settings_svc.get_settings()
+            now = time.time()
+            has_active_initiators = bool(has_active_initiators_fn()) if callable(has_active_initiators_fn) else False
             if has_new_tasks_fn():
+                if self._instance_paused:
+                    self._resume_instance_locked(cfg)
                 self._last_activity_ts = time.time()
+                self._empty_queue_since_ts = 0.0
+                self._paused_since_ts = 0.0
                 return
-            idle_grace = int(cfg.get("idle_grace_sec") or 60)
-            self._log_gpu_usage("gpu_idle_wait", {"idle_grace_sec": idle_grace})
-        time.sleep(max(1, idle_grace))
-        with self._lock:
-            if has_new_tasks_fn():
-                self._last_activity_ts = time.time()
+
+            pause_after_sec = int(cfg.get("pause_after_idle_sec") or 600)
+            destroy_after_pause_sec = int(cfg.get("destroy_after_pause_sec") or 600)
+            if self._empty_queue_since_ts <= 0:
+                self._empty_queue_since_ts = now
+                self._log_gpu_usage(
+                    "gpu_idle_wait",
+                    {
+                        "idle_grace_sec": pause_after_sec,
+                        "stage": "active_before_pause",
+                    },
+                )
                 return
-            self._teardown_locked(reason="pool_drained")
+
+            idle_for = max(0, int(now - self._empty_queue_since_ts))
+            if not self._instance_paused:
+                if idle_for < pause_after_sec:
+                    return
+                self._pause_instance_locked(cfg, reason="idle_queue_pause")
+                self._paused_since_ts = time.time()
+                return
+
+            if self._paused_since_ts <= 0:
+                self._paused_since_ts = now
+                return
+
+            paused_for = max(0, int(now - self._paused_since_ts))
+            if paused_for < destroy_after_pause_sec:
+                return
+            if has_active_initiators:
+                self._log_gpu_usage(
+                    "gpu_destroy_delayed",
+                    {
+                        "reason": "active_initiators",
+                        "paused_for_sec": paused_for,
+                        "instance_id": self._instance_id,
+                    },
+                )
+                return
+            self._teardown_locked(reason="idle_paused_timeout")
 
     def force_shutdown(self, reason: str = "manual") -> None:
         with self._lock:
@@ -213,12 +330,18 @@ class VllmRuntimeOrchestrator:
         endpoint = self._endpoint
         public_endpoint = self._public_endpoint
         local_endpoint = self._ssh_local_endpoint
+        effective_endpoint = endpoint or self._select_effective_endpoint(public_endpoint)
+        endpoint_source = "runtime_ready" if endpoint else ("ssh_tunnel" if effective_endpoint == local_endpoint and effective_endpoint else ("public" if effective_endpoint == public_endpoint and effective_endpoint else "none"))
         instance_id = self._instance_id
+        instance_paused = self._instance_paused
         with self._obs_lock:
             recent_logs = list(self._recent_observability_logs[-40:])
         return {
             "instance_id": instance_id,
+            "instance_paused": instance_paused,
             "endpoint": endpoint,
+            "effective_endpoint": effective_endpoint,
+            "effective_endpoint_source": endpoint_source,
             "public_endpoint": public_endpoint,
             "ssh_local_endpoint": local_endpoint,
             "ssh_tunnel_enabled": bool(local_endpoint),
@@ -226,6 +349,34 @@ class VllmRuntimeOrchestrator:
             "ssh_log_stream_alive": stream_alive,
             "recent_logs": recent_logs,
         }
+
+    def _select_effective_endpoint(self, public_endpoint: Optional[str]) -> Optional[str]:
+        local_endpoint = self._ssh_local_endpoint
+        if local_endpoint and self._is_ssh_tunnel_alive():
+            return local_endpoint
+        return public_endpoint
+
+    def _is_ssh_tunnel_alive(self) -> bool:
+        proc = self._ssh_tunnel_proc
+        return bool(proc and proc.poll() is None)
+
+    def _resolve_runtime_endpoint(self, public_endpoint: str, previous_endpoint: Optional[str], phase: str) -> str:
+        endpoint = self._select_effective_endpoint(public_endpoint)
+        if not endpoint:
+            raise RuntimeError("Runtime endpoint is unavailable: no ssh tunnel and no public endpoint.")
+        if previous_endpoint and previous_endpoint != endpoint:
+            self._log_gpu_usage(
+                "gpu_endpoint_switched",
+                {
+                    "phase": phase,
+                    "from_endpoint": previous_endpoint,
+                    "to_endpoint": endpoint,
+                    "public_endpoint": public_endpoint,
+                    "ssh_local_endpoint": self._ssh_local_endpoint,
+                    "reason": "ssh_tunnel_unavailable" if endpoint == public_endpoint else "ssh_tunnel_restored",
+                },
+            )
+        return endpoint
 
     def _teardown_locked(self, reason: str) -> None:
         if not self._instance_id:
@@ -266,22 +417,146 @@ class VllmRuntimeOrchestrator:
         self._session_id = None
         self._endpoint = None
         self._public_endpoint = None
+        self._instance_paused = False
+        self._empty_queue_since_ts = 0.0
+        self._paused_since_ts = 0.0
         self._started_at = None
         self._last_activity_ts = 0.0
+        self._coord_release(
+            state="idle",
+            instance_id=None,
+            endpoint=None,
+            public_endpoint=None,
+            last_error="",
+        )
 
-    def _wait_for_network_endpoint_info(self, client: VastAiClient, instance_id: str, timeout_sec: int) -> Dict[str, Any]:
+    def _pause_instance_locked(self, cfg: Dict[str, Any], reason: str) -> None:
+        if not self._instance_id or self._instance_paused:
+            return
+        instance_id = self._instance_id
+        endpoint = self._endpoint or self._public_endpoint
+        self._stop_ssh_processes_locked()
+        try:
+            client = VastAiClient(api_key=cfg.get("vast_api_key", ""), timeout_sec=30)
+            client.stop_instance(instance_id)
+        except Exception as e:
+            self._log_gpu_usage(
+                "gpu_pause_failed",
+                {
+                    "instance_id": instance_id,
+                    "reason": reason,
+                    "error": str(e),
+                },
+            )
+            return
+        self._instance_paused = True
+        self._endpoint = None
+        self._coord_update_state(
+            state="paused",
+            instance_id=instance_id,
+            endpoint=None,
+            public_endpoint=self._public_endpoint,
+        )
+        self._log_gpu_usage(
+            "gpu_paused",
+            {
+                "instance_id": instance_id,
+                "reason": reason,
+                "endpoint": endpoint,
+            },
+        )
+        if self._session_id:
+            self._sessions.update_session(
+                self._session_id,
+                {
+                    "state": "paused",
+                    "paused_at": datetime.now(timezone.utc),
+                },
+            )
+
+    def _resume_instance_locked(self, cfg: Dict[str, Any]) -> None:
+        if not self._instance_id:
+            return
+        instance_id = self._instance_id
+        client = VastAiClient(api_key=cfg.get("vast_api_key", ""), timeout_sec=min(60, int(cfg.get("boot_timeout_sec") or 900)))
+        try:
+            client.start_instance(instance_id)
+        except Exception:
+            # Якщо інстанс already running — ігноруємо та переходимо до перевірки endpoint.
+            pass
+        endpoint_timeout_sec = int(cfg.get("endpoint_timeout_sec") or min(1200, int(cfg.get("boot_timeout_sec") or 1200)))
+        network_info = self._wait_for_network_endpoint_info(
+            client,
+            instance_id,
+            endpoint_timeout_sec,
+            int(cfg.get("vllm_port") or 8000),
+            heartbeat_fn=lambda: self._coord_renew_lease(cfg, state="resuming"),
+        )
+        public_endpoint = network_info["endpoint"]
+        instance_payload = network_info["payload"]
+        self._public_endpoint = public_endpoint
+        self._coord_update_state(
+            state="network_ready",
+            instance_id=instance_id,
+            public_endpoint=public_endpoint,
+            endpoint=None,
+        )
+        self._start_instance_observability(public_endpoint, instance_payload, cfg)
+        if self._use_ollama_runtime(cfg):
+            endpoint = self._wait_for_ollama_control_readiness(public_endpoint, int(cfg.get("boot_timeout_sec") or 1200), cfg)
+            endpoint = self._ensure_ollama_model_ready(endpoint, public_endpoint, int(cfg.get("ready_timeout_sec") or 1200), cfg)
+        else:
+            endpoint = self._wait_for_runtime_readiness(public_endpoint, int(cfg.get("ready_timeout_sec") or 1200), cfg)
+        self._endpoint = endpoint
+        self._instance_paused = False
+        self._coord_update_state(
+            state="running",
+            instance_id=instance_id,
+            endpoint=endpoint,
+            public_endpoint=public_endpoint,
+            last_error="",
+        )
+        self._log_gpu_usage(
+            "gpu_resumed",
+            {
+                "instance_id": instance_id,
+                "endpoint": endpoint,
+                "public_endpoint": public_endpoint,
+            },
+        )
+        if self._session_id:
+            self._sessions.update_session(
+                self._session_id,
+                {
+                    "state": "running",
+                    "endpoint": endpoint,
+                    "public_endpoint": public_endpoint,
+                    "resumed_at": datetime.now(timezone.utc),
+                },
+            )
+
+    def _wait_for_network_endpoint_info(
+        self,
+        client: VastAiClient,
+        instance_id: str,
+        timeout_sec: int,
+        service_port: int,
+        heartbeat_fn=None,
+    ) -> Dict[str, Any]:
         deadline = time.time() + max(30, timeout_sec)
         last_err = "Endpoint was not published."
         while time.time() < deadline:
+            if callable(heartbeat_fn):
+                heartbeat_fn()
             try:
                 data = client.show_instance(instance_id)
                 payload = data
                 if isinstance(data, dict) and isinstance(data.get("instances"), dict):
                     payload = data.get("instances") or {}
-                endpoint = self._extract_http_endpoint(payload)
+                endpoint = self._extract_http_endpoint(payload, service_port=service_port)
                 if endpoint:
                     return {"endpoint": endpoint, "payload": payload}
-                last_err = "Waiting for host/port mapping."
+                last_err = f"Waiting host/port mapping for service port {service_port}."
             except Exception as e:
                 last_err = str(e)
             time.sleep(5)
@@ -296,6 +571,28 @@ class VllmRuntimeOrchestrator:
             self._start_ssh_instance_log_stream(instance_payload, cfg)
 
     @staticmethod
+    def _extract_port_mapping(instance_payload: Dict[str, Any], container_port: int) -> Optional[int]:
+        if not isinstance(instance_payload, dict):
+            return None
+        ports = instance_payload.get("ports")
+        if not isinstance(ports, dict):
+            return None
+        candidates = ports.get(f"{int(container_port)}/tcp")
+        if not isinstance(candidates, list):
+            return None
+        for entry in candidates:
+            if not isinstance(entry, dict):
+                continue
+            host_port = entry.get("HostPort")
+            try:
+                p = int(host_port)
+                if 1 <= p <= 65535:
+                    return p
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
     def _extract_ssh_access(instance_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(instance_payload, dict):
             return None
@@ -306,10 +603,11 @@ class VllmRuntimeOrchestrator:
         )
         if not host:
             return None
-        port = (
-            instance_payload.get("ssh_port")
+        mapped_ssh_port = VllmRuntimeOrchestrator._extract_port_mapping(instance_payload, container_port=22)
+        port = mapped_ssh_port or (
+            instance_payload.get("external_ssh_port")
+            or instance_payload.get("ssh_port")
             or instance_payload.get("ssh_port_start")
-            or instance_payload.get("external_ssh_port")
             or 22
         )
         try:
@@ -361,17 +659,18 @@ class VllmRuntimeOrchestrator:
             "-p",
             str(access["port"]),
             f'{access["user"]}@{access["host"]}',
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "ServerAliveInterval=20",
-            "-o",
-            "ServerAliveCountMax=3",
         ]
+        cmd.extend(self._build_ssh_common_options(cfg))
+        cmd.extend(
+            [
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "ServerAliveInterval=20",
+                "-o",
+                "ServerAliveCountMax=3",
+            ]
+        )
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -425,12 +724,9 @@ class VllmRuntimeOrchestrator:
             "-p",
             str(access["port"]),
             f'{access["user"]}@{access["host"]}',
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
             remote_cmd,
         ]
+        cmd[4:4] = self._build_ssh_common_options(cfg)
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -466,6 +762,40 @@ class VllmRuntimeOrchestrator:
         threading.Thread(target=_read_stream, args=(proc.stdout, "stdout"), daemon=True).start()
         threading.Thread(target=_read_stream, args=(proc.stderr, "stderr"), daemon=True).start()
 
+    @staticmethod
+    def _known_hosts_null_path() -> str:
+        # OpenSSH on Windows expects NUL instead of /dev/null.
+        return "NUL" if os.name == "nt" else os.devnull
+
+    @staticmethod
+    def _resolve_ssh_identity_file(cfg: Dict[str, Any]) -> str:
+        value = str(cfg.get("ssh_identity_file") or os.getenv("PAZUZU_SSH_IDENTITY_FILE") or "").strip()
+        if not value:
+            return ""
+        expanded = os.path.expanduser(os.path.expandvars(value))
+        return expanded if os.path.isfile(expanded) else ""
+
+    def _build_ssh_common_options(self, cfg: Dict[str, Any]) -> List[str]:
+        options: List[str] = [
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            f"UserKnownHostsFile={self._known_hosts_null_path()}",
+        ]
+        identity_file = self._resolve_ssh_identity_file(cfg)
+        if identity_file:
+            options.extend(
+                [
+                    "-i",
+                    identity_file,
+                    "-o",
+                    "IdentitiesOnly=yes",
+                ]
+            )
+        return options
+
     def _stop_ssh_processes_locked(self) -> None:
         for attr in ("_ssh_log_proc", "_ssh_tunnel_proc"):
             proc = getattr(self, attr, None)
@@ -489,13 +819,23 @@ class VllmRuntimeOrchestrator:
             if len(self._recent_observability_logs) > 400:
                 self._recent_observability_logs = self._recent_observability_logs[-200:]
 
-    def _wait_for_runtime_readiness(self, endpoint: str, timeout_sec: int, cfg: Dict[str, Any]) -> None:
+    def _wait_for_runtime_readiness(self, public_endpoint: str, timeout_sec: int, cfg: Dict[str, Any]) -> str:
         deadline = time.time() + max(30, timeout_sec)
         runtime_name = "Ollama" if self._use_ollama_runtime(cfg) else "vLLM"
         last_err = f"{runtime_name} readiness check did not pass."
+        endpoint: Optional[str] = None
         while time.time() < deadline:
+            self._coord_renew_lease(cfg, state="runtime_ready")
+            endpoint = self._resolve_runtime_endpoint(public_endpoint, endpoint, phase="ready_check")
             if self._is_runtime_ready(endpoint, cfg, timeout_sec=8):
-                return
+                self._log_gpu_usage(
+                    "gpu_runtime_endpoint_ready",
+                    {
+                        "runtime": "vllm",
+                        "endpoint": endpoint,
+                    },
+                )
+                return endpoint
             last_err = f"Waiting {runtime_name} readiness on {endpoint}"
             time.sleep(4)
         raise RuntimeError(last_err)
@@ -545,32 +885,101 @@ class VllmRuntimeOrchestrator:
         except Exception:
             return False
 
-    def _wait_for_ollama_control_readiness(self, endpoint: str, timeout_sec: int) -> None:
+    def _wait_for_ollama_control_readiness(self, public_endpoint: str, timeout_sec: int, cfg: Dict[str, Any]) -> str:
         deadline = time.time() + max(30, timeout_sec)
-        last_err = f"Waiting Ollama control endpoint on {endpoint}"
+        endpoint: Optional[str] = None
+        last_err = "Waiting Ollama control endpoint."
+        last_wait_log_ts = 0.0
         while time.time() < deadline:
+            self._coord_renew_lease(cfg, state="ollama_control_ready")
+            endpoint = self._resolve_runtime_endpoint(public_endpoint, endpoint, phase="ollama_control_ready")
             if self._is_ollama_ready(endpoint, timeout_sec=8):
-                return
+                self._log_gpu_usage(
+                    "gpu_runtime_endpoint_ready",
+                    {
+                        "runtime": "ollama",
+                        "endpoint": endpoint,
+                    },
+                )
+                return endpoint
+            now_ts = time.time()
+            if now_ts - last_wait_log_ts >= 30:
+                self._log_gpu_usage(
+                    "gpu_runtime_endpoint_wait",
+                    {
+                        "runtime": "ollama",
+                        "endpoint": endpoint,
+                    },
+                )
+                last_wait_log_ts = now_ts
+            if not cfg.get("enable_ssh_tunnel", True) and public_endpoint:
+                endpoint = public_endpoint
             time.sleep(3)
         raise RuntimeError(last_err)
 
-    def _ensure_ollama_model_ready(self, endpoint: str, timeout_sec: int, cfg: Dict[str, Any]) -> None:
+    def _ensure_ollama_model_ready(self, endpoint: str, public_endpoint: str, timeout_sec: int, cfg: Dict[str, Any]) -> str:
         model = self._normalize_ollama_model_ref(str(cfg.get("vllm_model") or ""))
         if not model:
             raise RuntimeError("Ollama model is empty in runtime settings.")
-        if self._is_ollama_model_available(endpoint, model, timeout_sec=8):
-            return
-        self._log_gpu_usage(
-            "gpu_model_pull_started",
-            {
-                "runtime": "ollama",
-                "model": model,
-                "endpoint": endpoint,
-            },
-        )
-        self._trigger_ollama_pull_with_feedback(endpoint, model, timeout_sec)
-        if not self._is_ollama_model_available(endpoint, model, timeout_sec=8):
-            raise RuntimeError(f"Ollama pull completed but model is not available: {model}")
+        availability_timeout = min(60, max(20, timeout_sec // 3))
+        repaired_once = False
+        while True:
+            if not self._is_ollama_model_available(endpoint, model, timeout_sec=8):
+                self._log_gpu_usage(
+                    "gpu_model_pull_started",
+                    {
+                        "runtime": "ollama",
+                        "model": model,
+                        "endpoint": endpoint,
+                    },
+                )
+                try:
+                    self._trigger_ollama_pull_with_feedback(endpoint, model, timeout_sec)
+                except RuntimeError:
+                    fallback_endpoint = self._resolve_runtime_endpoint(public_endpoint, endpoint, phase="ollama_pull_retry")
+                    if fallback_endpoint == endpoint:
+                        raise
+                    self._log_gpu_usage(
+                        "gpu_model_pull_retry",
+                        {
+                            "runtime": "ollama",
+                            "model": model,
+                            "from_endpoint": endpoint,
+                            "to_endpoint": fallback_endpoint,
+                        },
+                    )
+                    endpoint = fallback_endpoint
+                    self._trigger_ollama_pull_with_feedback(endpoint, model, timeout_sec)
+                if not self._wait_for_ollama_model_available(endpoint, model, timeout_sec=availability_timeout):
+                    raise RuntimeError(f"Ollama pull completed but model is not available: {model}")
+
+            loadable, load_error = self._wait_for_ollama_model_loadable(endpoint, model, timeout_sec=75)
+            if loadable:
+                break
+            if repaired_once or not self._is_ollama_blob_load_error(load_error):
+                raise RuntimeError(f"Ollama model is not loadable: {load_error or model}")
+            self._log_gpu_usage(
+                "gpu_model_repair_started",
+                {
+                    "runtime": "ollama",
+                    "model": model,
+                    "endpoint": endpoint,
+                    "reason": "blob_load_error",
+                },
+            )
+            self._delete_ollama_model(endpoint, model, timeout_sec=20)
+            self._log_gpu_usage(
+                "gpu_model_repair_pull",
+                {
+                    "runtime": "ollama",
+                    "model": model,
+                    "endpoint": endpoint,
+                },
+            )
+            self._trigger_ollama_pull_with_feedback(endpoint, model, timeout_sec)
+            if not self._wait_for_ollama_model_available(endpoint, model, timeout_sec=availability_timeout):
+                raise RuntimeError(f"Ollama repair pull completed but model is not available: {model}")
+            repaired_once = True
         self._log_gpu_usage(
             "gpu_model_pull_ready",
             {
@@ -579,6 +988,79 @@ class VllmRuntimeOrchestrator:
                 "endpoint": endpoint,
             },
         )
+        return endpoint
+
+    def _wait_for_ollama_model_available(self, endpoint: str, model: str, timeout_sec: int = 30) -> bool:
+        deadline = time.time() + max(10, int(timeout_sec))
+        while time.time() < deadline:
+            self._coord_renew_lease(self._settings_svc.get_settings(), state="model_available_wait")
+            if self._is_ollama_model_available(endpoint, model, timeout_sec=8):
+                return True
+            time.sleep(2)
+        return False
+
+    @staticmethod
+    def _is_ollama_blob_load_error(message: str) -> bool:
+        txt = str(message or "").lower()
+        return ("unable to load model" in txt) or ("models/blobs/sha256" in txt)
+
+    def _check_ollama_model_loadability(self, endpoint: str, model: str, timeout_sec: int = 45) -> tuple[bool, str]:
+        base = endpoint.rstrip("/")
+        try:
+            resp = requests.post(
+                f"{base}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": "hello",
+                    "stream": False,
+                    "options": {"num_predict": 1},
+                },
+                timeout=timeout_sec,
+            )
+        except requests.RequestException as e:
+            return False, str(e)
+        if resp.status_code == 200:
+            return True, ""
+        body = ""
+        try:
+            parsed = resp.json()
+            if isinstance(parsed, dict):
+                body = str(parsed.get("error") or parsed)
+            else:
+                body = str(parsed)
+        except Exception:
+            body = (resp.text or "").strip()
+        return False, f"http={resp.status_code} {body[:500]}".strip()
+
+    def _wait_for_ollama_model_loadable(self, endpoint: str, model: str, timeout_sec: int = 75) -> tuple[bool, str]:
+        deadline = time.time() + max(15, int(timeout_sec))
+        last_error = ""
+        while time.time() < deadline:
+            self._coord_renew_lease(self._settings_svc.get_settings(), state="model_loadable_wait")
+            ok, error = self._check_ollama_model_loadability(endpoint, model, timeout_sec=45)
+            if ok:
+                return True, ""
+            last_error = error
+            time.sleep(4)
+        return False, last_error
+
+    def _delete_ollama_model(self, endpoint: str, model: str, timeout_sec: int = 20) -> None:
+        base = endpoint.rstrip("/")
+        errors: List[str] = []
+        for method in ("delete", "post"):
+            try:
+                req = getattr(requests, method)
+                resp = req(
+                    f"{base}/api/delete",
+                    json={"model": model},
+                    timeout=timeout_sec,
+                )
+                if resp.status_code in (200, 202, 204, 404):
+                    return
+                errors.append(f"{method.upper()} {resp.status_code}: {(resp.text or '')[:180]}")
+            except requests.RequestException as e:
+                errors.append(f"{method.upper()} {e}")
+        raise RuntimeError(f"Ollama delete failed for {model}: {' | '.join(errors)}")
 
     def _trigger_ollama_pull_with_feedback(self, endpoint: str, model: str, timeout_sec: int) -> None:
         base = endpoint.rstrip("/")
@@ -600,6 +1082,7 @@ class VllmRuntimeOrchestrator:
                 last_progress_log = 0.0
                 deadline = time.time() + max(30, timeout_sec)
                 for line in resp.iter_lines(decode_unicode=True):
+                    self._coord_renew_lease(self._settings_svc.get_settings(), state="model_pull")
                     if time.time() > deadline:
                         raise RuntimeError(f"Ollama pull timeout for {model}")
                     if not line:
@@ -629,10 +1112,16 @@ class VllmRuntimeOrchestrator:
                         last_progress_log = now
                     if payload.get("error"):
                         raise RuntimeError(f"Ollama pull error: {payload.get('error')}")
+                    if status.lower() == "success":
+                        return
                     if payload.get("done") is True:
                         return
+                if self._is_ollama_model_available(endpoint, model, timeout_sec=8):
+                    return
                 raise RuntimeError(f"Ollama pull stream ended before done=true for {model}")
         except requests.RequestException as e:
+            if self._is_ollama_model_available(endpoint, model, timeout_sec=8):
+                return
             raise RuntimeError(f"Ollama pull request failed: {e}") from e
 
     @staticmethod
@@ -835,7 +1324,7 @@ class VllmRuntimeOrchestrator:
         }
 
     @staticmethod
-    def _extract_http_endpoint(instance_payload: Dict[str, Any]) -> Optional[str]:
+    def _extract_http_endpoint(instance_payload: Dict[str, Any], service_port: int = 8000) -> Optional[str]:
         if not isinstance(instance_payload, dict):
             return None
         for key in ("public_ipaddr", "public_ip", "ssh_host"):
@@ -846,17 +1335,20 @@ class VllmRuntimeOrchestrator:
             ip = None
         if not ip:
             return None
+        # Prefer explicit Docker/NAT mapping for the requested service port.
+        mapped_port = VllmRuntimeOrchestrator._extract_port_mapping(instance_payload, container_port=service_port)
+        if mapped_port:
+            return f"http://{ip}:{mapped_port}"
         direct_port = (
             instance_payload.get("direct_port_start")
             or instance_payload.get("direct_port")
-            or 8000
         )
         try:
             p = int(direct_port)
         except (TypeError, ValueError):
-            p = 8000
+            p = 0
         if p <= 0 or p >= 65535:
-            p = 8000
+            return None
         return f"http://{ip}:{p}"
 
     def _estimate_cost_usd(self, active_seconds: float, cfg: Dict[str, Any]) -> float:
@@ -875,14 +1367,120 @@ class VllmRuntimeOrchestrator:
             snap["hf_token"] = "***"
         return snap
 
+    def _coord_lease_seconds(self, cfg: Dict[str, Any]) -> int:
+        endpoint_timeout = int(cfg.get("endpoint_timeout_sec") or 1200)
+        ready_timeout = int(cfg.get("ready_timeout_sec") or 1200)
+        boot_timeout = int(cfg.get("boot_timeout_sec") or 1200)
+        return max(90, min(1800, max(endpoint_timeout, ready_timeout, boot_timeout) + 120))
+
+    def _coord_try_acquire(self, cfg: Dict[str, Any], state: str) -> bool:
+        return self._coord.try_acquire(
+            self._owner_id,
+            self._coord_lease_seconds(cfg),
+            {
+                "state": state,
+                "instance_id": self._instance_id,
+                "endpoint": self._endpoint,
+                "public_endpoint": self._public_endpoint,
+                "last_error": "",
+            },
+        )
+
+    def _coord_renew_lease(self, cfg: Dict[str, Any], state: str) -> None:
+        try:
+            self._coord.renew(
+                self._owner_id,
+                self._coord_lease_seconds(cfg),
+                {
+                    "state": state,
+                    "instance_id": self._instance_id,
+                    "endpoint": self._endpoint,
+                    "public_endpoint": self._public_endpoint,
+                },
+            )
+        except Exception:
+            pass
+
+    def _coord_update_state(self, state: str, **extra: Any) -> None:
+        try:
+            payload = {"state": state}
+            payload.update(extra)
+            self._coord.update_state(self._owner_id, payload)
+        except Exception:
+            pass
+
+    def _coord_release(self, state: str, **extra: Any) -> None:
+        try:
+            payload = {"state": state}
+            payload.update(extra)
+            self._coord.release(self._owner_id, payload)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _shared_state_has_active_owner(state: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(state, dict):
+            return False
+        owner_id = state.get("owner_id")
+        lease_until = state.get("lease_expires_at")
+        if not owner_id or not isinstance(lease_until, datetime):
+            return False
+        return lease_until > datetime.now(timezone.utc)
+
+    def _wait_for_shared_runtime_or_acquire(self, cfg: Dict[str, Any]) -> Optional[str]:
+        deadline = time.time() + max(
+            30,
+            int(cfg.get("endpoint_timeout_sec") or 1200),
+            int(cfg.get("ready_timeout_sec") or 1200),
+            int(cfg.get("boot_timeout_sec") or 1200),
+        )
+        while time.time() < deadline:
+            state = self._coord.get_runtime_state() or {}
+            public_endpoint = str(state.get("public_endpoint") or "").strip()
+            endpoint = public_endpoint or str(state.get("endpoint") or "").strip()
+            runtime_state = str(state.get("state") or "").strip().lower()
+            if endpoint and runtime_state == "running" and self._is_runtime_ready(endpoint, cfg, timeout_sec=8):
+                self._instance_id = str(state.get("instance_id") or self._instance_id or "")
+                self._public_endpoint = public_endpoint or endpoint
+                self._endpoint = endpoint
+                self._instance_paused = False
+                self._log_gpu_usage(
+                    "gpu_ready",
+                    {
+                        "instance_id": self._instance_id,
+                        "endpoint": endpoint,
+                        "public_endpoint": self._public_endpoint,
+                        "attempt": 0,
+                        "ssh_tunnel_enabled": False,
+                    },
+                )
+                return endpoint
+            if not self._shared_state_has_active_owner(state):
+                if self._coord_try_acquire(cfg, state="starting"):
+                    return None
+            time.sleep(5)
+        raise RuntimeError("Timed out waiting for another process to finish Vast runtime startup.")
+
     def _log_gpu_usage(self, event: str, metadata: Dict[str, Any]) -> None:
         if event in {
+            "gpu_instance_booted",
             "gpu_model_pull_started",
             "gpu_model_pull_progress",
             "gpu_model_pull_ready",
+            "gpu_model_pull_retry",
+            "gpu_model_repair_started",
+            "gpu_model_repair_pull",
+            "gpu_startup_failed",
+            "gpu_paused",
+            "gpu_pause_failed",
+            "gpu_resumed",
+            "gpu_destroy_delayed",
+            "gpu_runtime_endpoint_ready",
+            "gpu_runtime_endpoint_wait",
             "gpu_ssh_tunnel_ready",
             "gpu_ssh_tunnel_failed",
             "gpu_ssh_tunnel_unavailable",
+            "gpu_endpoint_switched",
             "gpu_instance_log_stream_started",
             "gpu_ready",
             "gpu_rent_failed",
@@ -890,15 +1488,21 @@ class VllmRuntimeOrchestrator:
             summary_parts = [f"event={event}"]
             status = metadata.get("status")
             model = metadata.get("model")
+            stage = metadata.get("stage")
+            error = metadata.get("error")
             endpoint = metadata.get("endpoint") or metadata.get("local_endpoint") or metadata.get("public_endpoint")
             if model:
                 summary_parts.append(f"model={model}")
             if status:
                 summary_parts.append(f"status={status}")
+            if stage:
+                summary_parts.append(f"stage={stage}")
             if "progress_ratio" in metadata:
                 summary_parts.append(f"progress={metadata.get('progress_ratio')}")
             if endpoint:
                 summary_parts.append(f"endpoint={endpoint}")
+            if error:
+                summary_parts.append(f"error={str(error)[:240]}")
             self._append_recent_observability_log("runtime_event", "meta", " ".join(summary_parts))
         try:
             self._logging.log_api_usage(

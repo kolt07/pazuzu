@@ -59,7 +59,7 @@ class VastRuntimeSettingsServiceTest(unittest.TestCase):
         self.assertTrue(saved["enable_ssh_tunnel"])
         self.assertEqual(saved["ssh_tunnel_local_port"], 8000)
         self.assertTrue(saved["ssh_instance_log_stream"])
-        self.assertEqual(saved["endpoint_timeout_sec"], 240)
+        self.assertEqual(saved["endpoint_timeout_sec"], 1200)
         self.assertEqual(saved["boot_timeout_sec"], 1200)
         self.assertEqual(saved["ready_timeout_sec"], 1200)
         self.assertEqual(saved["vllm_max_model_len"], 4096)

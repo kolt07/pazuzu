@@ -517,6 +517,7 @@ class VastRuntimeSettingsUpdate(BaseModel):
     vllm_max_num_seqs: Optional[int] = None
     vllm_api_key: Optional[str] = None
     hf_token: Optional[str] = None
+    endpoint_timeout_sec: Optional[int] = None
     boot_timeout_sec: Optional[int] = None
     ready_timeout_sec: Optional[int] = None
     idle_grace_sec: Optional[int] = None

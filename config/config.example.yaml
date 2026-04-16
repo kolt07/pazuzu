@@ -100,11 +100,14 @@ llm:
 #   preferred_inet_down_mbps: 1000  # ranking target
 #   enable_ssh_tunnel: true         # піднімати локальний SSH tunnel одразу після старту інстанса
 #   ssh_tunnel_local_port: 8000     # локальний порт tunnel (якщо зайнятий, буде обрано сусідній вільний)
+#   ssh_identity_file: ""           # шлях до приватного SSH ключа (напр. C:\Users\you\.ssh\id_ed25519_custom)
 #   ssh_instance_log_stream: true   # stream stdout/stderr логів інстанса через SSH у app logs
 #   endpoint_timeout_sec: 240  # скільки чекаємо саме публікацію зовнішнього endpoint (ssh/port-forward), далі failover на інший офер
 #   boot_timeout_sec: 1200
 #   ready_timeout_sec: 1200
-#   idle_grace_sec: 60
+#   pause_after_idle_sec: 600     # якщо черга порожня > N сек після ready -> stop instance (pause)
+#   destroy_after_pause_sec: 600  # якщо інстанс у pause > N сек і немає активних ініціаторів -> destroy
+#   idle_grace_sec: 60            # legacy, залишено для сумісності
 #   hard_budget_usd: 20.0
 
 # OLX скрапер: отримання сторінок пошуку та деталей через браузер (Playwright) замість HTTP

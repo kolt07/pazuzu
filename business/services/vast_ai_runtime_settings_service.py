@@ -44,11 +44,14 @@ class VastRuntimeSettingsService:
             "hf_token": "",
             "enable_ssh_tunnel": True,
             "ssh_tunnel_local_port": 8000,
+            "ssh_identity_file": "",
             "ssh_instance_log_stream": True,
-            "endpoint_timeout_sec": 240,
+            "endpoint_timeout_sec": 1200,
             "boot_timeout_sec": 1200,
             "ready_timeout_sec": 1200,
             "idle_grace_sec": 60,
+            "pause_after_idle_sec": 600,
+            "destroy_after_pause_sec": 600,
             "hard_budget_usd": 20.0,
             "fallback_provider": "ollama",
         }
@@ -109,11 +112,14 @@ class VastRuntimeSettingsService:
         out["vllm_max_num_seqs"] = max(1, min(256, mns))
         out["enable_ssh_tunnel"] = bool(out.get("enable_ssh_tunnel", True))
         out["ssh_tunnel_local_port"] = int(out.get("ssh_tunnel_local_port") or 8000)
+        out["ssh_identity_file"] = str(out.get("ssh_identity_file") or "").strip()
         out["ssh_instance_log_stream"] = bool(out.get("ssh_instance_log_stream", True))
-        out["endpoint_timeout_sec"] = int(out.get("endpoint_timeout_sec") or 240)
+        out["endpoint_timeout_sec"] = int(out.get("endpoint_timeout_sec") or 1200)
         out["boot_timeout_sec"] = int(out.get("boot_timeout_sec") or 1200)
         out["ready_timeout_sec"] = int(out.get("ready_timeout_sec") or 1200)
         out["idle_grace_sec"] = int(out.get("idle_grace_sec") or 60)
+        out["pause_after_idle_sec"] = int(out.get("pause_after_idle_sec") or 600)
+        out["destroy_after_pause_sec"] = int(out.get("destroy_after_pause_sec") or 600)
         out["hard_budget_usd"] = float(out.get("hard_budget_usd") or 0.0)
         out["vast_api_key"] = str(out.get("vast_api_key") or "").strip()
         out["vllm_api_key"] = str(out.get("vllm_api_key") or "").strip()

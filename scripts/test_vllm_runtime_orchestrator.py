@@ -7,12 +7,39 @@
 """
 
 import unittest
+import threading
+import time
 import requests
 
 from business.services.vllm_runtime_orchestrator import VllmRuntimeOrchestrator
 
 
 class VllmRuntimeOrchestratorTest(unittest.TestCase):
+    @staticmethod
+    def _build_idle_lifecycle_subject():
+        obj = VllmRuntimeOrchestrator.__new__(VllmRuntimeOrchestrator)
+        obj._lock = threading.Lock()
+        obj._instance_id = "test-instance"
+        obj._instance_paused = False
+        obj._empty_queue_since_ts = 0.0
+        obj._paused_since_ts = 0.0
+        obj._last_activity_ts = 0.0
+        obj._log_gpu_usage = lambda *_args, **_kwargs: None
+        obj._resume_instance_locked = lambda _cfg: None
+        obj._pause_instance_locked = lambda _cfg, reason: None
+        obj._teardown_locked = lambda reason: None
+
+        class _Settings:
+            @staticmethod
+            def get_settings():
+                return {
+                    "pause_after_idle_sec": 600,
+                    "destroy_after_pause_sec": 600,
+                }
+
+        obj._settings_svc = _Settings()
+        return obj
+
     def test_build_offer_filters_contains_constraints(self):
         cfg = {
             "min_gpu_ram_gb": 24,
@@ -184,6 +211,51 @@ class VllmRuntimeOrchestratorTest(unittest.TestCase):
         }
         access = VllmRuntimeOrchestrator._extract_ssh_access(payload)
         self.assertEqual(access, {"host": "ssh6.vast.ai", "port": 10226, "user": "root"})
+
+    def test_handle_pool_drain_pauses_after_idle_timeout(self):
+        obj = self._build_idle_lifecycle_subject()
+        obj._empty_queue_since_ts = time.time() - 700
+        called = {"paused": False, "destroyed": False}
+
+        def _pause(_cfg, reason=None):
+            called["paused"] = True
+            obj._instance_paused = True
+
+        def _destroy(_reason):
+            called["destroyed"] = True
+
+        obj._pause_instance_locked = _pause
+        obj._teardown_locked = _destroy
+        obj.handle_pool_drain(lambda: False, lambda: True)
+        self.assertTrue(called["paused"])
+        self.assertFalse(called["destroyed"])
+
+    def test_handle_pool_drain_destroys_paused_instance_when_safe(self):
+        obj = self._build_idle_lifecycle_subject()
+        obj._instance_paused = True
+        obj._empty_queue_since_ts = time.time() - 1300
+        obj._paused_since_ts = time.time() - 700
+        called = {"destroy_reason": ""}
+        obj._teardown_locked = lambda reason: called.update({"destroy_reason": reason})
+        obj.handle_pool_drain(lambda: False, lambda: False)
+        self.assertEqual(called["destroy_reason"], "idle_paused_timeout")
+
+    def test_handle_pool_drain_resumes_when_new_tasks_appear(self):
+        obj = self._build_idle_lifecycle_subject()
+        obj._instance_paused = True
+        obj._empty_queue_since_ts = time.time() - 50
+        obj._paused_since_ts = time.time() - 50
+        called = {"resumed": False}
+
+        def _resume(_cfg):
+            called["resumed"] = True
+            obj._instance_paused = False
+
+        obj._resume_instance_locked = _resume
+        obj.handle_pool_drain(lambda: True, lambda: True)
+        self.assertTrue(called["resumed"])
+        self.assertEqual(obj._empty_queue_since_ts, 0.0)
+        self.assertEqual(obj._paused_since_ts, 0.0)
 
 
 if __name__ == "__main__":

@@ -2256,6 +2256,7 @@
         if (byId("admin-vast-min-gpu-ram")) byId("admin-vast-min-gpu-ram").value = cfg.min_gpu_ram_gb != null ? cfg.min_gpu_ram_gb : "";
         if (byId("admin-vast-max-hourly-usd")) byId("admin-vast-max-hourly-usd").value = cfg.max_hourly_usd != null ? cfg.max_hourly_usd : "";
         if (byId("admin-vast-idle-grace-sec")) byId("admin-vast-idle-grace-sec").value = cfg.idle_grace_sec != null ? cfg.idle_grace_sec : "";
+        if (byId("admin-vast-endpoint-timeout-sec")) byId("admin-vast-endpoint-timeout-sec").value = cfg.endpoint_timeout_sec != null ? cfg.endpoint_timeout_sec : "";
         if (byId("admin-vast-hard-budget-usd")) byId("admin-vast-hard-budget-usd").value = cfg.hard_budget_usd != null ? cfg.hard_budget_usd : "";
         if (statusEl) statusEl.textContent = "Поточний ключ Vast: " + (cfg.vast_api_key || "не задано") + " | HF token: " + (cfg.hf_token || "не задано");
       })
@@ -2278,6 +2279,7 @@
       min_gpu_ram_gb: byId("admin-vast-min-gpu-ram") ? parseInt(byId("admin-vast-min-gpu-ram").value || "0", 10) : 0,
       max_hourly_usd: byId("admin-vast-max-hourly-usd") ? parseFloat(byId("admin-vast-max-hourly-usd").value || "0") : 0,
       idle_grace_sec: byId("admin-vast-idle-grace-sec") ? parseInt(byId("admin-vast-idle-grace-sec").value || "60", 10) : 60,
+      endpoint_timeout_sec: byId("admin-vast-endpoint-timeout-sec") ? parseInt(byId("admin-vast-endpoint-timeout-sec").value || "1200", 10) : 1200,
       hard_budget_usd: byId("admin-vast-hard-budget-usd") ? parseFloat(byId("admin-vast-hard-budget-usd").value || "0") : 0,
     };
     var apiKeyInput = byId("admin-vast-api-key");

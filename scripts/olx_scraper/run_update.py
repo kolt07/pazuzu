@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -659,7 +659,7 @@ def _filter_regions_with_categories(
 
 
 def _phase1_worker(
-    job_queue: "queue.Queue[Optional[Tuple[str, Dict[str, Any]]]]",
+    job_queue: "queue.Queue[Tuple[str, Dict[str, Any]]]",
     raw_repo: RawOlxListingsRepository,
     log_fn: Callable[[str], None],
     cutoff_utc: Optional[datetime],
@@ -668,6 +668,15 @@ def _phase1_worker(
     results_lock: threading.Lock,
     total_listings_ref: List[int],
     all_loaded_urls_ref: List[str],
+    source_pending_ref: List[int],
+    source_inflight_ref: List[int],
+    source_state_lock: threading.Lock,
+    llm_process_url_fn: Optional[Callable[[str], bool]],
+    llm_enqueue_region_filter_fn: Optional[Callable[[str], bool]],
+    llm_queue: Optional["queue.Queue[str]"],
+    llm_seen_urls: Set[str],
+    llm_seen_lock: threading.Lock,
+    llm_processed_urls_ref: List[str],
 ) -> None:
     """
     Воркер Phase 1: бере завдання з черги (region_name, category_dict), виконує _process_category_raw_only,
@@ -701,40 +710,73 @@ def _phase1_worker(
             browser_fetcher=browser_fetcher,
         )
 
-    try:
-        if use_browser:
-            from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
-            with BrowserPageFetcher(headless=True, log_fn=log_fn) as bf:
-                browser_fetcher = bf
-                while True:
-                    job = job_queue.get()
-                    if job is None:
-                        break
-                    region_name, cat = job
-                    try:
-                        n_list, urls = run_job(region_name, cat)
-                        with results_lock:
-                            total_listings_ref[0] += n_list
-                            all_loaded_urls_ref.extend(urls)
-                    except Exception as e:
-                        with results_lock:
-                            log_fn(f"[OLX raw] Помилка {region_name} / {cat.get('label', '?')}: {e}")
-        else:
-            while True:
-                job = job_queue.get()
-                if job is None:
+    def _drain_llm_once() -> bool:
+        if not llm_process_url_fn or not llm_queue:
+            return False
+        try:
+            listing_url = llm_queue.get(timeout=0.2)
+        except queue.Empty:
+            return False
+        if llm_process_url_fn(listing_url):
+            with results_lock:
+                llm_processed_urls_ref.append(listing_url)
+        return True
+
+    def _can_stop() -> bool:
+        with source_state_lock:
+            no_more_source = source_pending_ref[0] == 0 and source_inflight_ref[0] == 0
+        if not no_more_source:
+            return False
+        if not llm_process_url_fn or not llm_queue:
+            return True
+        return llm_queue.empty()
+
+    def _run_loop() -> None:
+        while True:
+            try:
+                region_name, cat = job_queue.get_nowait()
+                with source_state_lock:
+                    source_pending_ref[0] = max(0, source_pending_ref[0] - 1)
+                    source_inflight_ref[0] += 1
+            except queue.Empty:
+                if _drain_llm_once():
+                    continue
+                if _can_stop():
                     break
-                region_name, cat = job
-                try:
-                    n_list, urls = run_job(region_name, cat)
-                    with results_lock:
-                        total_listings_ref[0] += n_list
-                        all_loaded_urls_ref.extend(urls)
-                except Exception as e:
-                    with results_lock:
-                        log_fn(f"[OLX raw] Помилка {region_name} / {cat.get('label', '?')}: {e}")
-    finally:
-        pass
+                continue
+
+            try:
+                n_list, urls = run_job(region_name, cat)
+                with results_lock:
+                    total_listings_ref[0] += n_list
+                    all_loaded_urls_ref.extend(urls)
+                if llm_process_url_fn and llm_queue:
+                    allow_region = True
+                    if llm_enqueue_region_filter_fn:
+                        allow_region = llm_enqueue_region_filter_fn(region_name)
+                    if allow_region:
+                        for url in urls:
+                            with llm_seen_lock:
+                                if url in llm_seen_urls:
+                                    continue
+                                llm_seen_urls.add(url)
+                            llm_queue.put(url)
+                while _drain_llm_once():
+                    pass
+            except Exception as e:
+                with results_lock:
+                    log_fn(f"[OLX raw] Помилка {region_name} / {cat.get('label', '?')}: {e}")
+            finally:
+                with source_state_lock:
+                    source_inflight_ref[0] = max(0, source_inflight_ref[0] - 1)
+
+    if use_browser:
+        from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
+        with BrowserPageFetcher(headless=True, log_fn=log_fn) as bf:
+            browser_fetcher = bf
+            _run_loop()
+    else:
+        _run_loop()
 
 
 def run_olx_update_raw_only(
@@ -745,6 +787,8 @@ def run_olx_update_raw_only(
     listing_types: Optional[List[str]] = None,
     use_browser: Optional[bool] = None,
     max_workers: Optional[int] = None,
+    llm_process_url_fn: Optional[Callable[[str], bool]] = None,
+    llm_enqueue_region_filter_fn: Optional[Callable[[str], bool]] = None,
 ) -> Dict[str, Any]:
     """
     Phase 1 pipeline: завантаження сирих даних OLX лише в raw_olx_listings (без LLM, без olx_listings).
@@ -756,7 +800,10 @@ def run_olx_update_raw_only(
     listing_types: якщо задано — лише категорії, чий label містить один із рядків (напр. «Нежитлова», «Земля»).
     use_browser: якщо задано — використовувати браузер (Playwright); інакше береться з settings.olx_use_browser, потім з env (OLX_SCRAPER_USE_BROWSER).
     max_workers: кількість потоків Phase 1; None = з конфігу (OLX_PHASE1_MAX_THREADS), 0 = не використовувати пул (legacy: по одному потоку на область).
-    Повертає success, total_listings, loaded_urls.
+    llm_process_url_fn: якщо задано — в режимі пулу вільні воркери обробляють LLM-чергу
+        (URL додаються туди одразу після завершення source-задачі категорії).
+    llm_enqueue_region_filter_fn: фільтр областей для додавання URL у LLM-чергу.
+    Повертає success, total_listings, loaded_urls, llm_processed_urls.
     """
     settings = settings or Settings()
     MongoDBConnection.initialize(settings)
@@ -793,7 +840,7 @@ def run_olx_update_raw_only(
     )
     if not regions_with_cats:
         log("[OLX raw] Phase 1: після фільтрації областей/типів немає категорій для обробки.")
-        return {"success": True, "total_listings": 0, "loaded_urls": []}
+        return {"success": True, "total_listings": 0, "loaded_urls": [], "llm_processed_urls": []}
 
     num_workers = max_workers if max_workers is not None else getattr(scraper_config, "OLX_PHASE1_MAX_THREADS", 5)
     use_pool = num_workers > 0
@@ -806,17 +853,24 @@ def run_olx_update_raw_only(
                 if callable(cat.get("get_list_url")):
                     job_list.append((region_name, cat))
         if not job_list:
-            return {"success": True, "total_listings": 0, "loaded_urls": []}
-        job_queue: "queue.Queue[Optional[Tuple[str, Dict[str, Any]]]]" = queue.Queue()
+            return {"success": True, "total_listings": 0, "loaded_urls": [], "llm_processed_urls": []}
+        job_queue: "queue.Queue[Tuple[str, Dict[str, Any]]]" = queue.Queue()
         for j in job_list:
             job_queue.put(j)
-        for _ in range(num_workers):
-            job_queue.put(None)  # sentinel для кожного воркера
 
         total_listings_ref: List[int] = [0]
         all_loaded_urls: List[str] = []
+        llm_processed_urls: List[str] = []
         results_lock = threading.Lock()
+        source_state_lock = threading.Lock()
+        source_pending_ref: List[int] = [len(job_list)]
+        source_inflight_ref: List[int] = [0]
+        llm_queue: Optional["queue.Queue[str]"] = queue.Queue() if llm_process_url_fn else None
+        llm_seen_urls: Set[str] = set()
+        llm_seen_lock = threading.Lock()
         log("[OLX raw] Phase 1: пул завдань (область + категорія), %s потоків, %s завдань" % (num_workers, len(job_list)))
+        if llm_process_url_fn:
+            log("[OLX raw] Phase 1/2: увімкнено динамічний підхват LLM-черги вільними воркерами.")
         workers = [
             threading.Thread(
                 target=_phase1_worker,
@@ -830,6 +884,15 @@ def run_olx_update_raw_only(
                     results_lock,
                     total_listings_ref,
                     all_loaded_urls,
+                    source_pending_ref,
+                    source_inflight_ref,
+                    source_state_lock,
+                    llm_process_url_fn,
+                    llm_enqueue_region_filter_fn,
+                    llm_queue,
+                    llm_seen_urls,
+                    llm_seen_lock,
+                    llm_processed_urls,
                 ),
                 name="OLXPhase1-%d" % (i + 1),
             )
@@ -844,6 +907,7 @@ def run_olx_update_raw_only(
         # Legacy: по одному завданню на область (послідовно з браузером або паралельно по областях)
         all_loaded_urls = []
         total_listings = 0
+        llm_processed_urls = []
         if use_browser:
             log("[OLX raw] Phase 1: сторінки пошуку — прямі запити; деталі оголошень — клікер (одним потоком). Області обробляються послідовно.")
             try:
@@ -900,6 +964,7 @@ def run_olx_update_raw_only(
         "success": True,
         "total_listings": total_listings,
         "loaded_urls": loaded_urls,
+        "llm_processed_urls": list(dict.fromkeys(llm_processed_urls)),
     }
 
 
@@ -962,6 +1027,136 @@ def _process_region(
     return total_listings, total_detail_fetches, by_category, all_search_urls, pending_llm_urls
 
 
+def _process_single_llm_pending_url(
+    listing_url: str,
+    raw_repo: Union[RawOlxListingsRepository, OlxListingsRepository],
+    main_repo: OlxListingsRepository,
+    llm_extractor: OlxLLMExtractorService,
+    geocoding_service: GeocodingService,
+    unified_service: Optional[UnifiedListingsService],
+    usd_rate: Optional[float],
+    log_fn: Optional[Callable[[str], None]],
+    geography_service: Optional[Any] = None,
+) -> bool:
+    """
+    Обробляє один URL у Phase 2 (LLM + гео + upsert у main + sync unified).
+    Повертає True, якщо обробка успішна.
+    """
+    def log(msg: str) -> None:
+        if log_fn:
+            log_fn(msg)
+        else:
+            print(msg, flush=True)
+
+    t_item_start = time.perf_counter()
+    try:
+        doc = raw_repo.find_by_url(listing_url)
+        if not doc:
+            return False
+        search_data = doc.get("search_data") or {}
+        detail_data = (doc.get("detail") or {}).copy()
+        if detail_data.get("_inactive"):
+            detail_data.pop("_inactive", None)
+
+        t0 = time.perf_counter()
+        llm_data = llm_extractor.extract_structured_data(search_data, detail_data)
+        t_llm = time.perf_counter() - t0
+        if llm_data:
+            detail_data["llm"] = llm_data
+        new_hash = detail_data.get("llm_content_hash")
+        if new_hash:
+            detail_data["llm_content_hash"] = new_hash
+
+        t0 = time.perf_counter()
+        result = _collect_and_geocode_locations(
+            search_data, detail_data, geocoding_service, geography_service
+        )
+        t_geocode = time.perf_counter() - t0
+        if len(result) == 3:
+            geocode_hashes, resolved_locations, address_refs_list = result
+        else:
+            geocode_hashes, resolved_locations = result
+            address_refs_list = []
+
+        detail_data["geocode_query_hashes"] = geocode_hashes
+        detail_data["resolved_locations"] = resolved_locations
+        if address_refs_list:
+            detail_data["address_refs"] = address_refs_list
+
+        price_value = search_data.get("price_value")
+        llm_struct = (detail_data.get("llm") or {}) if isinstance(detail_data, dict) else {}
+        total_area_m2 = llm_struct.get("total_area_m2")
+        if total_area_m2 is None:
+            total_area_m2 = search_data.get("area_m2")
+        land_area_sqm = llm_struct.get("land_area_sqm")
+        if land_area_sqm is None and llm_struct.get("land_area_ha") is not None:
+            try:
+                land_area_sqm = float(llm_struct["land_area_ha"]) * 10000.0
+            except (TypeError, ValueError):
+                land_area_sqm = None
+        metrics = compute_price_metrics(
+            total_price_uah=price_value,
+            building_area_sqm=total_area_m2,
+            land_area_sqm=land_area_sqm,
+            uah_per_usd=usd_rate,
+        )
+        detail_data["price_metrics"] = metrics
+
+        if price_value is not None:
+            currency = (search_data.get("currency") or "UAH").strip().upper() or "UAH"
+            if currency not in ("UAH", "USD", "EUR"):
+                currency = "UAH"
+            detail_data["price"] = {"value": float(price_value) if not isinstance(price_value, float) else price_value, "currency": currency}
+
+        formatted_address = ""
+        if address_refs_list and geography_service:
+            parts = []
+            for refs in address_refs_list:
+                if isinstance(refs, dict):
+                    addr = geography_service.format_address(refs)
+                    if addr and addr not in parts:
+                        parts.append(addr)
+            formatted_address = "; ".join(parts) if parts else ""
+        if not formatted_address:
+            for addr in (detail_data.get("llm") or {}).get("addresses") or []:
+                if isinstance(addr, dict):
+                    line = _address_line_from_llm_address(addr)
+                    if line:
+                        formatted_address = line
+                        break
+        if not formatted_address:
+            formatted_address = (search_data.get("location") or "").strip()
+        if formatted_address:
+            if "llm" not in detail_data:
+                detail_data["llm"] = {}
+            detail_data["llm"]["parsed_address"] = {"formatted_address": formatted_address}
+
+        t0 = time.perf_counter()
+        main_repo.upsert_listing(listing_url, search_data, detail=detail_data, is_active=True)
+        t_upsert = time.perf_counter() - t0
+
+        t_sync = 0.0
+        if unified_service:
+            try:
+                t0 = time.perf_counter()
+                unified_service.sync_olx_listing(listing_url)
+                t_sync = time.perf_counter() - t0
+            except Exception as sync_err:
+                log(f"[OLX] Помилка синхронізації в unified: {sync_err}")
+
+        t_total = time.perf_counter() - t_item_start
+        if t_total >= 10.0:
+            n_geocode = len(geocode_hashes) if geocode_hashes else 0
+            logger.info(
+                "[OLX] item timing: total=%.1fs llm=%.1fs geocode=%.1fs(%d) upsert=%.1fs sync=%.1fs url=%s",
+                t_total, t_llm, t_geocode, n_geocode, t_upsert, t_sync, listing_url[:60] + "..."
+            )
+        return True
+    except Exception as e:
+        log(f"[OLX] Помилка LLM для {listing_url[:50]}...: {e}")
+        return False
+
+
 def _process_llm_pending(
     pending_urls: List[str],
     raw_repo: Union[RawOlxListingsRepository, OlxListingsRepository],
@@ -1007,112 +1202,18 @@ def _process_llm_pending(
         )
 
     for listing_url in iterator:
-        t_item_start = time.perf_counter()
-        try:
-            doc = raw_repo.find_by_url(listing_url)
-            if not doc:
-                continue
-            search_data = doc.get("search_data") or {}
-            detail_data = (doc.get("detail") or {}).copy()
-            if detail_data.get("_inactive"):
-                detail_data.pop("_inactive", None)
-
-            t0 = time.perf_counter()
-            llm_data = llm_extractor.extract_structured_data(search_data, detail_data)
-            t_llm = time.perf_counter() - t0
-            if llm_data:
-                detail_data["llm"] = llm_data
-            new_hash = detail_data.get("llm_content_hash")
-            if new_hash:
-                detail_data["llm_content_hash"] = new_hash
-
-            t0 = time.perf_counter()
-            result = _collect_and_geocode_locations(
-                search_data, detail_data, geocoding_service, geography_service
-            )
-            t_geocode = time.perf_counter() - t0
-            if len(result) == 3:
-                geocode_hashes, resolved_locations, address_refs_list = result
-            else:
-                geocode_hashes, resolved_locations = result
-                address_refs_list = []
-
-            detail_data["geocode_query_hashes"] = geocode_hashes
-            detail_data["resolved_locations"] = resolved_locations
-            if address_refs_list:
-                detail_data["address_refs"] = address_refs_list
-
-            price_value = search_data.get("price_value")
-            llm_struct = (detail_data.get("llm") or {}) if isinstance(detail_data, dict) else {}
-            total_area_m2 = llm_struct.get("total_area_m2")
-            if total_area_m2 is None:
-                total_area_m2 = search_data.get("area_m2")
-            land_area_sqm = llm_struct.get("land_area_sqm")
-            if land_area_sqm is None and llm_struct.get("land_area_ha") is not None:
-                try:
-                    land_area_sqm = float(llm_struct["land_area_ha"]) * 10000.0
-                except (TypeError, ValueError):
-                    land_area_sqm = None
-            metrics = compute_price_metrics(
-                total_price_uah=price_value,
-                building_area_sqm=total_area_m2,
-                land_area_sqm=land_area_sqm,
-                uah_per_usd=usd_rate,
-            )
-            detail_data["price_metrics"] = metrics
-
-            if price_value is not None:
-                currency = (search_data.get("currency") or "UAH").strip().upper() or "UAH"
-                if currency not in ("UAH", "USD", "EUR"):
-                    currency = "UAH"
-                detail_data["price"] = {"value": float(price_value) if not isinstance(price_value, float) else price_value, "currency": currency}
-
-            formatted_address = ""
-            if address_refs_list and geography_service:
-                parts = []
-                for refs in address_refs_list:
-                    if isinstance(refs, dict):
-                        addr = geography_service.format_address(refs)
-                        if addr and addr not in parts:
-                            parts.append(addr)
-                formatted_address = "; ".join(parts) if parts else ""
-            if not formatted_address:
-                for addr in (detail_data.get("llm") or {}).get("addresses") or []:
-                    if isinstance(addr, dict):
-                        line = _address_line_from_llm_address(addr)
-                        if line:
-                            formatted_address = line
-                            break
-            if not formatted_address:
-                formatted_address = (search_data.get("location") or "").strip()
-            if formatted_address:
-                if "llm" not in detail_data:
-                    detail_data["llm"] = {}
-                detail_data["llm"]["parsed_address"] = {"formatted_address": formatted_address}
-
-            t0 = time.perf_counter()
-            main_repo.upsert_listing(listing_url, search_data, detail=detail_data, is_active=True)
-            t_upsert = time.perf_counter() - t0
+        if _process_single_llm_pending_url(
+            listing_url=listing_url,
+            raw_repo=raw_repo,
+            main_repo=main_repo,
+            llm_extractor=llm_extractor,
+            geocoding_service=geocoding_service,
+            unified_service=unified_service,
+            usd_rate=usd_rate,
+            log_fn=log_fn,
+            geography_service=geography_service,
+        ):
             processed += 1
-
-            t_sync = 0.0
-            if unified_service:
-                try:
-                    t0 = time.perf_counter()
-                    unified_service.sync_olx_listing(listing_url)
-                    t_sync = time.perf_counter() - t0
-                except Exception as sync_err:
-                    log(f"[OLX] Помилка синхронізації в unified: {sync_err}")
-
-            t_total = time.perf_counter() - t_item_start
-            if t_total >= 10.0:
-                n_geocode = len(geocode_hashes) if geocode_hashes else 0
-                logger.info(
-                    "[OLX] item timing: total=%.1fs llm=%.1fs geocode=%.1fs(%d) upsert=%.1fs sync=%.1fs url=%s",
-                    t_total, t_llm, t_geocode, n_geocode, t_upsert, t_sync, listing_url[:60] + "..."
-                )
-        except Exception as e:
-            log(f"[OLX] Помилка LLM для {listing_url[:50]}...: {e}")
 
     return processed
 

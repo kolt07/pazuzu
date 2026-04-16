@@ -112,11 +112,23 @@ class Application:
         """Ініціалізація компонентів застосунку."""
         self.prozorro_service = ProZorroService(self.settings)
 
+    def _notify_admins_sync(self, message: str) -> bool:
+        """Best-effort сповіщення адміністраторів через Telegram бота."""
+        if not self.telegram_bot_service:
+            return False
+        try:
+            return bool(self.telegram_bot_service.notify_admins_sync(message))
+        except Exception:
+            return False
+
     def _start_runtime_supervisor(self) -> None:
         if self.runtime_supervisor_service is not None:
             return
         try:
-            self.runtime_supervisor_service = VastRuntimeSupervisorService(self.settings)
+            self.runtime_supervisor_service = VastRuntimeSupervisorService(
+                self.settings,
+                notify_admins_fn=self._notify_admins_sync,
+            )
             self.runtime_supervisor_service.start()
         except Exception as e:
             print(f"Попередження: не вдалося запустити runtime supervisor: {e}")

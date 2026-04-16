@@ -1162,6 +1162,19 @@ class TelegramBotService:
         except Exception as e:
             print(f"Помилка відправки повідомлення планувальника: {e}")
 
+    def notify_admins_sync(self, text: str, timeout_per_chat: float = 15) -> bool:
+        """Надсилає повідомлення всім активним адміністраторам з фонового потоку."""
+        if not self.application or not self.application.bot or not self._bot_loop:
+            return False
+        delivered = False
+        for admin_id in self.user_service.get_admin_user_ids():
+            try:
+                self.send_message_to_chat_sync(admin_id, text, timeout=timeout_per_chat)
+                delivered = True
+            except Exception:
+                pass
+        return delivered
+
     def send_document_to_chat_sync(
         self,
         chat_id: int,
