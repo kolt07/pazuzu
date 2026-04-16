@@ -14,6 +14,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from config.settings import Settings
+from business.services.task_queue_service import TaskQueueService
 from data.repositories.scheduled_events_repository import (
     EVENT_TYPE_DATA_UPDATE,
     EVENT_TYPE_DATA_PROFILE,
@@ -73,6 +74,7 @@ class SchedulerService:
         self.user_service = None  # встановлюється ззовні для перевірки is_admin
         self._scheduler = BackgroundScheduler(timezone=KYIV_TZ)
         self._job_id_to_event_id: Dict[str, str] = {}
+        self._task_queue = TaskQueueService(settings)
 
     def set_user_service(self, user_service: Any) -> None:
         """Встановити UserService для перевірки прав (is_admin)."""
@@ -206,6 +208,16 @@ class SchedulerService:
             regions = [x.strip() for x in regions.split(",") if x.strip()] or None
         if isinstance(listing_types, str):
             listing_types = [x.strip() for x in listing_types.split(",") if x.strip()] or None
+        if self._task_queue.is_enabled():
+            dispatched = self._task_queue.enqueue_source_load(
+                days=days,
+                sources=sources,
+                regions=regions if isinstance(regions, list) and regions else None,
+                listing_types=listing_types if isinstance(listing_types, list) and listing_types else None,
+                metadata={"trigger": "scheduler", "event_id": event_id},
+            )
+            logger.info("Подія data_update %s поставлена в чергу (task_id=%s)", event_id, dispatched["task_id"])
+            return
         from business.services.source_data_load_service import run_full_pipeline
         run_full_pipeline(
             settings=self.settings,

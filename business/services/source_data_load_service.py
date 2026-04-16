@@ -140,6 +140,89 @@ def _promote_raw_prozorro_to_main(
     log(f"[Source load] Піднято {len(docs)} записів ProZorro з raw у prozorro_auctions.")
 
 
+def _run_phase3_post_processing(
+    sources: List[str],
+    result: Dict[str, Any],
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> None:
+    def log(msg: str) -> None:
+        if log_fn:
+            log_fn(msg)
+        else:
+            logger.info("%s", msg)
+
+    log("[Source load] Phase 3: перерахунок аналітики та географічного індексу.")
+    try:
+        log("[Source load] Phase 3: оновлення знань колекцій...")
+        from business.services.collection_knowledge_service import refresh_knowledge_after_sources
+        refresh_knowledge_after_sources(sources)
+        result["phase3"]["collection_knowledge"] = "ok"
+        log("[Source load] Phase 3: знання колекцій оновлено.")
+    except Exception as e:
+        logger.debug("Оновлення знань після source load: %s", e)
+        result["phase3"]["collection_knowledge"] = str(e)
+    try:
+        log("[Source load] Phase 3: price_analytics (перерахунок метрик)...")
+        from business.services.price_analytics_service import PriceAnalyticsService
+        analytics = PriceAnalyticsService()
+        counts = analytics.rebuild_all()
+        result["phase3"]["price_analytics"] = counts
+        log(f"[Source load] Phase 3: price_analytics готово. {counts}")
+    except Exception as e:
+        logger.warning("Помилка оновлення price analytics: %s", e)
+        result["phase3"]["price_analytics_error"] = str(e)
+    try:
+        log("[Source load] Phase 3: analytics_extracts (перезаповнення)...")
+        from business.services.analytics_extracts_populator import rebuild_analytics_extracts
+        n = rebuild_analytics_extracts()
+        result["phase3"]["analytics_extracts"] = n
+        log(f"[Source load] Phase 3: analytics_extracts готово. Записів: {n}.")
+    except Exception as e:
+        logger.debug("rebuild_analytics_extracts: %s", e)
+        result["phase3"]["analytics_extracts"] = None
+    try:
+        log("[Source load] Phase 3: гео-індекс (cadastral)...")
+        from business.services.cadastral_location_index_service import CadastralLocationIndexService
+        idx_svc = CadastralLocationIndexService()
+        idx_svc.build_index_from_parcels(batch_size=2000)
+        result["phase3"]["geo_index"] = "ok"
+        log("[Source load] Phase 3: гео-індекс готово.")
+    except Exception as e:
+        logger.debug("Побудова гео-індексу (cadastral): %s", e)
+        result["phase3"]["geo_index"] = None
+    log("[Source load] Phase 3 завершено. Pipeline виконано.")
+
+
+def process_prozorro_llm_auction(
+    auction_id: str,
+    settings: Optional[Settings] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Обробляє один ProZorro auction_id через LLM та sync у unified."""
+    st = settings or Settings()
+    from business.services.prozorro_service import ProZorroService
+    from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepository
+
+    def log(msg: str) -> None:
+        if log_fn:
+            log_fn(msg)
+        else:
+            logger.info("%s", msg)
+
+    repo = ProZorroAuctionsRepository()
+    doc = repo.find_by_auction_id(auction_id)
+    if not doc or not doc.get("auction_data"):
+        log(f"[Source load] ProZorro LLM: auction_id={auction_id} не знайдено у main-колекції.")
+        return False
+    service = ProZorroService(st)
+    if not service.llm_service:
+        log("[Source load] ProZorro LLM: сервіс LLM недоступний.")
+        return False
+    service._process_auction_with_llm(doc["auction_data"])
+    service._sync_auction_to_unified(auction_id)
+    return True
+
+
 def run_full_pipeline(
     settings: Optional[Settings] = None,
     sources: Optional[List[str]] = None,
@@ -149,6 +232,8 @@ def run_full_pipeline(
     listing_types: Optional[List[str]] = None,
     use_browser_olx: Optional[bool] = None,
     olx_phase1_max_threads: Optional[int] = None,
+    use_brokered_llm: bool = False,
+    llm_wait_heartbeat_fn: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """
     Запускає повний pipeline: Phase 1 (raw) → Phase 2 (promote + LLM для обраних) → Phase 3 (аналітика + гео).
@@ -284,6 +369,12 @@ def run_full_pipeline(
 
         # ---------- Phase 2: підняття raw → main, LLM для обраних, sync unified ----------
         log("[Source load] Phase 2: підняття з raw у основні колекції та LLM для обраних.")
+        task_queue = None
+        brokered_llm_task_ids: List[str] = []
+        if use_brokered_llm:
+            from business.services.task_queue_service import TaskQueueService
+            task_queue = TaskQueueService(st)
+            use_brokered_llm = task_queue.is_enabled()
         if "olx" in sources and olx_loaded_urls:
             urls_for_llm = set(_select_olx_urls_for_llm(raw_olx, olx_loaded_urls))
             if urls_for_llm:
@@ -292,19 +383,33 @@ def run_full_pipeline(
                 if preprocessed > 0:
                     log(f"[Source load] Phase 2 OLX: {preprocessed} оголошень вже оброблено LLM вільними воркерами під час Phase 1.")
                 log(f"[Source load] Phase 2 OLX: LLM-обробка для {len(pending_list)} оголошень (дані в olx_listings та unified тільки після LLM).")
-                n = _process_llm_pending(
-                    pending_list,
-                    raw_olx,
-                    main_olx,
-                    llm_extractor_olx,
-                    geocoding_olx,
-                    unified_olx,
-                    usd_rate_olx,
-                    log_fn,
-                )
-                total_olx_processed = n + len(olx_dynamic_llm_processed_urls)
+                if use_brokered_llm and task_queue:
+                    for listing_url in pending_list:
+                        brokered_llm_task_ids.append(
+                            task_queue.enqueue_olx_llm(
+                                listing_url,
+                                metadata={"source": "olx", "days": days},
+                            )
+                        )
+                    n = 0
+                    log(f"[Source load] Phase 2 OLX: поставлено в RabbitMQ {len(pending_list)} LLM-задач.")
+                else:
+                    n = _process_llm_pending(
+                        pending_list,
+                        raw_olx,
+                        main_olx,
+                        llm_extractor_olx,
+                        geocoding_olx,
+                        unified_olx,
+                        usd_rate_olx,
+                        log_fn,
+                    )
+                total_olx_processed = (len(pending_list) if use_brokered_llm else n) + len(olx_dynamic_llm_processed_urls)
                 result["phase2"]["olx_llm_processed"] = total_olx_processed
-                log(f"[Source load] Phase 2 OLX: LLM завершено. Оброблено {total_olx_processed}/{len([u for u in olx_loaded_urls if u in urls_for_llm])} оголошень (записано в olx_listings та unified).")
+                if use_brokered_llm:
+                    log(f"[Source load] Phase 2 OLX: LLM-задачі поставлено. Очікується {total_olx_processed}/{len([u for u in olx_loaded_urls if u in urls_for_llm])}.")
+                else:
+                    log(f"[Source load] Phase 2 OLX: LLM завершено. Оброблено {total_olx_processed}/{len([u for u in olx_loaded_urls if u in urls_for_llm])} оголошень (записано в olx_listings та unified).")
             else:
                 log(
                     f"[Source load] Phase 2 OLX: LLM пропущено (завантажено URL: {len(olx_loaded_urls)}, "
@@ -327,23 +432,59 @@ def run_full_pipeline(
             ids_for_llm = _select_prozorro_ids_for_llm(raw_prozorro, prozorro_loaded_ids)
             if ids_for_llm:
                 log(f"[Source load] Phase 2 ProZorro: LLM-обробка для {len(ids_for_llm)} аукціонів...")
-                prozorro_svc = ProZorroService(st)
-                if prozorro_svc.llm_service:
+                if use_brokered_llm and task_queue:
                     for auction_id in ids_for_llm:
-                        try:
-                            doc = main_prozorro.find_by_auction_id(auction_id)
-                            if doc and doc.get("auction_data"):
-                                prozorro_svc._process_auction_with_llm(doc["auction_data"])
-                                prozorro_svc._sync_auction_to_unified(auction_id)
-                                result["phase2"]["prozorro_llm_processed"] += 1
-                        except Exception as e:
-                            logger.warning("ProZorro LLM для %s: %s", auction_id, e)
-                    log(f"[Source load] Phase 2 ProZorro: LLM завершено. Оброблено {result['phase2']['prozorro_llm_processed']}/{len(ids_for_llm)}.")
+                        brokered_llm_task_ids.append(
+                            task_queue.enqueue_prozorro_llm(
+                                auction_id,
+                                metadata={"source": "prozorro", "days": days},
+                            )
+                        )
+                    result["phase2"]["prozorro_llm_processed"] = len(ids_for_llm)
+                    log(f"[Source load] Phase 2 ProZorro: поставлено в RabbitMQ {len(ids_for_llm)} LLM-задач.")
                 else:
-                    log("[Source load] Phase 2 ProZorro: LLM недоступний (сервіс не ініціалізовано).")
+                    prozorro_svc = ProZorroService(st)
+                    if prozorro_svc.llm_service:
+                        for auction_id in ids_for_llm:
+                            try:
+                                doc = main_prozorro.find_by_auction_id(auction_id)
+                                if doc and doc.get("auction_data"):
+                                    prozorro_svc._process_auction_with_llm(doc["auction_data"])
+                                    prozorro_svc._sync_auction_to_unified(auction_id)
+                                    result["phase2"]["prozorro_llm_processed"] += 1
+                            except Exception as e:
+                                logger.warning("ProZorro LLM для %s: %s", auction_id, e)
+                        log(f"[Source load] Phase 2 ProZorro: LLM завершено. Оброблено {result['phase2']['prozorro_llm_processed']}/{len(ids_for_llm)}.")
+                    else:
+                        log("[Source load] Phase 2 ProZorro: LLM недоступний (сервіс не ініціалізовано).")
             else:
                 log("[Source load] Phase 2 ProZorro: LLM пропущено (0 кандидатів за регіонами).")
             log("[Source load] Phase 2 ProZorro завершено.")
+
+        if use_brokered_llm and task_queue and brokered_llm_task_ids:
+            log(f"[Source load] Phase 2: очікування завершення {len(brokered_llm_task_ids)} LLM-задач із RabbitMQ...")
+            task_docs = task_queue.wait_for_all(
+                brokered_llm_task_ids,
+                timeout_sec=max(1800, len(brokered_llm_task_ids) * 120),
+                heartbeat_fn=llm_wait_heartbeat_fn,
+            )
+            olx_success = 0
+            prozorro_success = 0
+            for doc in task_docs:
+                if str(doc.get("state") or "").lower() != "success":
+                    logger.warning("LLM background task failed: %s", doc.get("error") or doc.get("task_id"))
+                    continue
+                payload = doc.get("payload") or {}
+                if doc.get("task_name") == "process_olx_llm_task" and payload.get("listing_url"):
+                    olx_success += 1
+                elif doc.get("task_name") == "process_prozorro_llm_task" and payload.get("auction_id"):
+                    prozorro_success += 1
+            result["phase2"]["olx_llm_processed"] = olx_success + len(olx_dynamic_llm_processed_urls)
+            result["phase2"]["prozorro_llm_processed"] = prozorro_success
+            log(
+                f"[Source load] Phase 2: LLM background tasks завершено. "
+                f"OLX={result['phase2']['olx_llm_processed']}, ProZorro={result['phase2']['prozorro_llm_processed']}."
+            )
 
         # Зберігаємо дату оновлення ProZorro для get_auctions_from_db_by_period / generate_excel_from_db
         if "prozorro" in sources and days is not None:
@@ -358,47 +499,7 @@ def run_full_pipeline(
             except Exception as e:
                 logger.debug("Збереження дати оновлення ProZorro: %s", e)
 
-        # ---------- Phase 3: аналітика та гео-індекс ----------
-        log("[Source load] Phase 3: перерахунок аналітики та географічного індексу.")
-        try:
-            log("[Source load] Phase 3: оновлення знань колекцій...")
-            from business.services.collection_knowledge_service import refresh_knowledge_after_sources
-            refresh_knowledge_after_sources(sources)
-            result["phase3"]["collection_knowledge"] = "ok"
-            log("[Source load] Phase 3: знання колекцій оновлено.")
-        except Exception as e:
-            logger.debug("Оновлення знань після source load: %s", e)
-            result["phase3"]["collection_knowledge"] = str(e)
-        try:
-            log("[Source load] Phase 3: price_analytics (перерахунок метрик)...")
-            from business.services.price_analytics_service import PriceAnalyticsService
-            analytics = PriceAnalyticsService()
-            counts = analytics.rebuild_all()
-            result["phase3"]["price_analytics"] = counts
-            log(f"[Source load] Phase 3: price_analytics готово. {counts}")
-        except Exception as e:
-            logger.warning("Помилка оновлення price analytics: %s", e)
-            result["phase3"]["price_analytics_error"] = str(e)
-        try:
-            log("[Source load] Phase 3: analytics_extracts (перезаповнення)...")
-            from business.services.analytics_extracts_populator import rebuild_analytics_extracts
-            n = rebuild_analytics_extracts()
-            result["phase3"]["analytics_extracts"] = n
-            log(f"[Source load] Phase 3: analytics_extracts готово. Записів: {n}.")
-        except Exception as e:
-            logger.debug("rebuild_analytics_extracts: %s", e)
-            result["phase3"]["analytics_extracts"] = None
-        try:
-            log("[Source load] Phase 3: гео-індекс (cadastral)...")
-            from business.services.cadastral_location_index_service import CadastralLocationIndexService
-            idx_svc = CadastralLocationIndexService()
-            idx_svc.build_index_from_parcels(batch_size=2000)
-            result["phase3"]["geo_index"] = "ok"
-            log("[Source load] Phase 3: гео-індекс готово.")
-        except Exception as e:
-            logger.debug("Побудова гео-індексу (cadastral): %s", e)
-            result["phase3"]["geo_index"] = None
-        log("[Source load] Phase 3 завершено. Pipeline виконано.")
+        _run_phase3_post_processing(sources, result, log_fn=log_fn)
 
         return result
     finally:

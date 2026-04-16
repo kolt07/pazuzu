@@ -105,6 +105,16 @@ class Settings:
             os.getenv('BACKGROUND_UPDATE_INTERVAL_MINUTES', '10')
         )
 
+        # Brokered background tasks (RabbitMQ + Celery)
+        self.task_queue_enabled = os.getenv('TASK_QUEUE_ENABLED', 'false').lower() in ('true', '1', 'yes')
+        self.task_queue_broker_url = os.getenv('TASK_QUEUE_BROKER_URL', '').strip()
+        self.task_queue_result_backend = os.getenv('TASK_QUEUE_RESULT_BACKEND', 'rpc://').strip()
+        self.rabbitmq_host = os.getenv('RABBITMQ_HOST', 'localhost').strip()
+        self.rabbitmq_port = int(os.getenv('RABBITMQ_PORT', '5672'))
+        self.rabbitmq_user = os.getenv('RABBITMQ_USER', 'guest').strip()
+        self.rabbitmq_password = os.getenv('RABBITMQ_PASSWORD', 'guest').strip()
+        self.rabbitmq_vhost = os.getenv('RABBITMQ_VHOST', 'pazuzu').strip() or 'pazuzu'
+
         # OLX скрапер: використовувати браузер (Playwright) замість HTTP-запитів для сторінок пошуку та деталей
         self.olx_use_browser = (
             os.getenv('OLX_SCRAPER_USE_BROWSER', '').strip().lower() in ('1', 'true', 'yes')
@@ -248,6 +258,25 @@ class Settings:
                             if 'interval_minutes' in bu:
                                 self.background_update_interval_minutes = int(bu['interval_minutes'])
 
+                        if 'task_queue' in config:
+                            tq = config['task_queue']
+                            if 'enabled' in tq:
+                                self.task_queue_enabled = bool(tq['enabled'])
+                            if 'broker_url' in tq:
+                                self.task_queue_broker_url = str(tq['broker_url'] or '').strip()
+                            if 'result_backend' in tq:
+                                self.task_queue_result_backend = str(tq['result_backend'] or '').strip()
+                            if 'rabbitmq_host' in tq:
+                                self.rabbitmq_host = str(tq['rabbitmq_host'] or '').strip()
+                            if 'rabbitmq_port' in tq:
+                                self.rabbitmq_port = int(tq['rabbitmq_port'])
+                            if 'rabbitmq_user' in tq:
+                                self.rabbitmq_user = str(tq['rabbitmq_user'] or '').strip()
+                            if 'rabbitmq_password' in tq:
+                                self.rabbitmq_password = str(tq['rabbitmq_password'] or '').strip()
+                            if 'rabbitmq_vhost' in tq:
+                                self.rabbitmq_vhost = str(tq['rabbitmq_vhost'] or '').strip() or self.rabbitmq_vhost
+
                         # Telegram Mini App (base_url — повний HTTPS URL, який відкриває Telegram, напр. ngrok)
                         if 'mini_app' in config:
                             ma = config['mini_app']
@@ -292,4 +321,10 @@ class Settings:
             except Exception as e:
                 print(f"Попередження: не вдалося завантажити конфігурацію з {config_path}: {e}")
                 print("Використовуються значення за замовчуванням або змінні оточення")
+
+        if not self.task_queue_broker_url:
+            self.task_queue_broker_url = (
+                f"amqp://{self.rabbitmq_user}:{self.rabbitmq_password}"
+                f"@{self.rabbitmq_host}:{self.rabbitmq_port}/{self.rabbitmq_vhost}"
+            )
 

@@ -13,6 +13,8 @@ from pydantic import BaseModel
 from telegram_mini_app.auth import validate_telegram_init_data
 import yaml
 
+from business.services.task_queue_service import TaskQueueService
+
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 # Задачі оновлення даних: task_id -> {status, message, ...}
@@ -222,9 +224,9 @@ def start_data_update(
     - listing_types — лише ці типи оголошень OLX (напр. «Нежитлова нерухомість», «Земля»).
     """
     _get_admin_user(request)
-    task_id = str(uuid.uuid4())
     prozorro = request.app.state.prozorro_service
     settings = request.app.state.settings
+    task_queue = TaskQueueService(settings)
 
     regions_list = _parse_comma_list(regions)
     listing_types_list = _parse_comma_list(listing_types)
@@ -264,6 +266,28 @@ def start_data_update(
         if days is not None and days not in (1, 7, 30):
             raise HTTPException(status_code=400, detail="days must be 1, 7 or 30")
 
+    pipeline_sources = []
+    if run_olx:
+        pipeline_sources.append("olx")
+    if run_prozorro:
+        pipeline_sources.append("prozorro")
+
+    if task_queue.is_enabled() and not olx_full and not prozorro_full:
+        dispatched = task_queue.enqueue_source_load(
+            days=None if (olx_full or prozorro_full) else effective_days,
+            sources=pipeline_sources,
+            regions=regions_list,
+            listing_types=listing_types_list,
+            use_browser_olx=olx_use_browser,
+            olx_phase1_max_threads=olx_phase1_max_threads,
+            metadata={"trigger": "mini_app_admin", "mode": mode or "period"},
+        )
+        out = {"task_id": dispatched["task_id"], "status": "queued", "days": effective_days, "queue": dispatched["queue"]}
+        if olx_phase1_max_threads is not None:
+            out["olx_phase1_max_threads"] = olx_phase1_max_threads
+        return out
+
+    task_id = str(uuid.uuid4())
     _data_update_tasks[task_id] = {
         "status": "running",
         "message": "Запуск оновлення...",
@@ -438,6 +462,19 @@ def process_anomalous_prices(
 def data_update_status(request: Request, task_id: str):
     """Повертає статус задачі оновлення даних (включно з прогресом LLM)."""
     _get_admin_user(request)
+    task_queue = TaskQueueService(request.app.state.settings)
+    if task_queue.is_enabled():
+        status = task_queue.get_task_status(task_id)
+        task_doc = status.get("task") or {}
+        if task_doc:
+            return {
+                "task_id": task_id,
+                "status": status.get("state"),
+                "message": task_doc.get("error") or task_doc.get("state"),
+                "started_at": task_doc.get("created_at"),
+                "task": task_doc,
+                "result": status.get("result"),
+            }
     if task_id not in _data_update_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     t = _data_update_tasks[task_id]
@@ -535,9 +572,18 @@ def start_llm_processing_backfill(request: Request, body: LlmProcessingBackfillR
     _get_admin_user(request)
     if body.days not in (1, 7, 30):
         raise HTTPException(status_code=400, detail="days must be 1, 7 or 30")
-    task_id = str(uuid.uuid4())
-    prozorro = request.app.state.prozorro_service
     settings = request.app.state.settings
+    task_queue = TaskQueueService(settings)
+
+    if task_queue.is_enabled():
+        dispatched = task_queue.enqueue_source_load(
+            days=body.days,
+            sources=["olx", "prozorro"],
+            metadata={"trigger": "mini_app_backfill", "process_inactive": body.process_inactive},
+        )
+        return {"task_id": dispatched["task_id"], "status": "queued", "days": body.days, "queue": dispatched["queue"]}
+
+    task_id = str(uuid.uuid4())
 
     _data_update_tasks[task_id] = {
         "status": "running",

@@ -18,6 +18,7 @@ from config.settings import Settings
 from data.repositories.olx_listings_repository import OlxListingsRepository
 from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepository
 from business.services.source_data_load_service import is_source_load_running
+from business.services.task_queue_service import TaskQueueService
 from business.services.vast_ai_client import VastAiClient
 from business.services.vllm_runtime_orchestrator import get_shared_vllm_runtime_orchestrator
 
@@ -42,6 +43,7 @@ class VastRuntimeSupervisorService:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._orchestrator = get_shared_vllm_runtime_orchestrator()
+        self._task_queue = TaskQueueService(settings)
         self._olx_repo = OlxListingsRepository()
         self._prozorro_repo = ProZorroAuctionsRepository()
         self._last_balance_check_ts: float = 0.0
@@ -80,7 +82,9 @@ class VastRuntimeSupervisorService:
 
                 self._check_low_balance()
                 has_pending = self._has_pending_llm_tasks()
-                source_load_active = is_source_load_running()
+                source_load_active = self._has_active_source_load_tasks()
+                if source_load_active:
+                    self._orchestrator.mark_source_load_activity()
                 has_instance = bool(self._orchestrator.get_observability_status().get("instance_id"))
 
                 if has_pending:
@@ -159,6 +163,8 @@ class VastRuntimeSupervisorService:
         return float(user_payload.get("balance") or 0.0)
 
     def _has_pending_llm_tasks(self) -> bool:
+        if self._task_queue.is_enabled():
+            return self._task_queue.has_pending_llm_tasks()
         try:
             if self._olx_repo.count({"detail.llm_pending": True}) > 0:
                 return True
@@ -169,4 +175,11 @@ class VastRuntimeSupervisorService:
                 return True
         except Exception:
             pass
+        return False
+
+    def _has_active_source_load_tasks(self) -> bool:
+        if is_source_load_running():
+            return True
+        if self._task_queue.is_enabled():
+            return self._task_queue.has_active_source_load_tasks()
         return False

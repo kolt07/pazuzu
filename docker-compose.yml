@@ -15,6 +15,25 @@ services:
       timeout: 5s
       retries: 10
 
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: pazuzu-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-pazuzu}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_DEFAULT_VHOST:-pazuzu}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - pazuzu_rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   pazuzu-app:
     build:
       context: .
@@ -24,11 +43,68 @@ services:
     depends_on:
       mongodb:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     volumes:
       - ./config/config.yaml:/app/config/config.yaml:ro
       - ./data:/app/data
       - ./temp:/app/temp
+    environment:
+      TASK_QUEUE_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
+      RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pazuzu}
+      RABBITMQ_VHOST: ${RABBITMQ_DEFAULT_VHOST:-pazuzu}
     command: ["python", "main.py"]
+
+  pazuzu-source-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pazuzu-source-worker
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./config/config.yaml:/app/config/config.yaml:ro
+      - ./data:/app/data
+      - ./temp:/app/temp
+    environment:
+      TASK_QUEUE_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
+      RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pazuzu}
+      RABBITMQ_VHOST: ${RABBITMQ_DEFAULT_VHOST:-pazuzu}
+    command: ["celery", "-A", "business.celery_app:celery_app", "worker", "-Q", "source_load", "--loglevel=info", "--concurrency=1"]
+
+  pazuzu-llm-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pazuzu-llm-worker
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./config/config.yaml:/app/config/config.yaml:ro
+      - ./data:/app/data
+      - ./temp:/app/temp
+    environment:
+      TASK_QUEUE_ENABLED: "true"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
+      RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pazuzu}
+      RABBITMQ_VHOST: ${RABBITMQ_DEFAULT_VHOST:-pazuzu}
+    command: ["celery", "-A", "business.celery_app:celery_app", "worker", "-Q", "llm_processing", "--loglevel=info", "--concurrency=1"]
 
   ngrok:
     image: ngrok/ngrok:latest
@@ -44,3 +120,4 @@ services:
 
 volumes:
   pazuzu_mongo_data:
+  pazuzu_rabbitmq_data:

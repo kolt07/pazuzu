@@ -50,8 +50,8 @@ class VastRuntimeSettingsService:
             "boot_timeout_sec": 1200,
             "ready_timeout_sec": 1200,
             "idle_grace_sec": 60,
-            "pause_after_idle_sec": 600,
-            "destroy_after_pause_sec": 600,
+            "pause_after_idle_sec": 60,
+            "destroy_after_pause_sec": 1200,
             "hard_budget_usd": 20.0,
             "fallback_provider": "ollama",
         }

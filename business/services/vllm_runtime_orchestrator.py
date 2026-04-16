@@ -70,6 +70,11 @@ class VllmRuntimeOrchestrator:
                 return None
             self._empty_queue_since_ts = 0.0
             self._paused_since_ts = 0.0
+            self._coord_update_state(
+                state="queue_active",
+                queue_empty_since_at=None,
+                queue_last_seen_at=self._utcnow(),
+            )
             if self._instance_id and self._instance_paused:
                 self._resume_instance_locked(cfg)
                 if self._endpoint and self._is_runtime_ready(self._endpoint, cfg, timeout_sec=8):
@@ -257,6 +262,11 @@ class VllmRuntimeOrchestrator:
             self._coord_renew_lease(cfg, state="running")
             self._log_gpu_usage("gpu_processing", metadata or {})
 
+    def mark_source_load_activity(self) -> None:
+        with self._lock:
+            state = "paused" if self._instance_paused else ("running" if self._instance_id else "idle")
+            self._coord_update_state(state=state, last_source_load_activity_at=self._utcnow())
+
     def handle_pool_drain(self, has_new_tasks_fn, has_active_initiators_fn=None) -> None:
         """Політика idle: active(10m)->pause(10m)->destroy(if no initiators)."""
         with self._lock:
@@ -274,12 +284,18 @@ class VllmRuntimeOrchestrator:
                 self._last_activity_ts = time.time()
                 self._empty_queue_since_ts = 0.0
                 self._paused_since_ts = 0.0
+                self._coord_update_state(
+                    state="running" if not self._instance_paused else "paused",
+                    queue_empty_since_at=None,
+                    queue_last_seen_at=self._utcnow(),
+                )
                 return
 
             pause_after_sec = int(cfg.get("pause_after_idle_sec") or 600)
             destroy_after_pause_sec = int(cfg.get("destroy_after_pause_sec") or 600)
             if self._empty_queue_since_ts <= 0:
                 self._empty_queue_since_ts = now
+                self._coord_update_state(queue_empty_since_at=self._utcnow(), queue_last_seen_at=self._utcnow(), state="idle_wait")
                 self._log_gpu_usage(
                     "gpu_idle_wait",
                     {
@@ -304,11 +320,11 @@ class VllmRuntimeOrchestrator:
             paused_for = max(0, int(now - self._paused_since_ts))
             if paused_for < destroy_after_pause_sec:
                 return
-            if has_active_initiators:
+            if has_active_initiators or self._has_recent_shared_source_load_activity(within_sec=20 * 60):
                 self._log_gpu_usage(
                     "gpu_destroy_delayed",
                     {
-                        "reason": "active_initiators",
+                        "reason": "active_source_load",
                         "paused_for_sec": paused_for,
                         "instance_id": self._instance_id,
                     },
@@ -456,6 +472,7 @@ class VllmRuntimeOrchestrator:
             instance_id=instance_id,
             endpoint=None,
             public_endpoint=self._public_endpoint,
+            paused_at=self._utcnow(),
         )
         self._log_gpu_usage(
             "gpu_paused",
@@ -515,6 +532,9 @@ class VllmRuntimeOrchestrator:
             endpoint=endpoint,
             public_endpoint=public_endpoint,
             last_error="",
+            paused_at=None,
+            queue_empty_since_at=None,
+            queue_last_seen_at=self._utcnow(),
         )
         self._log_gpu_usage(
             "gpu_resumed",
@@ -1171,6 +1191,28 @@ class VllmRuntimeOrchestrator:
         return filters
 
     @staticmethod
+    def _preferred_tokens(raw_value: Any) -> List[str]:
+        if raw_value is None:
+            return []
+        if isinstance(raw_value, (list, tuple, set)):
+            values = raw_value
+        else:
+            values = str(raw_value).split(",")
+        out: List[str] = []
+        for item in values:
+            token = str(item or "").strip().lower()
+            if token:
+                out.append(token)
+        return out
+
+    @classmethod
+    def _offer_matches_terms(cls, offer: Dict[str, Any], field_names: List[str], preferred_terms: List[str]) -> bool:
+        if not preferred_terms:
+            return False
+        haystacks = [str(offer.get(field_name) or "").strip().lower() for field_name in field_names]
+        return any(term in hay for term in preferred_terms for hay in haystacks if hay)
+
+    @staticmethod
     def _hf_hub_login_shell_prefix() -> str:
         """Bash prefix: persist Hub token before `vllm serve`.
 
@@ -1212,9 +1254,13 @@ class VllmRuntimeOrchestrator:
             return []
         preferred_inet_down_mbps = max(0.0, self._to_float(cfg.get("preferred_inet_down_mbps", 1000), 1000.0))
         min_inet_down_mbps = max(0.0, self._to_float(cfg.get("min_inet_down_mbps", 700), 700.0))
+        preferred_regions = self._preferred_tokens(cfg.get("region_like"))
+        preferred_datacenters = self._preferred_tokens(cfg.get("datacenter_like"))
         ranked = sorted(
             offers,
             key=lambda x: (
+                0 if self._offer_matches_terms(x, ["datacenter", "geolocation", "geoloc"], preferred_datacenters) else 1,
+                0 if self._offer_matches_terms(x, ["geolocation", "geoloc", "region", "country"], preferred_regions) else 1,
                 0 if self._to_float(x.get("inet_down"), 0.0) >= min_inet_down_mbps else 1,
                 abs(self._to_float(x.get("inet_down"), 0.0) - preferred_inet_down_mbps),
                 -self._to_float(x.get("inet_down"), 0.0),
@@ -1416,6 +1462,20 @@ class VllmRuntimeOrchestrator:
             self._coord.release(self._owner_id, payload)
         except Exception:
             pass
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _has_recent_shared_source_load_activity(self, within_sec: int) -> bool:
+        coord = getattr(self, "_coord", None)
+        if coord is None:
+            return False
+        state = coord.get_runtime_state() or {}
+        last_source_load_activity = state.get("last_source_load_activity_at")
+        if not isinstance(last_source_load_activity, datetime):
+            return False
+        return (self._utcnow() - last_source_load_activity).total_seconds() <= max(1, int(within_sec))
 
     @staticmethod
     def _shared_state_has_active_owner(state: Optional[Dict[str, Any]]) -> bool:

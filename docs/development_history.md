@@ -1,5 +1,14 @@
 # Історія розробки
 
+## 2026-04-16 — RabbitMQ/Celery черги та pause/resume lifecycle Vast runtime
+
+- **Запит**: Перевести source-load та LLM processing на RabbitMQ, додати worker-и в `docker-compose`, пріоритезувати Vast verified + preferred datacenter/region, pause-ити інстанс при порожній LLM-черзі та destroy робити лише після 20+ хв без активного source-load.
+- **Дії**: Додано brokered background layer на `Celery` (`business/celery_app.py`, `business/tasks.py`, `business/services/task_queue_service.py`) і Mongo-репозиторій станів задач `background_tasks`, через який тепер відслідковуються source-load/LLM task-и, heartbeat-и та status polling.
+- **Інтеграція черг**: `main.py`, `telegram_bot_service.py`, `scheduler_service.py`, `mcp_servers/data_update_mcp_server.py` і Mini App admin route-и переведено на enqueue через RabbitMQ/Celery з fallback на sync-виконання, якщо broker вимкнено.
+- **Source/LLM pipeline**: У `source_data_load_service.py` Phase 2 тепер у brokered-режимі enqueue-ить окремі OLX/ProZorro LLM task-и, чекає їх завершення через queue-state service і лише після цього виконує Phase 3.
+- **Runtime lifecycle**: `VastRuntimeSupervisorService` переключено з Mongo document flags у доменних колекціях на queue-aware перевірки; `VllmRuntimeOrchestrator` тепер публікує queue/source-load activity в coordination state, враховує `last_source_load_activity_at` перед destroy та ранжує Vast offers з пріоритетом `datacenter_like` / `region_like` поверх verified offers.
+- **Деплой і конфіг**: У `docker-compose.yml` додано `rabbitmq`, `pazuzu-source-worker`, `pazuzu-llm-worker`; у `config/settings.py`, `config/config.example.yaml`, `requirements.txt` та runtime defaults додано параметри RabbitMQ/Celery і нові idle timeout-и (`pause_after_idle_sec=60`, `destroy_after_pause_sec=1200`).
+
 ## 2026-04-16 — Довантаження LLM-пулу вільними source-воркерами
 
 - **Запит**: Якщо в multi-thread завантаженні джерел частина воркерів простоює (черга source-задач порожня, але кілька довгих задач ще виконуються), ці вільні воркери мають переключатися на LLM-парсинг.

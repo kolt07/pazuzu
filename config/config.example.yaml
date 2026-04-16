@@ -105,8 +105,10 @@ llm:
 #   endpoint_timeout_sec: 240  # скільки чекаємо саме публікацію зовнішнього endpoint (ssh/port-forward), далі failover на інший офер
 #   boot_timeout_sec: 1200
 #   ready_timeout_sec: 1200
-#   pause_after_idle_sec: 600     # якщо черга порожня > N сек після ready -> stop instance (pause)
-#   destroy_after_pause_sec: 600  # якщо інстанс у pause > N сек і немає активних ініціаторів -> destroy
+#   region_like: "de,eu"          # пріоритетні регіони/геолокації Vast offer (через кому)
+#   datacenter_like: "hetzner"    # пріоритетні датацентри Vast offer (через кому)
+#   pause_after_idle_sec: 60      # якщо LLM-черга порожня > N сек після ready -> pause instance
+#   destroy_after_pause_sec: 1200 # destroy лише після тривалої паузи та відсутності source-load activity > 20 хв
 #   idle_grace_sec: 60            # legacy, залишено для сумісності
 #   hard_budget_usd: 20.0
 
@@ -120,6 +122,17 @@ llm:
 # Працює лише при запуску Telegram бота. Інтервал у хвилинах; 0 = вимкнено
 # background_update:
 #   interval_minutes: 10
+
+# Brokered background tasks (RabbitMQ + Celery)
+# task_queue:
+#   enabled: true
+#   rabbitmq_host: "rabbitmq"
+#   rabbitmq_port: 5672
+#   rabbitmq_user: "pazuzu"
+#   rabbitmq_password: "pazuzu"
+#   rabbitmq_vhost: "pazuzu"
+#   # broker_url: "amqp://pazuzu:pazuzu@rabbitmq:5672/pazuzu"
+#   result_backend: "rpc://"
 
 # Налаштування Telegram бота
 telegram:
