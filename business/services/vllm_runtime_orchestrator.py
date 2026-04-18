@@ -37,6 +37,8 @@ def get_shared_vllm_runtime_orchestrator() -> "VllmRuntimeOrchestrator":
 class VllmRuntimeOrchestrator:
     """Керує lifecycle сесії GPU для batch parsing."""
 
+    VAST_RUNTIME_LABEL_DEFAULT = "pazuzu-vllm-runtime"
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._settings_svc = VastRuntimeSettingsService()
@@ -62,6 +64,161 @@ class VllmRuntimeOrchestrator:
     def is_enabled(self) -> bool:
         cfg = self._settings_svc.get_settings()
         return bool(cfg.get("is_enabled")) and bool(cfg.get("vast_api_key"))
+
+    def _runtime_instance_label(self, cfg: Dict[str, Any]) -> str:
+        label = str(cfg.get("vast_instance_label") or "").strip()
+        return label or self.VAST_RUNTIME_LABEL_DEFAULT
+
+    @staticmethod
+    def _normalize_vast_instance_id(raw: Any) -> str:
+        if raw is None:
+            return ""
+        if isinstance(raw, int):
+            return str(raw)
+        return str(raw).strip()
+
+    def _instances_matching_runtime_label(self, client: VastAiClient, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        want = self._runtime_instance_label(cfg)
+        out: List[Dict[str, Any]] = []
+        try:
+            for row in client.list_instances():
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("label") or "").strip() != want:
+                    continue
+                out.append(row)
+        except Exception as e:
+            self._log_gpu_usage(
+                "gpu_vast_list_failed",
+                {"error": str(e)},
+            )
+        return out
+
+    @staticmethod
+    def _choose_runtime_instance_to_keep(instances: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not instances:
+            return None
+        if len(instances) == 1:
+            return instances[0]
+
+        def score(row: Dict[str, Any]) -> tuple:
+            st = str(row.get("cur_state") or row.get("actual_status") or "").lower()
+            running = 1 if st == "running" else 0
+            try:
+                iid = int(row.get("id") or 0)
+            except (TypeError, ValueError):
+                iid = 0
+            return (running, iid)
+
+        return max(instances, key=score)
+
+    def _enforce_singleton_vast_instances(self, client: VastAiClient, cfg: Dict[str, Any]) -> None:
+        """За API Vast залишає не більше одного інстанса з міткою runtime (джерело істини — Vast)."""
+        rows = self._instances_matching_runtime_label(client, cfg)
+        if len(rows) <= 1:
+            return
+        keep = self._choose_runtime_instance_to_keep(rows)
+        if not keep:
+            return
+        keep_id = self._normalize_vast_instance_id(keep.get("id"))
+        for row in rows:
+            rid = self._normalize_vast_instance_id(row.get("id"))
+            if not rid or rid == keep_id:
+                continue
+            try:
+                client.destroy_instance(rid)
+                self._log_gpu_usage(
+                    "gpu_vast_duplicate_destroyed",
+                    {"keep_instance_id": keep_id, "destroyed_instance_id": rid},
+                )
+            except Exception as e:
+                self._log_gpu_usage(
+                    "gpu_vast_duplicate_destroy_failed",
+                    {"instance_id": rid, "error": str(e)},
+                )
+
+    def _get_singleton_runtime_instance_id(self, client: VastAiClient, cfg: Dict[str, Any]) -> str:
+        rows = self._instances_matching_runtime_label(client, cfg)
+        if len(rows) != 1:
+            return ""
+        return self._normalize_vast_instance_id(rows[0].get("id"))
+
+    def _execute_contract_boot_steps(
+        self,
+        client: VastAiClient,
+        cfg: Dict[str, Any],
+        instance_id: str,
+        idx: int,
+        session_id: str,
+    ) -> str:
+        """Мережа + observability + readiness після того, як контракт у Vast уже існує."""
+        self._instance_id = str(instance_id)
+        self._coord_update_state(state="starting", instance_id=self._instance_id, endpoint=None, public_endpoint=None)
+        endpoint_timeout_sec = int(
+            cfg.get("endpoint_timeout_sec") or min(1200, int(cfg.get("boot_timeout_sec") or 1200))
+        )
+        network_info = self._wait_for_network_endpoint_info(
+            client,
+            self._instance_id,
+            endpoint_timeout_sec,
+            int(cfg.get("vllm_port") or 8000),
+            heartbeat_fn=lambda: self._coord_renew_lease(cfg, state="starting"),
+        )
+        public_endpoint = network_info["endpoint"]
+        instance_payload = network_info["payload"]
+        self._public_endpoint = public_endpoint
+        self._coord_update_state(
+            state="network_ready",
+            instance_id=self._instance_id,
+            public_endpoint=public_endpoint,
+            endpoint=None,
+        )
+        self._log_gpu_usage(
+            "gpu_instance_booted",
+            {
+                "instance_id": self._instance_id,
+                "public_endpoint": public_endpoint,
+                "attempt": idx,
+            },
+        )
+        self._start_instance_observability(public_endpoint, instance_payload, cfg)
+        if self._use_ollama_runtime(cfg):
+            endpoint = self._wait_for_ollama_control_readiness(public_endpoint, cfg["boot_timeout_sec"], cfg)
+            endpoint = self._ensure_ollama_model_ready(endpoint, public_endpoint, cfg["ready_timeout_sec"], cfg)
+        else:
+            endpoint = self._wait_for_runtime_readiness(public_endpoint, cfg["ready_timeout_sec"], cfg)
+        self._endpoint = endpoint
+        self._started_at = datetime.now(timezone.utc)
+        self._last_activity_ts = time.time()
+        self._coord_update_state(
+            state="running",
+            instance_id=self._instance_id,
+            endpoint=endpoint,
+            public_endpoint=public_endpoint,
+            last_error="",
+        )
+        self._sessions.update_session(
+            session_id,
+            {
+                "state": "running",
+                "instance_id": self._instance_id,
+                "endpoint": endpoint,
+                "public_endpoint": public_endpoint,
+                "ready_at": datetime.now(timezone.utc),
+                "attempt": idx,
+            },
+        )
+        self._log_gpu_usage(
+            "gpu_ready",
+            {
+                "instance_id": self._instance_id,
+                "endpoint": endpoint,
+                "public_endpoint": public_endpoint,
+                "attempt": idx,
+                "ssh_tunnel_enabled": bool(self._ssh_local_endpoint),
+            },
+        )
+        return self._endpoint or ""
 
     def ensure_runtime_ready(self) -> Optional[str]:
         with self._lock:
@@ -89,8 +246,46 @@ class VllmRuntimeOrchestrator:
                 raise RuntimeError("Vast.ai API key is not configured.")
 
             client = VastAiClient(api_key=cfg["vast_api_key"], timeout_sec=min(60, cfg["boot_timeout_sec"]))
+            self._enforce_singleton_vast_instances(client, cfg)
+            singleton_id = self._get_singleton_runtime_instance_id(client, cfg)
+            if singleton_id:
+                self._session_id = self._sessions.start_session(
+                    {
+                        "state": "starting",
+                        "ask_id": "",
+                        "attempt": 0,
+                        "settings_snapshot": self._safe_settings_snapshot(cfg),
+                        "vast_adopt": True,
+                    }
+                )
+                try:
+                    return self._execute_contract_boot_steps(client, cfg, singleton_id, 0, self._session_id)
+                except Exception as e:
+                    last_error = str(e)
+                    if self._session_id:
+                        self._sessions.finish_session(self._session_id, "failed")
+                    self._log_gpu_usage(
+                        "gpu_startup_failed",
+                        {
+                            "instance_id": singleton_id,
+                            "attempt": 0,
+                            "stage": "vast_singleton_bootstrap",
+                            "error": last_error,
+                        },
+                    )
+                    self._coord_update_state(
+                        state="failed",
+                        instance_id=singleton_id,
+                        endpoint=None,
+                        public_endpoint=None,
+                        last_error=last_error,
+                    )
+                    raise RuntimeError(
+                        f"Існуючий Vast-інстанс із міткою {self._runtime_instance_label(cfg)} не вдалося довести до readiness: {last_error}"
+                    ) from e
+
             if not self._coord_try_acquire(cfg, state="starting"):
-                shared_endpoint = self._wait_for_shared_runtime_or_acquire(cfg)
+                shared_endpoint = self._wait_for_shared_runtime_or_acquire(cfg, client)
                 if shared_endpoint:
                     self._last_activity_ts = time.time()
                     return shared_endpoint
@@ -155,74 +350,8 @@ class VllmRuntimeOrchestrator:
                     last_error = "Vast.ai did not return instance id."
                     self._coord_update_state(state="failed", last_error=last_error)
                     continue
-                self._coord_update_state(state="starting", instance_id=self._instance_id, endpoint=None, public_endpoint=None)
                 try:
-                    endpoint_timeout_sec = int(
-                        cfg.get("endpoint_timeout_sec")
-                        or min(1200, int(cfg.get("boot_timeout_sec") or 1200))
-                    )
-                    network_info = self._wait_for_network_endpoint_info(
-                        client,
-                        self._instance_id,
-                        endpoint_timeout_sec,
-                        int(cfg.get("vllm_port") or 8000),
-                        heartbeat_fn=lambda: self._coord_renew_lease(cfg, state="starting"),
-                    )
-                    public_endpoint = network_info["endpoint"]
-                    instance_payload = network_info["payload"]
-                    self._public_endpoint = public_endpoint
-                    self._coord_update_state(
-                        state="network_ready",
-                        instance_id=self._instance_id,
-                        public_endpoint=public_endpoint,
-                        endpoint=None,
-                    )
-                    self._log_gpu_usage(
-                        "gpu_instance_booted",
-                        {
-                            "instance_id": self._instance_id,
-                            "public_endpoint": public_endpoint,
-                            "attempt": idx,
-                        },
-                    )
-                    self._start_instance_observability(public_endpoint, instance_payload, cfg)
-                    if self._use_ollama_runtime(cfg):
-                        endpoint = self._wait_for_ollama_control_readiness(public_endpoint, cfg["boot_timeout_sec"], cfg)
-                        endpoint = self._ensure_ollama_model_ready(endpoint, public_endpoint, cfg["ready_timeout_sec"], cfg)
-                    else:
-                        endpoint = self._wait_for_runtime_readiness(public_endpoint, cfg["ready_timeout_sec"], cfg)
-                    self._endpoint = endpoint
-                    self._started_at = datetime.now(timezone.utc)
-                    self._last_activity_ts = time.time()
-                    self._coord_update_state(
-                        state="running",
-                        instance_id=self._instance_id,
-                        endpoint=endpoint,
-                        public_endpoint=public_endpoint,
-                        last_error="",
-                    )
-                    self._sessions.update_session(
-                        self._session_id,
-                        {
-                            "state": "running",
-                            "instance_id": self._instance_id,
-                            "endpoint": endpoint,
-                            "public_endpoint": public_endpoint,
-                            "ready_at": datetime.now(timezone.utc),
-                            "attempt": idx,
-                        },
-                    )
-                    self._log_gpu_usage(
-                        "gpu_ready",
-                        {
-                            "instance_id": self._instance_id,
-                            "endpoint": endpoint,
-                            "public_endpoint": public_endpoint,
-                            "attempt": idx,
-                            "ssh_tunnel_enabled": bool(self._ssh_local_endpoint),
-                        },
-                    )
-                    return self._endpoint
+                    return self._execute_contract_boot_steps(client, cfg, self._instance_id, idx, self._session_id)
                 except Exception as e:
                     last_error = str(e)
                     startup_stage = "endpoint_publish"
@@ -1364,7 +1493,7 @@ class VllmRuntimeOrchestrator:
             "disk": int(cfg.get("disk_gb") or 40),
             "runtype": "ssh_direct",
             "cancel_unavail": True,
-            "label": "pazuzu-vllm-runtime",
+            "label": self._runtime_instance_label(cfg),
             "onstart": onstart,
             "env": env,
         }
@@ -1496,7 +1625,7 @@ class VllmRuntimeOrchestrator:
         lease_until = VllmRuntimeOrchestrator._mongo_datetime_as_utc_aware(lease_until)
         return lease_until > datetime.now(timezone.utc)
 
-    def _wait_for_shared_runtime_or_acquire(self, cfg: Dict[str, Any]) -> Optional[str]:
+    def _wait_for_shared_runtime_or_acquire(self, cfg: Dict[str, Any], client: VastAiClient) -> Optional[str]:
         deadline = time.time() + max(
             30,
             int(cfg.get("endpoint_timeout_sec") or 1200),
@@ -1504,6 +1633,10 @@ class VllmRuntimeOrchestrator:
             int(cfg.get("boot_timeout_sec") or 1200),
         )
         while time.time() < deadline:
+            try:
+                self._enforce_singleton_vast_instances(client, cfg)
+            except Exception:
+                pass
             state = self._coord.get_runtime_state() or {}
             public_endpoint = str(state.get("public_endpoint") or "").strip()
             endpoint = public_endpoint or str(state.get("endpoint") or "").strip()

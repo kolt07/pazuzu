@@ -74,6 +74,19 @@ class VllmRuntimeOrchestratorTest(unittest.TestCase):
         )
         self.assertEqual(candidates, ["22", "21", "23"])
 
+    def test_choose_runtime_instance_to_keep_prefers_running_then_higher_id(self):
+        rows = [
+            {"id": 1, "cur_state": "stopped"},
+            {"id": 2, "cur_state": "running"},
+            {"id": 3, "cur_state": "running"},
+        ]
+        keep = VllmRuntimeOrchestrator._choose_runtime_instance_to_keep(rows)
+        self.assertEqual(keep["id"], 3)
+
+    def test_choose_runtime_instance_to_keep_single(self):
+        row = {"id": 42, "cur_state": "running"}
+        self.assertEqual(VllmRuntimeOrchestrator._choose_runtime_instance_to_keep([row]), row)
+
     def test_rate_limit_error_detection(self):
         r = requests.Response()
         r.status_code = 429

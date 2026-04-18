@@ -64,6 +64,14 @@ class VastAiClient:
     def create_instance(self, ask_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._request("PUT", f"/asks/{ask_id}/", json=payload or {})
 
+    def list_instances(self) -> List[Dict[str, Any]]:
+        """Повертає всі інстанси поточного користувача (джерело істини для fleet)."""
+        data = self._request("GET", "/instances/")
+        raw = data.get("instances")
+        if isinstance(raw, list):
+            return raw
+        return []
+
     def get_current_user(self) -> Dict[str, Any]:
         """Повертає профіль поточного користувача Vast.ai, включно з балансом."""
         return self._request("GET", "/users/current/")

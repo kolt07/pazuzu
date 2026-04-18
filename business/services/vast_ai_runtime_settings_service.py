@@ -54,6 +54,8 @@ class VastRuntimeSettingsService:
             "destroy_after_pause_sec": 1200,
             "hard_budget_usd": 20.0,
             "fallback_provider": "ollama",
+            # Мітка контракту Vast; оркестратор зводить fleet до одного інстанса з цією міткою.
+            "vast_instance_label": "pazuzu-vllm-runtime",
         }
 
     def get_settings(self) -> Dict[str, Any]:
@@ -126,4 +128,5 @@ class VastRuntimeSettingsService:
         out["hf_token"] = str(out.get("hf_token") or "").strip()
         out["vllm_model"] = str(out.get("vllm_model") or "google/gemma-2-9b-it").strip()
         out["fallback_provider"] = str(out.get("fallback_provider") or "ollama").strip().lower()
+        out["vast_instance_label"] = str(out.get("vast_instance_label") or "").strip() or "pazuzu-vllm-runtime"
         return out
