@@ -16,15 +16,13 @@
 import sys
 from pathlib import Path
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
-elif getattr(sys.stdout, "encoding", "").lower() != "utf-8":
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+from utils.stdio_utf8 import ensure_stdout_utf8
+
+ensure_stdout_utf8()
 
 from config.settings import Settings
 from scripts.olx_scraper import config as scraper_config

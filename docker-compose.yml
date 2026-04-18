@@ -111,6 +111,8 @@ services:
     command: ["python", "-m", "celery", "-A", "business.celery_worker_entry:celery_app", "worker", "-Q", "llm_processing", "--loglevel=info", "--concurrency=1"]
 
   ngrok:
+    profiles:
+      - ngrok
     image: ngrok/ngrok:latest
     container_name: pazuzu-ngrok
     restart: unless-stopped

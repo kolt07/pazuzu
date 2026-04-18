@@ -88,6 +88,21 @@ class Settings:
             'TELEGRAM_USERS_CONFIG_PATH',
             str(Path(__file__).parent / 'users.yaml')
         )
+        # HTTP-клієнт до api.telegram.org (python-telegram-bot / HTTPXRequest)
+        def _float_env(name: str, default: float) -> float:
+            raw = os.getenv(name, '').strip()
+            if not raw:
+                return default
+            try:
+                return float(raw)
+            except ValueError:
+                return default
+
+        self.telegram_http_connect_timeout = _float_env('TELEGRAM_HTTP_CONNECT_TIMEOUT', 30.0)
+        self.telegram_http_read_timeout = _float_env('TELEGRAM_HTTP_READ_TIMEOUT', 60.0)
+        self.telegram_http_write_timeout = _float_env('TELEGRAM_HTTP_WRITE_TIMEOUT', 30.0)
+        self.telegram_http_pool_timeout = _float_env('TELEGRAM_HTTP_POOL_TIMEOUT', 30.0)
+        self.telegram_http_version = (os.getenv('TELEGRAM_HTTP_VERSION', '1.1') or '1.1').strip()
         
         # Google Maps API (геокодування адрес і топонімів)
         self.google_maps_api_key = os.getenv('GOOGLE_MAPS_API_KEY', '')
@@ -223,6 +238,16 @@ class Settings:
                                 self.telegram_bot_token = telegram_config['bot_token']
                             if 'users_config_path' in telegram_config:
                                 self.telegram_users_config_path = telegram_config['users_config_path']
+                            if 'http_connect_timeout' in telegram_config:
+                                self.telegram_http_connect_timeout = float(telegram_config['http_connect_timeout'])
+                            if 'http_read_timeout' in telegram_config:
+                                self.telegram_http_read_timeout = float(telegram_config['http_read_timeout'])
+                            if 'http_write_timeout' in telegram_config:
+                                self.telegram_http_write_timeout = float(telegram_config['http_write_timeout'])
+                            if 'http_pool_timeout' in telegram_config:
+                                self.telegram_http_pool_timeout = float(telegram_config['http_pool_timeout'])
+                            if 'http_version' in telegram_config:
+                                self.telegram_http_version = str(telegram_config['http_version'] or '1.1').strip()
                             if 'parsing' in telegram_config:
                                 p = telegram_config['parsing']
                                 if 'provider' in p:
