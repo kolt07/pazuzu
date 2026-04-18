@@ -6,6 +6,8 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+from pymongo.errors import DuplicateKeyError
+
 from data.repositories.base_repository import BaseRepository
 
 
@@ -50,23 +52,36 @@ class GpuRuntimeCoordinationRepository(BaseRepository):
                 "updated_at": now,
             }
         )
+        # Не використовуємо upsert: якщо документ з _id уже є, але фільтр не збігається
+        # (інший owner з активним lease), upsert намагався б insert → E11000 duplicate key.
+        filter_acquire = {
+            "_id": self.DOC_ID,
+            "$or": [
+                {"owner_id": owner_id},
+                {"owner_id": {"$exists": False}},
+                {"owner_id": None},
+                {"lease_expires_at": {"$lte": now}},
+            ],
+        }
         result = self.collection.update_one(
-            {
-                "_id": self.DOC_ID,
-                "$or": [
-                    {"owner_id": owner_id},
-                    {"owner_id": {"$exists": False}},
-                    {"owner_id": None},
-                    {"lease_expires_at": {"$lte": now}},
-                ],
-            },
-            {
-                "$set": patch,
-                "$setOnInsert": {"created_at": now},
-            },
-            upsert=True,
+            filter_acquire,
+            {"$set": patch},
+            upsert=False,
         )
-        return bool(result.matched_count or result.upserted_id is not None)
+        if result.matched_count:
+            return True
+        if self.collection.find_one({"_id": self.DOC_ID}) is not None:
+            return False
+        try:
+            self.collection.insert_one({"_id": self.DOC_ID, "created_at": now, **patch})
+            return True
+        except DuplicateKeyError:
+            retry = self.collection.update_one(
+                filter_acquire,
+                {"$set": patch},
+                upsert=False,
+            )
+            return bool(retry.matched_count)
 
     def renew(self, owner_id: str, lease_seconds: int, payload: Optional[Dict[str, Any]] = None) -> bool:
         self._ensure_indexes()
@@ -81,10 +96,10 @@ class GpuRuntimeCoordinationRepository(BaseRepository):
         )
         result = self.collection.update_one(
             {"_id": self.DOC_ID, "owner_id": owner_id},
-            {"$set": patch, "$setOnInsert": {"created_at": now}},
-            upsert=True,
+            {"$set": patch},
+            upsert=False,
         )
-        return bool(result.matched_count or result.upserted_id is not None)
+        return bool(result.matched_count)
 
     def update_state(self, owner_id: str, patch: Dict[str, Any]) -> bool:
         self._ensure_indexes()
@@ -109,7 +124,7 @@ class GpuRuntimeCoordinationRepository(BaseRepository):
         )
         result = self.collection.update_one(
             {"_id": self.DOC_ID, "owner_id": owner_id},
-            {"$set": update_patch, "$setOnInsert": {"created_at": now}},
-            upsert=True,
+            {"$set": update_patch},
+            upsert=False,
         )
-        return bool(result.matched_count or result.upserted_id is not None)
+        return bool(result.matched_count)
