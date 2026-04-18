@@ -5,11 +5,12 @@ FROM python:3.11-slim
 # Встановлюємо робочу директорію
 WORKDIR /app
 
-# Встановлюємо змінні середовища
+# Встановлюємо змінні середовища (PYTHONPATH — імпорт business.* для Celery)
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONIOENCODING=utf-8 \
-    LANG=C.UTF-8
+    LANG=C.UTF-8 \
+    PYTHONPATH=/app
 
 # Оновлюємо систему та встановлюємо необхідні пакети
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -20,7 +21,9 @@ COPY requirements.txt .
 
 # Встановлюємо залежності Python
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir "celery>=5.3.0" && \
+    python -c "import celery; print('celery', celery.__version__)"
 
 # Копіюємо весь код проекту
 COPY . .

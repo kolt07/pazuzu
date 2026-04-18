@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   mongodb:
     image: mongo:7
@@ -39,6 +37,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: pazuzu-app
+    working_dir: /app
     restart: unless-stopped
     depends_on:
       mongodb:
@@ -50,6 +49,7 @@ services:
       - ./data:/app/data
       - ./temp:/app/temp
     environment:
+      PYTHONPATH: /app
       TASK_QUEUE_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
@@ -63,6 +63,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: pazuzu-source-worker
+    working_dir: /app
     restart: unless-stopped
     depends_on:
       mongodb:
@@ -74,19 +75,21 @@ services:
       - ./data:/app/data
       - ./temp:/app/temp
     environment:
+      PYTHONPATH: /app
       TASK_QUEUE_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pazuzu}
       RABBITMQ_VHOST: ${RABBITMQ_DEFAULT_VHOST:-pazuzu}
-    command: ["celery", "-A", "business.celery_app:celery_app", "worker", "-Q", "source_load", "--loglevel=info", "--concurrency=1"]
+    command: ["python", "-m", "celery", "-A", "business.celery_worker_entry:celery_app", "worker", "-Q", "source_load", "--loglevel=info", "--concurrency=1"]
 
   pazuzu-llm-worker:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: pazuzu-llm-worker
+    working_dir: /app
     restart: unless-stopped
     depends_on:
       mongodb:
@@ -98,13 +101,14 @@ services:
       - ./data:/app/data
       - ./temp:/app/temp
     environment:
+      PYTHONPATH: /app
       TASK_QUEUE_ENABLED: "true"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pazuzu}
       RABBITMQ_VHOST: ${RABBITMQ_DEFAULT_VHOST:-pazuzu}
-    command: ["celery", "-A", "business.celery_app:celery_app", "worker", "-Q", "llm_processing", "--loglevel=info", "--concurrency=1"]
+    command: ["python", "-m", "celery", "-A", "business.celery_worker_entry:celery_app", "worker", "-Q", "llm_processing", "--loglevel=info", "--concurrency=1"]
 
   ngrok:
     image: ngrok/ngrok:latest
