@@ -7,6 +7,7 @@ MCP сервер для ініціювання оновлення даних у 
 from typing import Any, Dict, Optional
 
 from mcp.server.fastmcp import FastMCP
+from business.services.task_queue_service import TaskQueueService
 from config.settings import Settings
 from data.database.connection import MongoDBConnection
 from business.services.source_data_load_service import run_full_pipeline
@@ -34,6 +35,21 @@ def trigger_olx_update(
     try:
         settings = Settings()
         MongoDBConnection.initialize(settings)
+        task_queue = TaskQueueService(settings)
+        if task_queue.is_enabled():
+            dispatched = task_queue.enqueue_source_load(
+                days=days or 1,
+                sources=["olx"],
+                regions=regions if isinstance(regions, list) and regions else None,
+                listing_types=listing_types if isinstance(listing_types, list) and listing_types else None,
+                metadata={"trigger": "mcp"},
+            )
+            return {
+                "success": True,
+                "message": "OLX update queued via RabbitMQ/Celery.",
+                "task_id": dispatched["task_id"],
+                "queue": dispatched["queue"],
+            }
         result = run_full_pipeline(
             settings=settings,
             sources=["olx"],

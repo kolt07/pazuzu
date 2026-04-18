@@ -1738,6 +1738,7 @@
       if (olxClickerStartBtn) olxClickerStartBtn.addEventListener("click", startAdminOlxClickerScraper);
       var olxClickerRefreshStatsBtn = document.getElementById("admin-olx-clicker-refresh-stats");
       if (olxClickerRefreshStatsBtn) olxClickerRefreshStatsBtn.addEventListener("click", loadAdminOlxClickerStats);
+      initAdminVastRuntimeSettings();
       initAdminScheduler();
       initAdminFeedback();
     }
@@ -2136,7 +2137,7 @@
       });
   }
 
-  var adminUsageCharts = { llm: null, geocoding: null };
+  var adminUsageCharts = { llm: null, geocoding: null, gpuRuntime: null };
 
   function loadAdminUsageStats() {
     var summaryEl = document.getElementById("admin-usage-stats-summary");
@@ -2147,6 +2148,7 @@
       .then(function (data) {
         var llm = data.llm || {};
         var geo = data.geocoding || {};
+        var gpu = data.gpu_runtime || {};
         var inp = llm.input_tokens_total || 0;
         var out = llm.output_tokens_total || 0;
         var cost = llm.estimated_cost_usd != null ? llm.estimated_cost_usd : 0;
@@ -2162,19 +2164,29 @@
         if (llm.model) llmStr += " [" + llm.model + "]";
         var geoStr = "Geocoding API: " + (geo.total || 0) + " викликів (за міс. " + (geo.last_month || 0) + ")";
         if (geo.cache_hits_total != null) geoStr += ", з кешу " + geo.cache_hits_total;
-        summaryEl.innerHTML = "<strong>" + llmStr + "</strong> &nbsp;|&nbsp; <strong>" + geoStr + "</strong>";
+        var gpuTotalMin = gpu.active_minutes_total || 0;
+        var gpuMonthMin = gpu.active_minutes_last_month || 0;
+        var gpuCost = gpu.estimated_cost_usd_total || 0;
+        var gpuCostMonth = gpu.estimated_cost_usd_last_month || 0;
+        var gpuStr = "GPU runtime: " + gpuTotalMin.toFixed(1) + " хв";
+        if (gpuCost > 0) gpuStr += ", ~$" + gpuCost.toFixed(4);
+        gpuStr += " (за міс. " + gpuMonthMin.toFixed(1) + " хв";
+        if (gpuCostMonth > 0) gpuStr += ", ~$" + gpuCostMonth.toFixed(4);
+        gpuStr += ")";
+        summaryEl.innerHTML = "<strong>" + llmStr + "</strong> &nbsp;|&nbsp; <strong>" + geoStr + "</strong> &nbsp;|&nbsp; <strong>" + gpuStr + "</strong>";
         if (data.error) summaryEl.innerHTML += " <span class=\"admin-hint\">(" + data.error + ")</span>";
-        renderAdminUsageCharts(llm.by_day || [], geo.by_day || []);
+        renderAdminUsageCharts(llm.by_day || [], geo.by_day || [], gpu.by_day || []);
       })
       .catch(function (err) {
         summaryEl.textContent = "Помилка: " + (err.message || "невідома");
       });
   }
 
-  function renderAdminUsageCharts(llmByDay, geoByDay) {
+  function renderAdminUsageCharts(llmByDay, geoByDay, gpuByDay) {
     var llmCanvas = document.getElementById("admin-chart-llm");
     var geoCanvas = document.getElementById("admin-chart-geocoding");
-    if (!llmCanvas || !geoCanvas || typeof Chart === "undefined") return;
+    var gpuCanvas = document.getElementById("admin-chart-gpu-runtime");
+    if (!llmCanvas || !geoCanvas || !gpuCanvas || typeof Chart === "undefined") return;
 
     var chartOpts = {
       responsive: true,
@@ -2206,6 +2218,97 @@
       },
       options: chartOpts
     });
+
+    if (adminUsageCharts.gpuRuntime) adminUsageCharts.gpuRuntime.destroy();
+    adminUsageCharts.gpuRuntime = new Chart(gpuCanvas, {
+      type: "bar",
+      data: {
+        labels: gpuByDay.map(function (d) { return d.date; }),
+        datasets: [{ label: "GPU runtime (хв)", data: gpuByDay.map(function (d) { return d.active_minutes || 0; }), backgroundColor: "rgba(255, 152, 0, 0.6)", borderColor: "rgb(255, 152, 0)", borderWidth: 1 }]
+      },
+      options: chartOpts
+    });
+  }
+
+  function initAdminVastRuntimeSettings() {
+    var saveBtn = document.getElementById("admin-vast-settings-save");
+    if (!saveBtn) return;
+    loadAdminVastRuntimeSettings();
+    saveBtn.addEventListener("click", saveAdminVastRuntimeSettings);
+  }
+
+  function loadAdminVastRuntimeSettings() {
+    var statusEl = document.getElementById("admin-vast-settings-status");
+    fetch("/api/admin/vast-runtime-settings", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function (cfg) {
+        var byId = function (id) { return document.getElementById(id); };
+        if (byId("admin-vast-enabled")) byId("admin-vast-enabled").checked = !!cfg.is_enabled;
+        if (byId("admin-vast-image")) byId("admin-vast-image").value = cfg.image || "";
+        if (byId("admin-vast-vllm-model")) byId("admin-vast-vllm-model").value = cfg.vllm_model || "";
+        if (byId("admin-vast-vllm-max-len")) byId("admin-vast-vllm-max-len").value = cfg.vllm_max_model_len != null ? cfg.vllm_max_model_len : "";
+        if (byId("admin-vast-vllm-gpu-mem")) byId("admin-vast-vllm-gpu-mem").value = cfg.vllm_gpu_memory_utilization != null ? cfg.vllm_gpu_memory_utilization : "";
+        if (byId("admin-vast-vllm-max-seqs")) byId("admin-vast-vllm-max-seqs").value = cfg.vllm_max_num_seqs != null ? cfg.vllm_max_num_seqs : "";
+        if (byId("admin-vast-vllm-enforce-eager")) byId("admin-vast-vllm-enforce-eager").checked = cfg.vllm_enforce_eager !== false;
+        if (byId("admin-vast-min-gpu-ram")) byId("admin-vast-min-gpu-ram").value = cfg.min_gpu_ram_gb != null ? cfg.min_gpu_ram_gb : "";
+        if (byId("admin-vast-max-hourly-usd")) byId("admin-vast-max-hourly-usd").value = cfg.max_hourly_usd != null ? cfg.max_hourly_usd : "";
+        if (byId("admin-vast-idle-grace-sec")) byId("admin-vast-idle-grace-sec").value = cfg.idle_grace_sec != null ? cfg.idle_grace_sec : "";
+        if (byId("admin-vast-endpoint-timeout-sec")) byId("admin-vast-endpoint-timeout-sec").value = cfg.endpoint_timeout_sec != null ? cfg.endpoint_timeout_sec : "";
+        if (byId("admin-vast-hard-budget-usd")) byId("admin-vast-hard-budget-usd").value = cfg.hard_budget_usd != null ? cfg.hard_budget_usd : "";
+        if (statusEl) statusEl.textContent = "Поточний ключ Vast: " + (cfg.vast_api_key || "не задано") + " | HF token: " + (cfg.hf_token || "не задано");
+      })
+      .catch(function (e) {
+        if (statusEl) statusEl.textContent = "Помилка: " + (e.message || "не вдалося завантажити налаштування");
+      });
+  }
+
+  function saveAdminVastRuntimeSettings() {
+    var statusEl = document.getElementById("admin-vast-settings-status");
+    var byId = function (id) { return document.getElementById(id); };
+    var payload = {
+      is_enabled: !!(byId("admin-vast-enabled") && byId("admin-vast-enabled").checked),
+      image: byId("admin-vast-image") ? byId("admin-vast-image").value : "",
+      vllm_model: byId("admin-vast-vllm-model") ? byId("admin-vast-vllm-model").value : "",
+      vllm_max_model_len: byId("admin-vast-vllm-max-len") ? parseInt(byId("admin-vast-vllm-max-len").value || "4096", 10) : 4096,
+      vllm_gpu_memory_utilization: byId("admin-vast-vllm-gpu-mem") ? parseFloat(byId("admin-vast-vllm-gpu-mem").value || "0.9") : 0.9,
+      vllm_max_num_seqs: byId("admin-vast-vllm-max-seqs") ? parseInt(byId("admin-vast-vllm-max-seqs").value || "4", 10) : 4,
+      vllm_enforce_eager: !!(byId("admin-vast-vllm-enforce-eager") && byId("admin-vast-vllm-enforce-eager").checked),
+      min_gpu_ram_gb: byId("admin-vast-min-gpu-ram") ? parseInt(byId("admin-vast-min-gpu-ram").value || "0", 10) : 0,
+      max_hourly_usd: byId("admin-vast-max-hourly-usd") ? parseFloat(byId("admin-vast-max-hourly-usd").value || "0") : 0,
+      idle_grace_sec: byId("admin-vast-idle-grace-sec") ? parseInt(byId("admin-vast-idle-grace-sec").value || "60", 10) : 60,
+      endpoint_timeout_sec: byId("admin-vast-endpoint-timeout-sec") ? parseInt(byId("admin-vast-endpoint-timeout-sec").value || "1200", 10) : 1200,
+      hard_budget_usd: byId("admin-vast-hard-budget-usd") ? parseFloat(byId("admin-vast-hard-budget-usd").value || "0") : 0,
+    };
+    var apiKeyInput = byId("admin-vast-api-key");
+    var hfTokenInput = byId("admin-vast-hf-token");
+    if (apiKeyInput && apiKeyInput.value && apiKeyInput.value.trim()) {
+      payload.vast_api_key = apiKeyInput.value.trim();
+    }
+    if (hfTokenInput && hfTokenInput.value && hfTokenInput.value.trim()) {
+      payload.hf_token = hfTokenInput.value.trim();
+    }
+    if (statusEl) statusEl.textContent = "Збереження...";
+    fetch("/api/admin/vast-runtime-settings", {
+      method: "PUT",
+      headers: apiHeaders(),
+      body: JSON.stringify(payload)
+    })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function () {
+        if (apiKeyInput) apiKeyInput.value = "";
+        if (hfTokenInput) hfTokenInput.value = "";
+        if (statusEl) statusEl.textContent = "Збережено.";
+        loadAdminVastRuntimeSettings();
+      })
+      .catch(function (e) {
+        if (statusEl) statusEl.textContent = "Помилка: " + (e.message || "не вдалося зберегти");
+      });
   }
 
   function loadAdminCadastralStats() {

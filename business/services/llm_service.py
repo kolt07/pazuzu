@@ -15,6 +15,11 @@ from config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+def _get_vllm_orchestrator():
+    from business.services.vllm_runtime_orchestrator import get_shared_vllm_runtime_orchestrator
+
+    return get_shared_vllm_runtime_orchestrator()
+
 
 class RateLimiter:
     """Клас для обмеження швидкості викликів API. При calls_per_minute <= 0 — без обмежень."""
@@ -941,6 +946,233 @@ class OllamaLLMProvider(BaseLLMProvider):
             return ""
 
 
+class VllmRemoteLLMProvider(BaseLLMProvider):
+    """Провайдер remote vLLM (OpenAI-compatible) з автоматичним стартом Vast.ai."""
+
+    def __init__(
+        self,
+        api_key: str,
+        rate_limiter: RateLimiter,
+        model_name: str = "google/gemma-2-9b-it",
+    ):
+        super().__init__(api_key=api_key or "", rate_limiter=rate_limiter)
+        self._runtime = _get_vllm_orchestrator()
+        self.model_name = model_name
+        self._client = None
+        self._base_url = ""
+        self._vllm_api_key = api_key or "pazuzu-vllm"
+        self._last_usage: Optional[Dict[str, int]] = None
+        self._last_request_text: Optional[str] = None
+        self._last_response_text: Optional[str] = None
+        self._last_runtime_meta: Dict[str, Any] = {}
+
+    def _ensure_client(self) -> bool:
+        endpoint = self._runtime.ensure_runtime_ready()
+        if not endpoint:
+            return False
+        base_url = endpoint.rstrip("/") + "/v1"
+        if self._client is None or self._base_url != base_url:
+            from openai import OpenAI
+
+            self._client = OpenAI(base_url=base_url, api_key=self._vllm_api_key)
+            self._base_url = base_url
+        return True
+
+    @staticmethod
+    def _usage_from_openai_response(response: Any) -> Dict[str, int]:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return {"input_tokens": 0, "output_tokens": 0}
+        return {
+            "input_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+            "output_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        }
+
+    def parse_auction_description(self, description: str) -> Dict[str, Any]:
+        if not description or not description.strip():
+            return self._empty_result()
+        self.rate_limiter.wait_if_needed()
+        if not self._ensure_client():
+            return self._empty_result()
+
+        prompt = self._create_parsing_prompt(description)
+        self._last_request_text = prompt
+        self._last_response_text = None
+        t0 = time.perf_counter()
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model_name,
+                temperature=0.0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Return only valid JSON. Keep textual values in Ukrainian.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            self._last_usage = self._usage_from_openai_response(response)
+            response_text = (response.choices[0].message.content or "").strip()
+            self._last_response_text = response_text
+            self._last_runtime_meta = {
+                "provider": "vllm_remote",
+                "endpoint": self._base_url,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            }
+            self._runtime.mark_processing_activity(self._last_runtime_meta)
+            if not response_text:
+                return self._empty_result()
+            json_text = self._extract_json_from_response(response_text)
+            if not json_text:
+                return self._empty_result()
+            result = json.loads(json_text)
+            if isinstance(result, list):
+                if len(result) > 0 and isinstance(result[0], dict):
+                    result = result[0]
+                else:
+                    return self._empty_result()
+            elif not isinstance(result, dict):
+                return self._empty_result()
+            return self._normalize_result(result)
+        except Exception as e:
+            self._last_response_text = f"[error] {e!s}"
+            return self._empty_result()
+
+    def generate_text(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.0,
+    ) -> str:
+        self.rate_limiter.wait_if_needed()
+        if not self._ensure_client():
+            return ""
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        self._last_request_text = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+        self._last_response_text = None
+        t0 = time.perf_counter()
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model_name,
+                temperature=temperature,
+                messages=messages,
+            )
+            self._last_usage = self._usage_from_openai_response(response)
+            out = (response.choices[0].message.content or "").strip()
+            self._last_response_text = out
+            self._last_runtime_meta = {
+                "provider": "vllm_remote",
+                "endpoint": self._base_url,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            }
+            self._runtime.mark_processing_activity(self._last_runtime_meta)
+            return out
+        except Exception as e:
+            self._last_response_text = f"[error] {e!s}"
+            return ""
+
+    # Методи нормалізації/витягу JSON уніфіковані з Ollama-провайдером.
+    def _extract_json_from_response(self, text: str) -> str:
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            json_lines = []
+            in_json = False
+            for line in lines:
+                if line.strip().startswith("```"):
+                    if not in_json:
+                        in_json = True
+                    else:
+                        break
+                    continue
+                if in_json:
+                    json_lines.append(line)
+            return "\n".join(json_lines)
+        if "{" in text:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return text[start : end + 1]
+        return text
+
+    def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        addresses = result.get("addresses", [])
+        if not addresses and (result.get("address_region") or result.get("address_city")):
+            addresses = [{
+                "region": result.get("address_region", ""),
+                "district": result.get("address_district", ""),
+                "settlement_type": result.get("address_settlement_type", ""),
+                "settlement": result.get("address_city", ""),
+                "settlement_district": result.get("address_settlement_district", ""),
+                "street_type": result.get("address_street_type", ""),
+                "street": result.get("address_street", ""),
+                "building": result.get("address_building", ""),
+                "building_part": result.get("address_building_part", ""),
+                "room": result.get("address_room", ""),
+            }]
+
+        building_area_sqm = result.get("building_area_sqm", "")
+        land_area_ha = result.get("land_area_ha", "")
+        if not building_area_sqm and not land_area_ha:
+            old_area = result.get("area", "")
+            old_unit = result.get("area_unit", "")
+            if old_area:
+                try:
+                    area_value = float(str(old_area).replace(",", ".").replace(" ", ""))
+                    if old_unit:
+                        unit_lower = str(old_unit).lower()
+                        if any(x in unit_lower for x in ["гектар", "hectare", "га"]):
+                            land_area_ha = area_value
+                        elif any(x in unit_lower for x in ["м²", "м2", "кв.м", "квадратний метр"]):
+                            building_area_sqm = area_value
+                        elif any(x in unit_lower for x in ["сотка", "соток"]):
+                            land_area_ha = area_value * 0.01 if area_value < 100 else area_value * 100
+                    else:
+                        building_area_sqm = area_value if area_value > 1000 else ""
+                        land_area_ha = area_value if area_value < 10 else ""
+                except (ValueError, AttributeError):
+                    pass
+
+        tags_raw = result.get("tags", [])
+        tags = [str(t).strip().lower() for t in (tags_raw if isinstance(tags_raw, list) else []) if t and str(t).strip()]
+        tags = list(dict.fromkeys(tags))
+        land_area_sqm = result.get("land_area_sqm", "")
+        if not land_area_sqm and land_area_ha:
+            try:
+                land_area_sqm = float(land_area_ha) * 10000.0
+            except (TypeError, ValueError):
+                land_area_sqm = ""
+        return {
+            "cadastral_number": result.get("cadastral_number", ""),
+            "building_area_sqm": building_area_sqm if building_area_sqm else "",
+            "land_area_ha": land_area_ha if land_area_ha else "",
+            "land_area_sqm": land_area_sqm if land_area_sqm else "",
+            "addresses": addresses,
+            "floor": result.get("floor", ""),
+            "property_type": result.get("property_type", ""),
+            "utilities": result.get("utilities", ""),
+            "tags": tags,
+            "arrests_info": result.get("arrests_info", ""),
+        }
+
+    def _empty_result(self) -> Dict[str, Any]:
+        return {
+            "cadastral_number": "",
+            "building_area_sqm": "",
+            "land_area_ha": "",
+            "land_area_sqm": "",
+            "addresses": [],
+            "floor": "",
+            "property_type": "",
+            "utilities": "",
+            "tags": [],
+            "arrests_info": "",
+        }
+
+
 class LLMService:
     """Сервіс для роботи з LLM провайдерами."""
 
@@ -970,6 +1202,25 @@ class LLMService:
         """Створює провайдера для парсингу описів (на основі llm_parsing_*)."""
         provider_name = self.settings.llm_parsing_provider.lower()
         api_key = self.settings.llm_api_keys.get(provider_name, '')
+
+        if provider_name == 'vllm_remote':
+            model_name = getattr(self.settings, 'llm_parsing_model_name', 'google/gemma-2-9b-it')
+            runtime_cfg = None
+            try:
+                from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
+
+                runtime_cfg = VastRuntimeSettingsService().get_settings()
+            except Exception:
+                runtime_cfg = None
+            vllm_key = (runtime_cfg or {}).get("vllm_api_key", "") or api_key
+            try:
+                return VllmRemoteLLMProvider(vllm_key, self.rate_limiter, model_name)
+            except Exception as e:
+                fallback = ((runtime_cfg or {}).get("fallback_provider") or "ollama").lower()
+                if fallback == "ollama":
+                    logger.warning("vllm_remote недоступний, fallback на ollama: %s", e)
+                    return OllamaLLMProvider('', self.rate_limiter, model_name='gemma3:27b')
+                raise
 
         if provider_name == 'ollama':
             model_name = getattr(self.settings, 'llm_parsing_model_name', 'gemma3:27b')
@@ -1029,6 +1280,9 @@ class LLMService:
                 if isinstance(usage, dict):
                     meta["input_tokens"] = usage.get("input_tokens", 0)
                     meta["output_tokens"] = usage.get("output_tokens", 0)
+                runtime_meta = getattr(self.provider, "_last_runtime_meta", None)
+                if isinstance(runtime_meta, dict):
+                    meta.update(runtime_meta)
                 log_svc.log_api_usage(
                     service="llm",
                     source="llm_service.parse_auction_description",
@@ -1044,6 +1298,7 @@ class LLMService:
                     output_tokens=meta.get("output_tokens", 0),
                     source="llm_service.parse_auction_description",
                     provider=(getattr(self.settings, "llm_parsing_provider", None) or "ollama"),
+                    duration_ms=meta.get("duration_ms"),
                 )
             except Exception as e:
                 logger.warning("Не вдалося записати llm_exchange (parse_auction): %s", e)
@@ -1083,6 +1338,9 @@ class LLMService:
                     if isinstance(usage, dict):
                         meta["input_tokens"] = usage.get("input_tokens", 0)
                         meta["output_tokens"] = usage.get("output_tokens", 0)
+                    runtime_meta = getattr(parsing_provider, "_last_runtime_meta", None)
+                    if isinstance(runtime_meta, dict):
+                        meta.update(runtime_meta)
                     log_svc.log_api_usage(
                         service="llm",
                         source="llm_service.parse_real_estate_objects",
@@ -1098,6 +1356,7 @@ class LLMService:
                         output_tokens=meta.get("output_tokens", 0),
                         source="llm_service.parse_real_estate_objects",
                         provider=(getattr(self.settings, "llm_parsing_provider", None) or "ollama"),
+                        duration_ms=meta.get("duration_ms"),
                     )
                 except Exception as e:
                     logger.warning("Не вдалося записати llm_exchange (parse_real_estate_objects): %s", e)

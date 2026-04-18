@@ -1,0 +1,172 @@
+# -*- coding: utf-8 -*-
+"""
+Celery tasks для brokered source-load та LLM processing.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, Optional
+
+from celery import current_task
+
+from business.celery_app import celery_app
+from business.services.source_data_load_service import process_prozorro_llm_auction, run_full_pipeline
+from business.services.task_queue_service import TaskQueueService
+from config.settings import Settings
+from data.database.connection import MongoDBConnection
+
+logger = logging.getLogger(__name__)
+
+
+def _init_runtime() -> Settings:
+    settings = Settings()
+    MongoDBConnection.initialize(settings)
+    return settings
+
+
+def _queue_service(settings: Settings) -> TaskQueueService:
+    return TaskQueueService(settings)
+
+
+def _current_task_id() -> str:
+    req = getattr(current_task, "request", None)
+    return str(getattr(req, "id", "") or "")
+
+
+def _heartbeat_logger(queue: TaskQueueService, task_id: str):
+    def _log(message: str) -> None:
+        logger.info("%s", message)
+        if task_id:
+            queue.heartbeat(task_id, patch={"message": str(message)[:1000]})
+
+    return _log
+
+
+@celery_app.task(bind=True, name="business.tasks.run_source_load_pipeline_task")
+def run_source_load_pipeline_task(
+    self,
+    days: Optional[int] = None,
+    sources: Optional[list] = None,
+    regions: Optional[list] = None,
+    listing_types: Optional[list] = None,
+    use_browser_olx: Optional[bool] = None,
+    olx_phase1_max_threads: Optional[int] = None,
+) -> Dict[str, Any]:
+    settings = _init_runtime()
+    queue = _queue_service(settings)
+    task_id = _current_task_id()
+    if task_id:
+        queue.mark_task_started(task_id)
+        queue.heartbeat(task_id, patch={"phase": "source_load_started"})
+    try:
+        log_fn = _heartbeat_logger(queue, task_id)
+        result = run_full_pipeline(
+            settings=settings,
+            sources=list(sources or []),
+            days=days,
+            regions=list(regions or []) or None,
+            listing_types=list(listing_types or []) or None,
+            use_browser_olx=use_browser_olx,
+            olx_phase1_max_threads=olx_phase1_max_threads,
+            use_brokered_llm=True,
+            log_fn=log_fn,
+            llm_wait_heartbeat_fn=lambda: queue.heartbeat(task_id, patch={"phase": "waiting_llm_tasks"}),
+        )
+        if task_id:
+            queue.mark_task_success(task_id, result=result)
+        return result
+    except Exception as e:
+        logger.exception("Source-load task failed: %s", e)
+        if task_id:
+            queue.mark_task_failed(task_id, str(e))
+        raise
+
+
+@celery_app.task(bind=True, name="business.tasks.process_olx_llm_task")
+def process_olx_llm_task(self, listing_url: str) -> Dict[str, Any]:
+    settings = _init_runtime()
+    queue = _queue_service(settings)
+    task_id = _current_task_id()
+    if task_id:
+        queue.mark_task_started(task_id)
+        queue.heartbeat(task_id, patch={"phase": "llm_started", "listing_url": listing_url})
+    try:
+        from business.services.llm_service import _get_vllm_orchestrator
+        from business.services.olx_llm_extractor_service import OlxLLMExtractorService
+        from business.services.geocoding_service import GeocodingService
+        from business.services.unified_listings_service import UnifiedListingsService
+        from business.services.currency_rate_service import CurrencyRateService
+        from data.repositories.raw_olx_listings_repository import RawOlxListingsRepository
+        from data.repositories.olx_listings_repository import OlxListingsRepository
+        from scripts.olx_scraper.run_update import _process_single_llm_pending_url
+
+        log_fn = _heartbeat_logger(queue, task_id)
+        raw_repo = RawOlxListingsRepository()
+        main_repo = OlxListingsRepository()
+        llm_extractor = OlxLLMExtractorService(settings)
+        geocoding_service = GeocodingService(settings)
+        unified_service = UnifiedListingsService(settings)
+        try:
+            usd_rate = CurrencyRateService(settings).get_today_usd_rate(allow_fetch=True)
+        except Exception:
+            usd_rate = None
+
+        runtime = _get_vllm_orchestrator()
+        if runtime.is_enabled():
+            runtime.ensure_runtime_ready()
+        ok = _process_single_llm_pending_url(
+            listing_url=listing_url,
+            raw_repo=raw_repo,
+            main_repo=main_repo,
+            llm_extractor=llm_extractor,
+            geocoding_service=geocoding_service,
+            unified_service=unified_service,
+            usd_rate=usd_rate,
+            log_fn=log_fn,
+        )
+        result = {"success": bool(ok), "listing_url": listing_url}
+        if task_id:
+            if ok:
+                queue.mark_task_success(task_id, result=result)
+            else:
+                queue.mark_task_failed(task_id, f"OLX LLM processing returned false for {listing_url}")
+        return result
+    except Exception as e:
+        logger.exception("OLX LLM task failed for %s: %s", listing_url, e)
+        if task_id:
+            queue.mark_task_failed(task_id, str(e))
+        raise
+
+
+@celery_app.task(bind=True, name="business.tasks.process_prozorro_llm_task")
+def process_prozorro_llm_task(self, auction_id: str) -> Dict[str, Any]:
+    settings = _init_runtime()
+    queue = _queue_service(settings)
+    task_id = _current_task_id()
+    if task_id:
+        queue.mark_task_started(task_id)
+        queue.heartbeat(task_id, patch={"phase": "llm_started", "auction_id": auction_id})
+    try:
+        from business.services.llm_service import _get_vllm_orchestrator
+
+        runtime = _get_vllm_orchestrator()
+        if runtime.is_enabled():
+            runtime.ensure_runtime_ready()
+        ok = process_prozorro_llm_auction(
+            auction_id,
+            settings=settings,
+            log_fn=_heartbeat_logger(queue, task_id),
+        )
+        result = {"success": bool(ok), "auction_id": auction_id}
+        if task_id:
+            if ok:
+                queue.mark_task_success(task_id, result=result)
+            else:
+                queue.mark_task_failed(task_id, f"ProZorro LLM processing returned false for {auction_id}")
+        return result
+    except Exception as e:
+        logger.exception("ProZorro LLM task failed for %s: %s", auction_id, e)
+        if task_id:
+            queue.mark_task_failed(task_id, str(e))
+        raise

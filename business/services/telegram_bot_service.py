@@ -36,6 +36,7 @@ from business.services.source_data_load_service import run_full_pipeline
 from business.services.logging_service import LoggingService
 from business.services.multi_agent_service import MultiAgentService
 from business.services.agent_test_runner_service import AgentTestRunnerService
+from business.services.task_queue_service import TaskQueueService
 from utils.file_utils import create_zip_archive
 from utils.date_utils import format_datetime_display
 
@@ -58,6 +59,7 @@ class TelegramBotService:
         self.user_service = UserService(settings.telegram_users_config_path)
         self.prozorro_service = ProZorroService(settings)
         self.logging_service = LoggingService()
+        self.task_queue_service = TaskQueueService(settings)
         self.llm_agent_service = None  # Ініціалізується лише для адмін-тесту агента
         self.application = None
         self._running = False
@@ -403,14 +405,11 @@ class TelegramBotService:
             loop = asyncio.get_event_loop()
             await self._send_progress_message(chat_id, "Phase 1: завантаження сирих даних (без LLM)...")
 
-            result = await loop.run_in_executor(
+            result_wrapper = await loop.run_in_executor(
                 None,
-                lambda: run_full_pipeline(
-                    settings=self.settings,
-                    sources=["olx", "prozorro"],
-                    days=days,
-                )
+                lambda: self._run_data_update_sync(days)
             )
+            result = result_wrapper.get("pipeline_result") or {}
             p1 = result.get("phase1", {})
             p2 = result.get("phase2", {})
             await self._send_progress_message(
@@ -848,6 +847,17 @@ class TelegramBotService:
 
     def _run_data_update_sync(self, days: int) -> Dict[str, Any]:
         """Синхронне оновлення даних через pipeline raw → main → LLM (Phase 1 без LLM). Для виклику з фонового потоку."""
+        if self.task_queue_service.is_enabled():
+            dispatched = self.task_queue_service.enqueue_source_load(
+                days=days,
+                sources=["olx", "prozorro"],
+                metadata={"trigger": "telegram_bot"},
+            )
+            docs = self.task_queue_service.wait_for_all([dispatched["task_id"]], timeout_sec=6 * 3600)
+            doc = docs[0] if docs else {}
+            if str(doc.get("state") or "").lower() != "success":
+                raise RuntimeError(doc.get("error") or f"Task {dispatched['task_id']} failed")
+            return {"pipeline_result": doc.get("result") or {}}
         result = run_full_pipeline(
             settings=self.settings,
             sources=["olx", "prozorro"],
@@ -1161,6 +1171,19 @@ class TelegramBotService:
             fut.result(timeout=timeout)
         except Exception as e:
             print(f"Помилка відправки повідомлення планувальника: {e}")
+
+    def notify_admins_sync(self, text: str, timeout_per_chat: float = 15) -> bool:
+        """Надсилає повідомлення всім активним адміністраторам з фонового потоку."""
+        if not self.application or not self.application.bot or not self._bot_loop:
+            return False
+        delivered = False
+        for admin_id in self.user_service.get_admin_user_ids():
+            try:
+                self.send_message_to_chat_sync(admin_id, text, timeout=timeout_per_chat)
+                delivered = True
+            except Exception:
+                pass
+        return delivered
 
     def send_document_to_chat_sync(
         self,

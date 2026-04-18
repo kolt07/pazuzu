@@ -179,6 +179,9 @@ class LoggingService:
         request_id: Optional[str] = None,
         initiator: Optional[str] = None,
         provider: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        gpu_seconds: Optional[float] = None,
+        gpu_cost_usd: Optional[float] = None,
     ) -> str:
         """
         Логує повний обмін запит–відповідь LLM у колекцію llm_exchange_logs (Gemini, Ollama тощо).
@@ -208,6 +211,9 @@ class LoggingService:
                 request_id=request_id,
                 initiator=initiator,
                 provider=provider,
+                duration_ms=duration_ms,
+                gpu_seconds=gpu_seconds,
+                gpu_cost_usd=gpu_cost_usd,
             )
             return doc_id
         except Exception as e:

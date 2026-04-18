@@ -6,12 +6,14 @@ API: адміністрування (додати/заблокувати кор�
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
 from telegram_mini_app.auth import validate_telegram_init_data
 import yaml
+
+from business.services.task_queue_service import TaskQueueService
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -222,9 +224,9 @@ def start_data_update(
     - listing_types — лише ці типи оголошень OLX (напр. «Нежитлова нерухомість», «Земля»).
     """
     _get_admin_user(request)
-    task_id = str(uuid.uuid4())
     prozorro = request.app.state.prozorro_service
     settings = request.app.state.settings
+    task_queue = TaskQueueService(settings)
 
     regions_list = _parse_comma_list(regions)
     listing_types_list = _parse_comma_list(listing_types)
@@ -264,6 +266,28 @@ def start_data_update(
         if days is not None and days not in (1, 7, 30):
             raise HTTPException(status_code=400, detail="days must be 1, 7 or 30")
 
+    pipeline_sources = []
+    if run_olx:
+        pipeline_sources.append("olx")
+    if run_prozorro:
+        pipeline_sources.append("prozorro")
+
+    if task_queue.is_enabled() and not olx_full and not prozorro_full:
+        dispatched = task_queue.enqueue_source_load(
+            days=None if (olx_full or prozorro_full) else effective_days,
+            sources=pipeline_sources,
+            regions=regions_list,
+            listing_types=listing_types_list,
+            use_browser_olx=olx_use_browser,
+            olx_phase1_max_threads=olx_phase1_max_threads,
+            metadata={"trigger": "mini_app_admin", "mode": mode or "period"},
+        )
+        out = {"task_id": dispatched["task_id"], "status": "queued", "days": effective_days, "queue": dispatched["queue"]}
+        if olx_phase1_max_threads is not None:
+            out["olx_phase1_max_threads"] = olx_phase1_max_threads
+        return out
+
+    task_id = str(uuid.uuid4())
     _data_update_tasks[task_id] = {
         "status": "running",
         "message": "Запуск оновлення...",
@@ -438,6 +462,19 @@ def process_anomalous_prices(
 def data_update_status(request: Request, task_id: str):
     """Повертає статус задачі оновлення даних (включно з прогресом LLM)."""
     _get_admin_user(request)
+    task_queue = TaskQueueService(request.app.state.settings)
+    if task_queue.is_enabled():
+        status = task_queue.get_task_status(task_id)
+        task_doc = status.get("task") or {}
+        if task_doc:
+            return {
+                "task_id": task_id,
+                "status": status.get("state"),
+                "message": task_doc.get("error") or task_doc.get("state"),
+                "started_at": task_doc.get("created_at"),
+                "task": task_doc,
+                "result": status.get("result"),
+            }
     if task_id not in _data_update_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     t = _data_update_tasks[task_id]
@@ -496,6 +533,35 @@ class LlmProcessingBackfillRequest(BaseModel):
     process_inactive: bool = False
 
 
+class VastRuntimeSettingsUpdate(BaseModel):
+    is_enabled: Optional[bool] = None
+    vast_api_key: Optional[str] = None
+    max_hourly_usd: Optional[float] = None
+    min_gpu_ram_gb: Optional[int] = None
+    min_reliability: Optional[float] = None
+    target_cuda: Optional[str] = None
+    gpu_name_like: Optional[str] = None
+    region_like: Optional[str] = None
+    datacenter_like: Optional[str] = None
+    disk_gb: Optional[int] = None
+    image: Optional[str] = None
+    vllm_model: Optional[str] = None
+    vllm_host: Optional[str] = None
+    vllm_port: Optional[int] = None
+    vllm_max_model_len: Optional[int] = None
+    vllm_gpu_memory_utilization: Optional[float] = None
+    vllm_enforce_eager: Optional[bool] = None
+    vllm_max_num_seqs: Optional[int] = None
+    vllm_api_key: Optional[str] = None
+    hf_token: Optional[str] = None
+    endpoint_timeout_sec: Optional[int] = None
+    boot_timeout_sec: Optional[int] = None
+    ready_timeout_sec: Optional[int] = None
+    idle_grace_sec: Optional[int] = None
+    hard_budget_usd: Optional[float] = None
+    fallback_provider: Optional[str] = None
+
+
 @router.post("/llm-processing-regions/backfill")
 def start_llm_processing_backfill(request: Request, body: LlmProcessingBackfillRequest):
     """
@@ -506,9 +572,18 @@ def start_llm_processing_backfill(request: Request, body: LlmProcessingBackfillR
     _get_admin_user(request)
     if body.days not in (1, 7, 30):
         raise HTTPException(status_code=400, detail="days must be 1, 7 or 30")
-    task_id = str(uuid.uuid4())
-    prozorro = request.app.state.prozorro_service
     settings = request.app.state.settings
+    task_queue = TaskQueueService(settings)
+
+    if task_queue.is_enabled():
+        dispatched = task_queue.enqueue_source_load(
+            days=body.days,
+            sources=["olx", "prozorro"],
+            metadata={"trigger": "mini_app_backfill", "process_inactive": body.process_inactive},
+        )
+        return {"task_id": dispatched["task_id"], "status": "queued", "days": body.days, "queue": dispatched["queue"]}
+
+    task_id = str(uuid.uuid4())
 
     _data_update_tasks[task_id] = {
         "status": "running",
@@ -546,6 +621,33 @@ def start_llm_processing_backfill(request: Request, body: LlmProcessingBackfillR
 
     threading.Thread(target=run_update, daemon=True, name="LLMRegionsBackfill").start()
     return {"task_id": task_id, "status": "started", "days": body.days}
+
+
+@router.get("/vast-runtime-settings")
+def get_vast_runtime_settings(request: Request):
+    """Повертає актуальні налаштування Vast.ai/vLLM (секрети масковані)."""
+    _get_admin_user(request)
+    try:
+        from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
+
+        svc = VastRuntimeSettingsService()
+        return svc.get_public_settings()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/vast-runtime-settings")
+def update_vast_runtime_settings(request: Request, body: VastRuntimeSettingsUpdate):
+    """Оновлює runtime налаштування Vast.ai/vLLM."""
+    _get_admin_user(request)
+    try:
+        from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
+
+        svc = VastRuntimeSettingsService()
+        payload = body.dict(exclude_none=True)
+        return {"success": True, "settings": svc.update_settings(payload)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/cadastral-scraper/start")
@@ -1236,6 +1338,27 @@ def get_usage_stats(
             service="geocoding", from_cache_only=True
         )
         geocode_by_day = _fill_days_with_zeros(geocode_api_by_day, days)
+        gpu_by_day_raw = logs_repo.sum_gpu_runtime_by_day(days=days)
+        gpu_total = logs_repo.sum_gpu_runtime_total()
+        gpu_last_month = logs_repo.sum_gpu_runtime_last_month()
+        gpu_by_day: List[Dict[str, Any]] = []
+        gpu_by_date = {d.get("date"): d for d in gpu_by_day_raw}
+        from datetime import datetime, timedelta
+
+        today = datetime.utcnow().date()
+        for i in range(days - 1, -1, -1):
+            day = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+            row = gpu_by_date.get(day) or {}
+            sec = float(row.get("active_seconds") or 0.0)
+            gpu_by_day.append(
+                {
+                    "date": day,
+                    "active_seconds": sec,
+                    "active_minutes": round(sec / 60.0, 3),
+                    "estimated_cost_usd": float(row.get("estimated_cost_usd") or 0.0),
+                    "sessions": int(row.get("sessions") or 0),
+                }
+            )
 
         return {
             "llm": {
@@ -1258,11 +1381,23 @@ def get_usage_stats(
                 "last_month": geocode_api_last_month,
                 "cache_hits_total": geocode_cache_total,
             },
+            "gpu_runtime": {
+                "by_day": gpu_by_day,
+                "active_seconds_total": float(gpu_total.get("active_seconds") or 0.0),
+                "active_minutes_total": round(float(gpu_total.get("active_seconds") or 0.0) / 60.0, 3),
+                "estimated_cost_usd_total": round(float(gpu_total.get("estimated_cost_usd") or 0.0), 6),
+                "sessions_total": int(gpu_total.get("sessions") or 0),
+                "active_seconds_last_month": float(gpu_last_month.get("active_seconds") or 0.0),
+                "active_minutes_last_month": round(float(gpu_last_month.get("active_seconds") or 0.0) / 60.0, 3),
+                "estimated_cost_usd_last_month": round(float(gpu_last_month.get("estimated_cost_usd") or 0.0), 6),
+                "sessions_last_month": int(gpu_last_month.get("sessions") or 0),
+            },
         }
     except Exception as e:
         return {
             "llm": {"by_day": [], "input_tokens_total": 0, "output_tokens_total": 0, "total": 0, "last_month": 0, "estimated_cost_usd": 0, "estimated_cost_usd_last_month": 0},
             "geocoding": {"by_day": [], "total": 0, "last_month": 0},
+            "gpu_runtime": {"by_day": [], "active_seconds_total": 0, "estimated_cost_usd_total": 0, "sessions_total": 0},
             "error": str(e),
         }
 

@@ -1,5 +1,197 @@
 # Історія розробки
 
+## 2026-04-16 — RabbitMQ/Celery черги та pause/resume lifecycle Vast runtime
+
+- **Запит**: Перевести source-load та LLM processing на RabbitMQ, додати worker-и в `docker-compose`, пріоритезувати Vast verified + preferred datacenter/region, pause-ити інстанс при порожній LLM-черзі та destroy робити лише після 20+ хв без активного source-load.
+- **Дії**: Додано brokered background layer на `Celery` (`business/celery_app.py`, `business/tasks.py`, `business/services/task_queue_service.py`) і Mongo-репозиторій станів задач `background_tasks`, через який тепер відслідковуються source-load/LLM task-и, heartbeat-и та status polling.
+- **Інтеграція черг**: `main.py`, `telegram_bot_service.py`, `scheduler_service.py`, `mcp_servers/data_update_mcp_server.py` і Mini App admin route-и переведено на enqueue через RabbitMQ/Celery з fallback на sync-виконання, якщо broker вимкнено.
+- **Source/LLM pipeline**: У `source_data_load_service.py` Phase 2 тепер у brokered-режимі enqueue-ить окремі OLX/ProZorro LLM task-и, чекає їх завершення через queue-state service і лише після цього виконує Phase 3.
+- **Runtime lifecycle**: `VastRuntimeSupervisorService` переключено з Mongo document flags у доменних колекціях на queue-aware перевірки; `VllmRuntimeOrchestrator` тепер публікує queue/source-load activity в coordination state, враховує `last_source_load_activity_at` перед destroy та ранжує Vast offers з пріоритетом `datacenter_like` / `region_like` поверх verified offers.
+- **Деплой і конфіг**: У `docker-compose.yml` додано `rabbitmq`, `pazuzu-source-worker`, `pazuzu-llm-worker`; у `config/settings.py`, `config/config.example.yaml`, `requirements.txt` та runtime defaults додано параметри RabbitMQ/Celery і нові idle timeout-и (`pause_after_idle_sec=60`, `destroy_after_pause_sec=1200`).
+
+## 2026-04-16 — Довантаження LLM-пулу вільними source-воркерами
+
+- **Запит**: Якщо в multi-thread завантаженні джерел частина воркерів простоює (черга source-задач порожня, але кілька довгих задач ще виконуються), ці вільні воркери мають переключатися на LLM-парсинг.
+- **Дії**: У `scripts/olx_scraper/run_update.py` додано гібридний цикл `_phase1_worker`: воркер пріоритетно бере source-задачу, а при тимчасово порожній source-черзі обробляє `llm_queue` через callback `llm_process_url_fn`. URL для LLM додаються одразу після завершення source-задачі, з дедуплікацією (`llm_seen_urls`) та фільтром регіонів (`llm_enqueue_region_filter_fn`).
+- **Інтеграція pipeline**: У `business/services/source_data_load_service.py` підключено inline-LLM callback через `_process_single_llm_pending_url`, а в Phase 2 виключаються URL, які вже оброблені “на льоту”; у підсумковій статистиці `olx_llm_processed` враховано обидва шляхи (inline + залишок у класичній Phase 2).
+
+## 2026-04-16 — Двофазний idle lifecycle: pause, потім destroy
+
+- **Запит**: Після прогріву runtime при порожній LLM-черзі понад 10 хвилин ставити інстанс на паузу (stop, не destroy). Destroy робити лише якщо черга лишається порожньою, інстанс вже 10+ хв на pause, і немає активних процесів-ініціаторів.
+- **Дії**: У `VllmRuntimeOrchestrator` перероблено `handle_pool_drain()` на state-machine: `active idle -> pause -> destroy`. Додано стани `instance_paused`, `empty_queue_since`, `paused_since`, події telemetry (`gpu_paused`, `gpu_resumed`, `gpu_destroy_delayed`, `gpu_pause_failed`) і автоматичний resume paused-інстанса в `ensure_runtime_ready()`/при появі задач.
+- **Supervisor-flow**: У `VastRuntimeSupervisorService` логіка оновлена: при active source-load і відсутності інстанса виконується warmup (`ensure_runtime_ready()`), у всіх idle-кейсах викликається новий `handle_pool_drain(..., is_source_load_running)` — тому pause дозволений навіть під час source-load, а destroy блокується, доки ініціатор ще активний.
+- **Налаштування**: У `VastRuntimeSettingsService` та `config/config.example.yaml` додано `pause_after_idle_sec` і `destroy_after_pause_sec` (дефолт по 600с), `idle_grace_sec` лишено як legacy для сумісності.
+
+## 2026-04-16 — Захист від idle-drain під час source load
+
+- **Запит**: Гарантувати, що якщо runtime піднявся швидко, а завантаження джерел ще триває, supervisor не вимкне інстанс через порожню LLM-чергу.
+- **Дії**: У `source_data_load_service` додано thread-safe прапорець активного pipeline (`is_source_load_running()` з ref-counter). У `VastRuntimeSupervisorService` додано guard: під час active source-load викликається `ensure_runtime_ready()` і пропускається `handle_pool_drain()`. Це утримує інстанс активним до завершення оновлення джерел.
+
+## 2026-04-15 — Fallback endpoint + покрокова аналітика smoke
+
+- **Запит**: Додати fallback на `public_endpoint`, якщо SSH-тунель після старту недоступний, і виводити в термінал читабельну покрокову аналітику: старт інстанса, підйом інстанса, підйом endpoint, модель скачано, готово.
+- **Дії**: У `VllmRuntimeOrchestrator` readiness-перевірки переведені на динамічний вибір endpoint (`ssh_local` якщо tunnel alive, інакше `public`) з логуванням `gpu_endpoint_switched`; у `get_observability_status()` додано `effective_endpoint` та `effective_endpoint_source`. У `scripts/smoke_vast_runtime.py` додано чекліст 1..5 з `[x]/[ ]`, який оновлюється за runtime-event'ами та поточним observability-станом.
+- **Уточнення**: Щоб уникнути передчасного статусу “готово”, додано окремі події `gpu_instance_booted` та `gpu_runtime_endpoint_ready`; кроки 2/3 у smoke тепер ставляться тільки по цих подіях (або живому SSH для кроку 2), а не просто по наявності endpoint-адреси.
+- **Логи**: Прибрано однотипний spam `WAIT ...` у smoke; рядок стану підключення тепер виводиться тільки при зміні фактичного connection state (або один раз наприкінці з `force=True`).
+- **Прогрес моделі**: У smoke додано окремі рядки `MODEL: ...` для `gpu_model_pull_started/progress/retry/ready` з відсотком завантаження, а в кроці 4 чекліста показується поточний `%` та status pull; також додано heartbeat `очікуємо прогрес завантаження`, якщо pull ще не почався.
+- **Уточнення кроку 3**: Статус `Ендпоінт піднявся` у smoke переведено на мережеву доступність endpoint (`effective/public`), а не на readiness-подію. Фінальна готовність до роботи лишається тільки у кроці 5.
+- **Діагностика фази готовності**: Додано telemetry `gpu_runtime_endpoint_wait` кожні ~30с під час очікування `Ollama control endpoint`, а у smoke з'явилися окремі повідомлення `RUNTIME: control endpoint ...` і `MODEL: ...` лише після `control ready`. Це прибирає плутанину, коли endpoint вже опублікований, але pull моделі ще не стартував.
+- **Smoke Hello-check**: Фінальний крок `Готово до роботи` у `scripts/smoke_vast_runtime.py` тепер ставиться тільки після тестового запиту `Hello` до моделі (`/api/generate` для Ollama, `/v1/chat/completions` для vLLM). Це робить смок-тест повним E2E: endpoint ready → модель доступна → inference працює.
+- **Фікс мережевого мапінгу Vast**: Виявлено, що endpoint міг визначатися зарано як `:8000` до появи фактичного `HostPort` у `ports["8000/tcp"]`, через що readiness-check зависав. У `VllmRuntimeOrchestrator` перероблено визначення endpoint/SSH порту: пріоритетно через Docker/NAT-мапінг `ports`, без fallback на `:8000`, а для SSH — пріоритет `ports["22/tcp"]`. Це синхронізує оркестратор з реальним мережевим станом інстанса Vast.
+- **Фікс loop з повторними інстансами після pull**: Після `ollama /api/pull` оркестратор міг не побачити `done=true` (на деяких хостах фінальний меседж приходить як `status=success`), помилково вважати pull незавершеним і teardown-ити інстанс. У `VllmRuntimeOrchestrator` додано завершення pull на `status=success` та wait-вікно перевірки `/api/show` перед фінальним fail, щоб уникнути хибного перезапуску наступної спроби.
+- **Прозорість retries у smoke**: У `scripts/smoke_vast_runtime.py` додано явний лог `нова спроба оркестратора` при зміні `instance_id`; кроки 4/5 та внутрішній прогрес pull скидаються для нової спроби, а кроки 1/2/3 оновлюють актуальні endpoint/instance значення.
+- **Фікс Hello-check для Ollama GGUF**: У smoke `HELLO CHECK /api/generate` переведено на normalized model ref (`hf.co/...`) як у runtime pull, з fallback retry на original id при 404. Також виправлено фінальний статус кроку 4: якщо в recent logs уже є `gpu_model_pull_ready`, більше не показуємо хибне `already present`.
+- **Лікування битого Ollama blob після pull**: Зафіксовано кейс `HELLO CHECK /api/generate -> 500 unable to load model .../models/blobs/sha256...` при наявному `gpu_model_pull_ready`. У `VllmRuntimeOrchestrator` додано жорстку перевірку loadability моделі через `/api/generate` перед `gpu_ready`; при blob-load помилці виконується одноразове авто-відновлення `DELETE/POST /api/delete` + повторний `pull`, після чого повторна перевірка loadability.
+- **Стабілізація перед failover**: Щоб уникати передчасного teardown після `status=success`, додано retry-вікно loadability-check (`/api/generate`) до 75с з інтервалом 4с перед рішенням про failover на інший інстанс. Це покриває короткий лаг після `writing manifest/success`.
+- **Прозора причина failover**: Додано telemetry `gpu_startup_failed` з текстом помилки перед `gpu_teardown(startup_failed_attempt_X)`, а в smoke вивід `RUNTIME FAIL: ...`. Також при переході на нову спробу smoke скидає кроки 2/3/4/5, щоб не показувати застарілий стан попереднього інстанса.
+
+## 2026-04-15 — SSH identity file для Vast tunnel на Windows
+
+- **Запит**: Інстанс Vast стартує, але локальний статус показує `ssh_alive=False`, бо SSH-тунель не підхоплює кастомний ключ.
+- **Дії**: У `VllmRuntimeOrchestrator` додано кросплатформені SSH-опції (`UserKnownHostsFile=NUL` на Windows), `BatchMode=yes`, підтримку явного ключа через `ssh_identity_file` (та env `PAZUZU_SSH_IDENTITY_FILE`) з `-i` + `IdentitiesOnly=yes`. У `VastRuntimeSettingsService` і `config/config.example.yaml` додано параметр `ssh_identity_file`.
+
+## 2026-04-14 — Smoke test: видимість SSH та логів інстанса
+
+- **Запит**: Актуалізувати smoke test, щоб у консолі було видно стан SSH-підключення та логи інстанса.
+- **Дії**: У `VllmRuntimeOrchestrator` додано `get_observability_status()` (effective/public/local endpoint, status SSH tunnel, status log stream, recent observability lines). `scripts/smoke_vast_runtime.py` тепер після `ensure_runtime_ready()` виводить ці стани й останні рядки `vast_ssh_tunnel`/`vast_instance_log`.
+
+## 2026-04-14 — SSH tunnel + stream логів інстанса в runtime оркестраторі
+
+- **Запит**: Одразу після підйому інстанса будувати прямий SSH-тунель і бачити у своїх логах, що відбувається на інстансі.
+- **Дії**: У `VllmRuntimeOrchestrator` додано best-effort SSH observability: автоматичний `ssh -L` тунель на локальний порт після публікації endpoint, та фоновий стрім логів інстанса через SSH (docker logs) у telemetry події (`vast_ssh_tunnel`, `vast_instance_log`, `gpu_ssh_tunnel_*`). Для цього додано runtime-параметри `enable_ssh_tunnel`, `ssh_tunnel_local_port`, `ssh_instance_log_stream`.
+
+## 2026-04-14 — Швидкий failover при проблемах SSH/port-forward на Vast
+
+- **Запит**: У логах інстанса повторюється `remote port forwarding failed for listen port ...`, що блокує публікацію endpoint.
+- **Дії**: Додано окремий таймаут `endpoint_timeout_sec` (дефолт 240с) для очікування саме мережевого endpoint у `VllmRuntimeOrchestrator`. Якщо endpoint не опубліковано в цей час — оркестратор швидко teardown-ить невдалий інстанс і переходить до наступного кандидата (не чекаючи весь `boot_timeout_sec`).
+
+## 2026-04-14 — Пріоритет оферів Vast за швидкістю мережі
+
+- **Запит**: Додати відбір серверів Vast за мережевим з'єднанням з пріоритетом близько 1 Gbps (700–800+ також прийнятно).
+- **Дії**: У `VllmRuntimeOrchestrator` додано фільтр `inet_down >= 700` (Mbps, згідно з Vast `search offers`) і ранжування кандидатів за близькістю до `preferred_inet_down_mbps=1000`, далі за вартістю та reliability. Оновлено unit-тести відбору оферів.
+
+## 2026-04-14 — Runtime supervisor як окремий фоновий процес застосунку
+
+- **Запит**: Оркестратор має стартувати разом із застосунком, працювати як єдиний незалежний процес і сам вирішувати, коли прогрівати/зупиняти Vast на основі черги LLM.
+- **Дії**: Додано `business/services/vast_runtime_supervisor_service.py` (daemon-loop): перевіряє `llm_parsing_provider`, стан Vast runtime, чергу LLM (`detail.llm_pending`, ProZorro без `llm`) і викликає `ensure_runtime_ready()` або `handle_pool_drain()`. У `main.py` supervisor стартує при запуску `Application` і коректно зупиняється в `stop()`. Локальні ручні виклики warmup/drain прибрано з `source_data_load_service` та `scripts/olx_scraper/run_update` — керування runtime централізовано.
+
+## 2026-04-14 — Єдиний shared оркестратор Vast runtime (single-process)
+
+- **Запит**: При запуску оновлення по двох джерелах створювались 2 інстанси Vast.
+- **Дії**: У `vllm_runtime_orchestrator` додано process-level singleton `get_shared_vllm_runtime_orchestrator()`. `source_data_load_service`, `run_update` і `llm_service` переведено на цей shared оркестратор, щоб у межах одного процесу використовувався один lifecycle runtime instance і не виникало дублювання оренди GPU.
+
+## 2026-04-14 — 2-фазне розгортання Ollama runtime
+
+- **Запит**: Змінити алгоритм: спочатку піднімати endpoint готовності сервера, потім запускати завантаження моделі зі зворотним зв'язком через цей endpoint.
+- **Дії**: У `VllmRuntimeOrchestrator` для Ollama введено дві стадії: (1) чек `control endpoint` (`/api/tags`) після публікації мережевого endpoint, (2) асинхронне завантаження моделі через `POST /api/pull` зі stream-прогресом у telemetry (`gpu_model_pull_*`), з фінальною валідацією моделі через `POST /api/show`. `onstart` для Ollama спрощено до `ollama serve` без блокуючого `ollama pull`.
+
+## 2026-04-14 — Прогрів runtime під час Phase 1 + таймаути 20 хв
+
+- **Запит**: Дати до 20 хв на старт сервера і стільки ж на появу endpoint; запускати оркестратор паралельно з обміном/парсингом сирих даних.
+- **Дії**: Дефолти `boot_timeout_sec` та `ready_timeout_sec` піднято до `1200` у runtime settings. У `run_full_pipeline` (`source_data_load_service`) і standalone `run_olx_update` додано background warmup (`ensure_runtime_ready`) на старті Phase 1, щоб підготовка GPU-інстанса йшла паралельно з raw exchange; перед Phase 2 лишається лише дочекатися готовності. Оновлено unit-тест дефолтів runtime settings.
+
+## 2026-04-14 — Backoff на Vast 429 (asks API)
+
+- **Запит**: Smoke падав через `429 Too Many Requests` на `PUT /asks/{id}/`.
+- **Дії**: У `ensure_runtime_ready` додано retry/backoff для `create_instance` (до 3 спроб на один ask з паузами), з окремим telemetry евентом `gpu_rent_rate_limited`.
+
+## 2026-04-14 — Перехід на GGUF + Ollama template
+
+- **Запит**: Використовувати модель `ggml-org/gemma-4-E4B-it-GGUF` і шукати template з Ollama.
+- **Дії**: Дефолт `vast_runtime.image` змінено на `ollama/ollama:latest`, `vllm_model` — на `ggml-org/gemma-4-E4B-it-GGUF`. В оркестратор додано автоматичний Ollama-режим для `image`/`model` з `gguf`: `onstart` запускає `ollama serve`, тягне модель через `ollama pull`, readiness перевіряється через `/api/tags` (з fallback на `/v1/models`). У адмінці додано поле Docker image/template.
+
+## 2026-04-14 — Фікс параметрів запуску vLLM
+
+- **Запит**: Використовувати параметри `--dtype float16`, `--gpu-memory-utilization 0.9`, `--max-model-len 4096`.
+- **Дії**: В `vllm_runtime_orchestrator` `onstart` доповнено `--dtype float16`; дефолти `vllm_max_model_len` та `vllm_gpu_memory_utilization` встановлено на `4096` і `0.9`. Оновлено значення за замовчуванням у UI та прикладі конфігурації.
+
+## 2026-04-14 — Перехід стеку на CUDA 11.8
+
+- **Запит**: Знизити runtime stack до CUDA 11.8 і підібрати темплейти "CUDA 11.8 + PyTorch 2.1".
+- **Дії**: Дефолти Vast runtime змінено на `target_cuda=11.8` і image `imroc/vllm-openai:cuda-11.8.0`. У `config.example.yaml` додано перелік шаблонів/образів для цього стеку: `imroc/vllm-openai:cuda-11.8.0`, `pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime`, `pytorch/pytorch:2.1.2-cuda11.8-cudnn8-devel`.
+
+## 2026-04-14 — Автопідвищення VRAM floor для Gemma-2-9B
+
+- **Запит**: Після memory-тюнінгу інколи все ще орендувався інстанс ~21.5 GB і vLLM падав з OOM.
+- **Дії**: В `VllmRuntimeOrchestrator` додано `_effective_min_gpu_ram_gb`: для `gemma-2-9b*` мінімум GPU RAM автоматично піднімається до **24 GB** незалежно від нижчого значення в конфігу. Дефолт `min_gpu_ram_gb` у runtime settings також змінено на 24.
+
+## 2026-04-14 — Фільтр несумісних GPU архітектур
+
+- **Запит**: Після фіксу OOM старт падіння з `cudaErrorNoKernelImageForDevice` на `Tesla P40 (sm_61)`.
+- **Дії**: У виборі офера Vast додано `_is_offer_gpu_compatible` і відсікання legacy GPU, які часто не підтримуються сучасним PyTorch/vLLM (`Tesla P40/P100/K80/M40/M60`, `Quadro P*`). При наявності сумісних карт обирається найкраща з них.
+
+## 2026-04-14 — Retry startup по кількох оферах Vast
+
+- **Запит**: Навіть після фільтрів окремі хости падали на ініціалізації CUDA/EngineCore.
+- **Дії**: `ensure_runtime_ready` переведено на стратегію кількох кандидатів (`_select_offer_candidates`): при `startup_failed` оркестратор teardown-ить інстанс і автоматично пробує наступний сумісний офер (до 5 спроб) перед фінальним падінням.
+
+## 2026-04-14 — Обробка 400 на create_instance (asks/{id})
+
+- **Запит**: Smoke падав на `400 Bad Request` під час `PUT /asks/{id}/`.
+- **Дії**: `ensure_runtime_ready` тепер не падає на першому `create_instance` 400 — сесія маркується `failed`, пишеться telemetry `gpu_rent_failed`, і оркестратор переходить до наступного кандидата. У `VastAiClient` додано розширений текст HTTP-помилки з `vast_response=...`.
+
+## 2026-04-14 — Hard filter `compute_cap >= 700` для Vast оферів
+
+- **Запит**: Повторні падіння `cudaGetDeviceCount Error 804` (non-supported HW / sm_61).
+- **Дії**: До фільтра оферів Vast додано обмеження `compute_cap >= 700`, щоб запит не повертав офери класу Pascal (P40/P100) і старіші для поточного vLLM/PyTorch image.
+
+## 2026-04-14 — HF Hub auth перед vLLM на Vast
+
+- **Запит**: Після додавання HF токена все ще помилка доступу до моделі; узгодити з офіційною практикою (`hf auth login`).
+- **Дії**: У `vllm_runtime_orchestrator._build_create_payload` перед `vllm serve` додано bash-префікс: за наявності `HF_TOKEN` викликається `hf auth login --token "$HF_TOKEN"` або fallback `huggingface-cli login`; у `env` лишається лише рекомендований `HF_TOKEN` (без застарілого `HUGGING_FACE_HUB_TOKEN`). Оновлено unit-тести payload.
+
+## 2026-04-14 — VRAM / OOM для Gemma-2-9B на Vast (vLLM)
+
+- **Запит**: `torch.OutOfMemoryError` при старті EngineCore (~21.5 GiB GPU, max_model_len 8192).
+- **Дії**: Дефолт `vllm_max_model_len` 4096, новий параметр `vllm_gpu_memory_utilization` (дефолт 0.88) → у `onstart` додано `--gpu-memory-utilization`; у `env` контейнера — `PYTORCH_ALLOC_CONF=expandable_segments:True`. Адмінка Mini App: поля max len та GPU utilization; API `VastRuntimeSettingsUpdate`.
+
+## 2026-04-14 — Додатковий захист OOM (vLLM)
+
+- **Запит**: OOM лишається на ~21.5 GiB після 4096 / 0.88.
+- **Дії**: Дефолти зміщено на **max_model_len 3072**, **gpu_memory_utilization 0.72**; у `onstart` додано **`--max-num-seqs`** (дефолт 4) та опційно **`--enforce-eager`** (дефолт увімкнено). Нові поля в Mongo/адмінці: `vllm_enforce_eager`, `vllm_max_num_seqs`.
+
+## 2026-04-14 — Локальні тести vLLM на машині розробника
+
+- **Запит**: Тести розгортання vLLM на цій машині (без Vast).
+- **Дії**: Додано `scripts/test_vllm_local_deployment.py` — opt-in через `PAZUZU_LOCAL_VLLM_SMOKE=1`, опційно `PAZUZU_LOCAL_VLLM_URL`, `PAZUZU_LOCAL_VLLM_API_KEY` або `LLM_API_KEY_VLLM_REMOTE`; перевірки `GET /v1/models`, узгодженість з `VllmRuntimeOrchestrator._is_vllm_ready`, мінімальний `POST /v1/chat/completions`.
+
+## 2026-04-14 — vLLM `--hf-token` для gated Hub
+
+- **Запит**: У логах vLLM `GatedRepoError` / 403 на `google/gemma-2-9b-it`.
+- **Дії (оновлення)**: `--hf-token true` давало в логах `hf_token: 'true'` і **401** (рядок `"true"` як bearer). Замінено на `--hf-token "$HF_TOKEN"` поруч із `HF_TOKEN` у `env` та `hf auth login`. Для gated моделей на Hub додатково потрібен accept умов тим самим акаунтом, що й токен.
+
+## 2026-04-13 — Vast.ai + vLLM runtime для parsing pipeline
+
+- **Запит**: Додати cloud оренду GPU (Vast.ai), автоматичне розгортання vLLM з моделлю Gemma, обробку pooled LLM задач тільки для parsing джерел, керування параметрами через Mini App Admin та облік часу/вартості оренди.
+
+- **Дії**:
+  - **Нові модулі orchestration/domain**:
+    - `business/services/vast_ai_client.py`: REST-клієнт Vast.ai (`search_offers`, `create/start/stop/destroy instance`).
+    - `business/services/vast_ai_runtime_settings_service.py`: runtime-параметри Vast/vLLM з маскуванням секретів.
+    - `business/services/vllm_runtime_orchestrator.py`: lifecycle оренди + readiness probe (`/v1/models`) + idle-grace teardown.
+    - `data/repositories/vast_runtime_settings_repository.py`: зберігання налаштувань runtime.
+    - `data/repositories/gpu_runtime_sessions_repository.py`: журнал сесій оренди GPU.
+  - **LLM провайдер**:
+    - `business/services/llm_service.py`: додано parsing-провайдер `vllm_remote` (OpenAI-compatible endpoint), без змін assistant-контуру.
+    - Для parsing-викликів додано runtime metadata (`duration_ms`, endpoint/provider) в `api_usage` та `llm_exchange`.
+    - Додано fallback на локальний `ollama` при недоступності remote runtime (за налаштуванням).
+  - **Інтеграція в pipeline/pool policy**:
+    - `business/services/source_data_load_service.py`: перед LLM phase для OLX/ProZorro запускається runtime, після завершення застосовується policy `pool empty -> idle wait -> recheck -> teardown`.
+    - `scripts/olx_scraper/run_update.py`: аналогічний контроль runtime для standalone OLX flow.
+  - **Адмінка Mini App (керування параметрами)**:
+    - API: `telegram_mini_app/routes/admin.py` — нові ендпоїнти `GET/PUT /api/admin/vast-runtime-settings`.
+    - UI: `telegram_mini_app/static/index.html` + `telegram_mini_app/static/app.js` — форма налаштувань Vast/vLLM.
+  - **Телеметрія та витрати**:
+    - `data/repositories/logs_repository.py`: агрегації `sum_gpu_runtime_*` (час/сесії/estimated_cost_usd).
+    - `telegram_mini_app/routes/admin.py` (`/usage-stats`): додано блок `gpu_runtime`.
+    - `telegram_mini_app/static/index.html` + `telegram_mini_app/static/app.js`: додано summary та графік GPU runtime.
+  - **Конфіг та міграції**:
+    - `config/settings.py`: ключ `LLM_API_KEY_VLLM_REMOTE` + YAML mapping `llm.api_keys.vllm_remote`.
+    - `config/config.example.yaml`: приклади для `vllm_remote` і `vast_runtime`.
+    - `scripts/migrations/044_vast_gpu_runtime_collections.py`: нові колекції runtime settings/sessions.
+  - **Глосарій**:
+    - `docs/developer_glossary.md`: додано терміни `cloud GPU runtime (Vast.ai)` і `LLM work pool (parsing)`.
+
 ## 2026-04-13 — Виправлення 500 у експорті/імпорті конфігу через бота
 
 - **Запит**: Актуалізувати механіку вивантаження/завантаження конфіга/даних через бота, бо при використанні з'являлась 500 помилка.
@@ -2543,3 +2735,38 @@
 - Додано запит деталей `GET /tenders/{id}` для кожного `id` зі списку.
 - Детальні дані зберігаються в **один** JSON файл у `temp/` з `metadata` та `data`.
 - Додано паузу 0.5s між запитами деталей для уникнення блокувань/rate-limit.
+
+## 2026-04-13 — OLX: перевірка фільтрів і клікер-режиму
+- Запит: перевірити, чому на сторінках OLX видно замало оголошень, та прогнати тест по нежитловій нерухомості Київської області за 1 день.
+- Підтверджено, що невелика кількість оголошень пояснюється бізнес-фільтрами пошуку в URL (площа/поверх/типи об'єктів), які залишаються активними за задумом.
+- Виконано тестовий запуск OLX через browser-клікер (raw-only): для Київської області отримано 43 картки на першій сторінці, 13 релевантних за 1 день, завантажено/оновлено 12 URL.
+
+## 2026-04-13 — Vast runtime: безпечний teardown і фікс endpoint detection
+- Запит: зупинити дублювання інстансів Vast.ai під час тестового бенчмарку нового vLLM пайплайну.
+- Очищено активні інстанси Vast.ai та закрито завислі `gpu_runtime_sessions` у стані `starting`.
+- У `business/services/vllm_runtime_orchestrator.py` додано teardown при `startup_failed`, мітку `label: pazuzu-vllm-runtime` для інстансів, перехід `onstart` на `python3`, а також виправлено визначення endpoint для відповіді `show_instance` з вкладеним `instances` і некоректним `direct_port_start=65535`.
+
+## 2026-04-13 — Vast/vLLM: додано HF token в Admin UI
+- Запит: додати параметр токена Hugging Face у Mini App Admin для завантаження моделі на Vast.
+- Додано `hf_token` у runtime settings (service + API model + UI), з маскуванням у публічному представленні.
+- `VllmRuntimeOrchestrator` тепер прокидає токен у `env` як `HF_TOKEN` і `HUGGING_FACE_HUB_TOKEN`.
+
+## 2026-04-16 — Сповіщення адмінам про низький баланс Vast.ai
+- Запит: додати сповіщення адміністраторам застосунку, якщо баланс Vast.ai падає нижче за 1 USD.
+- У `VastAiClient` додано офіційний виклик `GET /api/v0/users/current/` для читання поточного балансу акаунта.
+- У `VastRuntimeSupervisorService` додано періодичну перевірку балансу Vast.ai та anti-spam логіку: повідомлення надсилається один раз при падінні нижче порога `1.00 USD`, а після відновлення балансу тригер може спрацювати повторно.
+- У `TelegramBotService` додано `notify_admins_sync()`, а `main.py` підключає цей канал до supervisor, щоб фоновий контроль Vast міг розсилати алерти всім активним адміністраторам.
+- Додано unit-тести `scripts/test_vast_runtime_supervisor_service.py` на одноразове спрацювання алерта та повторне спрацювання після recovery.
+- Після перевірки live payload з'ясовано, що Vast може повертати `balance=0` одночасно з додатним `credit`; тому для алерта використовується фактично доступний `credit`, а `balance` лишається fallback, щоб уникати хибних low-balance сповіщень.
+
+## 2026-04-16 — Vast runtime: збільшено endpoint timeout і додано видимість причин startup failure
+- Запит: виправити передчасне пересоздання Vast інстанса під час старту, коли endpoint ще не опубліковано.
+- У `business/services/vast_ai_runtime_settings_service.py` дефолтний `endpoint_timeout_sec` збільшено з `240` до `1200`, щоб оркестратор не зносив інстанс завчасно.
+- У Mini App Admin додано поле `endpoint_timeout_sec`: оновлено `telegram_mini_app/routes/admin.py`, `telegram_mini_app/static/index.html` і `telegram_mini_app/static/app.js`.
+- У `business/services/vllm_runtime_orchestrator.py` startup failure тепер логуються з `stage` та обрізаним `error` у `recent_logs`, щоб було видно, чи це саме timeout публікації endpoint, readiness runtime або модельний етап.
+
+## 2026-04-16 — Vast runtime: міжпроцесна координація оркестратора
+- Запит: з'ясувати, чому під час старту Vast інстанса через кілька хвилин створюється ще один інстанс, поки перший ще не піднявся.
+- Виявлено, що `main.py` і дочірній процес `uvicorn` мають окремі process-local singleton оркестратори, тому один запуск застосунку міг паралельно стартувати два Vast runtime.
+- Додано `data/repositories/gpu_runtime_coordination_repository.py` з singleton-документом у MongoDB для lease/ownership координації між процесами.
+- У `business/services/vllm_runtime_orchestrator.py` додано acquire/renew/release lease, публікацію shared state (`starting`, `network_ready`, `running`, `paused`, `failed`) і логіку очікування вже запущеного runtime замість створення дубліката.

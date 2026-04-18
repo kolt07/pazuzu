@@ -48,6 +48,8 @@ from business.services.telegram_bot_service import TelegramBotService
 from business.services.scheduler_service import SchedulerService, TelegramSchedulerNotifier
 from business.services.source_data_load_service import run_full_pipeline
 from business.services.logging_service import LoggingService
+from business.services.task_queue_service import TaskQueueService
+from business.services.vast_runtime_supervisor_service import VastRuntimeSupervisorService
 from data.database.connection import MongoDBConnection
 from business.services.currency_rate_service import CurrencyRateService
 
@@ -72,6 +74,8 @@ class Application:
         self._mcp_processes = []
         self.scheduler_service = None
         self.currency_rate_service = None
+        self.runtime_supervisor_service = None
+        self.task_queue_service = None
         
         # Ініціалізуємо MongoDB підключення ПЕРЕД створенням сервісів, які його використовують
         try:
@@ -85,6 +89,10 @@ class Application:
             self.currency_rate_service = CurrencyRateService(self.settings)
         except Exception as e:
             print(f"Попередження: не вдалося ініціалізувати сервіс курсів валют: {e}")
+        try:
+            self.task_queue_service = TaskQueueService(self.settings)
+        except Exception as e:
+            print(f"Попередження: не вдалося ініціалізувати task queue: {e}")
         
         # Логуємо старт застосунку
         try:
@@ -110,6 +118,64 @@ class Application:
         """Ініціалізація компонентів застосунку."""
         self.prozorro_service = ProZorroService(self.settings)
 
+    def _notify_admins_sync(self, message: str) -> bool:
+        """Best-effort сповіщення адміністраторів через Telegram бота."""
+        if not self.telegram_bot_service:
+            return False
+        try:
+            return bool(self.telegram_bot_service.notify_admins_sync(message))
+        except Exception:
+            return False
+
+    def _start_runtime_supervisor(self) -> None:
+        if self.runtime_supervisor_service is not None:
+            return
+        try:
+            self.runtime_supervisor_service = VastRuntimeSupervisorService(
+                self.settings,
+                notify_admins_fn=self._notify_admins_sync,
+            )
+            self.runtime_supervisor_service.start()
+        except Exception as e:
+            print(f"Попередження: не вдалося запустити runtime supervisor: {e}")
+
+    def _run_pipeline_with_queue(
+        self,
+        *,
+        sources,
+        days: int = None,
+        regions=None,
+        listing_types=None,
+        use_browser_olx=None,
+        olx_phase1_max_threads=None,
+    ):
+        if not self.task_queue_service or not self.task_queue_service.is_enabled():
+            return run_full_pipeline(
+                settings=self.settings,
+                sources=sources,
+                days=days,
+                regions=regions,
+                listing_types=listing_types,
+                use_browser_olx=use_browser_olx,
+                olx_phase1_max_threads=olx_phase1_max_threads,
+            )
+        dispatched = self.task_queue_service.enqueue_source_load(
+            days=days,
+            sources=sources,
+            regions=regions,
+            listing_types=listing_types,
+            use_browser_olx=use_browser_olx,
+            olx_phase1_max_threads=olx_phase1_max_threads,
+            metadata={"trigger": "main_application"},
+        )
+        task_id = dispatched["task_id"]
+        print(f"Source-load задача поставлена в RabbitMQ: {task_id}")
+        docs = self.task_queue_service.wait_for_all([task_id], timeout_sec=6 * 3600)
+        doc = docs[0] if docs else {}
+        if str(doc.get("state") or "").lower() != "success":
+            raise RuntimeError(doc.get("error") or f"Task {task_id} failed")
+        return doc.get("result") or {}
+
     def run(
         self,
         days: int = None,
@@ -126,11 +192,11 @@ class Application:
 
         self.initialize()
         self._running = True
+        self._start_runtime_supervisor()
         print("Застосунок запущено")
 
         # Єдиний pipeline: raw → main + LLM для обраних → аналітика (без LLM на етапі збору сирих даних)
-        result = run_full_pipeline(
-            settings=self.settings,
+        result = self._run_pipeline_with_queue(
             sources=["olx", "prozorro"],
             days=days,
         )
@@ -212,8 +278,7 @@ class Application:
     def run_olx_data_update(self, days: int = None) -> None:
         """Оновлює оголошення OLX через pipeline raw → LLM (Phase 1 без LLM). days=1 або 7 — зупинка по даті."""
         try:
-            result = run_full_pipeline(
-                settings=self.settings,
+            result = self._run_pipeline_with_queue(
                 sources=["olx"],
                 days=days or 1,
             )
@@ -243,8 +308,7 @@ class Application:
                 break
             try:
                 logger.info("Фонове оновлення даних: старт (минула добу, pipeline raw → LLM)")
-                run_full_pipeline(
-                    settings=self.settings,
+                self._run_pipeline_with_queue(
                     sources=["olx", "prozorro"],
                     days=1,
                 )
@@ -265,6 +329,7 @@ class Application:
 
         self.initialize()
         self._running = True
+        self._start_runtime_supervisor()
 
         # Тимчасово вимкнено: оновлення даних — через меню адміністратора (за добу / за тиждень)
         # if self.settings.background_update_interval_minutes > 0:
@@ -357,6 +422,14 @@ class Application:
         if self.scheduler_service:
             self.scheduler_service.shutdown(wait=True)
             self.scheduler_service = None
+
+        # Зупиняємо supervisor Vast runtime
+        if self.runtime_supervisor_service:
+            try:
+                self.runtime_supervisor_service.stop()
+            except Exception:
+                pass
+            self.runtime_supervisor_service = None
         
         # Зупиняємо Telegram бота
         if self.telegram_bot_service:
