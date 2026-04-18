@@ -1219,7 +1219,7 @@ class LLMService:
                 fallback = ((runtime_cfg or {}).get("fallback_provider") or "ollama").lower()
                 if fallback == "ollama":
                     logger.warning("vllm_remote недоступний, fallback на ollama: %s", e)
-                    return OllamaLLMProvider('', self.rate_limiter, model_name='gemma3:27b')
+                    return OllamaLLMProvider('', self.rate_limiter, model_name=model_name)
                 raise
 
         if provider_name == 'ollama':
@@ -1406,6 +1406,9 @@ class LLMService:
                     if isinstance(usage, dict):
                         meta["input_tokens"] = usage.get("input_tokens", 0)
                         meta["output_tokens"] = usage.get("output_tokens", 0)
+                    runtime_meta = getattr(self._assistant_provider, "_last_runtime_meta", None)
+                    if isinstance(runtime_meta, dict):
+                        meta.update(runtime_meta)
                     log_svc.log_api_usage(
                         service="llm",
                         source="llm_service.extract_intent_for_routing",
@@ -1421,6 +1424,7 @@ class LLMService:
                         output_tokens=meta.get("output_tokens", 0),
                         source="llm_service.extract_intent_for_routing",
                         provider=(getattr(self.settings, "llm_assistant_provider", None) or "gemini"),
+                        duration_ms=meta.get("duration_ms"),
                     )
                 except Exception as e:
                     logger.warning("Не вдалося записати llm_exchange (extract_intent): %s", e)
@@ -1469,6 +1473,9 @@ class LLMService:
                     if isinstance(usage, dict):
                         meta["input_tokens"] = usage.get("input_tokens", 0)
                         meta["output_tokens"] = usage.get("output_tokens", 0)
+                    runtime_meta = getattr(self._assistant_provider, "_last_runtime_meta", None)
+                    if isinstance(runtime_meta, dict):
+                        meta.update(runtime_meta)
                     log_svc.log_api_usage(
                         service="llm",
                         source=_caller or "llm_service.generate_text",
@@ -1484,6 +1491,7 @@ class LLMService:
                         output_tokens=meta.get("output_tokens", 0),
                         source=_caller or "llm_service.generate_text",
                         provider=(getattr(self.settings, "llm_assistant_provider", None) or "gemini"),
+                        duration_ms=meta.get("duration_ms"),
                     )
                 except Exception as e:
                     logger.warning("Не вдалося записати llm_exchange (generate_text): %s", e)

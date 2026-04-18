@@ -54,4 +54,9 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
     return app
 
 
-celery_app = create_celery_app()
+# Важливо: імпорт модуля має бути безпечним навіть коли Celery не встановлено.
+# Інакше падає імпорт TaskQueueService у режимі optional queue.
+if Celery is not None:
+    celery_app = create_celery_app()
+else:  # pragma: no cover - optional dependency branch
+    celery_app = None
