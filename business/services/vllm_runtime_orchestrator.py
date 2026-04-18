@@ -1467,6 +1467,13 @@ class VllmRuntimeOrchestrator:
     def _utcnow() -> datetime:
         return datetime.now(timezone.utc)
 
+    @staticmethod
+    def _mongo_datetime_as_utc_aware(dt: datetime) -> datetime:
+        """PyMongo/Mongo часто дають naive UTC; порівняння з aware datetime падає."""
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
     def _has_recent_shared_source_load_activity(self, within_sec: int) -> bool:
         coord = getattr(self, "_coord", None)
         if coord is None:
@@ -1475,6 +1482,7 @@ class VllmRuntimeOrchestrator:
         last_source_load_activity = state.get("last_source_load_activity_at")
         if not isinstance(last_source_load_activity, datetime):
             return False
+        last_source_load_activity = self._mongo_datetime_as_utc_aware(last_source_load_activity)
         return (self._utcnow() - last_source_load_activity).total_seconds() <= max(1, int(within_sec))
 
     @staticmethod
@@ -1485,6 +1493,7 @@ class VllmRuntimeOrchestrator:
         lease_until = state.get("lease_expires_at")
         if not owner_id or not isinstance(lease_until, datetime):
             return False
+        lease_until = VllmRuntimeOrchestrator._mongo_datetime_as_utc_aware(lease_until)
         return lease_until > datetime.now(timezone.utc)
 
     def _wait_for_shared_runtime_or_acquire(self, cfg: Dict[str, Any]) -> Optional[str]:
