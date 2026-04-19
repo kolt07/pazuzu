@@ -737,10 +737,7 @@ class TelegramBotService:
         self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
-        # Error handler вже зареєстровано в методі run() перед setup_handlers()
-        # Додаємо тут тільки якщо він ще не зареєстрований (для безпеки)
-        if not hasattr(self.application, '_error_handlers') or not self.application._error_handlers:
-            self.application.add_error_handler(self.error_handler)
+        # Error handler реєструється один раз у run(), щоб уникати дублювання callback'а.
     
     async def _back_to_admin_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Повертає до меню адміністратора."""
@@ -1146,6 +1143,7 @@ class TelegramBotService:
                 drop_pending_updates=False,  # Не скидаємо очікуючі оновлення
                 close_loop=False,  # Не закриваємо event loop при помилках
                 stop_signals=None,  # У контейнері бот запускається з non-main thread
+                bootstrap_retries=-1,  # Нескінченні ретраї bootstrap при тимчасових мережевих збоях
             )
         except KeyboardInterrupt:
             print("\nОтримано сигнал переривання, зупиняємо бота...")
