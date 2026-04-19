@@ -3,9 +3,11 @@
 Сервіс для роботи з LLM API (Gemini, ChatGPT, Claude).
 """
 
+import os
 import time
 import json
 from typing import Dict, Any, Optional, List
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
 
@@ -756,6 +758,14 @@ class AnthropicLLMProvider(BaseLLMProvider):
 class OllamaLLMProvider(BaseLLMProvider):
     """Провайдер для локальної LLM через Ollama (gemma3:27b тощо)."""
 
+    def _ollama_host_for_log(self) -> str:
+        """Куди ходить клієнт Ollama (локально або Vast через OLLAMA_HOST)."""
+        for attr in ("host", "_host"):
+            h = getattr(self.client, attr, None)
+            if h:
+                return str(h)
+        return str(os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434"))
+
     def __init__(self, api_key: str, rate_limiter: RateLimiter, model_name: str = 'gemma3:27b'):
         super().__init__(api_key or '', rate_limiter)
         self._last_usage: Optional[Dict[str, int]] = None
@@ -784,6 +794,7 @@ class OllamaLLMProvider(BaseLLMProvider):
         self._last_request_text = prompt
         self._last_response_text = None
 
+        t0 = time.perf_counter()
         try:
             response = self.client.generate(
                 model=self.model_name,
@@ -810,10 +821,26 @@ class OllamaLLMProvider(BaseLLMProvider):
             elif not isinstance(result, dict):
                 return self._empty_result()
 
+            dur_ms = int((time.perf_counter() - t0) * 1000)
+            u = self._last_usage or {}
+            logger.info(
+                "[llm-ollama] парсинг опису: model=%s тривалість_ms=%s вхід_ток=%s вихід_ток=%s host=%s",
+                self.model_name,
+                dur_ms,
+                u.get("input_tokens", 0),
+                u.get("output_tokens", 0),
+                self._ollama_host_for_log(),
+            )
             return self._normalize_result(result)
         except Exception as e:
+            dur_ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning(
+                "[llm-ollama] парсинг опису помилка після %sms host=%s: %s",
+                dur_ms,
+                self._ollama_host_for_log(),
+                e,
+            )
             self._last_response_text = f"[error] {e!s}"
-            print(f"Помилка при парсингу через Ollama: {e}")
             return self._empty_result()
 
     def _extract_json_from_response(self, text: str) -> str:
@@ -927,6 +954,7 @@ class OllamaLLMProvider(BaseLLMProvider):
         full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
         self._last_request_text = full_prompt
         self._last_response_text = None
+        t0 = time.perf_counter()
         try:
             messages = []
             if system_prompt:
@@ -940,14 +968,42 @@ class OllamaLLMProvider(BaseLLMProvider):
             self._last_usage = self._usage_from_ollama_response(response)
             out = (response.get("message", {}).get("content") or "").strip()
             self._last_response_text = out
+            dur_ms = int((time.perf_counter() - t0) * 1000)
+            u = self._last_usage or {}
+            logger.info(
+                "[llm-ollama] chat: model=%s тривалість_ms=%s вхід_ток=%s вихід_ток=%s host=%s",
+                self.model_name,
+                dur_ms,
+                u.get("input_tokens", 0),
+                u.get("output_tokens", 0),
+                self._ollama_host_for_log(),
+            )
             return out
         except Exception as e:
+            dur_ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning(
+                "[llm-ollama] chat помилка після %sms host=%s: %s",
+                dur_ms,
+                self._ollama_host_for_log(),
+                e,
+            )
             self._last_response_text = f"[error] {e!s}"
             return ""
 
 
 class VllmRemoteLLMProvider(BaseLLMProvider):
     """Провайдер remote vLLM (OpenAI-compatible) з автоматичним стартом Vast.ai."""
+
+    @staticmethod
+    def _api_host_label(base_url: str) -> str:
+        """Короткий host для логів (Vast/Ollama за SSH — той самий OpenAI /v1)."""
+        if not base_url:
+            return ""
+        try:
+            netloc = urlparse(base_url).netloc
+            return netloc or base_url[:96]
+        except Exception:
+            return base_url[:96]
 
     def __init__(
         self,
@@ -1033,8 +1089,25 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
                     return self._empty_result()
             elif not isinstance(result, dict):
                 return self._empty_result()
+            dur_ms = int((time.perf_counter() - t0) * 1000)
+            u = self._last_usage or {}
+            logger.info(
+                "[llm-remote] парсинг опису: model=%s тривалість_ms=%s вхід_ток=%s вихід_ток=%s api_host=%s",
+                self.model_name,
+                dur_ms,
+                u.get("input_tokens", 0),
+                u.get("output_tokens", 0),
+                self._api_host_label(self._base_url),
+            )
             return self._normalize_result(result)
         except Exception as e:
+            dur_ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning(
+                "[llm-remote] парсинг опису помилка після %sms (host=%s): %s",
+                dur_ms,
+                self._api_host_label(self._base_url),
+                e,
+            )
             self._last_response_text = f"[error] {e!s}"
             return self._empty_result()
 
@@ -1063,14 +1136,31 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
             self._last_usage = self._usage_from_openai_response(response)
             out = (response.choices[0].message.content or "").strip()
             self._last_response_text = out
+            dur_ms = int((time.perf_counter() - t0) * 1000)
             self._last_runtime_meta = {
                 "provider": "vllm_remote",
                 "endpoint": self._base_url,
-                "duration_ms": int((time.perf_counter() - t0) * 1000),
+                "duration_ms": dur_ms,
             }
             self._runtime.mark_processing_activity(self._last_runtime_meta)
+            u = self._last_usage or {}
+            logger.info(
+                "[llm-remote] generate_text: model=%s тривалість_ms=%s вхід_ток=%s вихід_ток=%s api_host=%s",
+                self.model_name,
+                dur_ms,
+                u.get("input_tokens", 0),
+                u.get("output_tokens", 0),
+                self._api_host_label(self._base_url),
+            )
             return out
         except Exception as e:
+            dur_ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning(
+                "[llm-remote] generate_text помилка після %sms (host=%s): %s",
+                dur_ms,
+                self._api_host_label(self._base_url),
+                e,
+            )
             self._last_response_text = f"[error] {e!s}"
             return ""
 

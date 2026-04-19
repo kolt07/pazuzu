@@ -7,6 +7,7 @@
 """
 
 import unittest
+from unittest.mock import patch
 
 from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
 
@@ -52,7 +53,8 @@ class VastRuntimeSettingsServiceTest(unittest.TestCase):
         self.assertEqual(saved["max_hourly_usd"], 1.25)
 
     def test_defaults_include_vram_tuning_for_vllm(self):
-        saved = self.svc.get_settings()
+        with patch.object(VastRuntimeSettingsService, "_config_yaml_vast_runtime_overlay", return_value={}):
+            saved = self.svc.get_settings()
         self.assertEqual(saved["target_cuda"], "11.8")
         self.assertEqual(saved["image"], "ollama/ollama:latest")
         self.assertEqual(saved["vllm_model"], "ggml-org/gemma-4-E4B-it-GGUF")
@@ -66,6 +68,21 @@ class VastRuntimeSettingsServiceTest(unittest.TestCase):
         self.assertAlmostEqual(saved["vllm_gpu_memory_utilization"], 0.9, places=4)
         self.assertTrue(saved["vllm_enforce_eager"])
         self.assertEqual(saved["vllm_max_num_seqs"], 4)
+
+    def test_mongo_settings_override_config_yaml(self):
+        with patch.object(
+            VastRuntimeSettingsService,
+            "_config_yaml_vast_runtime_overlay",
+            return_value={"vllm_model": "google/gemma-2-9b-it", "is_enabled": True},
+        ):
+            self.svc.repository.save_settings(
+                {
+                    "vllm_model": "gemma3:27b",
+                    "is_enabled": True,
+                }
+            )
+            saved = self.svc.get_settings()
+        self.assertEqual(saved["vllm_model"], "gemma3:27b")
 
 
 if __name__ == "__main__":

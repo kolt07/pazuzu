@@ -6,14 +6,17 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Встановлюємо змінні середовища (PYTHONPATH — імпорт business.* для Celery)
+# PLAYWRIGHT_BROWSERS_PATH — браузери в спільній директорії (доступні для appuser після chown)
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONIOENCODING=utf-8 \
     LANG=C.UTF-8 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# Оновлюємо систему та встановлюємо необхідні пакети
+# Базові пакети; APT для Chromium додає `playwright install --with-deps`
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Копіюємо файл залежностей
@@ -25,11 +28,16 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir "celery>=5.3.0" && \
     python -c "import celery; print('celery', celery.__version__)"
 
+# Chromium для OLX (clicker / browser_fetcher): системні залежності + завантаження браузера
+RUN python -m playwright install --with-deps chromium && \
+    chmod -R a+rx /ms-playwright
+
 # Копіюємо весь код проекту
 COPY . .
 
 # Створюємо користувача для безпеки (не root)
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app /ms-playwright
 USER appuser
 
 # Вказуємо точку входу

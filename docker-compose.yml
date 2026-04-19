@@ -25,6 +25,7 @@ services:
       - "5672:5672"
       - "15672:15672"
     volumes:
+      - ./config/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
       - pazuzu_rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
@@ -51,6 +52,7 @@ services:
     environment:
       PYTHONPATH: /app
       TASK_QUEUE_ENABLED: "true"
+      MONGODB_HOST: mongodb
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
@@ -77,6 +79,7 @@ services:
     environment:
       PYTHONPATH: /app
       TASK_QUEUE_ENABLED: "true"
+      MONGODB_HOST: mongodb
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
@@ -103,6 +106,7 @@ services:
     environment:
       PYTHONPATH: /app
       TASK_QUEUE_ENABLED: "true"
+      MONGODB_HOST: mongodb
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}

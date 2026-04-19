@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import socket
 import time
 from typing import Any, Dict, Iterable, List, Optional
@@ -16,6 +17,8 @@ except ImportError:  # pragma: no cover - Celery is optional in local fallback m
 
 from config.settings import Settings
 from data.repositories.background_task_repository import BackgroundTaskRepository
+
+logger = logging.getLogger(__name__)
 
 
 class TaskQueueService:
@@ -38,6 +41,60 @@ class TaskQueueService:
 
     def is_enabled(self) -> bool:
         return bool(getattr(self.settings, "task_queue_enabled", False) and self.settings.task_queue_broker_url and self._celery is not None)
+
+    def _rabbitmq_passive_queue_message_count(self, queue_name: str) -> Optional[int]:
+        """Кількість повідомлень у черзі RabbitMQ (passive declare)."""
+        url = (getattr(self.settings, "task_queue_broker_url", None) or "").strip()
+        if not url:
+            return None
+        try:
+            from kombu import Connection
+
+            with Connection(url, connect_timeout=4) as conn:
+                conn.ensure_connection(max_retries=2)
+                ch = conn.channel()
+                try:
+                    declare_ok = ch.queue_declare(queue=queue_name, passive=True)
+                finally:
+                    try:
+                        ch.close()
+                    except Exception:
+                        pass
+            if declare_ok is None:
+                return None
+            mc = getattr(declare_ok, "message_count", None)
+            if mc is not None:
+                return int(mc)
+            if isinstance(declare_ok, (tuple, list)) and len(declare_ok) >= 2:
+                return int(declare_ok[1])
+        except Exception as e:
+            logger.debug("Passive queue_declare для %s: %s", queue_name, e)
+        return None
+
+    def get_llm_queue_snapshot(self) -> Dict[str, Any]:
+        """Орієнтир черги llm_processing: Rabbit + активні записи у Mongo."""
+        snap: Dict[str, Any] = {
+            "rabbit_messages": None,
+            "mongo_active_tasks": None,
+            "mongo_queued_only": None,
+        }
+        try:
+            snap["rabbit_messages"] = self._rabbitmq_passive_queue_message_count(self.LLM_QUEUE)
+        except Exception:
+            pass
+        try:
+            snap["mongo_active_tasks"] = int(
+                self._repo.count_by_queue_states(self.LLM_QUEUE, self.ACTIVE_STATES)
+            )
+        except Exception:
+            pass
+        try:
+            snap["mongo_queued_only"] = int(
+                self._repo.count_by_queue_states(self.LLM_QUEUE, ["queued", "received"])
+            )
+        except Exception:
+            pass
+        return snap
 
     def enqueue_source_load(
         self,

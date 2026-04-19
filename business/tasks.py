@@ -29,6 +29,28 @@ def _queue_service(settings: Settings) -> TaskQueueService:
     return TaskQueueService(settings)
 
 
+def _log_llm_queue_progress(settings: Settings) -> None:
+    """Короткий знімок RabbitMQ + Mongo для оцінки «скільки лишилось» у llm_processing."""
+    if not getattr(settings, "task_queue_enabled", False):
+        return
+    try:
+        snap = TaskQueueService(settings).get_llm_queue_snapshot()
+        r = snap.get("rabbit_messages")
+        ma = snap.get("mongo_active_tasks")
+        mq = snap.get("mongo_queued_only")
+        parts = []
+        if r is not None:
+            parts.append(f"у RabbitMQ очікує ≈{r} повідомлень")
+        if ma is not None:
+            parts.append(f"у БД активних задач ≈{ma}")
+        if mq is not None:
+            parts.append(f"з них queued/received ≈{mq}")
+        if parts:
+            logger.info("[llm-processing] Черга LLM: %s", " | ".join(parts))
+    except Exception:
+        logger.debug("LLM queue snapshot failed", exc_info=True)
+
+
 def _current_task_id() -> str:
     req = getattr(current_task, "request", None)
     return str(getattr(req, "id", "") or "")
@@ -88,6 +110,13 @@ def process_olx_llm_task(self, listing_url: str) -> Dict[str, Any]:
     settings = _init_runtime()
     queue = _queue_service(settings)
     task_id = _current_task_id()
+    wid = str(getattr(getattr(self, "request", None), "id", "") or task_id or "")
+    logger.info(
+        "[llm-processing] OLX LLM: старт listing_url=%s celery_id=%s",
+        listing_url[:400] + ("…" if len(listing_url) > 400 else ""),
+        wid or "—",
+    )
+    _log_llm_queue_progress(settings)
     if task_id:
         queue.mark_task_started(task_id)
         queue.heartbeat(task_id, patch={"phase": "llm_started", "listing_url": listing_url})
@@ -126,6 +155,12 @@ def process_olx_llm_task(self, listing_url: str) -> Dict[str, Any]:
             log_fn=log_fn,
         )
         result = {"success": bool(ok), "listing_url": listing_url}
+        logger.info(
+            "[llm-processing] OLX LLM: кінець ok=%s celery_id=%s url=%s",
+            ok,
+            wid or "—",
+            listing_url[:200] + ("…" if len(listing_url) > 200 else ""),
+        )
         if task_id:
             if ok:
                 queue.mark_task_success(task_id, result=result)
@@ -144,6 +179,9 @@ def process_prozorro_llm_task(self, auction_id: str) -> Dict[str, Any]:
     settings = _init_runtime()
     queue = _queue_service(settings)
     task_id = _current_task_id()
+    wid = str(getattr(getattr(self, "request", None), "id", "") or task_id or "")
+    logger.info("[llm-processing] ProZorro LLM: старт auction_id=%s celery_id=%s", auction_id, wid or "—")
+    _log_llm_queue_progress(settings)
     if task_id:
         queue.mark_task_started(task_id)
         queue.heartbeat(task_id, patch={"phase": "llm_started", "auction_id": auction_id})
@@ -159,6 +197,12 @@ def process_prozorro_llm_task(self, auction_id: str) -> Dict[str, Any]:
             log_fn=_heartbeat_logger(queue, task_id),
         )
         result = {"success": bool(ok), "auction_id": auction_id}
+        logger.info(
+            "[llm-processing] ProZorro LLM: кінець ok=%s auction_id=%s celery_id=%s",
+            ok,
+            auction_id,
+            wid or "—",
+        )
         if task_id:
             if ok:
                 queue.mark_task_success(task_id, result=result)

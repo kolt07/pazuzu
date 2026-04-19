@@ -3,6 +3,7 @@
 Оркестратор оренди Vast.ai інстанса та готовності vLLM endpoint.
 """
 
+import logging
 import threading
 import time
 import json
@@ -20,6 +21,8 @@ from business.services.vast_ai_client import VastAiClient
 from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
 from data.repositories.gpu_runtime_coordination_repository import GpuRuntimeCoordinationRepository
 from data.repositories.gpu_runtime_sessions_repository import GpuRuntimeSessionsRepository
+
+logger = logging.getLogger(__name__)
 
 _SHARED_ORCHESTRATOR_LOCK = threading.Lock()
 _SHARED_ORCHESTRATOR: Optional["VllmRuntimeOrchestrator"] = None
@@ -127,6 +130,11 @@ class VllmRuntimeOrchestrator:
                 continue
             try:
                 client.destroy_instance(rid)
+                logger.warning(
+                    "Vast singleton: знищено дублікат інстанса %s (залишаємо %s)",
+                    rid,
+                    keep_id,
+                )
                 self._log_gpu_usage(
                     "gpu_vast_duplicate_destroyed",
                     {"keep_instance_id": keep_id, "destroyed_instance_id": rid},
@@ -225,6 +233,9 @@ class VllmRuntimeOrchestrator:
             cfg = self._settings_svc.get_settings()
             if not cfg.get("is_enabled"):
                 return None
+            logger.info(
+                "[gpu-runtime] прогрів: перевірка готовності інстансу/Ollama (ensure_runtime_ready)…"
+            )
             self._empty_queue_since_ts = 0.0
             self._paused_since_ts = 0.0
             self._coord_update_state(
@@ -236,10 +247,18 @@ class VllmRuntimeOrchestrator:
                 self._resume_instance_locked(cfg)
                 if self._endpoint and self._is_runtime_ready(self._endpoint, cfg, timeout_sec=8):
                     self._last_activity_ts = time.time()
+                    logger.info(
+                        "[gpu-runtime] прогрів не потрібен (після resume): endpoint=%s",
+                        self._endpoint,
+                    )
                     return self._endpoint
             if self._endpoint and self._is_runtime_ready(self._endpoint, cfg, timeout_sec=5):
                 self._coord_renew_lease(cfg, state="running")
                 self._last_activity_ts = time.time()
+                logger.info(
+                    "[gpu-runtime] прогрів не потрібен (endpoint уже готовий): %s",
+                    self._endpoint,
+                )
                 return self._endpoint
 
             if not cfg.get("vast_api_key"):
@@ -249,6 +268,10 @@ class VllmRuntimeOrchestrator:
             self._enforce_singleton_vast_instances(client, cfg)
             singleton_id = self._get_singleton_runtime_instance_id(client, cfg)
             if singleton_id:
+                logger.info(
+                    "[gpu-runtime] прогрів: використовуємо наявний контракт Vast instance_id=%s",
+                    singleton_id,
+                )
                 self._session_id = self._sessions.start_session(
                     {
                         "state": "starting",
@@ -288,6 +311,10 @@ class VllmRuntimeOrchestrator:
                 shared_endpoint = self._wait_for_shared_runtime_or_acquire(cfg, client)
                 if shared_endpoint:
                     self._last_activity_ts = time.time()
+                    logger.info(
+                        "[gpu-runtime] використано спільний endpoint іншого процесу: %s",
+                        shared_endpoint,
+                    )
                     return shared_endpoint
             ask_ids = self._select_offer_candidates(client, cfg, limit=5)
             if not ask_ids:
@@ -529,6 +556,12 @@ class VllmRuntimeOrchestrator:
         cfg = self._settings_svc.get_settings()
         instance_id = self._instance_id
         endpoint = self._endpoint
+        logger.warning(
+            "Vast GPU teardown: reason=%s instance_id=%s endpoint=%s",
+            reason,
+            instance_id,
+            endpoint or "",
+        )
         self._stop_ssh_processes_locked()
         try:
             client = VastAiClient(api_key=cfg.get("vast_api_key", ""), timeout_sec=30)
@@ -1663,6 +1696,134 @@ class VllmRuntimeOrchestrator:
             time.sleep(5)
         raise RuntimeError("Timed out waiting for another process to finish Vast runtime startup.")
 
+    @staticmethod
+    def _gpu_meta_tail(metadata: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for key in (
+            "instance_id",
+            "ask_id",
+            "attempt",
+            "model",
+            "endpoint",
+            "public_endpoint",
+            "local_endpoint",
+            "status",
+            "stage",
+            "reason",
+            "runtime",
+        ):
+            val = metadata.get(key)
+            if val is None or val == "":
+                continue
+            parts.append(f"{key}={val}")
+        err = metadata.get("error")
+        if err:
+            parts.append(f"error={str(err)[:180]}")
+        pr = metadata.get("progress_ratio")
+        if pr is not None:
+            try:
+                pct = round(float(pr) * 100.0, 1)
+                parts.append(f"progress_pct={pct}")
+            except (TypeError, ValueError):
+                parts.append(f"progress_ratio={pr}")
+        return (" " + " ".join(parts)) if parts else ""
+
+    def _format_gpu_worker_log_line(self, event: str, metadata: Dict[str, Any]) -> Optional[str]:
+        """Короткий текст для Celery/docker logs (utf-8)."""
+        pfx = "[gpu-runtime]"
+        tail = self._gpu_meta_tail(metadata)
+        if event == "gpu_rent_started":
+            return (
+                f"{pfx} оренда Vast: ask_id={metadata.get('ask_id')} "
+                f"спроба {metadata.get('attempt')} з {metadata.get('candidates')}"
+            )
+        if event == "gpu_rent_failed":
+            return f"{pfx} помилка оренди Vast:{tail}"
+        if event == "gpu_instance_booted":
+            pub = metadata.get("public_endpoint")
+            return (
+                f"{pfx} інстанс у мережі instance_id={metadata.get('instance_id')} "
+                f"public_endpoint={pub}"
+            )
+        if event == "gpu_ready":
+            return (
+                f"{pfx} runtime готовий до LLM endpoint={metadata.get('endpoint')} "
+                f"tunnel={'так' if metadata.get('ssh_tunnel_enabled') else 'ні'}"
+            )
+        if event == "gpu_startup_failed":
+            return f"{pfx} збій старту GPU:{tail}"
+        if event == "gpu_model_pull_started":
+            return f"{pfx} модель Ollama: початок завантаження (pull){tail}"
+        if event == "gpu_model_pull_progress":
+            return f"{pfx} модель Ollama: завантаження:{tail}"
+        if event == "gpu_model_pull_ready":
+            return f"{pfx} модель Ollama: у пам'яті контейнера готова{tail}"
+        if event == "gpu_model_pull_retry":
+            return f"{pfx} модель Ollama: повтор pull{tail}"
+        if event == "gpu_model_repair_started":
+            return f"{pfx} модель Ollama: спроба ремонту (delete + pull){tail}"
+        if event == "gpu_model_repair_pull":
+            return f"{pfx} модель Ollama: повторний pull після ремонту{tail}"
+        if event == "gpu_runtime_endpoint_ready":
+            return f"{pfx} API рантайму доступний ({metadata.get('runtime')}){tail}"
+        if event == "gpu_runtime_endpoint_wait":
+            return f"{pfx} очікування API рантайму ({metadata.get('runtime')}){tail}"
+        if event == "gpu_ssh_tunnel_ready":
+            return f"{pfx} SSH-тунель до порту піднято local={metadata.get('local_endpoint')}{tail}"
+        if event == "gpu_ssh_tunnel_failed":
+            return f"{pfx} SSH-тунель не вдався:{tail}"
+        if event == "gpu_ssh_tunnel_unavailable":
+            return f"{pfx} SSH-тунель недоступний причина={metadata.get('reason')}{tail}"
+        if event == "gpu_endpoint_switched":
+            return (
+                f"{pfx} змінено endpoint етап={metadata.get('phase')} "
+                f"{metadata.get('from_endpoint')} → {metadata.get('to_endpoint')}"
+            )
+        if event == "gpu_instance_log_stream_started":
+            return f"{pfx} стрім логів інстанса SSH host={metadata.get('host')}:{metadata.get('port')}"
+        if event == "gpu_paused":
+            return f"{pfx} інстанс призупинено (pause){tail}"
+        if event == "gpu_pause_failed":
+            return f"{pfx} pause інстанса не вдався:{tail}"
+        if event == "gpu_resumed":
+            return f"{pfx} інстанс відновлено (resume){tail}"
+        if event == "gpu_destroy_delayed":
+            return f"{pfx} destroy відкладено:{tail}"
+        if event == "gpu_idle_wait":
+            return f"{pfx} черга порожня, очікування перед pause:{tail}"
+        if event == "gpu_vast_duplicate_destroyed":
+            return (
+                f"{pfx} видалено дублікат контракту destroyed={metadata.get('destroyed_instance_id')} "
+                f"залишено={metadata.get('keep_instance_id')}"
+            )
+        if event == "gpu_vast_duplicate_destroy_failed":
+            return f"{pfx} не вдалося знищити дублікат інстанса:{tail}"
+        if event == "gpu_vast_list_failed":
+            return f"{pfx} не вдалося отримати список контрактів Vast:{tail}"
+        return f"{pfx} {event}{tail}" if tail else f"{pfx} {event}"
+
+    def _emit_gpu_worker_log(self, event: str, metadata: Dict[str, Any]) -> None:
+        """Дублює ключові gpu_* події в stderr (Docker logs), зокрема для LLM-воркера."""
+        if event in {"gpu_processing", "gpu_teardown"}:
+            return
+        if not str(event).startswith("gpu_"):
+            return
+        line = self._format_gpu_worker_log_line(event, metadata)
+        if not line:
+            return
+        warn_events = {
+            "gpu_startup_failed",
+            "gpu_rent_failed",
+            "gpu_ssh_tunnel_failed",
+            "gpu_pause_failed",
+            "gpu_vast_duplicate_destroy_failed",
+            "gpu_vast_list_failed",
+        }
+        if event in warn_events:
+            logger.warning("%s", line)
+        else:
+            logger.info("%s", line)
+
     def _log_gpu_usage(self, event: str, metadata: Dict[str, Any]) -> None:
         if event in {
             "gpu_instance_booted",
@@ -1715,3 +1876,4 @@ class VllmRuntimeOrchestrator:
             )
         except Exception:
             pass
+        self._emit_gpu_worker_log(event, metadata)

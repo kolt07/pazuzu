@@ -5,7 +5,10 @@
 
 import os
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Dict
+
+import yaml
 
 from data.repositories.vast_runtime_settings_repository import VastRuntimeSettingsRepository
 
@@ -58,10 +61,28 @@ class VastRuntimeSettingsService:
             "vast_instance_label": "pazuzu-vllm-runtime",
         }
 
+    @staticmethod
+    def _config_yaml_vast_runtime_overlay() -> Dict[str, Any]:
+        """Поля з config/config.yaml (секція vast_runtime): defaults/deployment до MongoDB."""
+        try:
+            root = Path(__file__).resolve().parent.parent.parent
+            config_path = root / "config" / "config.yaml"
+            if not config_path.exists():
+                return {}
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            block = cfg.get("vast_runtime")
+            return block if isinstance(block, dict) else {}
+        except Exception:
+            return {}
+
     def get_settings(self) -> Dict[str, Any]:
         env_api_key = os.getenv("VAST_API_KEY", "")
-        stored = self.repository.get_settings() or {}
         merged = self.default_settings()
+        yaml_overlay = self._config_yaml_vast_runtime_overlay()
+        if yaml_overlay:
+            merged.update(yaml_overlay)
+        stored = self.repository.get_settings() or {}
         merged.update(stored)
         if env_api_key and not merged.get("vast_api_key"):
             merged["vast_api_key"] = env_api_key

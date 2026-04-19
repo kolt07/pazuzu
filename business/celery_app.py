@@ -58,5 +58,8 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
 # Інакше падає імпорт TaskQueueService у режимі optional queue.
 if Celery is not None:
     celery_app = create_celery_app()
+    from business.celery_worker_logging import register_celery_worker_logging
+
+    register_celery_worker_logging()
 else:  # pragma: no cover - optional dependency branch
     celery_app = None
