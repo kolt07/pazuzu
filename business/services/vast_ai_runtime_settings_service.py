@@ -48,6 +48,7 @@ class VastRuntimeSettingsService:
             "enable_ssh_tunnel": True,
             "ssh_tunnel_local_port": 8000,
             "ssh_identity_file": "",
+            "ssh_binary": "",
             "ssh_instance_log_stream": True,
             "endpoint_timeout_sec": 1200,
             "boot_timeout_sec": 1200,
@@ -136,6 +137,7 @@ class VastRuntimeSettingsService:
         out["enable_ssh_tunnel"] = bool(out.get("enable_ssh_tunnel", True))
         out["ssh_tunnel_local_port"] = int(out.get("ssh_tunnel_local_port") or 8000)
         out["ssh_identity_file"] = str(out.get("ssh_identity_file") or "").strip()
+        out["ssh_binary"] = str(out.get("ssh_binary") or "").strip()
         out["ssh_instance_log_stream"] = bool(out.get("ssh_instance_log_stream", True))
         out["endpoint_timeout_sec"] = int(out.get("endpoint_timeout_sec") or 1200)
         out["boot_timeout_sec"] = int(out.get("boot_timeout_sec") or 1200)

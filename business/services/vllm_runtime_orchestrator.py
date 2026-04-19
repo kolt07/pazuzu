@@ -816,8 +816,12 @@ class VllmRuntimeOrchestrator:
         raise RuntimeError(f"No free local port found near {start_port}")
 
     def _start_ssh_tunnel(self, public_endpoint: str, instance_payload: Dict[str, Any], cfg: Dict[str, Any]) -> None:
-        ssh_bin = shutil.which("ssh")
+        ssh_bin = self._resolve_ssh_binary(cfg)
         if not ssh_bin:
+            logger.warning(
+                "[gpu-runtime] SSH-клієнт не знайдено (ssh). Для Docker: додайте пакет openssh-client у образ "
+                "або задайте vast_runtime.ssh_binary / змінну PAZUZU_SSH_BINARY."
+            )
             self._log_gpu_usage(
                 "gpu_ssh_tunnel_unavailable",
                 {"reason": "ssh_binary_not_found", "public_endpoint": public_endpoint},
@@ -887,7 +891,7 @@ class VllmRuntimeOrchestrator:
         )
 
     def _start_ssh_instance_log_stream(self, instance_payload: Dict[str, Any], cfg: Dict[str, Any]) -> None:
-        ssh_bin = shutil.which("ssh")
+        ssh_bin = self._resolve_ssh_binary(cfg)
         if not ssh_bin:
             return
         access = self._extract_ssh_access(instance_payload)
@@ -956,6 +960,34 @@ class VllmRuntimeOrchestrator:
             return ""
         expanded = os.path.expanduser(os.path.expandvars(value))
         return expanded if os.path.isfile(expanded) else ""
+
+    @staticmethod
+    def _resolve_ssh_binary(cfg: Dict[str, Any]) -> Optional[str]:
+        """Шлях до ssh: vast_runtime.ssh_binary, PAZUZU_SSH_BINARY, PATH, типові місця на Windows."""
+        explicit = str(cfg.get("ssh_binary") or os.getenv("PAZUZU_SSH_BINARY") or "").strip()
+        if explicit:
+            expanded = os.path.expanduser(os.path.expandvars(explicit))
+            if os.path.isfile(expanded):
+                return expanded
+            found = shutil.which(expanded)
+            if found:
+                return found
+            base = os.path.basename(expanded)
+            if base and base != expanded:
+                found = shutil.which(base)
+                if found:
+                    return found
+        found = shutil.which("ssh")
+        if found:
+            return found
+        if os.name == "nt":
+            for candidate in (
+                r"C:\Windows\System32\OpenSSH\ssh.exe",
+                r"C:\Program Files\Git\usr\bin\ssh.exe",
+            ):
+                if os.path.isfile(candidate):
+                    return candidate
+        return None
 
     def _build_ssh_common_options(self, cfg: Dict[str, Any]) -> List[str]:
         options: List[str] = [

@@ -17,6 +17,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Базові пакети; APT для Chromium додає `playwright install --with-deps`
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Копіюємо файл залежностей

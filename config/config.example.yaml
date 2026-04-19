@@ -100,6 +100,7 @@ llm:
 #   preferred_inet_down_mbps: 1000  # ranking target
 #   enable_ssh_tunnel: true         # піднімати локальний SSH tunnel одразу після старту інстанса
 #   ssh_tunnel_local_port: 8000     # локальний порт tunnel (якщо зайнятий, буде обрано сусідній вільний)
+#   ssh_binary: ""                  # необов'язково: повний шлях до ssh (або змінна PAZUZU_SSH_BINARY), якщо не в PATH
 #   ssh_identity_file: ""           # шлях до приватного SSH ключа (напр. C:\Users\you\.ssh\id_ed25519_custom)
 #   ssh_instance_log_stream: true   # stream stdout/stderr логів інстанса через SSH у app logs
 #   endpoint_timeout_sec: 240  # скільки чекаємо саме публікацію зовнішнього endpoint (ssh/port-forward), далі failover на інший офер
