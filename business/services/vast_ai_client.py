@@ -9,7 +9,10 @@ import requests
 
 
 class VastAiClient:
-    """Мінімальний клієнт Vast.ai для search/create/start/stop/destroy instance."""
+    """Мінімальний клієнт Vast.ai для search/create/start/stop/destroy instance.
+
+    Керування станом інстансу — PUT з полем ``state`` (running/stopped), див. OpenAPI manage instance.
+    """
 
     BASE_URL = "https://console.vast.ai/api/v0"
 
@@ -80,10 +83,21 @@ class VastAiClient:
         return self._request("GET", f"/instances/{instance_id}/")
 
     def start_instance(self, instance_id: str) -> Dict[str, Any]:
-        return self._request("PUT", f"/instances/{instance_id}/", json={"method": "start"})
+        # OpenAPI: PUT /api/v0/instances/{id}/ body state=running|stopped (не legacy method:start/stop)
+        data = self._request("PUT", f"/instances/{instance_id}/", json={"state": "running"})
+        self._raise_if_vast_false_success(data)
+        return data
 
     def stop_instance(self, instance_id: str) -> Dict[str, Any]:
-        return self._request("PUT", f"/instances/{instance_id}/", json={"method": "stop"})
+        data = self._request("PUT", f"/instances/{instance_id}/", json={"state": "stopped"})
+        self._raise_if_vast_false_success(data)
+        return data
+
+    @staticmethod
+    def _raise_if_vast_false_success(data: Dict[str, Any]) -> None:
+        if isinstance(data, dict) and "success" in data and data.get("success") is False:
+            msg = str(data.get("msg") or data.get("error") or "Vast API success=false")
+            raise RuntimeError(msg)
 
     def destroy_instance(self, instance_id: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/instances/{instance_id}/")

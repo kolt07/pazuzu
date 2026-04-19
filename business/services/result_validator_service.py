@@ -87,10 +87,12 @@ class ResultValidatorService:
             filter_metrics = query_structure.get("filter_metrics", {})
             expected_count = len([k for k in filter_metrics if filter_metrics.get(k) is not None])
             if applied_count is not None and expected_count > applied_count:
+                # Лічильники не збігаються семантично: intent (ключі filter_metrics)
+                # vs домен (filter_group.items + geo). Ретрай тим самим пайплайном це не виправляє.
                 issues.append({
                     "type": "filter_loss",
                     "message": f"Втрата фільтрів: очікувалось {expected_count}, застосовано {applied_count}",
-                    "severity": "error"
+                    "severity": "warning",
                 })
         
         # Перевірка відповідності фільтрам
@@ -113,16 +115,12 @@ class ResultValidatorService:
 
         critical_issues = [i for i in issues if i.get("severity") == "error"]
         potential_conflict = any(i.get("type") == "potential_filter_conflict" for i in issues)
-        filter_loss = any(i.get("type") == "filter_loss" for i in issues)
         if critical_issues:
             should_retry = True
             retry_reason = critical_issues[0].get("message")
         elif potential_conflict:
             should_retry = True
             retry_reason = "Потенційний конфлікт гео-фільтрів — спроба fallback"
-        elif filter_loss:
-            should_retry = True
-            retry_reason = "filter_loss"
         
         return {
             "valid": len(critical_issues) == 0,

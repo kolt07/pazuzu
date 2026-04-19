@@ -93,9 +93,13 @@ class VastRuntimeSupervisorService:
                     # Прогрів на старті source-load: інстанс піднімаємо наперед.
                     self._orchestrator.ensure_runtime_ready()
                 else:
+                    # drain: другий колбек має блокувати destroy, поки є «ініціатори» навантаження.
+                    # Раніше передавався лише is_source_load_running() — True лише для run_full_pipeline
+                    # у процесі pazuzu-app; у Celery-source-worker завжди False → інстанс різало
+                    # через idle_paused_timeout, хоч пайплайн ще працював.
                     self._orchestrator.handle_pool_drain(
                         self._has_pending_llm_tasks,
-                        is_source_load_running,
+                        self._has_active_source_load_tasks,
                     )
             except Exception as e:
                 logger.warning("Vast runtime supervisor tick failed: %s", e)
