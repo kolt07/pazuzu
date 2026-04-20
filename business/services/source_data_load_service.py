@@ -9,6 +9,7 @@ Phase 3: перерахунок аналітики та побудова гео�
 
 import logging
 import threading
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from config.settings import Settings
@@ -254,7 +255,6 @@ def run_full_pipeline(
     from scripts.olx_scraper.run_update import (
         run_olx_update_raw_only,
         _process_llm_pending,
-        _process_single_llm_pending_url,
     )
     from business.services.prozorro_service import ProZorroService
     from business.services.unified_listings_service import UnifiedListingsService
@@ -290,6 +290,8 @@ def run_full_pipeline(
         log("[Source load] Phase 1: завантаження сирих даних з джерел (без LLM).")
         olx_loaded_urls: List[str] = []
         prozorro_loaded_ids: List[str] = []
+        # LLM має стартувати тільки після повного завершення Phase 1 (raw),
+        # тому не робимо inline LLM під час завантаження сирих даних.
         olx_dynamic_llm_processed_urls: Set[str] = set()
 
         raw_olx = RawOlxListingsRepository()
@@ -303,7 +305,6 @@ def run_full_pipeline(
         geocoding_olx: Optional[GeocodingService] = None
         llm_extractor_olx: Optional[OlxLLMExtractorService] = None
         usd_rate_olx: Optional[float] = None
-        enabled_regions_for_llm = get_enabled_regions()
         if "olx" in sources:
             unified_olx = UnifiedListingsService(st)
             geocoding_olx = GeocodingService(st)
@@ -314,28 +315,6 @@ def run_full_pipeline(
                 usd_rate_olx = None
 
         if "olx" in sources:
-            def _should_enqueue_llm_for_region(region_name: str) -> bool:
-                if not enabled_regions_for_llm:
-                    return True
-                return is_region_enabled_for_llm(region_name)
-
-            def _process_olx_llm_url_inline(listing_url: str) -> bool:
-                if not llm_extractor_olx or not geocoding_olx or not unified_olx:
-                    return False
-                ok = _process_single_llm_pending_url(
-                    listing_url=listing_url,
-                    raw_repo=raw_olx,
-                    main_repo=main_olx,
-                    llm_extractor=llm_extractor_olx,
-                    geocoding_service=geocoding_olx,
-                    unified_service=unified_olx,
-                    usd_rate=usd_rate_olx,
-                    log_fn=log_fn,
-                )
-                if ok:
-                    olx_dynamic_llm_processed_urls.add(listing_url)
-                return ok
-
             olx_use_browser = use_browser_olx if use_browser_olx is not None else getattr(st, "olx_use_browser", None)
             r = run_olx_update_raw_only(
                 settings=st,
@@ -345,11 +324,10 @@ def run_full_pipeline(
                 listing_types=listing_types,
                 use_browser=olx_use_browser,
                 max_workers=olx_phase1_max_threads,
-                llm_process_url_fn=_process_olx_llm_url_inline,
-                llm_enqueue_region_filter_fn=_should_enqueue_llm_for_region,
             )
             result["phase1"]["olx"] = r
             olx_loaded_urls = r.get("loaded_urls") or []
+            # Для сумісності зі старими результатами, якщо поле існує у відповіді.
             olx_dynamic_llm_processed_urls.update(r.get("llm_processed_urls") or [])
 
         if "prozorro" in sources:
@@ -375,20 +353,25 @@ def run_full_pipeline(
             from business.services.task_queue_service import TaskQueueService
             task_queue = TaskQueueService(st)
             use_brokered_llm = task_queue.is_enabled()
+        llm_batch_progress_state = {"processed": -1}
         if "olx" in sources and olx_loaded_urls:
             urls_for_llm = set(_select_olx_urls_for_llm(raw_olx, olx_loaded_urls))
             if urls_for_llm:
                 pending_list = [u for u in olx_loaded_urls if u in urls_for_llm and u not in olx_dynamic_llm_processed_urls]
-                preprocessed = len([u for u in olx_loaded_urls if u in urls_for_llm]) - len(pending_list)
-                if preprocessed > 0:
-                    log(f"[Source load] Phase 2 OLX: {preprocessed} оголошень вже оброблено LLM вільними воркерами під час Phase 1.")
                 log(f"[Source load] Phase 2 OLX: LLM-обробка для {len(pending_list)} оголошень (дані в olx_listings та unified тільки після LLM).")
                 if use_brokered_llm and task_queue:
+                    olx_llm_batch_id = f"phase2-olx-{uuid.uuid4().hex[:12]}"
                     for listing_url in pending_list:
                         brokered_llm_task_ids.append(
                             task_queue.enqueue_olx_llm(
                                 listing_url,
-                                metadata={"source": "olx", "days": days},
+                                metadata={
+                                    "source": "olx",
+                                    "days": days,
+                                    "llm_batch_id": olx_llm_batch_id,
+                                    "llm_batch_total": len(pending_list),
+                                    "llm_batch_source": "olx",
+                                },
                             )
                         )
                     n = 0
@@ -433,11 +416,18 @@ def run_full_pipeline(
             if ids_for_llm:
                 log(f"[Source load] Phase 2 ProZorro: LLM-обробка для {len(ids_for_llm)} аукціонів...")
                 if use_brokered_llm and task_queue:
+                    prozorro_llm_batch_id = f"phase2-prozorro-{uuid.uuid4().hex[:12]}"
                     for auction_id in ids_for_llm:
                         brokered_llm_task_ids.append(
                             task_queue.enqueue_prozorro_llm(
                                 auction_id,
-                                metadata={"source": "prozorro", "days": days},
+                                metadata={
+                                    "source": "prozorro",
+                                    "days": days,
+                                    "llm_batch_id": prozorro_llm_batch_id,
+                                    "llm_batch_total": len(ids_for_llm),
+                                    "llm_batch_source": "prozorro",
+                                },
                             )
                         )
                     result["phase2"]["prozorro_llm_processed"] = len(ids_for_llm)
@@ -463,10 +453,24 @@ def run_full_pipeline(
 
         if use_brokered_llm and task_queue and brokered_llm_task_ids:
             log(f"[Source load] Phase 2: очікування завершення {len(brokered_llm_task_ids)} LLM-задач із RabbitMQ...")
+
+            def _llm_wait_progress(docs: List[Dict[str, Any]], task_ids: List[str]) -> None:
+                by_id = {doc.get("task_id"): doc for doc in docs}
+                processed = sum(
+                    1
+                    for tid in task_ids
+                    if str((by_id.get(tid) or {}).get("state") or "").lower() in TaskQueueService.TERMINAL_STATES
+                )
+                total = len(task_ids)
+                if processed != llm_batch_progress_state["processed"]:
+                    llm_batch_progress_state["processed"] = processed
+                    log(f"[Source load] Phase 2 LLM queue: оброблено {processed} з {total}.")
+
             task_docs = task_queue.wait_for_all(
                 brokered_llm_task_ids,
                 timeout_sec=max(1800, len(brokered_llm_task_ids) * 120),
                 heartbeat_fn=llm_wait_heartbeat_fn,
+                progress_fn=_llm_wait_progress,
             )
             olx_success = 0
             prozorro_success = 0

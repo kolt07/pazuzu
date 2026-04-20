@@ -87,6 +87,13 @@ class VllmRuntimeOrchestratorTest(unittest.TestCase):
         row = {"id": 42, "cur_state": "running"}
         self.assertEqual(VllmRuntimeOrchestrator._choose_runtime_instance_to_keep([row]), row)
 
+    def test_vast_instance_running_state_detection(self):
+        self.assertTrue(VllmRuntimeOrchestrator._is_vast_instance_running({"cur_state": "running"}))
+        self.assertTrue(VllmRuntimeOrchestrator._is_vast_instance_running({"actual_status": "ACTIVE"}))
+        self.assertFalse(VllmRuntimeOrchestrator._is_vast_instance_running({"cur_state": "stopped"}))
+        self.assertFalse(VllmRuntimeOrchestrator._is_vast_instance_running({"state": "paused"}))
+        self.assertFalse(VllmRuntimeOrchestrator._is_vast_instance_running({}))
+
     def test_rate_limit_error_detection(self):
         r = requests.Response()
         r.status_code = 429

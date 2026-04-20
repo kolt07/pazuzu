@@ -51,6 +51,34 @@ def _log_llm_queue_progress(settings: Settings) -> None:
         logger.debug("LLM queue snapshot failed", exc_info=True)
 
 
+def _log_llm_batch_progress(queue: TaskQueueService, task_id: str, stage: str) -> None:
+    """Логує прогрес batch-черги у форматі «оброблено X з Y»."""
+    if not task_id:
+        return
+    try:
+        doc = queue.get_task_doc(task_id) or {}
+        meta = doc.get("metadata") or {}
+        batch_id = str(meta.get("llm_batch_id") or "").strip()
+        if not batch_id:
+            return
+        total_hint = meta.get("llm_batch_total")
+        source = str(meta.get("llm_batch_source") or "").strip() or "unknown"
+        progress = queue.get_llm_batch_progress(batch_id, total_hint=total_hint)
+        logger.info(
+            "[llm-processing] Черга LLM (%s, source=%s): оброблено %s з %s "
+            "(success=%s, failed=%s, in_progress=%s)",
+            stage,
+            source,
+            progress["processed"],
+            progress["total"],
+            progress["success"],
+            progress["failed"],
+            progress["in_progress"],
+        )
+    except Exception:
+        logger.debug("LLM batch progress failed", exc_info=True)
+
+
 def _current_task_id() -> str:
     req = getattr(current_task, "request", None)
     return str(getattr(req, "id", "") or "")
@@ -120,6 +148,7 @@ def process_olx_llm_task(self, listing_url: str) -> Dict[str, Any]:
     if task_id:
         queue.mark_task_started(task_id)
         queue.heartbeat(task_id, patch={"phase": "llm_started", "listing_url": listing_url})
+        _log_llm_batch_progress(queue, task_id, stage="start")
     try:
         from business.services.llm_service import _get_vllm_orchestrator
         from business.services.olx_llm_extractor_service import OlxLLMExtractorService
@@ -166,6 +195,7 @@ def process_olx_llm_task(self, listing_url: str) -> Dict[str, Any]:
                 queue.mark_task_success(task_id, result=result)
             else:
                 queue.mark_task_failed(task_id, f"OLX LLM processing returned false for {listing_url}")
+            _log_llm_batch_progress(queue, task_id, stage="finish")
         return result
     except Exception as e:
         logger.exception("OLX LLM task failed for %s: %s", listing_url, e)
@@ -185,6 +215,7 @@ def process_prozorro_llm_task(self, auction_id: str) -> Dict[str, Any]:
     if task_id:
         queue.mark_task_started(task_id)
         queue.heartbeat(task_id, patch={"phase": "llm_started", "auction_id": auction_id})
+        _log_llm_batch_progress(queue, task_id, stage="start")
     try:
         from business.services.llm_service import _get_vllm_orchestrator
 
@@ -208,6 +239,7 @@ def process_prozorro_llm_task(self, auction_id: str) -> Dict[str, Any]:
                 queue.mark_task_success(task_id, result=result)
             else:
                 queue.mark_task_failed(task_id, f"ProZorro LLM processing returned false for {auction_id}")
+            _log_llm_batch_progress(queue, task_id, stage="finish")
         return result
     except Exception as e:
         logger.exception("ProZorro LLM task failed for %s: %s", auction_id, e)

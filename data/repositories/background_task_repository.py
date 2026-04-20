@@ -28,6 +28,7 @@ class BackgroundTaskRepository(BaseRepository):
             self.collection.create_index("queue_name")
             self.collection.create_index("task_name")
             self.collection.create_index("state")
+            self.collection.create_index("metadata.llm_batch_id")
             self.collection.create_index("updated_at")
             self.collection.create_index("heartbeat_at")
             self._indexes_created = True
@@ -135,6 +136,13 @@ class BackgroundTaskRepository(BaseRepository):
         for doc in docs:
             doc["_id"] = str(doc["_id"])
         return docs
+
+    def count_by_batch_id(self, batch_id: str, states: Optional[List[str]] = None) -> int:
+        self._ensure_indexes()
+        query: Dict[str, Any] = {"metadata.llm_batch_id": str(batch_id or "").strip()}
+        if states:
+            query["state"] = {"$in": list(states)}
+        return int(self.collection.count_documents(query))
 
     def _set_state(self, task_id: str, state: str, **extra: Any) -> None:
         self._ensure_indexes()

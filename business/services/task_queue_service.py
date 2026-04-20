@@ -96,6 +96,29 @@ class TaskQueueService:
             pass
         return snap
 
+    def get_task_doc(self, task_id: str) -> Optional[Dict[str, Any]]:
+        return self._repo.get_by_task_id(str(task_id or "").strip())
+
+    def get_llm_batch_progress(self, batch_id: str, total_hint: Optional[int] = None) -> Dict[str, int]:
+        bid = str(batch_id or "").strip()
+        if not bid:
+            total = int(total_hint or 0)
+            return {"total": max(0, total), "processed": 0, "success": 0, "failed": 0, "in_progress": max(0, total)}
+        total = self._repo.count_by_batch_id(bid)
+        if total_hint is not None:
+            total = max(total, int(total_hint))
+        success = self._repo.count_by_batch_id(bid, states=["success"])
+        failed = self._repo.count_by_batch_id(bid, states=["failed", "revoked"])
+        processed = success + failed
+        in_progress = max(0, total - processed)
+        return {
+            "total": int(total),
+            "processed": int(processed),
+            "success": int(success),
+            "failed": int(failed),
+            "in_progress": int(in_progress),
+        }
+
     def enqueue_source_load(
         self,
         *,
@@ -192,6 +215,7 @@ class TaskQueueService:
         timeout_sec: int = 3600,
         poll_interval_sec: float = 2.0,
         heartbeat_fn=None,
+        progress_fn=None,
     ) -> List[Dict[str, Any]]:
         ids = [str(task_id).strip() for task_id in list(task_ids or []) if str(task_id).strip()]
         if not ids:
@@ -200,6 +224,8 @@ class TaskQueueService:
         while time.time() < deadline:
             docs = self._repo.list_by_task_ids(ids)
             by_id = {doc.get("task_id"): doc for doc in docs}
+            if callable(progress_fn):
+                progress_fn(docs, ids)
             if all(str((by_id.get(task_id) or {}).get("state") or "").lower() in self.TERMINAL_STATES for task_id in ids):
                 return docs
             if callable(heartbeat_fn):

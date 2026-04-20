@@ -1,5 +1,21 @@
 # Історія розробки
 
+## 2026-04-20 — Послідовний LLM phase + прогрес черги X/Y
+
+- **Запит**: Вимкнути паралельну LLM-обробку під час завантаження сирих даних, виконувати LLM-операції через `llm-worker`, додати в логах стан черги у форматі «оброблено X з Y».
+- **Дії**: У `run_full_pipeline` прибрано inline LLM під час `Phase 1` (тепер LLM стартує лише у `Phase 2` після завершення raw). Для brokered LLM-задач додано batch-метадані (`llm_batch_id`, `llm_batch_total`, `llm_batch_source`) і прогрес-лог у source-load очікуванні: `Phase 2 LLM queue: оброблено X з Y`. У `process_olx_llm_task` та `process_prozorro_llm_task` додано batch-прогрес у логах `llm-worker` на старті/фініші задачі.
+- **Інфраструктура черги**: `TaskQueueService` доповнено методами читання task-doc та batch progress; `BackgroundTaskRepository` — індексом `metadata.llm_batch_id` і підрахунком задач по batch id.
+
+## 2026-04-20 — Узгодження wake-up paused Vast singleton
+
+- **Запит**: Перевірити механіку пробудження, щоб процес не очікував readiness від інстанса, який фактично у pause/sleep.
+- **Дії**: У `VllmRuntimeOrchestrator.ensure_runtime_ready()` для сценарію `adopt existing singleton` додано явну перевірку стану Vast-інстанса (`running/active/online` vs `paused/stopped`). Якщо singleton не running — оркестратор спочатку виконує `_resume_instance_locked()` і лише після цього переходить до readiness. Додано helper-и `_extract_vast_instance_state` / `_is_vast_instance_running` та unit-тест на визначення станів.
+
+## 2026-04-20 — Унікальний owner для координації Vast runtime між контейнерами
+
+- **Запит**: Після ручного завершення Vast-інстанса система інколи створювала два нових інстанси замість одного.
+- **Дії**: Виявлено колізію `owner_id` у міжпроцесній координації (`pid:<n>`): у Docker різні контейнери часто мають однаковий PID (`1`), тож виглядали як один і той самий власник lease. У `VllmRuntimeOrchestrator` `owner_id` змінено на `host:<hostname>:pid:<pid>`, щоб lease був унікальний між контейнерами і не допускав паралельний `create_instance`.
+
 ## 2026-04-16 — RabbitMQ/Celery черги та pause/resume lifecycle Vast runtime
 
 - **Запит**: Перевести source-load та LLM processing на RabbitMQ, додати worker-и в `docker-compose`, пріоритезувати Vast verified + preferred datacenter/region, pause-ити інстанс при порожній LLM-черзі та destroy робити лише після 20+ хв без активного source-load.

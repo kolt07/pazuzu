@@ -48,7 +48,7 @@ class VllmRuntimeOrchestrator:
         self._logging = LoggingService()
         self._sessions = GpuRuntimeSessionsRepository()
         self._coord = GpuRuntimeCoordinationRepository()
-        self._owner_id = f"pid:{os.getpid()}"
+        self._owner_id = f"host:{socket.gethostname()}:pid:{os.getpid()}"
         self._instance_id: Optional[str] = None
         self._session_id: Optional[str] = None
         self._endpoint: Optional[str] = None
@@ -145,11 +145,31 @@ class VllmRuntimeOrchestrator:
                     {"instance_id": rid, "error": str(e)},
                 )
 
-    def _get_singleton_runtime_instance_id(self, client: VastAiClient, cfg: Dict[str, Any]) -> str:
+    def _get_singleton_runtime_instance(self, client: VastAiClient, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         rows = self._instances_matching_runtime_label(client, cfg)
         if len(rows) != 1:
+            return None
+        row = rows[0]
+        return row if isinstance(row, dict) else None
+
+    @staticmethod
+    def _extract_vast_instance_state(payload: Dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
             return ""
-        return self._normalize_vast_instance_id(rows[0].get("id"))
+        for key in ("cur_state", "actual_status", "state", "status"):
+            raw = payload.get(key)
+            if raw is None:
+                continue
+            state = str(raw).strip().lower()
+            if state:
+                return state
+        return ""
+
+    @classmethod
+    def _is_vast_instance_running(cls, payload: Dict[str, Any]) -> bool:
+        state = cls._extract_vast_instance_state(payload)
+        # Vast може повертати різні назви станів залежно від endpoint.
+        return state in {"running", "active", "online"}
 
     def _execute_contract_boot_steps(
         self,
@@ -266,11 +286,14 @@ class VllmRuntimeOrchestrator:
 
             client = VastAiClient(api_key=cfg["vast_api_key"], timeout_sec=min(60, cfg["boot_timeout_sec"]))
             self._enforce_singleton_vast_instances(client, cfg)
-            singleton_id = self._get_singleton_runtime_instance_id(client, cfg)
+            singleton = self._get_singleton_runtime_instance(client, cfg)
+            singleton_id = self._normalize_vast_instance_id((singleton or {}).get("id")) if singleton else ""
             if singleton_id:
+                singleton_state = self._extract_vast_instance_state(singleton or {})
                 logger.info(
-                    "[gpu-runtime] прогрів: використовуємо наявний контракт Vast instance_id=%s",
+                    "[gpu-runtime] прогрів: використовуємо наявний контракт Vast instance_id=%s state=%s",
                     singleton_id,
+                    singleton_state or "unknown",
                 )
                 self._session_id = self._sessions.start_session(
                     {
@@ -282,6 +305,20 @@ class VllmRuntimeOrchestrator:
                     }
                 )
                 try:
+                    # Узгодження state-машини між процесами:
+                    # якщо singleton у Vast не running (paused/stopped), обов'язково
+                    # виконуємо resume ПЕРЕД очікуванням runtime readiness.
+                    self._instance_id = singleton_id
+                    if not self._is_vast_instance_running(singleton or {}):
+                        self._instance_paused = True
+                        self._resume_instance_locked(cfg)
+                        if self._endpoint and self._is_runtime_ready(self._endpoint, cfg, timeout_sec=8):
+                            self._last_activity_ts = time.time()
+                            logger.info(
+                                "[gpu-runtime] singleton resumed і готовий: endpoint=%s",
+                                self._endpoint,
+                            )
+                            return self._endpoint
                     return self._execute_contract_boot_steps(client, cfg, singleton_id, 0, self._session_id)
                 except Exception as e:
                     last_error = str(e)
