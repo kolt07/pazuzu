@@ -2786,3 +2786,12 @@
 - Виявлено, що `main.py` і дочірній процес `uvicorn` мають окремі process-local singleton оркестратори, тому один запуск застосунку міг паралельно стартувати два Vast runtime.
 - Додано `data/repositories/gpu_runtime_coordination_repository.py` з singleton-документом у MongoDB для lease/ownership координації між процесами.
 - У `business/services/vllm_runtime_orchestrator.py` додано acquire/renew/release lease, публікацію shared state (`starting`, `network_ready`, `running`, `paused`, `failed`) і логіку очікування вже запущеного runtime замість створення дубліката.
+
+## 2026-04-20 — Vast runtime: міграція зі "сплячого" інстанса після timeout wakeup
+- Запит: якщо paused інстанс не прокидається довше 5 хвилин (може бути зайнятий), автоматично орендувати новий інстанс, скопіювати сесію і знищити старий.
+- Перевірено офіційну документацію Vast API: підтверджено endpoint `PUT /api/v0/commands/copy_direct/` для копіювання між інстансами, а також `PUT /api/v0/instances/{id}/` (start/stop) і `DELETE /api/v0/instances/{id}/` (destroy).
+- Виконано live-експеримент сценарію: оренда інстанса #1 з Ollama (без pull моделі) → pause → оренда інстанса #2 → `copy_direct` шляхів `/workspace/` і `/root/.ollama/` → destroy #1 → healthcheck #2 (`/api/tags`=200) → destroy #2. Звіт з таймлайном збережено в `temp/vast_sleep_report.json`.
+- У `VastAiClient` додано метод `copy_direct(...)`.
+- У `VastRuntimeSettingsService` додано нові параметри: `sleep_wakeup_timeout_sec`, `sleep_migration_enabled`, `sleep_migration_copy_paths`, `sleep_migration_settle_sec` (з нормалізацією).
+- У `VllmRuntimeOrchestrator._resume_instance_locked` додано failover-механіку: при timeout wakeup запускається міграція на новий контракт, копіювання даних через Vast copy API, знищення source та продовження ready-check уже на destination.
+- Додано unit-тести: `scripts/test_vllm_runtime_orchestrator.py` (тригер міграції при resume-timeout), `scripts/test_vast_runtime_settings_service.py` (дефолти/нормалізація нових налаштувань).

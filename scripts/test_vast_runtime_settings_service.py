@@ -64,6 +64,10 @@ class VastRuntimeSettingsServiceTest(unittest.TestCase):
         self.assertEqual(saved["endpoint_timeout_sec"], 1200)
         self.assertEqual(saved["boot_timeout_sec"], 1200)
         self.assertEqual(saved["ready_timeout_sec"], 1200)
+        self.assertEqual(saved["sleep_wakeup_timeout_sec"], 300)
+        self.assertTrue(saved["sleep_migration_enabled"])
+        self.assertEqual(saved["sleep_migration_copy_paths"], ["/workspace/", "/root/.ollama/"])
+        self.assertEqual(saved["sleep_migration_settle_sec"], 45)
         self.assertEqual(saved["vllm_max_model_len"], 4096)
         self.assertAlmostEqual(saved["vllm_gpu_memory_utilization"], 0.9, places=4)
         self.assertTrue(saved["vllm_enforce_eager"])
@@ -83,6 +87,16 @@ class VastRuntimeSettingsServiceTest(unittest.TestCase):
             )
             saved = self.svc.get_settings()
         self.assertEqual(saved["vllm_model"], "gemma3:27b")
+
+    def test_normalize_sleep_migration_copy_paths_from_csv(self):
+        self.svc.repository.save_settings(
+            {
+                "sleep_migration_copy_paths": "/workspace/, /root/.ollama/ ,",
+                "is_enabled": True,
+            }
+        )
+        saved = self.svc.get_settings()
+        self.assertEqual(saved["sleep_migration_copy_paths"], ["/workspace/", "/root/.ollama/"])
 
 
 if __name__ == "__main__":

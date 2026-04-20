@@ -106,6 +106,10 @@ llm:
 #   endpoint_timeout_sec: 240  # скільки чекаємо саме публікацію зовнішнього endpoint (ssh/port-forward), далі failover на інший офер
 #   boot_timeout_sec: 1200
 #   ready_timeout_sec: 1200
+#   sleep_wakeup_timeout_sec: 300   # якщо paused instance не прокидається > N сек, оркестратор мігрує сесію на новий інстанс
+#   sleep_migration_enabled: true
+#   sleep_migration_copy_paths: ["/workspace/", "/root/.ollama/"]  # шляхи для copy_direct src->dst
+#   sleep_migration_settle_sec: 45  # технічна пауза після запуску copy_direct перед destroy source
 #   region_like: "de,eu"          # пріоритетні регіони/геолокації Vast offer (через кому)
 #   datacenter_like: "hetzner"    # пріоритетні датацентри Vast offer (через кому)
 #   pause_after_idle_sec: 60      # якщо LLM-черга порожня > N сек після ready -> pause instance

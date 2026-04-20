@@ -695,19 +695,44 @@ class VllmRuntimeOrchestrator:
             return
         instance_id = self._instance_id
         client = VastAiClient(api_key=cfg.get("vast_api_key", ""), timeout_sec=min(60, int(cfg.get("boot_timeout_sec") or 900)))
+        resume_started_ts = time.time()
         try:
             client.start_instance(instance_id)
         except Exception:
             # Якщо інстанс already running — ігноруємо та переходимо до перевірки endpoint.
             pass
         endpoint_timeout_sec = int(cfg.get("endpoint_timeout_sec") or min(1200, int(cfg.get("boot_timeout_sec") or 1200)))
-        network_info = self._wait_for_network_endpoint_info(
-            client,
-            instance_id,
-            endpoint_timeout_sec,
-            int(cfg.get("vllm_port") or 8000),
-            heartbeat_fn=lambda: self._coord_renew_lease(cfg, state="resuming"),
-        )
+        try:
+            network_info = self._wait_for_network_endpoint_info(
+                client,
+                instance_id,
+                endpoint_timeout_sec,
+                int(cfg.get("vllm_port") or 8000),
+                heartbeat_fn=lambda: self._coord_renew_lease(cfg, state="resuming"),
+            )
+        except Exception as resume_error:
+            wakeup_timeout_sec = int(cfg.get("sleep_wakeup_timeout_sec") or 300)
+            waited_sec = max(0, int(time.time() - resume_started_ts))
+            migration_enabled = bool(cfg.get("sleep_migration_enabled", True))
+            should_migrate = migration_enabled and wakeup_timeout_sec > 0 and waited_sec >= wakeup_timeout_sec
+            if not should_migrate:
+                raise
+            self._log_gpu_usage(
+                "gpu_sleep_migration_triggered",
+                {
+                    "instance_id": instance_id,
+                    "waited_sec": waited_sec,
+                    "wakeup_timeout_sec": wakeup_timeout_sec,
+                    "error": str(resume_error),
+                },
+            )
+            network_info = self._migrate_sleeping_instance_to_new_contract_locked(
+                client=client,
+                cfg=cfg,
+                source_instance_id=instance_id,
+                wakeup_error=resume_error,
+            )
+            instance_id = str(self._instance_id or instance_id)
         public_endpoint = network_info["endpoint"]
         instance_payload = network_info["payload"]
         self._public_endpoint = public_endpoint
@@ -753,6 +778,118 @@ class VllmRuntimeOrchestrator:
                     "resumed_at": datetime.now(timezone.utc),
                 },
             )
+
+    @staticmethod
+    def _sleep_migration_copy_paths(cfg: Dict[str, Any]) -> List[str]:
+        raw = cfg.get("sleep_migration_copy_paths") or ["/workspace/", "/root/.ollama/"]
+        if isinstance(raw, str):
+            values = [x.strip() for x in raw.split(",")]
+        elif isinstance(raw, (list, tuple, set)):
+            values = [str(x).strip() for x in raw]
+        else:
+            values = ["/workspace/"]
+        out = [x for x in values if x]
+        return out or ["/workspace/"]
+
+    def _create_instance_with_retry_candidates(self, client: VastAiClient, cfg: Dict[str, Any]) -> str:
+        ask_ids = self._select_offer_candidates(client, cfg, limit=5)
+        if not ask_ids:
+            raise RuntimeError("No Vast.ai offers matched the configured constraints for sleep migration.")
+        payload = self._build_create_payload(cfg)
+        last_error = ""
+        for ask_id in ask_ids:
+            try:
+                created = client.create_instance(ask_id=ask_id, payload=payload)
+                new_id = self._normalize_vast_instance_id(
+                    created.get("new_contract") or created.get("instance_id") or created.get("id")
+                )
+                if new_id:
+                    return new_id
+                last_error = f"Vast did not return instance id for ask_id={ask_id}"
+            except Exception as e:
+                last_error = f"create_instance failed for ask_id={ask_id}: {e!s}"
+        raise RuntimeError(last_error or "Failed to create destination instance for sleep migration.")
+
+    def _migrate_sleeping_instance_to_new_contract_locked(
+        self,
+        client: VastAiClient,
+        cfg: Dict[str, Any],
+        source_instance_id: str,
+        wakeup_error: Exception,
+    ) -> Dict[str, Any]:
+        copy_paths = self._sleep_migration_copy_paths(cfg)
+        destination_instance_id = self._create_instance_with_retry_candidates(client, cfg)
+        try:
+            endpoint_timeout_sec = int(cfg.get("endpoint_timeout_sec") or min(1200, int(cfg.get("boot_timeout_sec") or 1200)))
+            network_info = self._wait_for_network_endpoint_info(
+                client,
+                destination_instance_id,
+                endpoint_timeout_sec,
+                int(cfg.get("vllm_port") or 8000),
+                heartbeat_fn=lambda: self._coord_renew_lease(cfg, state="sleep_migration_bootstrap"),
+            )
+            for path in copy_paths:
+                copy_resp = client.copy_direct(
+                    src_id=source_instance_id,
+                    dst_id=destination_instance_id,
+                    src_path=path,
+                    dst_path=path,
+                )
+                self._log_gpu_usage(
+                    "gpu_sleep_migration_copy_started",
+                    {
+                        "source_instance_id": source_instance_id,
+                        "destination_instance_id": destination_instance_id,
+                        "path": path,
+                        "copy_response": copy_resp,
+                    },
+                )
+            settle_sec = max(0, int(cfg.get("sleep_migration_settle_sec") or 45))
+            if settle_sec > 0:
+                time.sleep(settle_sec)
+            try:
+                client.destroy_instance(source_instance_id)
+                self._log_gpu_usage(
+                    "gpu_sleep_migration_source_destroyed",
+                    {
+                        "source_instance_id": source_instance_id,
+                        "destination_instance_id": destination_instance_id,
+                    },
+                )
+            except Exception as e:
+                self._log_gpu_usage(
+                    "gpu_sleep_migration_source_destroy_failed",
+                    {
+                        "source_instance_id": source_instance_id,
+                        "destination_instance_id": destination_instance_id,
+                        "error": str(e),
+                    },
+                )
+            self._instance_id = destination_instance_id
+            self._instance_paused = False
+            self._coord_update_state(
+                state="resuming",
+                instance_id=destination_instance_id,
+                endpoint=None,
+                public_endpoint=None,
+                last_error="",
+            )
+            self._log_gpu_usage(
+                "gpu_sleep_migration_done",
+                {
+                    "source_instance_id": source_instance_id,
+                    "destination_instance_id": destination_instance_id,
+                    "copy_paths": copy_paths,
+                    "wakeup_error": str(wakeup_error),
+                },
+            )
+            return network_info
+        except Exception:
+            try:
+                client.destroy_instance(destination_instance_id)
+            except Exception:
+                pass
+            raise
 
     def _wait_for_network_endpoint_info(
         self,

@@ -10,6 +10,7 @@ import unittest
 import threading
 import time
 import requests
+from unittest.mock import patch
 
 from business.services.vllm_runtime_orchestrator import VllmRuntimeOrchestrator
 
@@ -276,6 +277,62 @@ class VllmRuntimeOrchestratorTest(unittest.TestCase):
         self.assertTrue(called["resumed"])
         self.assertEqual(obj._empty_queue_since_ts, 0.0)
         self.assertEqual(obj._paused_since_ts, 0.0)
+
+    def test_resume_instance_triggers_sleep_migration_after_timeout(self):
+        class _FakeClient:
+            def __init__(self, api_key: str, timeout_sec: int = 30) -> None:
+                self.api_key = api_key
+                self.timeout_sec = timeout_sec
+
+            @staticmethod
+            def start_instance(_instance_id: str):
+                return {"success": True}
+
+        obj = VllmRuntimeOrchestrator.__new__(VllmRuntimeOrchestrator)
+        obj._instance_id = "src-instance"
+        obj._instance_paused = True
+        obj._session_id = None
+        obj._endpoint = None
+        obj._public_endpoint = None
+        obj._coord_update_state = lambda *args, **kwargs: None
+        obj._coord_renew_lease = lambda *args, **kwargs: None
+        obj._start_instance_observability = lambda *args, **kwargs: None
+        obj._wait_for_runtime_readiness = lambda public_endpoint, _timeout_sec, _cfg: public_endpoint
+        obj._use_ollama_runtime = lambda _cfg: False
+        captured_events = []
+        obj._log_gpu_usage = lambda event, metadata: captured_events.append((event, metadata))
+        obj._wait_for_network_endpoint_info = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("Vast instance endpoint timeout: host/port mapping")
+        )
+        migration_called = {"value": False}
+
+        def _migration(*_args, **_kwargs):
+            migration_called["value"] = True
+            obj._instance_id = "dst-instance"
+            return {"endpoint": "http://new-runtime:8000", "payload": {}}
+
+        obj._migrate_sleeping_instance_to_new_contract_locked = _migration
+        cfg = {
+            "vast_api_key": "secret",
+            "boot_timeout_sec": 1200,
+            "endpoint_timeout_sec": 1200,
+            "ready_timeout_sec": 1200,
+            "vllm_port": 8000,
+            "sleep_wakeup_timeout_sec": 5,
+            "sleep_migration_enabled": True,
+        }
+
+        with patch("business.services.vllm_runtime_orchestrator.VastAiClient", _FakeClient), patch(
+            "business.services.vllm_runtime_orchestrator.time.time",
+            side_effect=[100.0, 106.0],
+        ):
+            obj._resume_instance_locked(cfg)
+
+        self.assertTrue(migration_called["value"])
+        self.assertEqual(obj._instance_id, "dst-instance")
+        self.assertFalse(obj._instance_paused)
+        self.assertEqual(obj._endpoint, "http://new-runtime:8000")
+        self.assertTrue(any(event == "gpu_sleep_migration_triggered" for event, _meta in captured_events))
 
 
 if __name__ == "__main__":

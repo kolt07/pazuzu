@@ -101,3 +101,22 @@ class VastAiClient:
 
     def destroy_instance(self, instance_id: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/instances/{instance_id}/")
+
+    def copy_direct(
+        self,
+        src_id: str,
+        dst_id: str,
+        src_path: str,
+        dst_path: str,
+    ) -> Dict[str, Any]:
+        """Ініціює remote-copy між інстансами (Vast API copy_direct)."""
+        return self._request(
+            "PUT",
+            "/commands/copy_direct/",
+            json={
+                "src_id": str(src_id),
+                "dst_id": str(dst_id),
+                "src_path": str(src_path),
+                "dst_path": str(dst_path),
+            },
+        )
