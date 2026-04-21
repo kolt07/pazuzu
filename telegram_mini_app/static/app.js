@@ -1813,6 +1813,7 @@
           });
       });
     }
+  }
 
   function initAdminSubtabs() {
     var tabs = document.querySelectorAll("#screen-admin .admin-subtab");
