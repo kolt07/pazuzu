@@ -85,7 +85,7 @@ services:
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pazuzu}
       RABBITMQ_VHOST: ${RABBITMQ_DEFAULT_VHOST:-pazuzu}
-    command: ["python", "-m", "celery", "-A", "business.celery_worker_entry:celery_app", "worker", "-Q", "source_load", "--loglevel=info", "--concurrency=1"]
+    command: ["python", "-m", "business.celery_worker_runner", "source_load"]
 
   pazuzu-llm-worker:
     build:
@@ -112,7 +112,7 @@ services:
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pazuzu}
       RABBITMQ_VHOST: ${RABBITMQ_DEFAULT_VHOST:-pazuzu}
-    command: ["python", "-m", "celery", "-A", "business.celery_worker_entry:celery_app", "worker", "-Q", "llm_processing", "--loglevel=info", "--concurrency=1"]
+    command: ["python", "-m", "business.celery_worker_runner", "llm_processing"]
 
   ngrok:
     profiles:

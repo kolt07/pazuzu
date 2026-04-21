@@ -113,6 +113,31 @@ class BackgroundTaskRepository(BaseRepository):
         self._ensure_indexes()
         return int(self.collection.count_documents({"queue_name": queue_name, "state": {"$in": states}}))
 
+    def get_queue_state_counts(self, queue_name: str) -> Dict[str, int]:
+        self._ensure_indexes()
+        pipeline = [
+            {"$match": {"queue_name": str(queue_name or "").strip()}},
+            {"$group": {"_id": "$state", "count": {"$sum": 1}}},
+        ]
+        out: Dict[str, int] = {}
+        for row in self.collection.aggregate(pipeline):
+            state = str(row.get("_id") or "").strip().lower()
+            if not state:
+                continue
+            out[state] = int(row.get("count") or 0)
+        return out
+
+    def get_latest_task_for_queue(self, queue_name: str) -> Optional[Dict[str, Any]]:
+        self._ensure_indexes()
+        doc = self.collection.find_one(
+            {"queue_name": str(queue_name or "").strip()},
+            sort=[("updated_at", -1)],
+        )
+        if not doc:
+            return None
+        doc["_id"] = str(doc["_id"])
+        return doc
+
     def has_recent_activity(self, queue_name: str, states: List[str], within_seconds: int) -> bool:
         self._ensure_indexes()
         threshold = datetime.now(timezone.utc) - timedelta(seconds=max(1, int(within_seconds)))

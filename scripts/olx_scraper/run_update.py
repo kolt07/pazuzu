@@ -1061,6 +1061,41 @@ def _process_single_llm_pending_url(
         t_llm = time.perf_counter() - t0
         if llm_data:
             detail_data["llm"] = llm_data
+        if llm_extractor.has_cadastral_in_price_text(search_data):
+            recovered_price = llm_extractor.recover_price_ignoring_cadastral(search_data, detail_data)
+            llm_meta = detail_data.get("llm")
+            if not isinstance(llm_meta, dict):
+                llm_meta = {}
+                detail_data["llm"] = llm_meta
+            recovery_meta = {
+                "status": "failed",
+                "reason": "price_text_contains_cadastral_number",
+            }
+            recovered_value = recovered_price.get("price_value")
+            if recovered_value is not None:
+                old_price = search_data.get("price_value")
+                search_data["price_value"] = recovered_value
+                recovered_currency = (recovered_price.get("currency") or "").strip().upper()
+                if recovered_currency in ("UAH", "USD", "EUR"):
+                    search_data["currency"] = recovered_currency
+                recovered_price_text = (recovered_price.get("price_text") or "").strip()
+                if recovered_price_text:
+                    search_data["price_text"] = recovered_price_text
+                recovery_meta["status"] = "recovered"
+                recovery_meta["old_price_value"] = old_price
+                recovery_meta["new_price_value"] = recovered_value
+                logger.info(
+                    "[OLX] Виправлено ціну після кадастрового конфлікту: old=%s new=%s url=%s",
+                    old_price,
+                    recovered_value,
+                    listing_url[:60] + "...",
+                )
+            else:
+                logger.warning(
+                    "[OLX] Не вдалося відновити ціну після кадастрового конфлікту: url=%s",
+                    listing_url[:60] + "...",
+                )
+            llm_meta["price_recovery"] = recovery_meta
         new_hash = detail_data.get("llm_content_hash")
         if new_hash:
             detail_data["llm_content_hash"] = new_hash

@@ -1,5 +1,16 @@
 # Історія розробки
 
+## 2026-04-21 — Асинхронний health-check runtime + багатопотоковий LLM worker
+
+- **Запит**: Прибрати повний health-check перед кожним LLM-викликом до віддаленого GPU, залишити lifecycle/health під контролем оркестратора, запускати примусову перевірку лише після серії невдалих запитів та зробити LLM-обробку багатопотоковою з конфігурованою кількістю потоків (default 3) для однієї черги RabbitMQ.
+- **Дії**: У `VllmRuntimeOrchestrator` додано неблокуючий шлях `get_cached_runtime_endpoint()` (без синхронного readiness-пінгу), лічильник `consecutive_failures`, фоновий воркер примусових health-check (`schedule_forced_healthcheck` + `_forced_check_loop`) і API `report_inference_success/report_inference_failure`. У `VllmRemoteLLMProvider` прибрано виклик `ensure_runtime_ready()` на кожен запит; тепер провайдер працює лише з кешованим endpoint, а при серії помилок тригерить асинхронний forced health-check.
+- **LLM worker concurrency**: Додано налаштування `task_queue.llm_worker_threads` (та `source_worker_threads`) у `Settings`, новий launcher `business/celery_worker_runner.py`, і оновлено `docker-compose.yml`/документацію так, щоб `pazuzu-llm-worker` читав кількість потоків з конфігу (default 3) при роботі з єдиною чергою `llm_processing`.
+
+## 2026-04-21 — GPU витрати з Vast billing API (charges)
+
+- **Запит**: Не оцінювати вартість GPU за `max_hourly_usd`, а брати фактичні charges з Vast (`GET /api/v0/charges/`).
+- **Дії**: `VastAiClient.list_charges`, `vast_billing_service` — пагінація та сума рядків `type=instance` для інстанса / за календарні дні UTC. У `VllmRuntimeOrchestrator._teardown_locked` після сесії викликається `fetch_instance_contract_charges_usd`, у лог і `gpu_runtime_sessions` пишеться `billed_cost_usd`. Агрегація логів і admin `usage-stats` використовують `billed_cost_usd` з fallback на старий `estimated_cost_usd`; добові суми в адмінці при наявності `vast_api_key` підмішуються з Vast по днях; за місяць — сума останніх 30 календарних днів з Vast.
+
 ## 2026-04-20 — Послідовний LLM phase + прогрес черги X/Y
 
 - **Запит**: Вимкнути паралельну LLM-обробку під час завантаження сирих даних, виконувати LLM-операції через `llm-worker`, додати в логах стан черги у форматі «оброблено X з Y».
@@ -2795,3 +2806,25 @@
 - У `VastRuntimeSettingsService` додано нові параметри: `sleep_wakeup_timeout_sec`, `sleep_migration_enabled`, `sleep_migration_copy_paths`, `sleep_migration_settle_sec` (з нормалізацією).
 - У `VllmRuntimeOrchestrator._resume_instance_locked` додано failover-механіку: при timeout wakeup запускається міграція на новий контракт, копіювання даних через Vast copy API, знищення source та продовження ready-check уже на destination.
 - Додано unit-тести: `scripts/test_vllm_runtime_orchestrator.py` (тригер міграції при resume-timeout), `scripts/test_vast_runtime_settings_service.py` (дефолти/нормалізація нових налаштувань).
+
+## 2026-04-21 — OLX: захист від підміни ціни кадастровим номером + fallback-перепарсинг
+- Запит: додати в обробнику OLX перевірку випадків, коли ціна розпізнана у форматі кадастрового номера, та запускати повторний LLM-прохід окремим промптом, що шукає тільки ціну.
+- У `scripts/olx_scraper/run_update.py` додано перевірку `price_text/price` на формат кадастрового номера; при спрацьовуванні виконується повторне відновлення ціни, оновлюються `search_data.price_value/currency/price_text`, а в `detail.llm.price_recovery` зберігається статус.
+- У `business/services/olx_llm_extractor_service.py` додано детектор кадастрового конфлікту в полі ціни та окремий шлях `recover_price_ignoring_cadastral(...)` з кешем (`olx_price_recovery_*`).
+- У `business/services/llm_service.py` додано метод `parse_olx_price_recovery(...)` для виклику parsing-провайдера спеціальним промптом і нормалізації повернених `price_value/currency/price_text`.
+- У `config/prompts.yaml` додано промпт `olx_price_recovery`, який інструктує ігнорувати кадастрові номери як кандидати на ціну.
+
+## 2026-04-21 — Mini App Admin: структуроване меню та керування чергами
+- Запит: «причесати» інтерфейс адміністрування (розбити по підменю) та додати панель стану/керування чергами задач (source load, LLM processing) з pause/disable.
+- У `telegram_mini_app/static/index.html` оновлено навігацію Admin: додано окремі підменю `Черги задач` і `Користувачі`, перерозкладено блоки по розділах, додано нову панель `Стан та керування чергами`.
+- У `telegram_mini_app/static/styles.css` додано стилі для нового submenu Admin (`admin-subtabs`, `admin-subtab`) і карток черг (`admin-queue-*`) для чистішого, більш читабельного UI.
+- У `telegram_mini_app/static/app.js` додано завантаження/рендер стану черг, кнопки керування (`Resume/Pause/Disable`), авто-оновлення при відкритті відповідного підменю, та інтеграцію з новими API.
+- У `telegram_mini_app/routes/admin.py` додано API:
+  - `GET /api/admin/task-queues/status` — знімок стану черг;
+  - `POST /api/admin/task-queues/control` — дії `pause/resume/disable/enable`.
+- У `business/services/task_queue_service.py` додано persistent control state черг (`running/paused/disabled`) та snapshot з лічильниками.
+- Додано `data/repositories/task_queue_controls_repository.py` для збереження стану керування чергами в MongoDB.
+- У `business/tasks.py` додано дотримання queue control на старті задач:
+  - `paused` → відкладений retry;
+  - `disabled` → пропуск виконання з фіксацією failed/reason.
+- У `data/repositories/background_task_repository.py` додано агрегати по станах черги та отримання останньої задачі для UI-моніторингу.

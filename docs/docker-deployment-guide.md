@@ -14,7 +14,7 @@
 | **RabbitMQ** | `pazuzu-rabbitmq` | Брокер черг для Celery (`rabbitmq:4-management`) |
 | **Застосунок** | `pazuzu-app` | `main.py` (Telegram-бот тощо), `TASK_QUEUE_ENABLED=true` |
 | **Celery: source** | `pazuzu-source-worker` | Черга `source_load` |
-| **Celery: LLM** | `pazuzu-llm-worker` | Черга `llm_processing` |
+| **Celery: LLM** | `pazuzu-llm-worker` | Черга `llm_processing` (паралелізм з `task_queue.llm_worker_threads`) |
 | **ngrok** | `pazuzu-ngrok` | Тунель до `pazuzu-app:8000` (лише з профілем `ngrok`) |
 
 **Порти на хості:** `27017` (MongoDB), `5672` / `15672` (RabbitMQ), `4040` (веб-інспектор ngrok — якщо запущено сервіс ngrok). HTTP застосунку всередині мережі — `pazuzu-app:8000` (для ngrok-команди в compose).
@@ -268,7 +268,7 @@ services:
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pazuzu}
       RABBITMQ_VHOST: ${RABBITMQ_DEFAULT_VHOST:-pazuzu}
-    command: ["python", "-m", "celery", "-A", "business.celery_worker_entry:celery_app", "worker", "-Q", "source_load", "--loglevel=info", "--concurrency=1"]
+    command: ["python", "-m", "business.celery_worker_runner", "source_load"]
 
   pazuzu-llm-worker:
     build:
@@ -294,7 +294,7 @@ services:
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-pazuzu}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-pazuzu}
       RABBITMQ_VHOST: ${RABBITMQ_DEFAULT_VHOST:-pazuzu}
-    command: ["python", "-m", "celery", "-A", "business.celery_worker_entry:celery_app", "worker", "-Q", "llm_processing", "--loglevel=info", "--concurrency=1"]
+    command: ["python", "-m", "business.celery_worker_runner", "llm_processing"]
 
   ngrok:
     profiles:

@@ -3,6 +3,7 @@
 Клієнт Vast.ai REST API для lifecycle оренди GPU.
 """
 
+import json
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -120,3 +121,28 @@ class VastAiClient:
                 "dst_path": str(dst_path),
             },
         )
+
+    def list_charges(
+        self,
+        select_filters: Dict[str, Any],
+        *,
+        limit: int = 500,
+        after_token: Optional[str] = None,
+        fmt: str = "table",
+        latest_first: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Billing: charges per instance / volume (GET /api/v0/charges/).
+
+        Документація: https://docs.vast.ai/api-reference/billing/show-charges
+        Параметр ``select_filters`` передається JSON-рядком у query (вимога API).
+        """
+        params: Dict[str, Any] = {
+            "select_filters": json.dumps(select_filters, separators=(",", ":")),
+            "limit": min(500, max(1, int(limit))),
+            "format": fmt,
+            "latest_first": "true" if latest_first else "false",
+        }
+        if after_token:
+            params["after_token"] = after_token
+        return self._request("GET", "/charges/", params=params)

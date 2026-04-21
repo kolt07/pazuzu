@@ -124,6 +124,8 @@ class Settings:
         self.task_queue_enabled = os.getenv('TASK_QUEUE_ENABLED', 'false').lower() in ('true', '1', 'yes')
         self.task_queue_broker_url = os.getenv('TASK_QUEUE_BROKER_URL', '').strip()
         self.task_queue_result_backend = os.getenv('TASK_QUEUE_RESULT_BACKEND', 'rpc://').strip()
+        self.task_queue_llm_worker_threads = int(os.getenv('TASK_QUEUE_LLM_WORKER_THREADS', '3'))
+        self.task_queue_source_worker_threads = int(os.getenv('TASK_QUEUE_SOURCE_WORKER_THREADS', '1'))
         self.rabbitmq_host = os.getenv('RABBITMQ_HOST', 'localhost').strip()
         self.rabbitmq_port = int(os.getenv('RABBITMQ_PORT', '5672'))
         self.rabbitmq_user = os.getenv('RABBITMQ_USER', 'guest').strip()
@@ -291,6 +293,10 @@ class Settings:
                                 self.task_queue_broker_url = str(tq['broker_url'] or '').strip()
                             if 'result_backend' in tq:
                                 self.task_queue_result_backend = str(tq['result_backend'] or '').strip()
+                            if 'llm_worker_threads' in tq:
+                                self.task_queue_llm_worker_threads = int(tq['llm_worker_threads'])
+                            if 'source_worker_threads' in tq:
+                                self.task_queue_source_worker_threads = int(tq['source_worker_threads'])
                             if 'rabbitmq_host' in tq:
                                 self.rabbitmq_host = str(tq['rabbitmq_host'] or '').strip()
                             if 'rabbitmq_port' in tq:
@@ -352,4 +358,6 @@ class Settings:
                 f"amqp://{self.rabbitmq_user}:{self.rabbitmq_password}"
                 f"@{self.rabbitmq_host}:{self.rabbitmq_port}/{self.rabbitmq_vhost}"
             )
+        self.task_queue_llm_worker_threads = max(1, int(self.task_queue_llm_worker_threads or 3))
+        self.task_queue_source_worker_threads = max(1, int(self.task_queue_source_worker_threads or 1))
 

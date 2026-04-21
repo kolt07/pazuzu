@@ -720,6 +720,7 @@
           loadAdminCadastralStats();
           loadAdminOlxClickerStats();
           loadAdminUsageStats();
+          loadAdminQueueStatus();
           loadAdminLlmRegions();
         });
         nav.appendChild(a3);
@@ -1739,6 +1740,7 @@
       var olxClickerRefreshStatsBtn = document.getElementById("admin-olx-clicker-refresh-stats");
       if (olxClickerRefreshStatsBtn) olxClickerRefreshStatsBtn.addEventListener("click", loadAdminOlxClickerStats);
       initAdminVastRuntimeSettings();
+      initAdminQueueControls();
       initAdminScheduler();
       initAdminFeedback();
     }
@@ -1816,6 +1818,23 @@
     var tabs = document.querySelectorAll("#screen-admin .admin-subtab");
     var blocks = document.querySelectorAll("#screen-admin .admin-block[data-admin-tab]");
     if (!tabs.length || !blocks.length) return;
+    function onTabActivated(tabName) {
+      if (tabName === "overview") {
+        loadAdminUsageStats();
+      }
+      if (tabName === "queues") {
+        loadAdminQueueStatus();
+      }
+      if (tabName === "cadastral") {
+        loadAdminCadastralStats();
+      }
+      if (tabName === "data") {
+        loadAdminLlmRegions();
+      }
+      if (tabName === "config") {
+        loadAdminIntegrityStatus();
+      }
+    }
     function applyTab(tabName) {
       blocks.forEach(function (block) {
         var t = block.getAttribute("data-admin-tab");
@@ -1839,11 +1858,126 @@
           }
         });
         applyTab(tab);
+        onTabActivated(tab);
       });
     });
     var active = document.querySelector("#screen-admin .admin-subtab.active");
     var initialTab = (active && active.getAttribute("data-tab")) || "overview";
     applyTab(initialTab);
+    onTabActivated(initialTab);
+  }
+
+  function initAdminQueueControls() {
+    var refreshBtn = document.getElementById("admin-queue-refresh");
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", function () {
+        loadAdminQueueStatus();
+      });
+    }
+    var cards = document.getElementById("admin-queue-cards");
+    if (cards && !cards.dataset.bound) {
+      cards.addEventListener("click", function (e) {
+        var btn = e.target && e.target.closest("button[data-queue][data-action]");
+        if (!btn) return;
+        e.preventDefault();
+        var queueName = btn.getAttribute("data-queue");
+        var action = btn.getAttribute("data-action");
+        if (!queueName || !action) return;
+        controlAdminQueue(queueName, action);
+      });
+      cards.dataset.bound = "1";
+    }
+  }
+
+  function loadAdminQueueStatus() {
+    var statusEl = document.getElementById("admin-queue-controls-status");
+    var cardsEl = document.getElementById("admin-queue-cards");
+    if (!cardsEl) return;
+    cardsEl.innerHTML = "<p class=\"admin-hint\">Завантаження стану черг...</p>";
+    if (statusEl) statusEl.textContent = "";
+    fetch("/api/admin/task-queues/status", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function (data) {
+        renderAdminQueueStatus(data);
+      })
+      .catch(function (err) {
+        cardsEl.innerHTML = "<p class=\"admin-hint\" style=\"color:var(--tg-theme-destructive-text-color)\">" + (err.message || "Не вдалося завантажити стан черг") + "</p>";
+      });
+  }
+
+  function renderAdminQueueStatus(data) {
+    var statusEl = document.getElementById("admin-queue-controls-status");
+    var cardsEl = document.getElementById("admin-queue-cards");
+    if (!cardsEl) return;
+    var queues = (data && data.queues) || [];
+    if (!data.task_queue_enabled) {
+      if (statusEl) statusEl.textContent = "Brokered queue вимкнено в налаштуваннях (task_queue_enabled=false).";
+    } else if (statusEl) {
+      statusEl.textContent = "Черга увімкнена. Керування станом застосовується одразу для нових задач.";
+    }
+    if (!queues.length) {
+      cardsEl.innerHTML = "<p class=\"admin-hint\">Немає даних про черги.</p>";
+      return;
+    }
+    cardsEl.innerHTML = queues.map(function (q) {
+      var name = q.queue_name || "unknown";
+      var state = q.control_state || "running";
+      var counts = q.counts || {};
+      var rabbit = q.rabbit_messages;
+      var total = 0;
+      Object.keys(counts).forEach(function (k) { total += Number(counts[k] || 0); });
+      var latest = q.latest_task || null;
+      var latestText = "—";
+      if (latest && latest.task_id) {
+        latestText = "Остання: " + (latest.state || "unknown") + " (" + String(latest.task_id).slice(0, 8) + "...)";
+      }
+      var stateClass = state === "disabled" ? "error" : state === "paused" ? "running" : "done";
+      var rabbitText = rabbit == null ? "н/д" : String(rabbit);
+      var runningCount = Number(counts.running || 0) + Number(counts.started || 0) + Number(counts.received || 0) + Number(counts.retry || 0);
+      return (
+        "<div class=\"admin-queue-card\">" +
+          "<div class=\"admin-queue-card-header\">" +
+            "<div><strong>" + escapeHtml(name) + "</strong></div>" +
+            "<span class=\"admin-queue-state " + stateClass + "\">" + escapeHtml(state) + "</span>" +
+          "</div>" +
+          "<div class=\"admin-queue-metrics\">" +
+            "<span>RabbitMQ: " + escapeHtml(rabbitText) + "</span>" +
+            "<span>В БД: " + escapeHtml(String(total)) + "</span>" +
+            "<span>Активних: " + escapeHtml(String(runningCount)) + "</span>" +
+          "</div>" +
+          "<div class=\"admin-hint\">" + escapeHtml(latestText) + "</div>" +
+          "<div class=\"admin-queue-actions\">" +
+            "<button type=\"button\" class=\"btn btn-small\" data-queue=\"" + escapeHtml(name) + "\" data-action=\"resume\">Resume</button>" +
+            "<button type=\"button\" class=\"btn btn-small\" data-queue=\"" + escapeHtml(name) + "\" data-action=\"pause\">Pause</button>" +
+            "<button type=\"button\" class=\"btn btn-danger btn-small\" data-queue=\"" + escapeHtml(name) + "\" data-action=\"disable\">Disable</button>" +
+          "</div>" +
+        "</div>"
+      );
+    }).join("");
+  }
+
+  function controlAdminQueue(queueName, action) {
+    var statusEl = document.getElementById("admin-queue-controls-status");
+    if (statusEl) statusEl.textContent = "Оновлення стану черги " + queueName + "...";
+    fetch("/api/admin/task-queues/control", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ queue_name: queueName, action: action })
+    })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function () {
+        if (statusEl) statusEl.textContent = "Стан черги " + queueName + " оновлено (" + action + ").";
+        loadAdminQueueStatus();
+      })
+      .catch(function (err) {
+        if (statusEl) statusEl.textContent = "Помилка: " + (err.message || "Не вдалося оновити стан черги");
+      });
   }
 
   function adminCheckOlxScraperHealth() {
@@ -2166,12 +2300,12 @@
         if (geo.cache_hits_total != null) geoStr += ", з кешу " + geo.cache_hits_total;
         var gpuTotalMin = gpu.active_minutes_total || 0;
         var gpuMonthMin = gpu.active_minutes_last_month || 0;
-        var gpuCost = gpu.estimated_cost_usd_total || 0;
-        var gpuCostMonth = gpu.estimated_cost_usd_last_month || 0;
+        var gpuCost = gpu.billed_cost_usd_total != null ? gpu.billed_cost_usd_total : (gpu.estimated_cost_usd_total || 0);
+        var gpuCostMonth = gpu.billed_cost_usd_last_month != null ? gpu.billed_cost_usd_last_month : (gpu.estimated_cost_usd_last_month || 0);
         var gpuStr = "GPU runtime: " + gpuTotalMin.toFixed(1) + " хв";
-        if (gpuCost > 0) gpuStr += ", ~$" + gpuCost.toFixed(4);
+        if (gpuCost > 0) gpuStr += ", Vast $" + gpuCost.toFixed(4);
         gpuStr += " (за міс. " + gpuMonthMin.toFixed(1) + " хв";
-        if (gpuCostMonth > 0) gpuStr += ", ~$" + gpuCostMonth.toFixed(4);
+        if (gpuCostMonth > 0) gpuStr += ", Vast $" + gpuCostMonth.toFixed(4);
         gpuStr += ")";
         summaryEl.innerHTML = "<strong>" + llmStr + "</strong> &nbsp;|&nbsp; <strong>" + geoStr + "</strong> &nbsp;|&nbsp; <strong>" + gpuStr + "</strong>";
         if (data.error) summaryEl.innerHTML += " <span class=\"admin-hint\">(" + data.error + ")</span>";

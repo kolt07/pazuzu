@@ -235,6 +235,7 @@ def run_full_pipeline(
     olx_phase1_max_threads: Optional[int] = None,
     use_brokered_llm: bool = False,
     llm_wait_heartbeat_fn: Optional[Callable[[], None]] = None,
+    run_phase3: bool = True,
 ) -> Dict[str, Any]:
     """
     Запускає повний pipeline: Phase 1 (raw) → Phase 2 (promote + LLM для обраних) → Phase 3 (аналітика + гео).
@@ -248,6 +249,7 @@ def run_full_pipeline(
         listing_types: точкове оновлення OLX — лише категорії, чий label містить один із рядків (напр. «Нежитлова», «Земля»).
         use_browser_olx: якщо задано (True/False) — перевизначає settings.olx_use_browser для цього запуску (напр. з адмінки).
         olx_phase1_max_threads: кількість потоків Phase 1 OLX (пул завдань область+категорія); None = з конфігу; 0 = legacy (по області).
+        run_phase3: якщо False — пропускає перерахунок аналітик/гео-індексу (Phase 3).
 
     Returns:
         Словник з результатами по фазах та джерелах.
@@ -284,6 +286,7 @@ def run_full_pipeline(
             "phase1": {},
             "phase2": {"olx_llm_processed": 0, "prozorro_llm_processed": 0},
             "phase3": {},
+            "core_completed": False,
         }
 
         # ---------- Phase 1: завантаження сирих даних ----------
@@ -503,7 +506,13 @@ def run_full_pipeline(
             except Exception as e:
                 logger.debug("Збереження дати оновлення ProZorro: %s", e)
 
-        _run_phase3_post_processing(sources, result, log_fn=log_fn)
+        result["core_completed"] = True
+        log("[Source load] Core pipeline завершено: raw + promote/main + LLM виконано успішно.")
+        if run_phase3:
+            _run_phase3_post_processing(sources, result, log_fn=log_fn)
+        else:
+            result["phase3"]["skipped"] = True
+            log("[Source load] Phase 3 пропущено (run_phase3=False).")
 
         return result
     finally:

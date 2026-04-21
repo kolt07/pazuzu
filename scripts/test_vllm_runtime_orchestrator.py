@@ -105,10 +105,16 @@ class VllmRuntimeOrchestratorTest(unittest.TestCase):
         e400 = requests.HTTPError("400 Bad Request", response=r2)
         self.assertFalse(VllmRuntimeOrchestrator._is_rate_limited_error(e400))
 
-    def test_estimated_cost(self):
-        obj = VllmRuntimeOrchestrator.__new__(VllmRuntimeOrchestrator)
-        cost = obj._estimate_cost_usd(active_seconds=1800, cfg={"max_hourly_usd": 1.2})
-        self.assertAlmostEqual(cost, 0.6, places=6)
+    def test_sum_instance_rows_usd_filters_and_sums(self):
+        from business.services.vast_billing_service import sum_instance_rows_usd
+
+        rows = [
+            {"type": "instance", "source": "instance-42", "amount": 0.1},
+            {"type": "instance", "source": "instance-99", "amount": 9.0},
+            {"type": "volume", "source": "vol-1", "amount": 1.0},
+        ]
+        self.assertAlmostEqual(sum_instance_rows_usd(iter(rows), instance_id="42"), 0.1, places=6)
+        self.assertAlmostEqual(sum_instance_rows_usd(iter(rows), instance_id=None), 9.1, places=6)
 
     def test_select_offer_prefers_compatible_gpu_over_cheaper_incompatible(self):
         class _FakeClient:
@@ -333,6 +339,41 @@ class VllmRuntimeOrchestratorTest(unittest.TestCase):
         self.assertFalse(obj._instance_paused)
         self.assertEqual(obj._endpoint, "http://new-runtime:8000")
         self.assertTrue(any(event == "gpu_sleep_migration_triggered" for event, _meta in captured_events))
+
+    def test_get_cached_runtime_endpoint_prefers_local_state_without_healthcheck(self):
+        obj = VllmRuntimeOrchestrator.__new__(VllmRuntimeOrchestrator)
+        obj._lock = threading.Lock()
+        obj._endpoint = "http://127.0.0.1:8000"
+        obj._instance_paused = False
+
+        class _Settings:
+            @staticmethod
+            def get_settings():
+                return {"is_enabled": True}
+
+        obj._settings_svc = _Settings()
+        obj._coord = None
+        endpoint = obj.get_cached_runtime_endpoint(wait_timeout_sec=0)
+        self.assertEqual(endpoint, "http://127.0.0.1:8000")
+
+    def test_report_inference_failure_schedules_forced_healthcheck_on_threshold(self):
+        obj = VllmRuntimeOrchestrator.__new__(VllmRuntimeOrchestrator)
+        obj._lock = threading.Lock()
+        obj._runtime_fail_streak = 0
+        obj._log_gpu_usage = lambda *_args, **_kwargs: None
+        calls = {"scheduled": 0}
+
+        class _Settings:
+            @staticmethod
+            def get_settings():
+                return {"forced_healthcheck_after_failures": 3}
+
+        obj._settings_svc = _Settings()
+        obj.schedule_forced_healthcheck = lambda reason=None: calls.update({"scheduled": calls["scheduled"] + 1})
+        obj.report_inference_failure("err-1")
+        obj.report_inference_failure("err-2")
+        obj.report_inference_failure("err-3")
+        self.assertEqual(calls["scheduled"], 1)
 
 
 if __name__ == "__main__":

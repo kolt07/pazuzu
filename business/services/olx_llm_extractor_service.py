@@ -14,16 +14,23 @@ LLM-парсер сторінок оголошень OLX.
   заголовка, локації, параметрів, опису та контактних даних (витягнутих із detail).
 """
 
+import logging
+import re
 from typing import Dict, Any
 
 from config.settings import Settings
 from business.services.llm_service import LLMService
 from business.services.llm_cache_service import LLMCacheService
-from utils.hash_utils import calculate_object_version_hash
+from utils.hash_utils import calculate_object_version_hash, calculate_description_hash
+
+
+logger = logging.getLogger(__name__)
 
 
 class OlxLLMExtractorService:
     """Сервіс, що застосовує LLM до сторінки оголошення OLX з кешуванням результатів."""
+    _CADASTRAL_PATTERN = re.compile(r"\b\d{10,12}(?::\d{1,4}){2,3}\b")
+    _PRICE_RECOVERY_CACHE_PREFIX = "olx_price_recovery_"
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -220,4 +227,51 @@ class OlxLLMExtractorService:
             print(f"[OlxLLMExtractor] Помилка при збереженні в кеш: {e}")
 
         return result or {}
+
+    @classmethod
+    def has_cadastral_in_price_text(cls, search_data: Dict[str, Any]) -> bool:
+        """Повертає True, якщо в price_text/price є формат кадастрового номера."""
+        if not isinstance(search_data, dict):
+            return False
+        for key in ("price_text", "price"):
+            raw = search_data.get(key)
+            if not raw:
+                continue
+            text = str(raw)
+            if cls._CADASTRAL_PATTERN.search(text):
+                return True
+        return False
+
+    def recover_price_ignoring_cadastral(
+        self,
+        search_data: Dict[str, Any],
+        detail: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Повторно витягує ціну з опису, якщо базове поле ціни схоже на кадастровий номер.
+        """
+        if self.llm_service is None:
+            return {}
+
+        description_text = self._build_description_text(search_data, detail)
+        if not description_text.strip():
+            return {}
+
+        cache_key = self._PRICE_RECOVERY_CACHE_PREFIX + calculate_description_hash(description_text)
+        cached = self.cache_service.repository.find_by_cache_key(cache_key)
+        if cached and isinstance(cached.get("result"), dict):
+            return cached.get("result") or {}
+
+        try:
+            result = self.llm_service.parse_olx_price_recovery(description_text) or {}
+        except Exception as e:
+            logger.warning("OLX price recovery LLM error: %s", e)
+            return {}
+
+        try:
+            self.cache_service.repository.save_result_by_key(cache_key, result)
+        except Exception as e:
+            logger.warning("OLX price recovery cache save error: %s", e)
+
+        return result
 

@@ -57,6 +57,8 @@ class GpuRuntimeSessionsRepository(BaseRepository):
         session_id: str,
         state: str,
         estimated_cost_usd: Optional[float] = None,
+        *,
+        billed_cost_usd: Optional[float] = None,
     ) -> bool:
         self._ensure_indexes()
         now = datetime.now(timezone.utc)
@@ -65,6 +67,8 @@ class GpuRuntimeSessionsRepository(BaseRepository):
             "finished_at": now,
             "updated_at": now,
         }
-        if estimated_cost_usd is not None:
+        if billed_cost_usd is not None:
+            patch["billed_cost_usd"] = float(billed_cost_usd)
+        elif estimated_cost_usd is not None:
             patch["estimated_cost_usd"] = float(estimated_cost_usd)
         return self.update_by_id(session_id, {"$set": patch})

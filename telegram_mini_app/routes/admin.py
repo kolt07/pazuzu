@@ -73,6 +73,12 @@ class CreateSchedulerEventRequest(BaseModel):
     sources: str = "all"
 
 
+class TaskQueueControlRequest(BaseModel):
+    queue_name: str
+    action: str  # pause | resume | disable | enable
+    reason: str = ""
+
+
 @router.post("/trace")
 def trace_query(request: Request, body: TraceQueryRequest):
     """
@@ -491,6 +497,42 @@ def data_update_status(request: Request, task_id: str):
     return out
 
 
+@router.get("/task-queues/status")
+def get_task_queues_status(request: Request):
+    """Стан черг source_load та llm_processing + лічильники задач."""
+    _get_admin_user(request)
+    tq = TaskQueueService(request.app.state.settings)
+    return tq.get_queues_status_snapshot()
+
+
+@router.post("/task-queues/control")
+def control_task_queue(request: Request, body: TaskQueueControlRequest):
+    """Керування чергою: pause/resume/disable/enable."""
+    admin_id, _, _, _ = _get_admin_user(request)
+    action = str(body.action or "").strip().lower()
+    if action in ("resume", "enable"):
+        target_state = "running"
+    elif action == "pause":
+        target_state = "paused"
+    elif action == "disable":
+        target_state = "disabled"
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported action. Use pause/resume/disable/enable.")
+
+    tq = TaskQueueService(request.app.state.settings)
+    try:
+        control = tq.set_queue_control_state(
+            queue_name=body.queue_name,
+            state=target_state,
+            updated_by=str(admin_id),
+            reason=body.reason or "",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"success": True, "control": control}
+
+
 # ---------- Області для LLM-обробки (OLX + ProZorro) ----------
 
 @router.get("/llm-processing-regions")
@@ -560,6 +602,9 @@ class VastRuntimeSettingsUpdate(BaseModel):
     idle_grace_sec: Optional[int] = None
     hard_budget_usd: Optional[float] = None
     fallback_provider: Optional[str] = None
+    llm_cached_endpoint_wait_sec: Optional[int] = None
+    forced_healthcheck_after_failures: Optional[int] = None
+    forced_healthcheck_cooldown_sec: Optional[int] = None
 
 
 @router.post("/llm-processing-regions/backfill")
@@ -1292,11 +1337,17 @@ def get_usage_stats(
     """
     Статистика використання: LLM — вхідні/вихідні токени та орієнтовна вартість (USD);
     Geocoding — виклики API по днях.
+    GPU — час з логів; вартість по днях з Vast billing (charges), якщо задано vast_api_key.
     """
     _get_admin_user(request)
     from data.repositories.logs_repository import LogsRepository
     from data.repositories.geocode_cache_repository import GeocodeCacheRepository
     from config.llm_pricing import estimate_gemini_cost_usd
+    from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
+    from business.services.vast_billing_service import (
+        fetch_gpu_instance_charges_by_calendar_day_usd,
+        sum_billed_usd_last_n_calendar_days,
+    )
 
     try:
         logs_repo = LogsRepository()
@@ -1345,19 +1396,46 @@ def get_usage_stats(
         gpu_by_date = {d.get("date"): d for d in gpu_by_day_raw}
         from datetime import datetime, timedelta
 
+        vast_cfg = VastRuntimeSettingsService().get_settings()
+        vast_key = str(vast_cfg.get("vast_api_key") or "").strip()
+        vast_by_day: Dict[str, float] = {}
+        vast_err: Optional[str] = None
+        vast_days = max(int(days), 30)
+        if vast_key:
+            vast_by_day, vast_err = fetch_gpu_instance_charges_by_calendar_day_usd(
+                vast_key,
+                days=vast_days,
+                sleep_between_sec=0.05,
+                timeout_sec=120,
+            )
+
         today = datetime.utcnow().date()
         for i in range(days - 1, -1, -1):
             day = (today - timedelta(days=i)).strftime("%Y-%m-%d")
             row = gpu_by_date.get(day) or {}
             sec = float(row.get("active_seconds") or 0.0)
+            log_billed = float(row.get("billed_cost_usd") or 0.0)
+            if vast_key and vast_by_day and day in vast_by_day:
+                day_billed = float(vast_by_day[day] or 0.0)
+            else:
+                day_billed = log_billed
             gpu_by_day.append(
                 {
                     "date": day,
                     "active_seconds": sec,
                     "active_minutes": round(sec / 60.0, 3),
-                    "estimated_cost_usd": float(row.get("estimated_cost_usd") or 0.0),
+                    "billed_cost_usd": day_billed,
+                    "estimated_cost_usd": day_billed,
                     "sessions": int(row.get("sessions") or 0),
                 }
+            )
+
+        gpu_total_billed = float(gpu_total.get("billed_cost_usd") or 0.0)
+        gpu_month_from_logs = float(gpu_last_month.get("billed_cost_usd") or 0.0)
+        billed_last_month = gpu_month_from_logs
+        if vast_key and vast_by_day:
+            billed_last_month = float(
+                sum_billed_usd_last_n_calendar_days(vast_by_day, n=30)
             )
 
         return {
@@ -1385,19 +1463,30 @@ def get_usage_stats(
                 "by_day": gpu_by_day,
                 "active_seconds_total": float(gpu_total.get("active_seconds") or 0.0),
                 "active_minutes_total": round(float(gpu_total.get("active_seconds") or 0.0) / 60.0, 3),
-                "estimated_cost_usd_total": round(float(gpu_total.get("estimated_cost_usd") or 0.0), 6),
+                "billed_cost_usd_total": round(gpu_total_billed, 6),
+                "estimated_cost_usd_total": round(gpu_total_billed, 6),
                 "sessions_total": int(gpu_total.get("sessions") or 0),
                 "active_seconds_last_month": float(gpu_last_month.get("active_seconds") or 0.0),
                 "active_minutes_last_month": round(float(gpu_last_month.get("active_seconds") or 0.0) / 60.0, 3),
-                "estimated_cost_usd_last_month": round(float(gpu_last_month.get("estimated_cost_usd") or 0.0), 6),
+                "billed_cost_usd_last_month": round(float(billed_last_month), 6),
+                "estimated_cost_usd_last_month": round(float(billed_last_month), 6),
                 "sessions_last_month": int(gpu_last_month.get("sessions") or 0),
+                "vast_daily_charges_error": vast_err,
             },
         }
     except Exception as e:
         return {
             "llm": {"by_day": [], "input_tokens_total": 0, "output_tokens_total": 0, "total": 0, "last_month": 0, "estimated_cost_usd": 0, "estimated_cost_usd_last_month": 0},
             "geocoding": {"by_day": [], "total": 0, "last_month": 0},
-            "gpu_runtime": {"by_day": [], "active_seconds_total": 0, "estimated_cost_usd_total": 0, "sessions_total": 0},
+            "gpu_runtime": {
+                "by_day": [],
+                "active_seconds_total": 0,
+                "billed_cost_usd_total": 0,
+                "estimated_cost_usd_total": 0,
+                "billed_cost_usd_last_month": 0,
+                "estimated_cost_usd_last_month": 0,
+                "sessions_total": 0,
+            },
             "error": str(e),
         }
 

@@ -685,6 +685,37 @@ a.file-download-link:active {
 }
 
 /* Admin */
+.admin-subtabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0 0 1rem;
+  padding: 0.25rem;
+  border-radius: 10px;
+  background: var(--tg-theme-secondary-bg-color);
+}
+
+.admin-subtab {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--tg-theme-hint-color);
+  font-size: 0.88rem;
+  font-weight: 600;
+  padding: 0.45rem 0.7rem;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.admin-subtab:hover {
+  color: var(--tg-theme-text-color);
+}
+
+.admin-subtab.active {
+  color: var(--tg-theme-button-text-color);
+  background: var(--tg-theme-button-color);
+}
+
 .admin-block {
   margin-bottom: 1.5rem;
   padding: 1rem;
@@ -714,6 +745,66 @@ a.file-download-link:active {
 .admin-block .btn {
   margin-top: 0.25rem;
   margin-right: 0.5rem;
+}
+
+.admin-queue-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 0.75rem;
+}
+
+.admin-queue-card {
+  background: var(--tg-theme-bg-color);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.admin-queue-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.admin-queue-state {
+  display: inline-block;
+  padding: 0.2rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.admin-queue-state.done {
+  color: #0b7a3b;
+  background: rgba(29, 185, 84, 0.16);
+}
+
+.admin-queue-state.running {
+  color: #8a5d00;
+  background: rgba(255, 190, 11, 0.2);
+}
+
+.admin-queue-state.error {
+  color: #9b1c1c;
+  background: rgba(231, 76, 60, 0.16);
+}
+
+.admin-queue-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.8rem;
+  font-size: 0.85rem;
+}
+
+.admin-queue-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
 }
 
 .admin-usage-summary {

@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - Celery is optional in local fallback m
 
 from config.settings import Settings
 from data.repositories.background_task_repository import BackgroundTaskRepository
+from data.repositories.task_queue_controls_repository import TaskQueueControlsRepository
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +29,12 @@ class TaskQueueService:
     LLM_QUEUE = "llm_processing"
     ACTIVE_STATES = ["queued", "received", "started", "running", "retry"]
     TERMINAL_STATES = {"success", "failed", "revoked"}
+    CONTROL_STATES = {"running", "paused", "disabled"}
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self.settings = settings or Settings()
         self._repo = BackgroundTaskRepository()
+        self._controls = TaskQueueControlsRepository()
         self._celery = None
         try:
             from business.celery_app import create_celery_app
@@ -130,6 +133,8 @@ class TaskQueueService:
         olx_phase1_max_threads: Optional[int] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if self.get_queue_control_state(self.SOURCE_LOAD_QUEUE) == "disabled":
+            raise RuntimeError("Queue source_load is disabled by admin.")
         payload = {
             "days": days,
             "sources": list(sources or []),
@@ -155,6 +160,8 @@ class TaskQueueService:
         return {"task_id": async_result.id, "queue": self.SOURCE_LOAD_QUEUE}
 
     def enqueue_olx_llm(self, listing_url: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+        if self.get_queue_control_state(self.LLM_QUEUE) == "disabled":
+            raise RuntimeError("Queue llm_processing is disabled by admin.")
         payload = {"listing_url": listing_url}
         if self._celery is None:
             raise RuntimeError("Task queue is not available because Celery is not installed.")
@@ -173,6 +180,8 @@ class TaskQueueService:
         return async_result.id
 
     def enqueue_prozorro_llm(self, auction_id: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+        if self.get_queue_control_state(self.LLM_QUEUE) == "disabled":
+            raise RuntimeError("Queue llm_processing is disabled by admin.")
         payload = {"auction_id": auction_id}
         if self._celery is None:
             raise RuntimeError("Task queue is not available because Celery is not installed.")
@@ -235,6 +244,53 @@ class TaskQueueService:
 
     def has_pending_llm_tasks(self) -> bool:
         return self._repo.count_by_queue_states(self.LLM_QUEUE, self.ACTIVE_STATES) > 0
+
+    def get_queue_control_state(self, queue_name: str) -> str:
+        doc = self._controls.get_control(str(queue_name or "").strip())
+        state = str((doc or {}).get("state") or "running").strip().lower()
+        if state not in self.CONTROL_STATES:
+            return "running"
+        return state
+
+    def set_queue_control_state(
+        self,
+        queue_name: str,
+        state: str,
+        updated_by: Optional[str] = None,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        st = str(state or "").strip().lower()
+        if st not in self.CONTROL_STATES:
+            raise ValueError(f"Unsupported queue state: {state}")
+        qn = str(queue_name or "").strip()
+        if qn not in (self.SOURCE_LOAD_QUEUE, self.LLM_QUEUE):
+            raise ValueError(f"Unsupported queue: {queue_name}")
+        return self._controls.set_control(qn, st, updated_by=updated_by, reason=reason)
+
+    def get_queues_status_snapshot(self) -> Dict[str, Any]:
+        queues = [self.SOURCE_LOAD_QUEUE, self.LLM_QUEUE]
+        out: Dict[str, Any] = {"task_queue_enabled": self.is_enabled(), "queues": []}
+        for queue_name in queues:
+            state = self.get_queue_control_state(queue_name)
+            counts = self._repo.get_queue_state_counts(queue_name)
+            latest = self._repo.get_latest_task_for_queue(queue_name) or {}
+            out["queues"].append(
+                {
+                    "queue_name": queue_name,
+                    "control_state": state,
+                    "counts": counts,
+                    "rabbit_messages": self._rabbitmq_passive_queue_message_count(queue_name),
+                    "latest_task": {
+                        "task_id": latest.get("task_id"),
+                        "state": latest.get("state"),
+                        "updated_at": latest.get("updated_at"),
+                        "message": latest.get("message") or latest.get("error") or "",
+                    }
+                    if latest
+                    else None,
+                }
+            )
+        return out
 
     def has_active_source_load_tasks(self, within_sec: int = 20 * 60) -> bool:
         return self._repo.has_recent_activity(

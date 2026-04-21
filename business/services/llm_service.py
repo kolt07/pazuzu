@@ -1023,8 +1023,11 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
         self._last_runtime_meta: Dict[str, Any] = {}
 
     def _ensure_client(self) -> bool:
-        endpoint = self._runtime.ensure_runtime_ready()
+        runtime_cfg = self._runtime._settings_svc.get_settings()
+        wait_timeout_sec = int(runtime_cfg.get("llm_cached_endpoint_wait_sec") or 5)
+        endpoint = self._runtime.get_cached_runtime_endpoint(wait_timeout_sec=wait_timeout_sec)
         if not endpoint:
+            self._runtime.schedule_forced_healthcheck("llm_cached_endpoint_miss")
             return False
         base_url = endpoint.rstrip("/") + "/v1"
         if self._client is None or self._base_url != base_url:
@@ -1075,7 +1078,7 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
                 "endpoint": self._base_url,
                 "duration_ms": int((time.perf_counter() - t0) * 1000),
             }
-            self._runtime.mark_processing_activity(self._last_runtime_meta)
+            self._runtime.report_inference_success(self._last_runtime_meta)
             if not response_text:
                 return self._empty_result()
             json_text = self._extract_json_from_response(response_text)
@@ -1109,6 +1112,14 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
                 e,
             )
             self._last_response_text = f"[error] {e!s}"
+            self._runtime.report_inference_failure(
+                str(e),
+                {
+                    "provider": "vllm_remote",
+                    "endpoint": self._base_url,
+                    "duration_ms": dur_ms,
+                },
+            )
             return self._empty_result()
 
     def generate_text(
@@ -1142,7 +1153,7 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
                 "endpoint": self._base_url,
                 "duration_ms": dur_ms,
             }
-            self._runtime.mark_processing_activity(self._last_runtime_meta)
+            self._runtime.report_inference_success(self._last_runtime_meta)
             u = self._last_usage or {}
             logger.info(
                 "[llm-remote] generate_text: model=%s тривалість_ms=%s вхід_ток=%s вихід_ток=%s api_host=%s",
@@ -1162,6 +1173,14 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
                 e,
             )
             self._last_response_text = f"[error] {e!s}"
+            self._runtime.report_inference_failure(
+                str(e),
+                {
+                    "provider": "vllm_remote",
+                    "endpoint": self._base_url,
+                    "duration_ms": dur_ms,
+                },
+            )
             return ""
 
     # Методи нормалізації/витягу JSON уніфіковані з Ollama-провайдером.
@@ -1465,6 +1484,106 @@ class LLMService:
             return {"objects": objects}
         except json.JSONDecodeError:
             return {"objects": []}
+
+    def parse_olx_price_recovery(self, description: str) -> Dict[str, Any]:
+        """
+        Повторно витягує ціну OLX-оголошення спеціальним промптом.
+        Використовується коли базовий парсер/regex міг сплутати ціну з кадастровим номером.
+        """
+        empty = {"price_value": None, "currency": "", "price_text": "", "cadastral_number": ""}
+        if not description or not description.strip():
+            return empty
+
+        try:
+            from config.config_loader import get_config_loader
+            loader = get_config_loader()
+            template = loader.get_prompt("olx_price_recovery")
+            if not template:
+                return empty
+            prompt = template.format(description=description)
+        except Exception:
+            return empty
+
+        parsing_provider = getattr(self, "provider", None)
+        if parsing_provider and hasattr(parsing_provider, "generate_text"):
+            raw = parsing_provider.generate_text(prompt, system_prompt=None, temperature=0.0)
+            log_svc = self._get_logging()
+            if log_svc and raw:
+                try:
+                    usage = getattr(parsing_provider, "_last_usage", None)
+                    meta = {"desc_preview": (description or "")[:80] + ("..." if len(description or "") > 80 else "")}
+                    if isinstance(usage, dict):
+                        meta["input_tokens"] = usage.get("input_tokens", 0)
+                        meta["output_tokens"] = usage.get("output_tokens", 0)
+                    runtime_meta = getattr(parsing_provider, "_last_runtime_meta", None)
+                    if isinstance(runtime_meta, dict):
+                        meta.update(runtime_meta)
+                    log_svc.log_api_usage(
+                        service="llm",
+                        source="llm_service.parse_olx_price_recovery",
+                        from_cache=False,
+                        metadata=meta,
+                    )
+                    req_text = getattr(parsing_provider, "_last_request_text", None) or ""
+                    resp_text = getattr(parsing_provider, "_last_response_text", None) or ""
+                    log_svc.log_llm_exchange(
+                        request_text=req_text,
+                        response_text=resp_text,
+                        input_tokens=meta.get("input_tokens", 0),
+                        output_tokens=meta.get("output_tokens", 0),
+                        source="llm_service.parse_olx_price_recovery",
+                        provider=(getattr(self.settings, "llm_parsing_provider", None) or "ollama"),
+                        duration_ms=meta.get("duration_ms"),
+                    )
+                except Exception as e:
+                    logger.warning("Не вдалося записати llm_exchange (parse_olx_price_recovery): %s", e)
+        else:
+            raw = self.generate_text(prompt, temperature=0.0, _caller="llm_service.parse_olx_price_recovery")
+
+        if not raw or not raw.strip():
+            return empty
+        json_text = self._extract_json_from_intent_response(raw)
+        if not json_text:
+            return empty
+
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError:
+            return empty
+        if not isinstance(data, dict):
+            return empty
+
+        price_value = data.get("price_value")
+        if isinstance(price_value, str):
+            cleaned = (
+                price_value.replace("\u00a0", "")
+                .replace("\u202f", "")
+                .replace(" ", "")
+                .replace(",", ".")
+            )
+            try:
+                price_value = float(cleaned)
+            except (TypeError, ValueError):
+                price_value = None
+        elif isinstance(price_value, (int, float)):
+            price_value = float(price_value)
+        else:
+            price_value = None
+        if isinstance(price_value, float) and price_value <= 0:
+            price_value = None
+
+        currency = str(data.get("currency") or "").strip().upper()
+        if currency not in ("UAH", "USD", "EUR"):
+            currency = ""
+
+        price_text = str(data.get("price_text") or "").strip()
+        cadastral_number = str(data.get("cadastral_number") or "").strip()
+        return {
+            "price_value": price_value,
+            "currency": currency,
+            "price_text": price_text,
+            "cadastral_number": cadastral_number,
+        }
 
     def extract_intent_for_routing(
         self,

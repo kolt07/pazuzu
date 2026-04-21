@@ -65,6 +65,11 @@ class VastRuntimeSettingsService:
             "fallback_provider": "ollama",
             # Мітка контракту Vast; оркестратор зводить fleet до одного інстанса з цією міткою.
             "vast_instance_label": "pazuzu-vllm-runtime",
+            # LLM worker не робить блокуючих health-check; чекає лише на локально відомий endpoint.
+            "llm_cached_endpoint_wait_sec": 5,
+            # Після N підряд помилок inference оркестратор запускає фоновий примусовий health-check.
+            "forced_healthcheck_after_failures": 3,
+            "forced_healthcheck_cooldown_sec": 30,
         }
 
     @staticmethod
@@ -170,4 +175,7 @@ class VastRuntimeSettingsService:
         out["vllm_model"] = str(out.get("vllm_model") or "google/gemma-2-9b-it").strip()
         out["fallback_provider"] = str(out.get("fallback_provider") or "ollama").strip().lower()
         out["vast_instance_label"] = str(out.get("vast_instance_label") or "").strip() or "pazuzu-vllm-runtime"
+        out["llm_cached_endpoint_wait_sec"] = max(0, int(out.get("llm_cached_endpoint_wait_sec") or 5))
+        out["forced_healthcheck_after_failures"] = max(1, int(out.get("forced_healthcheck_after_failures") or 3))
+        out["forced_healthcheck_cooldown_sec"] = max(0, int(out.get("forced_healthcheck_cooldown_sec") or 30))
         return out

@@ -264,6 +264,26 @@ prompts:
 
       Поверни **тільки валідний JSON** без будь‑яких пояснень.
 
+  olx_price_recovery:
+    template: |
+      You extract only the listing price from an OLX real-estate description. Return only JSON.
+
+      Description (Ukrainian):
+      {description}
+
+      Rules:
+      - If the text contains cadastral number(s), never treat them as price.
+      - A cadastral number has format similar to 10-12 digits separated by ":" blocks (example: 6320685503:03:000:0202).
+      - Extract the real price only from explicit price context (грн, $, €, usd, eur, "ціна", "вартість", etc.).
+      - If reliable price is missing, return null for price_value.
+      - Currency must be one of: UAH, USD, EUR, or empty string if unknown.
+
+      Return exactly one JSON object with fields:
+      - `price_value`: number or null
+      - `currency`: "UAH" | "USD" | "EUR" | ""
+      - `price_text`: short original price fragment from text, or ""
+      - `cadastral_number`: detected cadastral number if present, otherwise ""
+
   listing_analytics:
     template: |
       Write a short analytical summary of the real‑estate listing **in Ukrainian**. The result is a ready‑to‑display text (без службових заголовків на кшталт “Ціна:”).

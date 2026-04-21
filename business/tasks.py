@@ -88,9 +88,21 @@ def _heartbeat_logger(queue: TaskQueueService, task_id: str):
     def _log(message: str) -> None:
         logger.info("%s", message)
         if task_id:
-            queue.heartbeat(task_id, patch={"message": str(message)[:1000]})
+            try:
+                queue.heartbeat(task_id, patch={"message": str(message)[:1000]})
+            except Exception:
+                logger.debug("Task heartbeat update failed (task_id=%s)", task_id, exc_info=True)
 
     return _log
+
+
+def _safe_queue_heartbeat(queue: TaskQueueService, task_id: str, patch: Dict[str, Any]) -> None:
+    if not task_id:
+        return
+    try:
+        queue.heartbeat(task_id, patch=patch)
+    except Exception:
+        logger.debug("Task heartbeat update failed (task_id=%s)", task_id, exc_info=True)
 
 
 @celery_app.task(bind=True, name="business.tasks.run_source_load_pipeline_task")
@@ -106,6 +118,16 @@ def run_source_load_pipeline_task(
     settings = _init_runtime()
     queue = _queue_service(settings)
     task_id = _current_task_id()
+    control_state = queue.get_queue_control_state(TaskQueueService.SOURCE_LOAD_QUEUE)
+    if control_state == "paused":
+        if task_id:
+            queue.heartbeat(task_id, patch={"phase": "paused_by_admin", "queue_control_state": "paused"})
+        raise self.retry(countdown=20, max_retries=None)
+    if control_state == "disabled":
+        msg = "Queue source_load is disabled by admin."
+        if task_id:
+            queue.mark_task_failed(task_id, msg)
+        return {"success": False, "skipped": True, "reason": msg}
     if task_id:
         queue.mark_task_started(task_id)
         queue.heartbeat(task_id, patch={"phase": "source_load_started"})
@@ -121,9 +143,27 @@ def run_source_load_pipeline_task(
             olx_phase1_max_threads=olx_phase1_max_threads,
             use_brokered_llm=True,
             log_fn=log_fn,
-            llm_wait_heartbeat_fn=lambda: queue.heartbeat(task_id, patch={"phase": "waiting_llm_tasks"}),
+            llm_wait_heartbeat_fn=lambda: _safe_queue_heartbeat(
+                queue,
+                task_id,
+                {"phase": "waiting_llm_tasks"},
+            ),
+            run_phase3=False,
+        )
+        logger.info(
+            "[source_load] Core pipeline completed (task_id=%s): raw + promote/main + LLM done. "
+            "Task marked SUCCESS. Phase 3 analytics is decoupled from this completion.",
+            task_id or "—",
         )
         if task_id:
+            _safe_queue_heartbeat(
+                queue,
+                task_id,
+                {
+                    "phase": "core_completed",
+                    "message": "Core pipeline completed: raw + promote/main + LLM done",
+                },
+            )
             queue.mark_task_success(task_id, result=result)
         return result
     except Exception as e:
@@ -138,6 +178,16 @@ def process_olx_llm_task(self, listing_url: str) -> Dict[str, Any]:
     settings = _init_runtime()
     queue = _queue_service(settings)
     task_id = _current_task_id()
+    control_state = queue.get_queue_control_state(TaskQueueService.LLM_QUEUE)
+    if control_state == "paused":
+        if task_id:
+            queue.heartbeat(task_id, patch={"phase": "paused_by_admin", "queue_control_state": "paused"})
+        raise self.retry(countdown=20, max_retries=None)
+    if control_state == "disabled":
+        msg = "Queue llm_processing is disabled by admin."
+        if task_id:
+            queue.mark_task_failed(task_id, msg)
+        return {"success": False, "skipped": True, "reason": msg, "listing_url": listing_url}
     wid = str(getattr(getattr(self, "request", None), "id", "") or task_id or "")
     logger.info(
         "[llm-processing] OLX LLM: старт listing_url=%s celery_id=%s",
@@ -172,7 +222,7 @@ def process_olx_llm_task(self, listing_url: str) -> Dict[str, Any]:
 
         runtime = _get_vllm_orchestrator()
         if runtime.is_enabled():
-            runtime.ensure_runtime_ready()
+            runtime.schedule_forced_healthcheck("llm_task_start_olx")
         ok = _process_single_llm_pending_url(
             listing_url=listing_url,
             raw_repo=raw_repo,
@@ -209,6 +259,16 @@ def process_prozorro_llm_task(self, auction_id: str) -> Dict[str, Any]:
     settings = _init_runtime()
     queue = _queue_service(settings)
     task_id = _current_task_id()
+    control_state = queue.get_queue_control_state(TaskQueueService.LLM_QUEUE)
+    if control_state == "paused":
+        if task_id:
+            queue.heartbeat(task_id, patch={"phase": "paused_by_admin", "queue_control_state": "paused"})
+        raise self.retry(countdown=20, max_retries=None)
+    if control_state == "disabled":
+        msg = "Queue llm_processing is disabled by admin."
+        if task_id:
+            queue.mark_task_failed(task_id, msg)
+        return {"success": False, "skipped": True, "reason": msg, "auction_id": auction_id}
     wid = str(getattr(getattr(self, "request", None), "id", "") or task_id or "")
     logger.info("[llm-processing] ProZorro LLM: старт auction_id=%s celery_id=%s", auction_id, wid or "—")
     _log_llm_queue_progress(settings)
@@ -221,7 +281,7 @@ def process_prozorro_llm_task(self, auction_id: str) -> Dict[str, Any]:
 
         runtime = _get_vllm_orchestrator()
         if runtime.is_enabled():
-            runtime.ensure_runtime_ready()
+            runtime.schedule_forced_healthcheck("llm_task_start_prozorro")
         ok = process_prozorro_llm_auction(
             auction_id,
             settings=settings,

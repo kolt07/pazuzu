@@ -18,6 +18,7 @@ import requests
 
 from business.services.logging_service import LoggingService
 from business.services.vast_ai_client import VastAiClient
+from business.services.vast_billing_service import fetch_instance_contract_charges_usd
 from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
 from data.repositories.gpu_runtime_coordination_repository import GpuRuntimeCoordinationRepository
 from data.repositories.gpu_runtime_sessions_repository import GpuRuntimeSessionsRepository
@@ -63,6 +64,18 @@ class VllmRuntimeOrchestrator:
         self._instance_paused: bool = False
         self._empty_queue_since_ts: float = 0.0
         self._paused_since_ts: float = 0.0
+        self._runtime_fail_streak: int = 0
+        self._forced_check_event = threading.Event()
+        self._forced_check_lock = threading.Lock()
+        self._forced_check_reason: str = ""
+        self._forced_check_running: bool = False
+        self._last_forced_check_ts: float = 0.0
+        self._forced_check_thread = threading.Thread(
+            target=self._forced_check_loop,
+            daemon=True,
+            name="VllmRuntimeForcedHealthcheck",
+        )
+        self._forced_check_thread.start()
 
     def is_enabled(self) -> bool:
         cfg = self._settings_svc.get_settings()
@@ -455,6 +468,87 @@ class VllmRuntimeOrchestrator:
             self._coord_renew_lease(cfg, state="running")
             self._log_gpu_usage("gpu_processing", metadata or {})
 
+    def get_cached_runtime_endpoint(self, wait_timeout_sec: int = 0) -> Optional[str]:
+        """Повертає endpoint без синхронного health-check; джерело істини — локальний/coord state."""
+        deadline = time.time() + max(0, int(wait_timeout_sec))
+        while True:
+            cfg = self._settings_svc.get_settings()
+            if not cfg.get("is_enabled"):
+                return None
+            with self._lock:
+                if self._endpoint and not self._instance_paused:
+                    return self._endpoint
+            try:
+                state = self._coord.get_runtime_state() or {}
+            except Exception:
+                state = {}
+            shared_state = str(state.get("state") or "").strip().lower()
+            shared_endpoint = str(state.get("endpoint") or state.get("public_endpoint") or "").strip()
+            if shared_endpoint and shared_state == "running":
+                with self._lock:
+                    self._instance_id = str(state.get("instance_id") or self._instance_id or "")
+                    self._public_endpoint = str(state.get("public_endpoint") or self._public_endpoint or "")
+                    self._endpoint = shared_endpoint
+                    self._instance_paused = False
+                    return self._endpoint
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.2)
+
+    def report_inference_success(self, metadata: Optional[Dict[str, Any]] = None) -> None:
+        with self._lock:
+            self._runtime_fail_streak = 0
+        self.mark_processing_activity(metadata)
+
+    def report_inference_failure(self, error: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        cfg = self._settings_svc.get_settings()
+        threshold = max(1, int(cfg.get("forced_healthcheck_after_failures") or 3))
+        with self._lock:
+            self._runtime_fail_streak += 1
+            streak = self._runtime_fail_streak
+        fail_meta = dict(metadata or {})
+        fail_meta.update({"error": str(error), "consecutive_failures": streak, "threshold": threshold})
+        self._log_gpu_usage("gpu_inference_failed", fail_meta)
+        if streak >= threshold:
+            self.schedule_forced_healthcheck(reason=f"llm_consecutive_failures_{streak}")
+
+    def schedule_forced_healthcheck(self, reason: str) -> None:
+        cfg = self._settings_svc.get_settings()
+        cooldown_sec = max(0, int(cfg.get("forced_healthcheck_cooldown_sec") or 30))
+        now_ts = time.time()
+        with self._forced_check_lock:
+            if self._forced_check_running:
+                self._forced_check_reason = reason or self._forced_check_reason
+                return
+            if cooldown_sec > 0 and (now_ts - self._last_forced_check_ts) < cooldown_sec:
+                return
+            self._forced_check_reason = reason or "manual"
+            self._last_forced_check_ts = now_ts
+            self._forced_check_event.set()
+
+    def _forced_check_loop(self) -> None:
+        while True:
+            self._forced_check_event.wait()
+            with self._forced_check_lock:
+                self._forced_check_event.clear()
+                reason = self._forced_check_reason or "unknown"
+                self._forced_check_reason = ""
+                self._forced_check_running = True
+            try:
+                self._log_gpu_usage("gpu_forced_healthcheck_started", {"reason": reason})
+                self.ensure_runtime_ready()
+                self._log_gpu_usage("gpu_forced_healthcheck_ready", {"reason": reason})
+                with self._lock:
+                    self._runtime_fail_streak = 0
+            except Exception as e:
+                self._log_gpu_usage(
+                    "gpu_forced_healthcheck_failed",
+                    {"reason": reason, "error": str(e)},
+                )
+            finally:
+                with self._forced_check_lock:
+                    self._forced_check_running = False
+
     def mark_source_load_activity(self) -> None:
         with self._lock:
             state = "paused" if self._instance_paused else ("running" if self._instance_id else "idle")
@@ -600,6 +694,23 @@ class VllmRuntimeOrchestrator:
             endpoint or "",
         )
         self._stop_ssh_processes_locked()
+        elapsed_sec = 0.0
+        if self._started_at:
+            elapsed_sec = max(
+                0.0,
+                (datetime.now(timezone.utc) - self._started_at).total_seconds(),
+            )
+        billed_usd, billed_err = (None, None)
+        if self._started_at:
+            gte = int(self._started_at.timestamp())
+            lte = int(datetime.now(timezone.utc).timestamp())
+            billed_usd, billed_err = fetch_instance_contract_charges_usd(
+                cfg.get("vast_api_key", ""),
+                str(instance_id),
+                gte,
+                lte,
+            )
+        effective_billed = float(billed_usd) if billed_usd is not None else 0.0
         try:
             client = VastAiClient(api_key=cfg.get("vast_api_key", ""), timeout_sec=30)
             client.destroy_instance(instance_id)
@@ -609,25 +720,19 @@ class VllmRuntimeOrchestrator:
                 client.stop_instance(instance_id)
             except Exception:
                 pass
-        elapsed_sec = 0.0
-        if self._started_at:
-            elapsed_sec = max(
-                0.0,
-                (datetime.now(timezone.utc) - self._started_at).total_seconds(),
-            )
-        estimated = self._estimate_cost_usd(elapsed_sec, cfg)
-        self._log_gpu_usage(
-            "gpu_teardown",
-            {
-                "reason": reason,
-                "instance_id": instance_id,
-                "endpoint": endpoint,
-                "active_seconds": elapsed_sec,
-                "estimated_cost_usd": estimated,
-            },
-        )
+        meta: Dict[str, Any] = {
+            "reason": reason,
+            "instance_id": instance_id,
+            "endpoint": endpoint,
+            "active_seconds": elapsed_sec,
+            "billed_cost_usd": effective_billed,
+            "cost_source": "vast_charges",
+        }
+        if billed_err:
+            meta["vast_billing_error"] = billed_err
+        self._log_gpu_usage("gpu_teardown", meta)
         if self._session_id:
-            self._sessions.finish_session(self._session_id, "stopped", estimated)
+            self._sessions.finish_session(self._session_id, "stopped", billed_cost_usd=effective_billed)
         self._instance_id = None
         self._session_id = None
         self._endpoint = None
@@ -1764,12 +1869,6 @@ class VllmRuntimeOrchestrator:
         if p <= 0 or p >= 65535:
             return None
         return f"http://{ip}:{p}"
-
-    def _estimate_cost_usd(self, active_seconds: float, cfg: Dict[str, Any]) -> float:
-        per_hour = float(cfg.get("max_hourly_usd") or 0.0)
-        if per_hour <= 0 or active_seconds <= 0:
-            return 0.0
-        return round((active_seconds / 3600.0) * per_hour, 6)
 
     def _safe_settings_snapshot(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         snap = dict(cfg)

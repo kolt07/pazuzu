@@ -116,6 +116,9 @@ llm:
 #   destroy_after_pause_sec: 1200 # destroy лише після тривалої паузи та відсутності source-load activity > 20 хв
 #   idle_grace_sec: 60            # legacy, залишено для сумісності
 #   hard_budget_usd: 20.0
+#   llm_cached_endpoint_wait_sec: 5
+#   forced_healthcheck_after_failures: 3
+#   forced_healthcheck_cooldown_sec: 30
 
 # OLX скрапер: отримання сторінок пошуку та деталей через браузер (Playwright) замість HTTP
 # true = клікер (області обробляються послідовно); false або відсутнє = requests (паралельно)
@@ -138,6 +141,8 @@ llm:
 #   rabbitmq_vhost: "pazuzu"
 #   # broker_url: "amqp://pazuzu:pazuzu@rabbitmq:5672/pazuzu"
 #   result_backend: "rpc://"
+#   llm_worker_threads: 3         # кількість паралельних потоків Celery воркера для однієї черги llm_processing
+#   source_worker_threads: 1      # окремо для source_load
 
 # Налаштування Telegram бота
 telegram:
