@@ -90,15 +90,12 @@ def create_app(settings: Settings) -> FastAPI:
 
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():
-        # Обчислюємо версію статичних файлів для cache-busting
-        static_version = _get_static_file_version(static_dir)
-        app.state.static_version = static_version
-        
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
         @app.get("/")
         def index():
             # Читаємо HTML та додаємо версію до посилань на статичні файли
+            static_version = _get_static_file_version(static_dir)
             html_path = static_dir / "index.html"
             if html_path.exists():
                 html_content = html_path.read_text(encoding="utf-8")
