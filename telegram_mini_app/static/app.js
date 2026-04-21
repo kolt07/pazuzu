@@ -1813,6 +1813,51 @@
           });
       });
     }
+    var modal = document.getElementById("admin-llm-backfill-modal");
+    var backfillRun = document.getElementById("admin-llm-backfill-run");
+    var backfillSkip = document.getElementById("admin-llm-backfill-skip");
+    if (backfillSkip && modal) {
+      backfillSkip.addEventListener("click", function () { modal.classList.add("hidden"); });
+    }
+    if (backfillRun && modal) {
+      backfillRun.addEventListener("click", function () {
+        var daysSel = document.getElementById("admin-llm-backfill-days");
+        var inactiveCb = document.getElementById("admin-llm-backfill-inactive");
+        var days = daysSel ? parseInt(daysSel.value, 10) : 7;
+        var processInactive = inactiveCb ? !!inactiveCb.checked : false;
+        modal.classList.add("hidden");
+        if (statusEl) statusEl.textContent = "Оновлення запущено...";
+        fetch("/api/admin/llm-processing-regions/backfill", {
+          method: "POST",
+          headers: apiHeaders(),
+          body: JSON.stringify({ days: days, process_inactive: processInactive })
+        })
+          .then(function (r) {
+            if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || "Помилка"); });
+            return r.json();
+          })
+          .then(function (data) {
+            var taskId = data.task_id;
+            if (taskId && statusEl) {
+              var poll = function () {
+                fetch("/api/admin/data-update/status?task_id=" + encodeURIComponent(taskId), { headers: apiHeaders() })
+                  .then(function (r) { return r.json(); })
+                  .then(function (t) {
+                    if (t.status === "done" || t.status === "error") {
+                      statusEl.textContent = t.message || t.status;
+                      return;
+                    }
+                    setTimeout(poll, 2000);
+                  });
+              };
+              setTimeout(poll, 2000);
+            }
+          })
+          .catch(function (e) {
+            if (statusEl) statusEl.textContent = (e.message || "Помилка запуску");
+          });
+      });
+    }
   }
 
   function initAdminSubtabs() {
@@ -2017,52 +2062,6 @@
   // Експортуємо в глобальний скоуп на випадок, якщо обробники подій викликають глобальну функцію
   if (typeof window !== "undefined") {
     window.adminCheckOlxScraperHealth = adminCheckOlxScraperHealth;
-  }
-    var modal = document.getElementById("admin-llm-backfill-modal");
-    var backfillRun = document.getElementById("admin-llm-backfill-run");
-    var backfillSkip = document.getElementById("admin-llm-backfill-skip");
-    if (backfillSkip && modal) {
-      backfillSkip.addEventListener("click", function () { modal.classList.add("hidden"); });
-    }
-    if (backfillRun && modal) {
-      backfillRun.addEventListener("click", function () {
-        var daysSel = document.getElementById("admin-llm-backfill-days");
-        var inactiveCb = document.getElementById("admin-llm-backfill-inactive");
-        var days = daysSel ? parseInt(daysSel.value, 10) : 7;
-        var processInactive = inactiveCb ? !!inactiveCb.checked : false;
-        modal.classList.add("hidden");
-        if (statusEl) statusEl.textContent = "Оновлення запущено...";
-        fetch("/api/admin/llm-processing-regions/backfill", {
-          method: "POST",
-          headers: apiHeaders(),
-          body: JSON.stringify({ days: days, process_inactive: processInactive })
-        })
-          .then(function (r) {
-            if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || "Помилка"); });
-            return r.json();
-          })
-          .then(function (data) {
-            var taskId = data.task_id;
-            if (taskId && statusEl) {
-              var poll = function () {
-                fetch("/api/admin/data-update/status?task_id=" + encodeURIComponent(taskId), { headers: apiHeaders() })
-                  .then(function (r) { return r.json(); })
-                  .then(function (t) {
-                    if (t.status === "done" || t.status === "error") {
-                      statusEl.textContent = t.message || t.status;
-                      return;
-                    }
-                    setTimeout(poll, 2000);
-                  });
-              };
-              setTimeout(poll, 2000);
-            }
-          })
-          .catch(function (e) {
-            if (statusEl) statusEl.textContent = (e.message || "Помилка запуску");
-          });
-      });
-    }
   }
 
   function initAdminFeedback() {
