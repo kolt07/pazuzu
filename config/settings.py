@@ -132,11 +132,6 @@ class Settings:
         self.rabbitmq_password = os.getenv('RABBITMQ_PASSWORD', 'guest').strip()
         self.rabbitmq_vhost = os.getenv('RABBITMQ_VHOST', 'pazuzu').strip() or 'pazuzu'
 
-        # OLX скрапер: використовувати браузер (Playwright) замість HTTP-запитів для сторінок пошуку та деталей
-        self.olx_use_browser = (
-            os.getenv('OLX_SCRAPER_USE_BROWSER', '').strip().lower() in ('1', 'true', 'yes')
-        )
-
         # Telegram Mini App (веб-застосунок у Telegram)
         self.mini_app_port = int(os.getenv('MINI_APP_PORT', '8000'))
         self.mini_app_base_url = os.getenv('MINI_APP_BASE_URL', '')  # HTTPS URL для BotFather, напр. https://example.com
@@ -330,12 +325,6 @@ class Settings:
                                 self.rate_limit_requests_per_minute = int(sl['rate_limit_requests_per_minute'])
                             if 'max_query_complexity_length' in sl:
                                 self.max_query_complexity_length = int(sl['max_query_complexity_length'])
-
-                        # OLX скрапер (клікер: браузер замість requests)
-                        if 'olx' in config:
-                            olx_cfg = config['olx']
-                            if 'use_browser' in olx_cfg:
-                                self.olx_use_browser = bool(olx_cfg['use_browser'])
 
                         if 'limits' in config:
                             lim = config['limits']

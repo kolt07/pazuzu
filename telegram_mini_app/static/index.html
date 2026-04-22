@@ -72,7 +72,7 @@
               <canvas id="admin-chart-geocoding"></canvas>
             </div>
             <div class="admin-chart-wrap">
-              <h4>GPU runtime (хв/день)</h4>
+              <h4>Vast витрати (USD/день)</h4>
               <canvas id="admin-chart-gpu-runtime"></canvas>
             </div>
           </div>
@@ -166,10 +166,6 @@
         <div class="admin-block" data-admin-tab="data">
           <h3>Оновлення даних</h3>
           <p class="admin-hint">Запустити оновлення з ProZorro та OLX. Прогрес відображається нижче.</p>
-          <div class="filter-group">
-            <label><input type="checkbox" id="admin-data-update-use-browser-olx" /> OLX через браузер (клікер)</label>
-            <span class="admin-hint"> Увімкнути для цього запуску — отримання сторінок через Playwright замість HTTP. Спрацьовує для будь-якого оновлення з OLX (у т.ч. точкове).</span>
-          </div>
           <div class="filter-group">
             <label for="admin-data-update-olx-phase1-threads">OLX Phase 1 — потоки (пул завдань область+категорія):</label>
             <input type="number" id="admin-data-update-olx-phase1-threads" min="0" max="25" placeholder="за замовч. 5" class="filter-input" style="width: 5rem;" title="0 = legacy (по області), 1–25 = кількість потоків" />

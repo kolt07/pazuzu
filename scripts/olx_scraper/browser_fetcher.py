@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Отримання HTML сторінок OLX через браузер (Playwright) замість HTTP-запитів.
+Отримання HTML сторінок OLX через браузер (Playwright).
 
-Використовується в основному скрапері при увімкненні OLX_SCRAPER_USE_BROWSER:
-замість fetcher.fetch_page / _fetch_detail_page викликаються методи цього класу.
-Повертає об'єкти з .text та .status_code, сумісні з поточним використанням у run_update.
-Стара логіка (requests) залишається за замовчуванням.
+Використовується основним скрапером для detail-сторінок оголошень.
+Повертає об'єкти з .text та .status_code, сумісні з використанням у run_update.
 """
 
 from __future__ import annotations

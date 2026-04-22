@@ -390,6 +390,7 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
         """Перетворює GeoFilter на MongoDB умову для unified_listings."""
         import re
         from domain.models.filter_models import GeoFilterElement, GeoFilterGroup, GeoFilterOperator
+        from utils.ukraine_regions import build_region_search_regex
         root = geo_filter.root
         
         def process_element(elem: GeoFilterElement) -> Dict[str, Any]:
@@ -403,10 +404,10 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
                         {"addresses": {"$elemMatch": {"settlement": {"$regex": pattern, "$options": "i"}}}},
                     ]}
                 if elem.geo_type == "region":
-                    escaped = re.escape(str(elem.value))
+                    region_pattern = build_region_search_regex(str(elem.value)) or re.escape(str(elem.value))
                     return {"$or": [
-                        {"region": {"$regex": f"^{escaped}", "$options": "i"}},
-                        {"addresses": {"$elemMatch": {"region": {"$regex": f"^{escaped}", "$options": "i"}}}},
+                        {"region": {"$regex": region_pattern, "$options": "i"}},
+                        {"addresses": {"$elemMatch": {"region": {"$regex": region_pattern, "$options": "i"}}}},
                     ]}
                 if elem.geo_type == "city_district":
                     escaped = re.escape(str(elem.value))
@@ -424,10 +425,10 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
                         {"addresses": {"$not": {"$elemMatch": {"settlement": {"$regex": pattern, "$options": "i"}}}}},
                     ]}
                 if elem.geo_type == "region":
-                    escaped = re.escape(str(elem.value))
+                    region_pattern = build_region_search_regex(str(elem.value)) or re.escape(str(elem.value))
                     return {"$and": [
-                        {"$or": [{"region": {"$exists": False}}, {"region": None}, {"region": {"$not": {"$regex": f"^{escaped}", "$options": "i"}}}]},
-                        {"addresses": {"$not": {"$elemMatch": {"region": {"$regex": f"^{escaped}", "$options": "i"}}}}},
+                        {"$or": [{"region": {"$exists": False}}, {"region": None}, {"region": {"$not": {"$regex": region_pattern, "$options": "i"}}}]},
+                        {"addresses": {"$not": {"$elemMatch": {"region": {"$regex": region_pattern, "$options": "i"}}}}},
                     ]}
                 if elem.geo_type == "city_district":
                     escaped = re.escape(str(elem.value))

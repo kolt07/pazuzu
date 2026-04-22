@@ -2307,6 +2307,7 @@
         gpuStr += " (за міс. " + gpuMonthMin.toFixed(1) + " хв";
         if (gpuCostMonth > 0) gpuStr += ", Vast $" + gpuCostMonth.toFixed(4);
         gpuStr += ")";
+        gpuStr += ", витрати Vast за 30 днів: $" + gpuCostMonth.toFixed(4);
         summaryEl.innerHTML = "<strong>" + llmStr + "</strong> &nbsp;|&nbsp; <strong>" + geoStr + "</strong> &nbsp;|&nbsp; <strong>" + gpuStr + "</strong>";
         if (data.error) summaryEl.innerHTML += " <span class=\"admin-hint\">(" + data.error + ")</span>";
         renderAdminUsageCharts(llm.by_day || [], geo.by_day || [], gpu.by_day || []);
@@ -2329,7 +2330,7 @@
       plugins: { legend: { display: false } },
       scales: {
         x: { ticks: { maxRotation: 45, font: { size: 10 } } },
-        y: { beginAtZero: true, ticks: { stepSize: 1 } }
+        y: { beginAtZero: true }
       }
     };
 
@@ -2358,7 +2359,7 @@
       type: "bar",
       data: {
         labels: gpuByDay.map(function (d) { return d.date; }),
-        datasets: [{ label: "GPU runtime (хв)", data: gpuByDay.map(function (d) { return d.active_minutes || 0; }), backgroundColor: "rgba(255, 152, 0, 0.6)", borderColor: "rgb(255, 152, 0)", borderWidth: 1 }]
+        datasets: [{ label: "Vast витрати (USD)", data: gpuByDay.map(function (d) { return d.billed_cost_usd || d.estimated_cost_usd || 0; }), backgroundColor: "rgba(255, 152, 0, 0.6)", borderColor: "rgb(255, 152, 0)", borderWidth: 1 }]
       },
       options: chartOpts
     });
@@ -2834,8 +2835,6 @@
     if (opts && opts.listing_types && (Array.isArray(opts.listing_types) ? opts.listing_types.length : opts.listing_types)) {
       params.set("listing_types", Array.isArray(opts.listing_types) ? opts.listing_types.join(",") : String(opts.listing_types));
     }
-    var useBrowserOlxEl = document.getElementById("admin-data-update-use-browser-olx");
-    if (useBrowserOlxEl && useBrowserOlxEl.checked) params.set("use_browser_olx", "1");
     var olxPhase1ThreadsEl = document.getElementById("admin-data-update-olx-phase1-threads");
     if (olxPhase1ThreadsEl && olxPhase1ThreadsEl.value !== "" && olxPhase1ThreadsEl.value !== null) {
       var v = parseInt(olxPhase1ThreadsEl.value, 10);

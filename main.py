@@ -146,7 +146,6 @@ class Application:
         days: int = None,
         regions=None,
         listing_types=None,
-        use_browser_olx=None,
         olx_phase1_max_threads=None,
     ):
         if not self.task_queue_service or not self.task_queue_service.is_enabled():
@@ -156,7 +155,6 @@ class Application:
                 days=days,
                 regions=regions,
                 listing_types=listing_types,
-                use_browser_olx=use_browser_olx,
                 olx_phase1_max_threads=olx_phase1_max_threads,
             )
         dispatched = self.task_queue_service.enqueue_source_load(
@@ -164,7 +162,6 @@ class Application:
             sources=sources,
             regions=regions,
             listing_types=listing_types,
-            use_browser_olx=use_browser_olx,
             olx_phase1_max_threads=olx_phase1_max_threads,
             metadata={"trigger": "main_application"},
         )

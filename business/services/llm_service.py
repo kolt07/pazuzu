@@ -362,12 +362,8 @@ class GeminiLLMProvider(BaseLLMProvider):
                             land_area_ha = area_value
                         elif any(x in unit_lower for x in ['м²', 'м2', 'кв.м', 'квадратний метр']):
                             building_area_sqm = area_value
-                        elif any(x in unit_lower for x in ['сотка', 'соток']):
-                            # Сотки можуть бути і для землі, і для нерухомості - за значенням визначаємо
-                            if area_value < 100:  # Швидше за все це гектари (менше 1 га)
-                                land_area_ha = area_value * 0.01
-                            else:  # Швидше за все це м²
-                                building_area_sqm = area_value * 100
+                        elif 'сот' in unit_lower:
+                            land_area_ha = area_value * 0.01
                     else:
                         # Якщо одиниця не вказана - визначаємо за значенням
                         if area_value > 1000:
@@ -548,12 +544,8 @@ class OpenAILLMProvider(BaseLLMProvider):
                             land_area_ha = area_value
                         elif any(x in unit_lower for x in ['м²', 'м2', 'кв.м', 'квадратний метр']):
                             building_area_sqm = area_value
-                        elif any(x in unit_lower for x in ['сотка', 'соток']):
-                            # Сотки можуть бути і для землі, і для нерухомості - за значенням визначаємо
-                            if area_value < 100:  # Швидше за все це гектари (менше 1 га)
-                                land_area_ha = area_value * 0.01
-                            else:  # Швидше за все це м²
-                                building_area_sqm = area_value * 100
+                        elif 'сот' in unit_lower:
+                            land_area_ha = area_value * 0.01
                     else:
                         # Якщо одиниця не вказана - визначаємо за значенням
                         if area_value > 1000:
@@ -702,12 +694,8 @@ class AnthropicLLMProvider(BaseLLMProvider):
                             land_area_ha = area_value
                         elif any(x in unit_lower for x in ['м²', 'м2', 'кв.м', 'квадратний метр']):
                             building_area_sqm = area_value
-                        elif any(x in unit_lower for x in ['сотка', 'соток']):
-                            # Сотки можуть бути і для землі, і для нерухомості - за значенням визначаємо
-                            if area_value < 100:  # Швидше за все це гектари (менше 1 га)
-                                land_area_ha = area_value * 0.01
-                            else:  # Швидше за все це м²
-                                building_area_sqm = area_value * 100
+                        elif 'сот' in unit_lower:
+                            land_area_ha = area_value * 0.01
                     else:
                         # Якщо одиниця не вказана - визначаємо за значенням
                         if area_value > 1000:
@@ -898,8 +886,8 @@ class OllamaLLMProvider(BaseLLMProvider):
                             land_area_ha = area_value
                         elif any(x in unit_lower for x in ["м²", "м2", "кв.м", "квадратний метр"]):
                             building_area_sqm = area_value
-                        elif any(x in unit_lower for x in ["сотка", "соток"]):
-                            land_area_ha = area_value * 0.01 if area_value < 100 else area_value * 100
+                        elif "сот" in unit_lower:
+                            land_area_ha = area_value * 0.01
                     else:
                         building_area_sqm = area_value if area_value > 1000 else ""
                         land_area_ha = area_value if area_value < 10 else ""
@@ -1237,8 +1225,8 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
                             land_area_ha = area_value
                         elif any(x in unit_lower for x in ["м²", "м2", "кв.м", "квадратний метр"]):
                             building_area_sqm = area_value
-                        elif any(x in unit_lower for x in ["сотка", "соток"]):
-                            land_area_ha = area_value * 0.01 if area_value < 100 else area_value * 100
+                        elif "сот" in unit_lower:
+                            land_area_ha = area_value * 0.01
                     else:
                         building_area_sqm = area_value if area_value > 1000 else ""
                         land_area_ha = area_value if area_value < 10 else ""

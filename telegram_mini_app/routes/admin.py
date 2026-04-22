@@ -192,18 +192,6 @@ def data_update_options(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _parse_use_browser_olx(value: Optional[str]) -> Optional[bool]:
-    """Парсить use_browser_olx з query: 1/true/yes → True, 0/false/no → False, інше → None."""
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return None
-    v = str(value).strip().lower()
-    if v in ("1", "true", "yes"):
-        return True
-    if v in ("0", "false", "no"):
-        return False
-    return None
-
-
 @router.post("/data-update")
 def start_data_update(
     request: Request,
@@ -212,7 +200,6 @@ def start_data_update(
     source: Optional[str] = Query(None, description="olx | prozorro | both — джерело для оновлення"),
     regions: Optional[str] = Query(None, description="Точкове оновлення: області через кому (напр. Київська,Львівська)"),
     listing_types: Optional[str] = Query(None, description="Точкове оновлення OLX: типи оголошень через кому (напр. Нежитлова,Земля)"),
-    use_browser_olx: Optional[str] = Query(None, description="1/true = OLX через браузер (клікер) для цього запуску"),
     olx_phase1_max_threads: Optional[int] = Query(None, description="Кількість потоків Phase 1 OLX (пул завдань область+категорія); за замовчуванням з конфігу (5); 0 = legacy по області"),
 ):
     """
@@ -237,7 +224,6 @@ def start_data_update(
     regions_list = _parse_comma_list(regions)
     listing_types_list = _parse_comma_list(listing_types)
     use_targeted_pipeline = bool(regions_list or listing_types_list) and not (mode in ("full_olx", "full_prozorro"))
-    olx_use_browser = _parse_use_browser_olx(use_browser_olx)
 
     # Джерела за source (точкове або класичне)
     source_lower = (source or "both").strip().lower()
@@ -284,7 +270,6 @@ def start_data_update(
             sources=pipeline_sources,
             regions=regions_list,
             listing_types=listing_types_list,
-            use_browser_olx=olx_use_browser,
             olx_phase1_max_threads=olx_phase1_max_threads,
             metadata={"trigger": "mini_app_admin", "mode": mode or "period"},
         )
@@ -333,7 +318,6 @@ def start_data_update(
                     days=None if (olx_full or prozorro_full) else effective_days,
                     regions=regions_list,
                     listing_types=listing_types_list,
-                    use_browser_olx=olx_use_browser,
                     olx_phase1_max_threads=olx_phase1_max_threads,
                 )
                 if run_prozorro:
@@ -387,7 +371,6 @@ def start_data_update(
                             settings=settings,
                             sources=["olx"],
                             days=None if olx_full else effective_days,
-                            use_browser_olx=olx_use_browser,
                             olx_phase1_max_threads=olx_phase1_max_threads,
                         )
                         p1 = result_olx.get("phase1", {}).get("olx", {})

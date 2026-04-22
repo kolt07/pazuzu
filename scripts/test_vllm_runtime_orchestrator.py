@@ -375,6 +375,71 @@ class VllmRuntimeOrchestratorTest(unittest.TestCase):
         obj.report_inference_failure("err-3")
         self.assertEqual(calls["scheduled"], 1)
 
+    def test_ensure_runtime_ready_reacquires_coord_after_teardown_before_next_attempt(self):
+        class _FakeClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.create_calls = 0
+
+            def create_instance(self, ask_id: str, payload):
+                self.create_calls += 1
+                return {"new_contract": "instance-first"}
+
+        class _FakeSettings:
+            @staticmethod
+            def get_settings():
+                return {
+                    "is_enabled": True,
+                    "vast_api_key": "token",
+                    "boot_timeout_sec": 60,
+                    "ready_timeout_sec": 60,
+                    "endpoint_timeout_sec": 60,
+                    "vllm_port": 8000,
+                }
+
+        class _FakeSessions:
+            @staticmethod
+            def start_session(_doc):
+                return "session-1"
+
+            @staticmethod
+            def finish_session(_session_id, _state):
+                return None
+
+        obj = VllmRuntimeOrchestrator.__new__(VllmRuntimeOrchestrator)
+        obj._lock = threading.Lock()
+        obj._settings_svc = _FakeSettings()
+        obj._sessions = _FakeSessions()
+        obj._owner_id = "owner-1"
+        obj._instance_id = None
+        obj._endpoint = None
+        obj._public_endpoint = None
+        obj._session_id = None
+        obj._instance_paused = False
+        obj._last_activity_ts = 0.0
+        obj._log_gpu_usage = lambda *_args, **_kwargs: None
+        obj._coord_update_state = lambda *_args, **_kwargs: None
+        obj._coord_release = lambda *_args, **_kwargs: None
+        obj._coord_renew_lease = lambda *_args, **_kwargs: None
+        obj._enforce_singleton_vast_instances = lambda *_args, **_kwargs: None
+        obj._get_singleton_runtime_instance = lambda *_args, **_kwargs: None
+        obj._build_create_payload = lambda _cfg: {"image": "test"}
+        obj._select_offer_candidates = lambda *_args, **_kwargs: ["ask-1", "ask-2"]
+        obj._execute_contract_boot_steps = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boot failed"))
+        obj._teardown_locked = lambda reason: None
+
+        owner_checks = [True, False]
+        obj._coord_owner_is_self = lambda: owner_checks.pop(0) if owner_checks else False
+        acquire_results = [True, False]
+        obj._coord_try_acquire = lambda *_args, **_kwargs: acquire_results.pop(0) if acquire_results else False
+        obj._wait_for_shared_runtime_or_acquire = lambda *_args, **_kwargs: "http://shared-runtime:8000"
+
+        fake_client = _FakeClient()
+        with patch("business.services.vllm_runtime_orchestrator.VastAiClient", lambda *_args, **_kwargs: fake_client):
+            endpoint = obj.ensure_runtime_ready()
+
+        self.assertEqual(endpoint, "http://shared-runtime:8000")
+        self.assertEqual(fake_client.create_calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

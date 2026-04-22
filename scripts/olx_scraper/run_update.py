@@ -36,7 +36,7 @@ from business.services.currency_rate_service import CurrencyRateService
 from utils.price_metrics import compute_price_metrics
 from scripts.olx_scraper import config as scraper_config
 from scripts.olx_scraper.fetcher import fetch_page, get_session
-from scripts.olx_scraper.parser import parse_listings_page, parse_detail_page, detect_antibot_page
+from scripts.olx_scraper.parser import parse_listings_page, parse_detail_page
 
 from scripts.olx_scraper.helpers import (
     search_data_from_listing,
@@ -49,24 +49,6 @@ from business.services.llm_processing_regions_service import is_region_enabled_f
 
 logger = logging.getLogger(__name__)
 
-
-def _fetch_detail_page(
-    url: str,
-    session: Optional[Any] = None,
-    log_fn: Optional[Callable[[str], None]] = None,
-) -> Any:
-    """
-    Завантажує сторінку оголошення з більшим таймаутом (is_detail=True).
-    При виявленні ознак антиботу — одна повторна спроба через 8 с.
-    """
-    log = log_fn or (lambda s: None)
-    resp = fetch_page(url, delay_before=False, session=session, is_detail=True)
-    antibot = detect_antibot_page(resp.text)
-    if antibot.get("is_antibot") and antibot.get("hints"):
-        log(f"[OLX] Ознаки антиботу/перевірки: {', '.join(antibot['hints'])}. Повтор через 8 с...")
-        time.sleep(8)
-        resp = fetch_page(url, delay_before=False, session=session, is_detail=True)
-    return resp
 
 try:
     from tqdm import tqdm
@@ -98,6 +80,7 @@ def _process_category(
     usd_rate: Optional[float] = None,
     session: Optional[Any] = None,
     region_name: Optional[str] = None,
+    browser_fetcher: Optional[Any] = None,
 ) -> Tuple[int, int, set, List[str]]:
     """
     Обробляє одну категорію OLX у два етапи:
@@ -231,6 +214,9 @@ def _process_category(
     if total_count == 0:
         return 0, 0, search_urls, []
 
+    if browser_fetcher is None:
+        raise RuntimeError("Browser detail fetcher is required for OLX detail pages.")
+
     # ——— Етап 2: завантаження деталей (сирі дані, без LLM). LLM — у Phase 2. ———
     total_detail_fetches = 0
     pending_llm_urls: List[str] = []
@@ -253,10 +239,9 @@ def _process_category(
             need_detail = True
 
         if need_detail:
-            time.sleep(scraper_config.get_delay_detail_seconds())
             try:
-                detail_response = _fetch_detail_page(listing_url, session=session, log_fn=log)
-                detail_data = parse_detail_page(detail_response.text)
+                detail_result = browser_fetcher.get_detail_page(listing_url)
+                detail_data = parse_detail_page(detail_result.text)
                 if detail_data.get("_inactive"):
                     detail_data.pop("_inactive", None)
 
@@ -414,7 +399,7 @@ def _process_category_raw_only(
     """
     Phase 1 (raw pipeline): лише завантаження сирих даних у raw_olx_listings.
     Фільтрація та зупинка пагінації — як у _process_category: 0 результатів (рекламні), cutoff по даті, ретраї, 404.
-    Сторінки пошуку — завжди через прямі HTTP-запити (session). Деталі оголошень: якщо browser_fetcher задано — через клікер (один потік), інакше — requests.
+    Сторінки пошуку — завжди через прямі HTTP-запити (session). Деталі оголошень — через browser_fetcher (Playwright).
     Повертає (total_count, loaded_urls).
     """
     def log(msg: str) -> None:
@@ -547,6 +532,9 @@ def _process_category_raw_only(
     if total_count == 0:
         return 0, []
 
+    if browser_fetcher is None:
+        raise RuntimeError("Browser detail fetcher is required for OLX detail pages.")
+
     # ——— Етап 2: завантаження деталей і запис у raw (без LLM) ———
     loaded_urls: List[str] = []
     fetch_filters: Dict[str, Any] = {"category_label": category_label}
@@ -564,15 +552,9 @@ def _process_category_raw_only(
         existing_raw = raw_repo.find_by_url(listing_url)
         if existing_raw and existing_raw.get("search_data_hash") == new_hash:
             continue
-        if not browser_fetcher:
-            time.sleep(scraper_config.get_delay_detail_seconds())
         try:
-            if browser_fetcher:
-                detail_result = browser_fetcher.get_detail_page(listing_url)
-                detail_html = detail_result.text
-            else:
-                detail_response = _fetch_detail_page(listing_url, session=session, log_fn=log_fn)
-                detail_html = detail_response.text
+            detail_result = browser_fetcher.get_detail_page(listing_url)
+            detail_html = detail_result.text
             detail_data = parse_detail_page(detail_html)
             if detail_data.get("_inactive"):
                 detail_data.pop("_inactive", None)
@@ -599,7 +581,7 @@ def _process_region_raw_only(
     max_pages_override: Optional[int] = None,
     browser_fetcher: Optional[Any] = None,
 ) -> Tuple[int, List[str]]:
-    """Phase 1: одна область — усі категорії, запис лише в raw. Список — requests, деталі — browser_fetcher якщо задано. Повертає (total_count, loaded_urls)."""
+    """Phase 1: одна область — усі категорії, запис лише в raw. Список — requests, деталі — browser_fetcher. Повертає (total_count, loaded_urls)."""
     session = get_session()
     total_count = 0
     loaded_urls: List[str] = []
@@ -662,7 +644,6 @@ def _phase1_worker(
     log_fn: Callable[[str], None],
     cutoff_utc: Optional[datetime],
     max_pages_override: Optional[int],
-    use_browser: bool,
     results_lock: threading.Lock,
     total_listings_ref: List[int],
     all_loaded_urls_ref: List[str],
@@ -678,8 +659,8 @@ def _phase1_worker(
 ) -> None:
     """
     Воркер Phase 1: бере завдання з черги (region_name, category_dict), виконує _process_category_raw_only,
-    додає результат до загальних total_listings та all_loaded_urls. Якщо use_browser — створює свій екземпляр браузера.
-    Один потік = один воркер; при use_browser = один браузер на потік.
+    додає результат до загальних total_listings і all_loaded_urls.
+    Один потік = один воркер = один браузер на потік.
     """
     session = get_session()
     browser_fetcher: Optional[Any] = None
@@ -768,12 +749,9 @@ def _phase1_worker(
                 with source_state_lock:
                     source_inflight_ref[0] = max(0, source_inflight_ref[0] - 1)
 
-    if use_browser:
-        from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
-        with BrowserPageFetcher(headless=True, log_fn=log_fn) as bf:
-            browser_fetcher = bf
-            _run_loop()
-    else:
+    from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
+    with BrowserPageFetcher(headless=True, log_fn=log_fn) as bf:
+        browser_fetcher = bf
         _run_loop()
 
 
@@ -783,7 +761,6 @@ def run_olx_update_raw_only(
     days: Optional[int] = None,
     regions: Optional[List[str]] = None,
     listing_types: Optional[List[str]] = None,
-    use_browser: Optional[bool] = None,
     max_workers: Optional[int] = None,
     llm_process_url_fn: Optional[Callable[[str], bool]] = None,
     llm_enqueue_region_filter_fn: Optional[Callable[[str], bool]] = None,
@@ -796,7 +773,6 @@ def run_olx_update_raw_only(
 
     regions: якщо задано — обробляються лише ці області (назви з olx_region_slugs).
     listing_types: якщо задано — лише категорії, чий label містить один із рядків (напр. «Нежитлова», «Земля»).
-    use_browser: якщо задано — використовувати браузер (Playwright); інакше береться з settings.olx_use_browser, потім з env (OLX_SCRAPER_USE_BROWSER).
     max_workers: кількість потоків Phase 1; None = з конфігу (OLX_PHASE1_MAX_THREADS), 0 = не використовувати пул (legacy: по одному потоку на область).
     llm_process_url_fn: якщо задано — в режимі пулу вільні воркери обробляють LLM-чергу
         (URL додаються туди одразу після завершення source-задачі категорії).
@@ -807,12 +783,6 @@ def run_olx_update_raw_only(
     MongoDBConnection.initialize(settings)
     raw_repo = RawOlxListingsRepository()
     raw_repo.ensure_index()
-
-    # Єдине джерело: явний параметр → settings.olx_use_browser → env (scraper_config.USE_BROWSER)
-    if use_browser is None:
-        use_browser = getattr(settings, "olx_use_browser", None)
-    if use_browser is None:
-        use_browser = getattr(scraper_config, "USE_BROWSER", False)
 
     cutoff_utc: Optional[datetime] = None
     if days is not None and days >= 1:
@@ -878,7 +848,6 @@ def run_olx_update_raw_only(
                     log,
                     cutoff_utc,
                     max_pages_override,
-                    use_browser,
                     results_lock,
                     total_listings_ref,
                     all_loaded_urls,
@@ -902,59 +871,33 @@ def run_olx_update_raw_only(
             t.join()
         total_listings = total_listings_ref[0]
     else:
-        # Legacy: по одному завданню на область (послідовно з браузером або паралельно по областях)
+        # Legacy: по одному завданню на область (послідовно з браузером)
         all_loaded_urls = []
         total_listings = 0
         llm_processed_urls = []
-        if use_browser:
-            log("[OLX raw] Phase 1: сторінки пошуку — прямі запити; деталі оголошень — клікер (одним потоком). Області обробляються послідовно.")
-            try:
-                from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
-                with BrowserPageFetcher(headless=True, log_fn=log) as browser_fetcher:
-                    for region_name, cats in regions_with_cats:
-                        try:
-                            n_list, urls = _process_region_raw_only(
-                                region_name,
-                                cats,
-                                raw_repo,
-                                log,
-                                cutoff_utc,
-                                max_pages_override,
-                                browser_fetcher=browser_fetcher,
-                            )
-                            total_listings += n_list
-                            all_loaded_urls.extend(urls)
-                        except Exception as e:
-                            log(f"[OLX raw] Помилка області {region_name}: {e}")
-            except RuntimeError as e:
-                log(f"[OLX raw] Браузер недоступний: {e}")
-            except Exception as e:
-                log(f"[OLX raw] Помилка браузера: {e}")
-        else:
-            max_workers_legacy = min(len(regions_with_cats), getattr(scraper_config, "MAX_PARALLEL_REGIONS", 25))
-            log(f"[OLX raw] Phase 1: паралельна обробка {len(regions_with_cats)} областей, до {max_workers_legacy} потоків")
-            with ThreadPoolExecutor(max_workers=max_workers_legacy) as executor:
-                futures = {
-                    executor.submit(
-                        _process_region_raw_only,
-                        region_name,
-                        cats,
-                        raw_repo,
-                        log,
-                        cutoff_utc,
-                        max_pages_override,
-                        None,
-                    ): region_name
-                    for region_name, cats in regions_with_cats
-                }
-                for future in as_completed(futures):
-                    region_name = futures[future]
+        log("[OLX raw] Phase 1: сторінки пошуку — прямі запити; деталі оголошень — браузер (Playwright). Області обробляються послідовно.")
+        try:
+            from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
+            with BrowserPageFetcher(headless=True, log_fn=log) as browser_fetcher:
+                for region_name, cats in regions_with_cats:
                     try:
-                        n_list, urls = future.result()
+                        n_list, urls = _process_region_raw_only(
+                            region_name,
+                            cats,
+                            raw_repo,
+                            log,
+                            cutoff_utc,
+                            max_pages_override,
+                            browser_fetcher=browser_fetcher,
+                        )
                         total_listings += n_list
                         all_loaded_urls.extend(urls)
                     except Exception as e:
                         log(f"[OLX raw] Помилка області {region_name}: {e}")
+        except RuntimeError as e:
+            log(f"[OLX raw] Браузер недоступний: {e}")
+        except Exception as e:
+            log(f"[OLX raw] Помилка браузера: {e}")
 
     loaded_urls = list(dict.fromkeys(all_loaded_urls))
     log(f"[OLX raw] Phase 1 готово. Оголошень: {total_listings}, завантажено/оновлено URL: {len(loaded_urls)}")
@@ -980,6 +923,7 @@ def _process_region(
 ) -> Tuple[int, int, List[Dict[str, Any]], set, List[str]]:
     """
     Обробляє одну область: 2 категорії (нежитлова + земля) з одним HTTP-сеансом.
+    Деталі оголошень завантажуються лише через браузерний fetcher.
     Повертає (total_listings, total_detail_fetches, by_category, search_urls, pending_llm_urls).
     """
     session = get_session()
@@ -989,38 +933,42 @@ def _process_region(
     all_search_urls: set = set()
     pending_llm_urls: List[str] = []
 
-    for cat in categories:
-        label = cat.get("label", "?")
-        get_list_url = cat.get("get_list_url")
-        if not callable(get_list_url):
-            continue
-        max_pages = (
-            max_pages_override
-            if max_pages_override is not None
-            else min(
-                int(cat.get("max_pages", scraper_config.MAX_SEARCH_PAGES)),
-                scraper_config.MAX_SEARCH_PAGES,
+    from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
+
+    with BrowserPageFetcher(headless=True, log_fn=log_fn) as browser_fetcher:
+        for cat in categories:
+            label = cat.get("label", "?")
+            get_list_url = cat.get("get_list_url")
+            if not callable(get_list_url):
+                continue
+            max_pages = (
+                max_pages_override
+                if max_pages_override is not None
+                else min(
+                    int(cat.get("max_pages", scraper_config.MAX_SEARCH_PAGES)),
+                    scraper_config.MAX_SEARCH_PAGES,
+                )
             )
-        )
-        n_listings, n_details, cat_urls, cat_pending = _process_category(
-            get_list_url,
-            max_pages,
-            label,
-            repo,
-            llm_extractor,
-            geocoding_service,
-            unified_service=unified_service,
-            log_fn=log_fn,
-            cutoff_utc=cutoff_utc,
-            usd_rate=usd_rate,
-            session=session,
-            region_name=region_name,
-        )
-        total_listings += n_listings
-        total_detail_fetches += n_details
-        all_search_urls.update(cat_urls or set())
-        pending_llm_urls.extend(cat_pending or [])
-        by_category.append({"label": label, "listings": n_listings, "detail_fetches": n_details})
+            n_listings, n_details, cat_urls, cat_pending = _process_category(
+                get_list_url,
+                max_pages,
+                label,
+                repo,
+                llm_extractor,
+                geocoding_service,
+                unified_service=unified_service,
+                log_fn=log_fn,
+                cutoff_utc=cutoff_utc,
+                usd_rate=usd_rate,
+                session=session,
+                region_name=region_name,
+                browser_fetcher=browser_fetcher,
+            )
+            total_listings += n_listings
+            total_detail_fetches += n_details
+            all_search_urls.update(cat_urls or set())
+            pending_llm_urls.extend(cat_pending or [])
+            by_category.append({"label": label, "listings": n_listings, "detail_fetches": n_details})
 
     return total_listings, total_detail_fetches, by_category, all_search_urls, pending_llm_urls
 
@@ -1398,26 +1346,28 @@ def run_olx_update(
         by_category = []
         all_search_urls: set = set()
         pending_llm_urls: List[str] = []
-        for cat in categories:
-            label = cat.get("label", "?")
-            get_list_url = cat.get("get_list_url")
-            max_pages = max_pages_override or min(
-                int(cat.get("max_pages", scraper_config.MAX_SEARCH_PAGES)),
-                scraper_config.MAX_SEARCH_PAGES,
-            )
-            if not callable(get_list_url):
-                log(f"[OLX] Пропуск категорії {label}: немає get_list_url")
-                continue
-            n_listings, n_details, cat_urls, cat_pending = _process_category(
-                get_list_url, max_pages, label, repo, llm_extractor, geocoding_service,
-                unified_service=unified_service, log_fn=log, cutoff_utc=cutoff_utc,
-                usd_rate=usd_rate, session=None, region_name=None,
-            )
-            total_listings += n_listings
-            total_detail_fetches += n_details
-            all_search_urls.update(cat_urls or set())
-            pending_llm_urls.extend(cat_pending or [])
-            by_category.append({"label": label, "listings": n_listings, "detail_fetches": n_details})
+        from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
+        with BrowserPageFetcher(headless=True, log_fn=log) as browser_fetcher:
+            for cat in categories:
+                label = cat.get("label", "?")
+                get_list_url = cat.get("get_list_url")
+                max_pages = max_pages_override or min(
+                    int(cat.get("max_pages", scraper_config.MAX_SEARCH_PAGES)),
+                    scraper_config.MAX_SEARCH_PAGES,
+                )
+                if not callable(get_list_url):
+                    log(f"[OLX] Пропуск категорії {label}: немає get_list_url")
+                    continue
+                n_listings, n_details, cat_urls, cat_pending = _process_category(
+                    get_list_url, max_pages, label, repo, llm_extractor, geocoding_service,
+                    unified_service=unified_service, log_fn=log, cutoff_utc=cutoff_utc,
+                    usd_rate=usd_rate, session=None, region_name=None, browser_fetcher=browser_fetcher,
+                )
+                total_listings += n_listings
+                total_detail_fetches += n_details
+                all_search_urls.update(cat_urls or set())
+                pending_llm_urls.extend(cat_pending or [])
+                by_category.append({"label": label, "listings": n_listings, "detail_fetches": n_details})
 
         # Phase 2 для sequential режиму
         pending_llm_urls = list(dict.fromkeys(pending_llm_urls))

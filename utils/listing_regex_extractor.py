@@ -27,7 +27,7 @@ _BUILDING_AREA_PATTERNS = [
 _LAND_AREA_PATTERNS = [
     re.compile(r'(\d[\d\s]*[.,]?\d*)\s*(?:га|гектар|гектарів)', re.IGNORECASE),
     re.compile(r'(?:площа\s+ділянки|площа\s+землі|земельна\s+ділянка)[:\s]*(\d[\d\s]*[.,]?\d*)\s*(?:га|м²|м2)?', re.IGNORECASE),
-    re.compile(r'(\d[\d\s]*[.,]?\d*)\s*соток(?:\s+землі)?', re.IGNORECASE),
+    re.compile(r'(\d[\d\s]*[.,]?\d*)\s*сот(?:к(?:а|и|у|ою|ами|ах)?|ок|их|і|и)?(?:\s+землі)?', re.IGNORECASE),
 ]
 
 # Область: "Харківська область", "Київська обл."
@@ -121,7 +121,7 @@ def extract_land_area_ha(text: str) -> str:
             val = _parse_float(m.group(1))
             if val is not None and 0.001 < val < 100000:
                 # Сотки -> га (100 соток = 1 га)
-                if 'соток' in (m.group(0) or '').lower():
+                if 'сот' in (m.group(0) or '').lower():
                     val = val * 0.01
                 values.append(val)
     if not values:

@@ -129,7 +129,6 @@ class TaskQueueService:
         sources: Optional[List[str]],
         regions: Optional[List[str]] = None,
         listing_types: Optional[List[str]] = None,
-        use_browser_olx: Optional[bool] = None,
         olx_phase1_max_threads: Optional[int] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -140,7 +139,6 @@ class TaskQueueService:
             "sources": list(sources or []),
             "regions": list(regions or []),
             "listing_types": list(listing_types or []),
-            "use_browser_olx": use_browser_olx,
             "olx_phase1_max_threads": olx_phase1_max_threads,
         }
         if self._celery is None:

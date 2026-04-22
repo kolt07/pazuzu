@@ -112,7 +112,6 @@ def run_source_load_pipeline_task(
     sources: Optional[list] = None,
     regions: Optional[list] = None,
     listing_types: Optional[list] = None,
-    use_browser_olx: Optional[bool] = None,
     olx_phase1_max_threads: Optional[int] = None,
 ) -> Dict[str, Any]:
     settings = _init_runtime()
@@ -139,7 +138,6 @@ def run_source_load_pipeline_task(
             days=days,
             regions=list(regions or []) or None,
             listing_types=list(listing_types or []) or None,
-            use_browser_olx=use_browser_olx,
             olx_phase1_max_threads=olx_phase1_max_threads,
             use_brokered_llm=True,
             log_fn=log_fn,

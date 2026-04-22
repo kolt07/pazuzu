@@ -373,6 +373,20 @@ class VllmRuntimeOrchestrator:
             tried_ask_ids: set[str] = set()
             ask_pool: List[str] = []
             while attempted < max_attempts:
+                # Після teardown lock звільняється; перед кожною новою орендою
+                # перевіряємо ownership, щоб уникнути подвійної оренди між процесами.
+                if not self._coord_owner_is_self():
+                    if not self._coord_try_acquire(cfg, state="starting"):
+                        shared_endpoint = self._wait_for_shared_runtime_or_acquire(cfg, client)
+                        if shared_endpoint:
+                            self._last_activity_ts = time.time()
+                            logger.info(
+                                "[gpu-runtime] використано спільний endpoint іншого процесу (reacquire): %s",
+                                shared_endpoint,
+                            )
+                            return shared_endpoint
+                    else:
+                        self._coord_renew_lease(cfg, state="starting")
                 if not ask_pool:
                     fresh_candidates = [
                         aid
@@ -1487,7 +1501,14 @@ class VllmRuntimeOrchestrator:
                 if not self._wait_for_ollama_model_available(endpoint, model, timeout_sec=availability_timeout):
                     raise RuntimeError(f"Ollama pull completed but model is not available: {model}")
 
-            loadable, load_error = self._wait_for_ollama_model_loadable(endpoint, model, timeout_sec=75)
+            # Після pull Ollama може ще довго "розігрівати" модель перед першим generate.
+            # Коротке вікно дає хибні fail/startup loops на повільних/мережевих хостах.
+            loadable_timeout = int(cfg.get("model_loadability_timeout_sec") or 240)
+            loadable, load_error = self._wait_for_ollama_model_loadable(
+                endpoint,
+                model,
+                timeout_sec=max(75, loadable_timeout),
+            )
             if loadable:
                 break
             if repaired_once or not self._is_ollama_blob_load_error(load_error):
@@ -1538,7 +1559,7 @@ class VllmRuntimeOrchestrator:
         txt = str(message or "").lower()
         return ("unable to load model" in txt) or ("models/blobs/sha256" in txt)
 
-    def _check_ollama_model_loadability(self, endpoint: str, model: str, timeout_sec: int = 45) -> tuple[bool, str]:
+    def _check_ollama_model_loadability(self, endpoint: str, model: str, timeout_sec: int = 90) -> tuple[bool, str]:
         base = endpoint.rstrip("/")
         try:
             resp = requests.post(
@@ -1566,12 +1587,15 @@ class VllmRuntimeOrchestrator:
             body = (resp.text or "").strip()
         return False, f"http={resp.status_code} {body[:500]}".strip()
 
-    def _wait_for_ollama_model_loadable(self, endpoint: str, model: str, timeout_sec: int = 75) -> tuple[bool, str]:
-        deadline = time.time() + max(15, int(timeout_sec))
+    def _wait_for_ollama_model_loadable(self, endpoint: str, model: str, timeout_sec: int = 240) -> tuple[bool, str]:
+        deadline = time.time() + max(30, int(timeout_sec))
         last_error = ""
         while time.time() < deadline:
             self._coord_renew_lease(self._settings_svc.get_settings(), state="model_loadable_wait")
-            ok, error = self._check_ollama_model_loadability(endpoint, model, timeout_sec=45)
+            remaining = max(1, int(deadline - time.time()))
+            # Даємо довший per-request timeout, але не більший за залишок загального вікна.
+            probe_timeout = max(20, min(120, remaining))
+            ok, error = self._check_ollama_model_loadability(endpoint, model, timeout_sec=probe_timeout)
             if ok:
                 return True, ""
             last_error = error
@@ -2046,6 +2070,16 @@ class VllmRuntimeOrchestrator:
                     return None
             time.sleep(5)
         raise RuntimeError("Timed out waiting for another process to finish Vast runtime startup.")
+
+    def _coord_owner_is_self(self) -> bool:
+        state = self._coord.get_runtime_state() or {}
+        if str(state.get("owner_id") or "").strip() != self._owner_id:
+            return False
+        lease_until = state.get("lease_expires_at")
+        if not isinstance(lease_until, datetime):
+            return False
+        lease_until = self._mongo_datetime_as_utc_aware(lease_until)
+        return lease_until > self._utcnow()
 
     @staticmethod
     def _gpu_meta_tail(metadata: Dict[str, Any]) -> str:

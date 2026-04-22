@@ -120,12 +120,6 @@ llm:
 #   forced_healthcheck_after_failures: 3
 #   forced_healthcheck_cooldown_sec: 30
 
-# OLX скрапер: отримання сторінок пошуку та деталей через браузер (Playwright) замість HTTP
-# true = клікер (області обробляються послідовно); false або відсутнє = requests (паралельно)
-# Також можна задати змінною середовища OLX_SCRAPER_USE_BROWSER=1
-# olx:
-#   use_browser: false
-
 # Регламентне фонове оновлення даних (ProZorro + OLX за минулу добу)
 # Працює лише при запуску Telegram бота. Інтервал у хвилинах; 0 = вимкнено
 # background_update:

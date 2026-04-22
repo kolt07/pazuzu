@@ -231,7 +231,6 @@ def run_full_pipeline(
     log_fn: Optional[Callable[[str], None]] = None,
     regions: Optional[List[str]] = None,
     listing_types: Optional[List[str]] = None,
-    use_browser_olx: Optional[bool] = None,
     olx_phase1_max_threads: Optional[int] = None,
     use_brokered_llm: bool = False,
     llm_wait_heartbeat_fn: Optional[Callable[[], None]] = None,
@@ -247,7 +246,6 @@ def run_full_pipeline(
         log_fn: опціональна функція логування.
         regions: точкове оновлення — лише ці області (для OLX — обмеження Phase 1; для ProZorro — фільтр Phase 2 по approximate_region).
         listing_types: точкове оновлення OLX — лише категорії, чий label містить один із рядків (напр. «Нежитлова», «Земля»).
-        use_browser_olx: якщо задано (True/False) — перевизначає settings.olx_use_browser для цього запуску (напр. з адмінки).
         olx_phase1_max_threads: кількість потоків Phase 1 OLX (пул завдань область+категорія); None = з конфігу; 0 = legacy (по області).
         run_phase3: якщо False — пропускає перерахунок аналітик/гео-індексу (Phase 3).
 
@@ -318,14 +316,12 @@ def run_full_pipeline(
                 usd_rate_olx = None
 
         if "olx" in sources:
-            olx_use_browser = use_browser_olx if use_browser_olx is not None else getattr(st, "olx_use_browser", None)
             r = run_olx_update_raw_only(
                 settings=st,
                 log_fn=log_fn,
                 days=days,
                 regions=regions,
                 listing_types=listing_types,
-                use_browser=olx_use_browser,
                 max_workers=olx_phase1_max_threads,
             )
             result["phase1"]["olx"] = r

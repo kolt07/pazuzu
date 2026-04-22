@@ -22,6 +22,11 @@ from config.settings import Settings
 from business.services.llm_service import LLMService
 from business.services.llm_cache_service import LLMCacheService
 from utils.hash_utils import calculate_object_version_hash, calculate_description_hash
+from utils.land_area_utils import (
+    coerce_land_area_sqm,
+    extract_sotok_area_sqm,
+    should_fix_land_area_sqm_by_sotok,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -31,7 +36,6 @@ class OlxLLMExtractorService:
     """Сервіс, що застосовує LLM до сторінки оголошення OLX з кешуванням результатів."""
     _CADASTRAL_PATTERN = re.compile(r"\b\d{10,12}(?::\d{1,4}){2,3}\b")
     _PRICE_RECOVERY_CACHE_PREFIX = "olx_price_recovery_"
-    _SOTOK_PATTERN = re.compile(r"(\d[\d\s]*[.,]?\d*)\s*сот(?:к(?:а|и|у|ою)?|ок)?\b", re.IGNORECASE)
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -237,50 +241,20 @@ class OlxLLMExtractorService:
     @classmethod
     def _extract_sotok_area_sqm(cls, text: str) -> float:
         """Повертає сумарну площу у м² з фрагментів виду 'N соток'."""
-        if not text:
-            return 0.0
-        total_sqm = 0.0
-        for m in cls._SOTOK_PATTERN.finditer(text):
-            raw = (m.group(1) or "").replace(" ", "").replace(",", ".").strip()
-            if not raw:
-                continue
-            try:
-                sotok_value = float(raw)
-            except ValueError:
-                continue
-            # Відсікаємо шумові/нереалістичні значення.
-            if sotok_value <= 0 or sotok_value > 100000:
-                continue
-            total_sqm += sotok_value * 100.0
-        return total_sqm
-
-    @staticmethod
-    def _to_float(value: Any) -> float:
-        if value in (None, ""):
-            return 0.0
-        try:
-            return float(str(value).replace(" ", "").replace(",", "."))
-        except (TypeError, ValueError):
-            return 0.0
+        return extract_sotok_area_sqm(text)
 
     def _fix_land_area_scale_from_sotok(self, llm_result: Dict[str, Any], description_text: str) -> None:
         expected_sqm = self._extract_sotok_area_sqm(description_text)
         if expected_sqm <= 0:
             return
-        raw_land_sqm = self._to_float(llm_result.get("land_area_sqm"))
-        if raw_land_sqm <= 0:
-            raw_land_ha = self._to_float(llm_result.get("land_area_ha"))
-            raw_land_sqm = raw_land_ha * 10000.0 if raw_land_ha > 0 else 0.0
-        if raw_land_sqm <= 0:
-            llm_result["land_area_sqm"] = expected_sqm
-            llm_result["land_area_ha"] = expected_sqm / 10000.0
-            return
-        ratio = raw_land_sqm / expected_sqm if expected_sqm else 1.0
-        # Типові промахи LLM по масштабу: /10 або *10 від значення з соток.
-        if 0.09 <= ratio <= 0.11 or 9.0 <= ratio <= 11.0:
+        raw_land_sqm = coerce_land_area_sqm(
+            llm_result.get("land_area_sqm"),
+            llm_result.get("land_area_ha"),
+        )
+        if should_fix_land_area_sqm_by_sotok(raw_land_sqm, expected_sqm):
             logger.warning(
                 "[OLX LLM] Скориговано площу землі за сотками: llm=%.2f sqm -> expected=%.2f sqm",
-                raw_land_sqm,
+                raw_land_sqm or 0.0,
                 expected_sqm,
             )
             llm_result["land_area_sqm"] = expected_sqm

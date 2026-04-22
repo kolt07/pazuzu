@@ -16,6 +16,13 @@ from telegram_mini_app.auth import validate_telegram_init_data
 from data.repositories.unified_listings_repository import UnifiedListingsRepository
 from data.repositories.olx_listings_repository import OlxListingsRepository, _olx_url_variants
 from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepository
+from utils.ukraine_regions import (
+    build_region_search_regex,
+    get_ua_region_options,
+    is_special_city_region,
+    normalize_region_for_repository_lookup,
+    special_city_from_region,
+)
 
 
 router = APIRouter(prefix="/api/search", tags=["search"])
@@ -61,6 +68,8 @@ def _build_olx_filters(
 ) -> Dict[str, Any]:
     """Будує MongoDB фільтри для OLX."""
     filters: Dict[str, Any] = {}
+    region_lookup = normalize_region_for_repository_lookup(region) if region else None
+    region_regex = build_region_search_regex(region) if region else None
     
     # Фільтри за регіоном та містом
     if region or city:
@@ -73,8 +82,8 @@ def _build_olx_filters(
             from business.services.geography_service import GeographyService
             geography_service = GeographyService()
             
-            if region:
-                region_obj = geography_service.regions_repo.find_by_name(region)
+            if region_lookup:
+                region_obj = geography_service.regions_repo.find_by_name(region_lookup)
                 if region_obj:
                     region_id = str(region_obj["_id"])
             
@@ -110,12 +119,13 @@ def _build_olx_filters(
         
         # Fallback: фільтри з текстового пошуку
         if region:
+            region_pattern = region_regex or re.escape(str(region).strip())
             or_conditions.append({
                 "detail.resolved_locations": {
-                    "$elemMatch": {"results.address_structured.region": {"$regex": str(region).strip(), "$options": "i"}}
+                    "$elemMatch": {"results.address_structured.region": {"$regex": region_pattern, "$options": "i"}}
                 }
             })
-            or_conditions.append({"search_data.location": {"$regex": str(region).strip(), "$options": "i"}})
+            or_conditions.append({"search_data.location": {"$regex": region_pattern, "$options": "i"}})
         if city:
             or_conditions.append({
                 "detail.resolved_locations": {
@@ -151,6 +161,8 @@ def _build_prozorro_filters(
 ) -> Dict[str, Any]:
     """Будує MongoDB фільтри для Prozorro."""
     filters = {}
+    region_lookup = normalize_region_for_repository_lookup(region) if region else None
+    region_regex = build_region_search_regex(region) if region else None
     
     # Фільтри за регіоном та містом
     if region or city:
@@ -163,8 +175,8 @@ def _build_prozorro_filters(
             from business.services.geography_service import GeographyService
             geography_service = GeographyService()
             
-            if region:
-                region_obj = geography_service.regions_repo.find_by_name(region)
+            if region_lookup:
+                region_obj = geography_service.regions_repo.find_by_name(region_lookup)
                 if region_obj:
                     region_id = str(region_obj["_id"])
             
@@ -200,10 +212,11 @@ def _build_prozorro_filters(
         
         # Fallback: фільтри з текстового пошуку
         if region:
+            region_pattern = region_regex or re.escape(str(region).strip())
             or_conditions.append({
                 "auction_data.items": {
                     "$elemMatch": {
-                        "address.region.uk_UA": {"$regex": str(region).strip(), "$options": "i"}
+                        "address.region.uk_UA": {"$regex": region_pattern, "$options": "i"}
                     }
                 }
             })
@@ -273,6 +286,7 @@ def _build_unified_filters(
 ) -> Dict[str, Any]:
     """Будує MongoDB фільтри для зведеної таблиці unified_listings."""
     filters: Dict[str, Any] = {}
+    region_regex = build_region_search_regex(region) if region else None
 
     # Фільтр за джерелом (olx/prozorro)
     if source and source.lower() in ("olx", "prozorro"):
@@ -283,14 +297,14 @@ def _build_unified_filters(
         elem_match: Dict[str, Any] = {}
         if region:
             r = str(region).strip()
-            if r in _CITIES_WITH_SPECIAL_STATUS:
+            if is_special_city_region(r):
                 # Київ, Севастополь — міста зі спеціальним статусом; фільтруємо за settlement
-                escaped = re.escape(r)
+                city_name = special_city_from_region(r) or r
+                escaped = re.escape(city_name)
                 elem_match["settlement"] = {"$regex": f"^(м\\.\\s*)?{escaped}", "$options": "i"}
             else:
-                # re.escape для безпеки; substring-збіг для варіантів "Житомирська"/"Житомирська область"
-                r_base = r.replace(" область", "").replace(" обл.", "").strip() or r
-                elem_match["region"] = {"$regex": re.escape(r_base), "$options": "i"}
+                # Канонічний regex покриває "область/обл./о." та відмінки.
+                elem_match["region"] = {"$regex": region_regex or re.escape(r), "$options": "i"}
         if city:
             c = str(city).strip()
             escaped = re.escape(c)
@@ -388,8 +402,7 @@ def _filter_addresses_by_region(
     if not addresses or not isinstance(addresses, list):
         return doc
     r = region_filter.strip()
-    r_base = r.replace(" область", "").replace(" обл.", "").strip() or r
-    pattern = re.compile(re.escape(r_base), re.IGNORECASE)
+    pattern = re.compile(build_region_search_regex(r) or re.escape(r), re.IGNORECASE)
     matching = [a for a in addresses if isinstance(a, dict) and pattern.search(str(a.get("region") or ""))]
     if not matching:
         return doc
@@ -683,61 +696,7 @@ def get_olx_regions(request: Request):
     user_id, user_service = _get_validated_user(request)
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
-    try:
-        from business.services.geography_service import GeographyService
-        geography_service = GeographyService()
-        regions_list = geography_service.get_all_regions()
-        if regions_list:
-            return {"regions": [r["name"] for r in regions_list]}
-    except Exception:
-        pass
-    repo = OlxListingsRepository()
-    regions = set()
-    try:
-        pipeline = [
-            {"$match": {"detail.address_refs": {"$exists": True, "$ne": []}}},
-            {"$unwind": "$detail.address_refs"},
-            {"$match": {"detail.address_refs.region.name": {"$exists": True, "$ne": None}}},
-            {"$group": {"_id": "$detail.address_refs.region.name"}},
-            {"$sort": {"_id": 1}},
-        ]
-        for item in repo.collection.aggregate(pipeline):
-            if item.get("_id"):
-                regions.add(item["_id"])
-    except Exception:
-        pass
-    if not regions:
-        try:
-            pipeline = [
-                {"$match": {"detail.resolved_locations": {"$exists": True, "$ne": []}}},
-                {"$unwind": "$detail.resolved_locations"},
-                {"$unwind": "$detail.resolved_locations.results"},
-                {"$match": {"detail.resolved_locations.results.address_structured.region": {"$exists": True, "$ne": None}}},
-                {"$group": {"_id": "$detail.resolved_locations.results.address_structured.region"}},
-                {"$sort": {"_id": 1}},
-            ]
-            for item in repo.collection.aggregate(pipeline):
-                if item.get("_id"):
-                    regions.add(item["_id"])
-        except Exception:
-            pass
-    if not regions:
-        try:
-            pipeline = [
-                {"$match": {"search_data.location": {"$exists": True, "$ne": None, "$ne": ""}}},
-                {"$group": {"_id": "$search_data.location"}},
-                {"$sort": {"_id": 1}},
-            ]
-            for item in repo.collection.aggregate(pipeline):
-                loc = item.get("_id") or ""
-                if not isinstance(loc, str):
-                    continue
-                part = loc.split(",")[-1].strip() if "," in loc else loc.strip()
-                if part:
-                    regions.add(part)
-        except Exception:
-            pass
-    return {"regions": sorted(list(regions)) if regions else []}
+    return {"regions": get_ua_region_options()}
 
 
 @router.get("/olx/filters/cities")
@@ -749,8 +708,9 @@ def get_olx_cities(request: Request, region: Optional[str] = Query(None)):
     try:
         from business.services.geography_service import GeographyService
         geography_service = GeographyService()
+        region_lookup = normalize_region_for_repository_lookup(region) if region else None
         if region:
-            region_obj = geography_service.regions_repo.find_by_name(region)
+            region_obj = geography_service.regions_repo.find_by_name(region_lookup or region)
             if region_obj:
                 cities_list = geography_service.get_cities_by_region(str(region_obj["_id"]))
                 if cities_list:
@@ -770,7 +730,10 @@ def get_olx_cities(request: Request, region: Optional[str] = Query(None)):
     try:
         match_stage = {"detail.address_refs": {"$exists": True, "$ne": []}}
         if region:
-            match_stage["detail.address_refs.region.name"] = {"$regex": region, "$options": "i"}
+            match_stage["detail.address_refs.region.name"] = {
+                "$regex": build_region_search_regex(region) or re.escape(region),
+                "$options": "i",
+            }
         pipeline = [
             {"$match": match_stage},
             {"$unwind": "$detail.address_refs"},
@@ -793,7 +756,14 @@ def get_olx_cities(request: Request, region: Optional[str] = Query(None)):
                 {"$match": {"detail.resolved_locations.results.address_structured.city": {"$exists": True, "$ne": None}}},
             ]
             if region:
-                pipeline.append({"$match": {"detail.resolved_locations.results.address_structured.region": {"$regex": region, "$options": "i"}}})
+                pipeline.append({
+                    "$match": {
+                        "detail.resolved_locations.results.address_structured.region": {
+                            "$regex": build_region_search_regex(region) or re.escape(region),
+                            "$options": "i",
+                        }
+                    }
+                })
             pipeline.extend([{"$group": {"_id": "$detail.resolved_locations.results.address_structured.city"}}, {"$sort": {"_id": 1}}])
             for item in repo.collection.aggregate(pipeline):
                 if item.get("_id"):
@@ -816,7 +786,11 @@ def get_olx_cities(request: Request, region: Optional[str] = Query(None)):
                 if not city_part:
                     continue
                 if region:
-                    if not region_part or region.lower() not in region_part.lower():
+                    region_pattern = re.compile(
+                        build_region_search_regex(region) or re.escape(region),
+                        re.IGNORECASE,
+                    )
+                    if not region_part or not region_pattern.search(region_part):
                         continue
                 cities.add(city_part)
         except Exception:
@@ -1321,33 +1295,7 @@ def get_unified_regions(request: Request):
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
 
-    try:
-        from business.services.geography_service import GeographyService
-        geography_service = GeographyService()
-        regions_list = geography_service.get_all_regions()
-        if regions_list:
-            return {"regions": [r["name"] for r in regions_list]}
-    except Exception:
-        pass
-
-    # Fallback: агрегація з unified_listings
-    repo = UnifiedListingsRepository()
-    regions = set()
-    try:
-        pipeline = [
-            {"$match": {"addresses": {"$exists": True, "$ne": []}}},
-            {"$unwind": "$addresses"},
-            {"$match": {"addresses.region": {"$exists": True, "$ne": None}}},
-            {"$group": {"_id": "$addresses.region"}},
-            {"$sort": {"_id": 1}},
-        ]
-        for item in repo.collection.aggregate(pipeline):
-            if item.get("_id"):
-                regions.add(item["_id"])
-    except Exception:
-        pass
-
-    return {"regions": sorted(list(regions)) if regions else []}
+    return {"regions": get_ua_region_options()}
 
 
 # Міста зі спеціальним статусом (не входять до складу областей)
@@ -1362,14 +1310,15 @@ def get_unified_cities(request: Request, region: Optional[str] = Query(None)):
         raise HTTPException(status_code=403, detail="User not authorized")
 
     # Київ та Севастополь — міста зі спеціальним статусом; при виборі регіону "Київ" повертаємо місто
-    if region and region.strip() in _CITIES_WITH_SPECIAL_STATUS:
-        return {"cities": [region.strip()]}
+    if region and is_special_city_region(region):
+        return {"cities": [special_city_from_region(region)]}
 
     try:
         from business.services.geography_service import GeographyService
         geography_service = GeographyService()
+        region_lookup = normalize_region_for_repository_lookup(region) if region else None
         if region:
-            region_obj = geography_service.regions_repo.find_by_name(region)
+            region_obj = geography_service.regions_repo.find_by_name(region_lookup or region)
             if region_obj:
                 cities_list = geography_service.get_cities_by_region(str(region_obj["_id"]))
                 if cities_list:
@@ -1397,7 +1346,10 @@ def get_unified_cities(request: Request, region: Optional[str] = Query(None)):
     try:
         match_stage: Dict[str, Any] = {"addresses.settlement": {"$exists": True, "$ne": None}}
         if region:
-            match_stage["addresses.region"] = {"$regex": region, "$options": "i"}
+            match_stage["addresses.region"] = {
+                "$regex": build_region_search_regex(region) or re.escape(region),
+                "$options": "i",
+            }
         pipeline = [
             {"$match": match_stage},
             {"$unwind": "$addresses"},
@@ -1821,57 +1773,7 @@ def get_prozorro_regions(request: Request):
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
     
-    # Спочатку пробуємо отримати з колекції regions
-    try:
-        from business.services.geography_service import GeographyService
-        geography_service = GeographyService()
-        regions_list = geography_service.get_all_regions()
-        if regions_list:
-            return {"regions": [r["name"] for r in regions_list]}
-    except Exception:
-        pass
-    
-    # Fallback: отримуємо з prozorro_auctions
-    repo = ProZorroAuctionsRepository()
-    regions = set()
-    
-    try:
-        # Спочатку з address_refs (якщо вони є в auction_data)
-        pipeline = [
-            {"$match": {"auction_data.address_refs": {"$exists": True, "$ne": []}}},
-            {"$unwind": "$auction_data.address_refs"},
-            {"$match": {"auction_data.address_refs.region.name": {"$exists": True, "$ne": None}}},
-            {"$group": {"_id": "$auction_data.address_refs.region.name"}},
-            {"$sort": {"_id": 1}},
-        ]
-        
-        for item in repo.collection.aggregate(pipeline):
-            if item.get("_id"):
-                regions.add(item["_id"])
-    except Exception:
-        pass
-    
-    # Якщо немає address_refs, пробуємо items.address
-    if not regions:
-        try:
-            pipeline = [
-                {"$match": {"auction_data.items.address.region.uk_UA": {"$exists": True, "$ne": None}}},
-                {"$unwind": "$auction_data.items"},
-                {"$match": {"auction_data.items.address.region.uk_UA": {"$exists": True, "$ne": None}}},
-                {"$group": {"_id": "$auction_data.items.address.region.uk_UA"}},
-                {"$sort": {"_id": 1}},
-            ]
-            
-            regions_raw = [item["_id"] for item in repo.collection.aggregate(pipeline) if item.get("_id")]
-            # Прибираємо " область" та " обл."
-            for r in regions_raw:
-                normalized = r.replace(" область", "").replace(" обл.", "").strip()
-                if normalized:
-                    regions.add(normalized)
-        except Exception:
-            pass
-    
-    return {"regions": sorted(list(regions)) if regions else []}
+    return {"regions": get_ua_region_options()}
 
 
 @router.get("/prozorro/filters/cities")
@@ -1885,10 +1787,11 @@ def get_prozorro_cities(request: Request, region: Optional[str] = Query(None)):
     try:
         from business.services.geography_service import GeographyService
         geography_service = GeographyService()
+        region_lookup = normalize_region_for_repository_lookup(region) if region else None
         
         if region:
             # Знаходимо область за назвою
-            region_obj = geography_service.regions_repo.find_by_name(region)
+            region_obj = geography_service.regions_repo.find_by_name(region_lookup or region)
             if region_obj:
                 cities_list = geography_service.get_cities_by_region(str(region_obj["_id"]))
                 if cities_list:
@@ -1913,7 +1816,10 @@ def get_prozorro_cities(request: Request, region: Optional[str] = Query(None)):
         # Спочатку з address_refs
         match_stage = {"auction_data.address_refs": {"$exists": True, "$ne": []}}
         if region:
-            match_stage["auction_data.address_refs.region.name"] = {"$regex": region, "$options": "i"}
+            match_stage["auction_data.address_refs.region.name"] = {
+                "$regex": build_region_search_regex(region) or re.escape(region),
+                "$options": "i",
+            }
         
         pipeline = [
             {"$match": match_stage},
@@ -1934,11 +1840,10 @@ def get_prozorro_cities(request: Request, region: Optional[str] = Query(None)):
         try:
             match_stage = {"auction_data.items.address.locality.uk_UA": {"$exists": True, "$ne": None}}
             if region:
-                # Шукаємо з " область" та без
-                match_stage["$or"] = [
-                    {"auction_data.items.address.region.uk_UA": {"$regex": region, "$options": "i"}},
-                    {"auction_data.items.address.region.uk_UA": {"$regex": region + " область", "$options": "i"}},
-                ]
+                match_stage["auction_data.items.address.region.uk_UA"] = {
+                    "$regex": build_region_search_regex(region) or re.escape(region),
+                    "$options": "i",
+                }
             
             pipeline = [
                 {"$match": match_stage},

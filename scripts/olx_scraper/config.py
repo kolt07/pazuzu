@@ -47,10 +47,6 @@ DELAY_BEFORE_REQUEST_MAX = float(os.getenv("OLX_SCRAPER_DELAY_MAX", "5"))
 DELAY_DETAIL_MIN = float(os.getenv("OLX_SCRAPER_DELAY_DETAIL_MIN", "2"))
 DELAY_DETAIL_MAX = float(os.getenv("OLX_SCRAPER_DELAY_DETAIL_MAX", "10"))
 
-# Використовувати браузер (Playwright) замість HTTP-запитів для сторінок пошуку та деталей.
-# 1/true/yes — клікер; інакше — стара логіка (requests). При увімкненні області обробляються послідовно (один браузер).
-USE_BROWSER = (os.getenv("OLX_SCRAPER_USE_BROWSER", "").strip().lower() in ("1", "true", "yes"))
-
 # Браузер: використовувати встановлений Chrome замість bundled Chromium (краще схожість із звичайним відкриттям).
 BROWSER_USE_CHROME = (os.getenv("OLX_SCRAPER_BROWSER_USE_CHROME", "").strip().lower() in ("1", "true", "yes"))
 
