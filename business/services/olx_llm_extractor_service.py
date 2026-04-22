@@ -31,6 +31,7 @@ class OlxLLMExtractorService:
     """Сервіс, що застосовує LLM до сторінки оголошення OLX з кешуванням результатів."""
     _CADASTRAL_PATTERN = re.compile(r"\b\d{10,12}(?::\d{1,4}){2,3}\b")
     _PRICE_RECOVERY_CACHE_PREFIX = "olx_price_recovery_"
+    _SOTOK_PATTERN = re.compile(r"(\d[\d\s]*[.,]?\d*)\s*сот(?:к(?:а|и|у|ою)?|ок)?\b", re.IGNORECASE)
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -220,6 +221,11 @@ class OlxLLMExtractorService:
             print(f"[OlxLLMExtractor] Помилка при виклику LLM: {e}")
             return {}
 
+        # Захист від типового зсуву масштабу площі землі (x10) при значеннях у "сотках".
+        # Напр.: "38 соток" -> має бути 3800 м², а не 380 або 38000.
+        if isinstance(result, dict):
+            self._fix_land_area_scale_from_sotok(result, description_text)
+
         # Зберігаємо в кеш
         try:
             self.cache_service.save_result(description_text, result)
@@ -227,6 +233,58 @@ class OlxLLMExtractorService:
             print(f"[OlxLLMExtractor] Помилка при збереженні в кеш: {e}")
 
         return result or {}
+
+    @classmethod
+    def _extract_sotok_area_sqm(cls, text: str) -> float:
+        """Повертає сумарну площу у м² з фрагментів виду 'N соток'."""
+        if not text:
+            return 0.0
+        total_sqm = 0.0
+        for m in cls._SOTOK_PATTERN.finditer(text):
+            raw = (m.group(1) or "").replace(" ", "").replace(",", ".").strip()
+            if not raw:
+                continue
+            try:
+                sotok_value = float(raw)
+            except ValueError:
+                continue
+            # Відсікаємо шумові/нереалістичні значення.
+            if sotok_value <= 0 or sotok_value > 100000:
+                continue
+            total_sqm += sotok_value * 100.0
+        return total_sqm
+
+    @staticmethod
+    def _to_float(value: Any) -> float:
+        if value in (None, ""):
+            return 0.0
+        try:
+            return float(str(value).replace(" ", "").replace(",", "."))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fix_land_area_scale_from_sotok(self, llm_result: Dict[str, Any], description_text: str) -> None:
+        expected_sqm = self._extract_sotok_area_sqm(description_text)
+        if expected_sqm <= 0:
+            return
+        raw_land_sqm = self._to_float(llm_result.get("land_area_sqm"))
+        if raw_land_sqm <= 0:
+            raw_land_ha = self._to_float(llm_result.get("land_area_ha"))
+            raw_land_sqm = raw_land_ha * 10000.0 if raw_land_ha > 0 else 0.0
+        if raw_land_sqm <= 0:
+            llm_result["land_area_sqm"] = expected_sqm
+            llm_result["land_area_ha"] = expected_sqm / 10000.0
+            return
+        ratio = raw_land_sqm / expected_sqm if expected_sqm else 1.0
+        # Типові промахи LLM по масштабу: /10 або *10 від значення з соток.
+        if 0.09 <= ratio <= 0.11 or 9.0 <= ratio <= 11.0:
+            logger.warning(
+                "[OLX LLM] Скориговано площу землі за сотками: llm=%.2f sqm -> expected=%.2f sqm",
+                raw_land_sqm,
+                expected_sqm,
+            )
+            llm_result["land_area_sqm"] = expected_sqm
+            llm_result["land_area_ha"] = expected_sqm / 10000.0
 
     @classmethod
     def has_cadastral_in_price_text(cls, search_data: Dict[str, Any]) -> bool:

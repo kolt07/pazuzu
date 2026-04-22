@@ -366,14 +366,29 @@ class VllmRuntimeOrchestrator:
                         shared_endpoint,
                     )
                     return shared_endpoint
-            ask_ids = self._select_offer_candidates(client, cfg, limit=5)
-            if not ask_ids:
-                self._coord_release(state="idle", last_error="No Vast.ai offers matched the configured constraints.")
-                raise RuntimeError("No Vast.ai offers matched the configured constraints.")
-
             payload = self._build_create_payload(cfg)
             last_error = ""
-            for idx, ask_id in enumerate(ask_ids, start=1):
+            max_attempts = 5
+            attempted = 0
+            tried_ask_ids: set[str] = set()
+            ask_pool: List[str] = []
+            while attempted < max_attempts:
+                if not ask_pool:
+                    fresh_candidates = [
+                        aid
+                        for aid in self._select_offer_candidates(client, cfg, limit=max_attempts * 3)
+                        if aid not in tried_ask_ids
+                    ]
+                    ask_pool.extend(fresh_candidates)
+                if not ask_pool:
+                    if attempted == 0:
+                        self._coord_release(state="idle", last_error="No Vast.ai offers matched the configured constraints.")
+                        raise RuntimeError("No Vast.ai offers matched the configured constraints.")
+                    break
+                ask_id = ask_pool.pop(0)
+                tried_ask_ids.add(ask_id)
+                attempted += 1
+                idx = attempted
                 self._session_id = self._sessions.start_session(
                     {
                         "state": "starting",
@@ -382,7 +397,7 @@ class VllmRuntimeOrchestrator:
                         "settings_snapshot": self._safe_settings_snapshot(cfg),
                     }
                 )
-                self._log_gpu_usage("gpu_rent_started", {"ask_id": ask_id, "attempt": idx, "candidates": len(ask_ids)})
+                self._log_gpu_usage("gpu_rent_started", {"ask_id": ask_id, "attempt": idx, "candidates": max_attempts})
                 created = None
                 create_error: Optional[Exception] = None
                 for create_try in range(1, 4):
@@ -414,6 +429,13 @@ class VllmRuntimeOrchestrator:
                         "gpu_rent_failed",
                         {"ask_id": ask_id, "attempt": idx, "error": last_error},
                     )
+                    if create_error is not None and self._is_no_such_ask_error(create_error):
+                        self._log_gpu_usage(
+                            "gpu_rent_offer_stale",
+                            {"ask_id": ask_id, "attempt": idx, "error": last_error},
+                        )
+                        # stale ask: force fetching fresh offers on next attempt
+                        ask_pool = []
                     continue
                 self._instance_id = str(
                     created.get("new_contract")
@@ -455,6 +477,8 @@ class VllmRuntimeOrchestrator:
                     )
                     # Не залишаємо інстанс завислим при помилці старту/ready-check.
                     self._teardown_locked(reason=f"startup_failed_attempt_{idx}")
+                    # Після довгого старту список оферів часто застаріває — примусовий рефреш.
+                    ask_pool = []
                     continue
             self._coord_release(state="failed", last_error=last_error)
             raise RuntimeError(f"All Vast startup attempts failed. Last error: {last_error}")
@@ -897,12 +921,25 @@ class VllmRuntimeOrchestrator:
         return out or ["/workspace/"]
 
     def _create_instance_with_retry_candidates(self, client: VastAiClient, cfg: Dict[str, Any]) -> str:
-        ask_ids = self._select_offer_candidates(client, cfg, limit=5)
-        if not ask_ids:
-            raise RuntimeError("No Vast.ai offers matched the configured constraints for sleep migration.")
         payload = self._build_create_payload(cfg)
         last_error = ""
-        for ask_id in ask_ids:
+        max_attempts = 5
+        attempts = 0
+        tried_ask_ids: set[str] = set()
+        ask_pool: List[str] = []
+        while attempts < max_attempts:
+            if not ask_pool:
+                fresh_candidates = [
+                    aid
+                    for aid in self._select_offer_candidates(client, cfg, limit=max_attempts * 3)
+                    if aid not in tried_ask_ids
+                ]
+                ask_pool.extend(fresh_candidates)
+            if not ask_pool:
+                break
+            ask_id = ask_pool.pop(0)
+            tried_ask_ids.add(ask_id)
+            attempts += 1
             try:
                 created = client.create_instance(ask_id=ask_id, payload=payload)
                 new_id = self._normalize_vast_instance_id(
@@ -913,6 +950,10 @@ class VllmRuntimeOrchestrator:
                 last_error = f"Vast did not return instance id for ask_id={ask_id}"
             except Exception as e:
                 last_error = f"create_instance failed for ask_id={ask_id}: {e!s}"
+                if self._is_no_such_ask_error(e):
+                    ask_pool = []
+        if not tried_ask_ids:
+            raise RuntimeError("No Vast.ai offers matched the configured constraints for sleep migration.")
         raise RuntimeError(last_error or "Failed to create destination instance for sleep migration.")
 
     def _migrate_sleeping_instance_to_new_contract_locked(
@@ -1767,6 +1808,11 @@ class VllmRuntimeOrchestrator:
         return "429" in txt and "too many requests" in txt
 
     @staticmethod
+    def _is_no_such_ask_error(error: Exception) -> bool:
+        txt = str(error).lower()
+        return ("no_such_ask" in txt) or ("3603" in txt)
+
+    @staticmethod
     def _use_ollama_runtime(cfg: Dict[str, Any]) -> bool:
         image = str(cfg.get("image") or "").strip().lower()
         model = str(cfg.get("vllm_model") or "").strip().lower()
@@ -2044,6 +2090,8 @@ class VllmRuntimeOrchestrator:
             )
         if event == "gpu_rent_failed":
             return f"{pfx} помилка оренди Vast:{tail}"
+        if event == "gpu_rent_offer_stale":
+            return f"{pfx} пропущено застарілий ask у Vast (no_such_ask), оновлюємо офери:{tail}"
         if event == "gpu_instance_booted":
             pub = metadata.get("public_endpoint")
             return (
@@ -2119,6 +2167,7 @@ class VllmRuntimeOrchestrator:
         warn_events = {
             "gpu_startup_failed",
             "gpu_rent_failed",
+            "gpu_rent_offer_stale",
             "gpu_ssh_tunnel_failed",
             "gpu_pause_failed",
             "gpu_vast_duplicate_destroy_failed",
@@ -2152,6 +2201,7 @@ class VllmRuntimeOrchestrator:
             "gpu_instance_log_stream_started",
             "gpu_ready",
             "gpu_rent_failed",
+            "gpu_rent_offer_stale",
         }:
             summary_parts = [f"event={event}"]
             status = metadata.get("status")
