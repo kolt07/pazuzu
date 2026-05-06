@@ -15,6 +15,7 @@ InvestigationService — оркестратор розслідувань Flx.
 import logging
 import uuid
 import base64
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -29,6 +30,7 @@ from business.agents.investigator import (
 )
 from business.services.artifact_service import ArtifactService
 from business.services.static_map_service import StaticMapService
+from business.services.web_search_service import WebSearchService
 
 from data.repositories.flx_lessons_repository import FlxLessonsRepository
 from data.repositories.investigation_event_repository import InvestigationEventRepository
@@ -39,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 # Максимальна кількість символів для serialized observation з tool result, що йде у нотатку
 TOOL_OBSERVATION_TRUNCATE = 4000
+LOG_TEXT_PREVIEW_LIMIT = 500
+SOURCE_WAIT_RECHECK_SECONDS = 60
 
 
 class InvestigationService:
@@ -157,12 +161,29 @@ class InvestigationService:
         sess = self._sessions.get_by_session_id(session_id)
         if not sess:
             return {"ok": False, "error": "session_not_found"}
+        request_id = str(sess.get("request_id") or "")
         state = sess.get("state")
+        logger.info(
+            "[flx-think] step.enter session=%s request_id=%s state=%s step_index=%s iteration=%s",
+            session_id,
+            request_id or "—",
+            state,
+            sess.get("step_index"),
+            sess.get("iteration"),
+        )
         if state in ("done", "failed", "cancelled"):
             return {"ok": True, "state": state, "note": "terminal"}
+        if state == "awaiting_sources":
+            return self._check_source_wait(session_id, sess)
         if state == "awaiting_user":
             # Якщо є pending_answer — споживемо і поточний step продовжимо
             if not sess.get("pending_answer"):
+                logger.info(
+                    "[flx-think] step.waiting_user session=%s request_id=%s expected=user_answer pending_question=%s",
+                    session_id,
+                    request_id or "—",
+                    self._preview_text((sess.get("pending_question") or {}).get("question")),
+                )
                 return {"ok": True, "state": state, "note": "awaiting_user"}
 
         plan = sess.get("plan") or {"steps": []}
@@ -196,10 +217,26 @@ class InvestigationService:
             tools_schemas=tools_schemas,
             pending_answer=pending_answer,
         )
+        logger.info(
+            "[flx-think] step.decision session=%s request_id=%s step=%s has_tool_call=%s has_ask_user=%s has_final=%s expected=%s",
+            session_id,
+            request_id or "—",
+            current_step.get("step_id") or step_index + 1,
+            "tool_call" in decision,
+            "ask_user" in decision,
+            "final_for_step" in decision,
+            "tool_result" if "tool_call" in decision else ("user_answer" if "ask_user" in decision else ("step_finalize" if "final_for_step" in decision else "fallback_finalize_step")),
+        )
 
         # Нотатка з думкою
         thought = (decision.get("thought") or "").strip()
         if thought:
+            logger.info(
+                "[flx-think] step.thought session=%s request_id=%s content=%s",
+                session_id,
+                request_id or "—",
+                self._preview_text(thought),
+            )
             self._notes.append(
                 session_id=session_id,
                 kind="thought",
@@ -210,7 +247,27 @@ class InvestigationService:
 
         # Виконуємо одну з трьох гілок
         if "tool_call" in decision:
-            return self._handle_tool_call(session_id, current_step, decision["tool_call"])
+            tool_call = decision["tool_call"] if isinstance(decision["tool_call"], dict) else {}
+            tool_name = str(tool_call.get("name") or "")
+            if tool_name == "query_builder.execute_query" and self._detect_repetitive_query_loop(session_id):
+                if "flx.targeted_source_search" in self._tools_registry and not self._has_recent_tool_usage(
+                    session_id, "flx.targeted_source_search", recent_notes=24
+                ):
+                    logger.info(
+                        "[flx-think] loop_guard session=%s step=%s override=query_builder.execute_query->flx.targeted_source_search",
+                        session_id,
+                        current_step.get("step_id") or 0,
+                    )
+                    sess_now = self._sessions.get_by_session_id(session_id) or {}
+                    tool_call = {
+                        "name": "flx.targeted_source_search",
+                        "args": {
+                            "query_text": str(sess_now.get("query") or ""),
+                            "source": "both",
+                            "days": 7,
+                        },
+                    }
+            return self._handle_tool_call(session_id, current_step, tool_call)
         if "ask_user" in decision:
             return self._handle_ask_user(session_id, current_step, decision["ask_user"])
         if "final_for_step" in decision:
@@ -232,6 +289,30 @@ class InvestigationService:
         args = tool_call.get("args") or {}
         if not isinstance(args, dict):
             args = {}
+        if (
+            name == "flx.web_search"
+            and "flx.targeted_source_search" in self._tools_registry
+            and not self._has_recent_tool_usage(session_id, "flx.targeted_source_search", recent_notes=24)
+        ):
+            sess = self._sessions.get_by_session_id(session_id) or {}
+            logger.info(
+                "[flx-think] tool_call.override session=%s step=%s from=flx.web_search to=flx.targeted_source_search reason=no_targeted_search_yet",
+                session_id,
+                current_step.get("step_id") or 0,
+            )
+            name = "flx.targeted_source_search"
+            args = {
+                "query_text": str(args.get("query") or sess.get("query") or ""),
+                "source": "both",
+                "days": 7,
+            }
+        logger.info(
+            "[flx-think] tool_call.start session=%s step=%s tool=%s args=%s expected=tool_result",
+            session_id,
+            current_step.get("step_id") or 0,
+            name,
+            self._safe_args_preview(args),
+        )
         if name not in self._tools_registry:
             self._notes.append(
                 session_id=session_id,
@@ -258,6 +339,13 @@ class InvestigationService:
         try:
             result = callable_(**merged_args)
         except TypeError as e:
+            logger.warning(
+                "[flx-think] tool_call.args_mismatch session=%s step=%s tool=%s error=%s",
+                session_id,
+                current_step.get("step_id") or 0,
+                name,
+                self._preview_text(str(e)),
+            )
             err = f"args_mismatch: {e}"
             self._notes.append(
                 session_id=session_id,
@@ -268,6 +356,13 @@ class InvestigationService:
             )
             return {"ok": True, "state": "running", "note": "tool_args_mismatch"}
         except Exception as e:
+            logger.warning(
+                "[flx-think] tool_call.failed session=%s step=%s tool=%s error=%s",
+                session_id,
+                current_step.get("step_id") or 0,
+                name,
+                self._preview_text(str(e)),
+            )
             err = f"tool_failed: {e}"
             self._notes.append(
                 session_id=session_id,
@@ -280,6 +375,13 @@ class InvestigationService:
 
         # Пишемо observation у нотатки
         observation = self._serialize_observation(result)
+        logger.info(
+            "[flx-think] tool_call.done session=%s step=%s tool=%s observation_preview=%s",
+            session_id,
+            current_step.get("step_id") or 0,
+            name,
+            self._preview_text(observation),
+        )
         self._notes.append(
             session_id=session_id,
             kind="observation",
@@ -291,7 +393,45 @@ class InvestigationService:
         # Деякі тулзи (ask_user, report_compose) самі змінюють state — обробляємо особливо.
         if name == "flx.ask_user":
             # Сесія вже в awaiting_user
+            logger.info(
+                "[flx-think] tool_call.ask_user session=%s step=%s expected=user_answer",
+                session_id,
+                current_step.get("step_id") or 0,
+            )
             return {"ok": True, "state": "awaiting_user", "note": "ask_user"}
+        if name == "flx.targeted_source_search":
+            mode = str((result or {}).get("mode") or "")
+            task_id = str((result or {}).get("task_id") or "")
+            if mode == "queued" and task_id:
+                wait_payload = {
+                    "task_id": task_id,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "sources": (result or {}).get("sources") or [],
+                    "days": (result or {}).get("days"),
+                }
+                self._sessions.update_fields(
+                    session_id,
+                    {
+                        "state": "awaiting_sources",
+                        "pending_source_wait": wait_payload,
+                    },
+                )
+                self._events.push(
+                    session_id=session_id,
+                    event_type="status",
+                    payload={
+                        "phase": "awaiting_sources",
+                        "message": "Чекаю завершення таргетного пошуку в джерелах (OLX/Prozorro).",
+                        "task_id": task_id,
+                    },
+                )
+                logger.info(
+                    "[flx-think] source_wait.start session=%s step=%s task_id=%s queue=source_load expected=wait_for_fresh_data",
+                    session_id,
+                    current_step.get("step_id") or 0,
+                    task_id,
+                )
+                return {"ok": True, "state": "awaiting_sources", "note": "source_wait_started"}
 
         return {"ok": True, "state": "running", "note": "tool_done"}
 
@@ -301,6 +441,14 @@ class InvestigationService:
             "options": [str(o)[:200] for o in (ask.get("options") or []) if str(o).strip()][:6],
             "allow_freeform": bool(ask.get("allow_freeform", True)),
         }
+        logger.info(
+            "[flx-think] ask_user session=%s step=%s expected=user_answer question=%s options=%s allow_freeform=%s",
+            session_id,
+            current_step.get("step_id") or 0,
+            self._preview_text(payload["question"]),
+            len(payload["options"]),
+            payload["allow_freeform"],
+        )
         self._sessions.set_pending_question(session_id, payload)
         self._events.push(session_id=session_id, event_type="question", payload=payload)
         self._notes.append(
@@ -320,6 +468,14 @@ class InvestigationService:
     ) -> Dict[str, Any]:
         observation = str(final.get("observation") or "")[:1000]
         next_action = str(final.get("next_action") or "continue").lower()
+        logger.info(
+            "[flx-think] step.final session=%s step=%s next_action=%s expected=%s observation=%s",
+            session_id,
+            current_step.get("step_id") or 0,
+            next_action,
+            "report_generation" if next_action == "finish" else "next_step_decision",
+            self._preview_text(observation),
+        )
         if observation:
             self._notes.append(
                 session_id=session_id,
@@ -669,9 +825,24 @@ h1{{margin:0 0 12px}} h2{{margin-top:32px}} section{{border-top:1px solid #eee;p
         )
         reg(
             "flx.web_search",
-            "Заглушка веб-пошуку. Без зовнішнього провайдера — використовується Gemini Grounding всередині LLM.",
+            "Веб-пошук (DuckDuckGo) для доповнення даних, коли БД не вистачає.",
             {"type": "object", "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}}, "required": ["query"]},
             self._tool_flx_web_search,
+        )
+        reg(
+            "flx.targeted_source_search",
+            "Ініціює таргетний пошук/оновлення в джерелах OLX/Prozorro через pipeline (queue або sync fallback).",
+            {
+                "type": "object",
+                "properties": {
+                    "query_text": {"type": "string"},
+                    "source": {"type": "string", "enum": ["olx", "prozorro", "both"]},
+                    "days": {"type": "integer"},
+                    "regions": {"type": "array"},
+                    "listing_types": {"type": "array"},
+                },
+            },
+            self._tool_flx_targeted_source_search,
         )
         return registry
 
@@ -884,12 +1055,76 @@ h1{{margin:0 0 12px}} h2{{margin-top:32px}} section{{border-top:1px solid #eee;p
         return {"ok": True, "ready_to_render": True}
 
     def _tool_flx_web_search(self, query: str, top_k: int = 5, **_: Any) -> Dict[str, Any]:
-        return {
-            "ok": False,
-            "error": "web_search_not_configured",
-            "message": "Web-search провайдер не налаштовано. Gemini Grounding активний — використовуй формулювання запитання у внутрішньому LLM-кроці.",
-            "items": [],
+        return WebSearchService(self.settings).search(query=query, top_k=top_k)
+
+    def _tool_flx_targeted_source_search(
+        self,
+        query_text: str = "",
+        source: str = "both",
+        days: int = 7,
+        regions: Optional[List[str]] = None,
+        listing_types: Optional[List[str]] = None,
+        **_: Any,
+    ) -> Dict[str, Any]:
+        src = str(source or "both").strip().lower()
+        if src not in ("olx", "prozorro", "both"):
+            src = "both"
+        sources = ["olx", "prozorro"] if src == "both" else [src]
+        regions_list = [str(r).strip() for r in (regions or []) if str(r).strip()]
+        listing_types_list = [str(v).strip() for v in (listing_types or []) if str(v).strip()]
+        safe_days = max(1, min(int(days or 7), 14))
+        payload = {
+            "sources": sources,
+            "days": safe_days,
+            "regions": regions_list or None,
+            "listing_types": listing_types_list or None,
+            "trigger": "flx_targeted_source_search",
+            "query_text": str(query_text or "")[:300],
         }
+        try:
+            from business.services.task_queue_service import TaskQueueService
+
+            tq = TaskQueueService(self.settings)
+            if tq.is_enabled():
+                dispatched = tq.enqueue_source_load(
+                    days=safe_days,
+                    sources=sources,
+                    regions=regions_list or None,
+                    listing_types=listing_types_list or None,
+                    metadata=payload,
+                )
+                return {
+                    "ok": True,
+                    "mode": "queued",
+                    "task_id": dispatched.get("task_id"),
+                    "queue": dispatched.get("queue"),
+                    "sources": sources,
+                    "days": safe_days,
+                    "regions": regions_list,
+                    "message": "Таргетний пошук по джерелах ініційовано в черзі. Після оновлення даних повтори вибірку.",
+                }
+        except Exception as e:
+            logger.warning("flx.targeted_source_search queue failed: %s", e)
+        try:
+            from business.services.source_data_load_service import run_full_pipeline
+
+            result = run_full_pipeline(
+                settings=self.settings,
+                sources=sources,
+                days=safe_days,
+                regions=regions_list or None,
+                listing_types=listing_types_list or None,
+            )
+            return {
+                "ok": True,
+                "mode": "sync",
+                "sources": sources,
+                "days": safe_days,
+                "regions": regions_list,
+                "result": result,
+            }
+        except Exception as e:
+            return {"ok": False, "error": f"targeted_source_search_failed:{e}", "sources": sources}
 
     # ----------------------------- helpers --------------------------------
 
@@ -900,6 +1135,97 @@ h1{{margin:0 0 12px}} h2{{margin-top:32px}} section{{border-top:1px solid #eee;p
             logger.debug("Lessons search failed: %s", e)
             return []
 
+    def _check_source_wait(self, session_id: str, sess: Dict[str, Any]) -> Dict[str, Any]:
+        wait = (sess or {}).get("pending_source_wait") or {}
+        task_id = str(wait.get("task_id") or "")
+        if not task_id:
+            self._sessions.update_fields(session_id, {"state": "running", "pending_source_wait": None})
+            return {"ok": True, "state": "running", "note": "source_wait_missing_task_id"}
+        try:
+            from business.services.task_queue_service import TaskQueueService
+
+            status = TaskQueueService(self.settings).get_task_status(task_id)
+            state = str(status.get("state") or "").lower()
+            if state in ("queued", "received", "started", "running", "retry", "pending"):
+                logger.info(
+                    "[flx-think] source_wait.poll session=%s task_id=%s state=%s expected=wait",
+                    session_id,
+                    task_id,
+                    state,
+                )
+                return {"ok": True, "state": "awaiting_sources", "note": f"source_wait:{state}"}
+            if state in ("success",):
+                self._sessions.update_fields(
+                    session_id,
+                    {
+                        "state": "running",
+                        "pending_source_wait": None,
+                    },
+                )
+                self._events.push(
+                    session_id=session_id,
+                    event_type="status",
+                    payload={
+                        "phase": "source_refresh_done",
+                        "message": "Таргетний пошук в джерелах завершено. Продовжую аналіз на оновлених даних.",
+                        "task_id": task_id,
+                    },
+                )
+                logger.info(
+                    "[flx-think] source_wait.done session=%s task_id=%s next=resume_analysis",
+                    session_id,
+                    task_id,
+                )
+                return {"ok": True, "state": "running", "note": "source_wait_done"}
+            self._sessions.update_fields(
+                session_id,
+                {
+                    "state": "running",
+                    "pending_source_wait": None,
+                },
+            )
+            self._events.push(
+                session_id=session_id,
+                event_type="status",
+                payload={
+                    "phase": "source_refresh_failed",
+                    "message": "Таргетний пошук в джерелах завершився помилкою. Продовжую з наявними даними.",
+                    "task_id": task_id,
+                    "state": state,
+                },
+            )
+            logger.warning("[flx-think] source_wait.failed session=%s task_id=%s state=%s", session_id, task_id, state)
+            return {"ok": True, "state": "running", "note": f"source_wait_failed:{state}"}
+        except Exception as e:
+            logger.warning("[flx-think] source_wait.poll_error session=%s task_id=%s error=%s", session_id, task_id, e)
+            return {"ok": True, "state": "awaiting_sources", "note": "source_wait_poll_error"}
+
+    def _has_recent_tool_usage(self, session_id: str, tool_name: str, recent_notes: int = 24) -> bool:
+        notes = self._notes.list_for_session(session_id, limit=max(1, recent_notes))
+        for n in notes:
+            tcs = n.get("tool_call_summary") or {}
+            if isinstance(tcs, dict) and str(tcs.get("name") or "") == str(tool_name):
+                return True
+        return False
+
+    def _detect_repetitive_query_loop(self, session_id: str) -> bool:
+        notes = self._notes.list_for_session(session_id, limit=12, kinds=["observation"])
+        sigs: List[str] = []
+        for n in notes:
+            tcs = n.get("tool_call_summary") or {}
+            if not isinstance(tcs, dict):
+                continue
+            if str(tcs.get("name") or "") != "query_builder.execute_query":
+                continue
+            text = str(n.get("text") or "")
+            head = text[:500]
+            sig = hashlib.sha1(head.encode("utf-8", errors="ignore")).hexdigest()
+            sigs.append(sig)
+        if len(sigs) < 3:
+            return False
+        tail = sigs[-3:]
+        return len(set(tail)) == 1
+
     def _dispatch(self, session_id: str) -> None:
         """Стартує продовження циклу. Якщо Celery увімкнено — відправляє таску; інакше виконує
         run_loop синхронно у поточному потоці. Викликається лише з public API (start/submit_user_answer).
@@ -908,11 +1234,13 @@ h1{{margin:0 0 12px}} h2{{margin-top:32px}} section{{border-top:1px solid #eee;p
         try:
             if getattr(self.settings, "task_queue_enabled", False):
                 from business.tasks import run_investigation_step  # type: ignore
-                run_investigation_step.apply_async(args=[session_id], countdown=0)
+                run_investigation_step.apply_async(args=[session_id], countdown=0, queue="llm_processing")
+                logger.info("[flx-think] dispatch.enqueued session=%s via=celery queue=llm_processing", session_id)
                 return
         except Exception as e:
             logger.debug("Celery enqueue failed (will run inline): %s", e)
         # Синхронний fallback — корисно у dev і тестах
+        logger.info("[flx-think] dispatch.inline session=%s via=sync_fallback", session_id)
         self.run_loop(session_id)
 
     def run_loop(self, session_id: str) -> Dict[str, Any]:
@@ -922,16 +1250,43 @@ h1{{margin:0 0 12px}} h2{{margin-top:32px}} section{{border-top:1px solid #eee;p
         """
         max_steps = max(1, int(getattr(self.settings, "llm_investigator_max_steps_per_task", 5)))
         last: Dict[str, Any] = {"ok": True, "state": "running"}
+        logger.info("[flx-think] loop.start session=%s max_steps=%s", session_id, max_steps)
         for _ in range(max_steps):
             last = self.run_one_step(session_id) or {}
             state = (last.get("state") or "running").lower()
             if state in ("done", "failed", "awaiting_user", "cancelled"):
+                logger.info("[flx-think] loop.stop session=%s state=%s note=%s", session_id, state, last.get("note"))
+                return last
+            if state == "awaiting_sources":
+                try:
+                    if getattr(self.settings, "task_queue_enabled", False):
+                        from business.tasks import run_investigation_step  # type: ignore
+                        run_investigation_step.apply_async(
+                            args=[session_id],
+                            countdown=SOURCE_WAIT_RECHECK_SECONDS,
+                            queue="llm_processing",
+                        )
+                        logger.info(
+                            "[flx-think] loop.wait_sources session=%s recheck_in_sec=%s queue=llm_processing",
+                            session_id,
+                            SOURCE_WAIT_RECHECK_SECONDS,
+                        )
+                except Exception as e:
+                    logger.debug("source wait re-enqueue failed: %s", e)
                 return last
         # Перевищили бюджет одного таску — re-enqueue, якщо Celery увімкнено
         try:
             if getattr(self.settings, "task_queue_enabled", False):
                 from business.tasks import run_investigation_step  # type: ignore
-                run_investigation_step.apply_async(args=[session_id], countdown=0)
+                run_investigation_step.apply_async(args=[session_id], countdown=0, queue="llm_processing")
+                logger.info("[flx-think] loop.reenqueue session=%s reason=max_steps_budget queue=llm_processing", session_id)
         except Exception as e:
             logger.debug("re-enqueue failed: %s", e)
         return last
+
+    @staticmethod
+    def _preview_text(value: Any, limit: int = LOG_TEXT_PREVIEW_LIMIT) -> str:
+        text = str(value or "").replace("\n", " ").strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "…"

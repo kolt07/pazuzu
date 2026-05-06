@@ -22,6 +22,8 @@ from data.repositories.investigation_event_repository import InvestigationEventR
 from data.repositories.investigation_notes_repository import InvestigationNotesRepository
 from data.repositories.investigation_session_repository import InvestigationSessionRepository
 from business.services.static_map_service import StaticMapService
+from business.services.web_search_service import WebSearchService
+from business.services.task_queue_service import TaskQueueService
 
 logger = logging.getLogger(__name__)
 mcp = FastMCP("flx-mcp", json_response=True)
@@ -32,11 +34,12 @@ _notes_repo: Optional[InvestigationNotesRepository] = None
 _lessons_repo: Optional[FlxLessonsRepository] = None
 _events_repo: Optional[InvestigationEventRepository] = None
 _static_map: Optional[StaticMapService] = None
+_web_search: Optional[WebSearchService] = None
 
 
 def _init() -> None:
     """Лінива ініціалізація."""
-    global _settings, _session_repo, _notes_repo, _lessons_repo, _events_repo, _static_map
+    global _settings, _session_repo, _notes_repo, _lessons_repo, _events_repo, _static_map, _web_search
     if _session_repo is not None:
         return
     try:
@@ -47,6 +50,7 @@ def _init() -> None:
         _lessons_repo = FlxLessonsRepository()
         _events_repo = InvestigationEventRepository()
         _static_map = StaticMapService(_settings)
+        _web_search = WebSearchService(_settings)
     except Exception as e:
         print(f"flx-mcp init error: {e}", file=sys.stderr)
         raise
@@ -254,20 +258,76 @@ def report_compose(
 
 @mcp.tool()
 def web_search(query: str, top_k: int = 5) -> Dict[str, Any]:
-    """Заглушка веб-пошуку. Поки що використовується лише Gemini Grounding всередині LLM.
+    """Виконує веб-пошук (DuckDuckGo) і повертає список знайдених джерел."""
+    try:
+        _init()
+        return _web_search.search(query=query, top_k=top_k)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "items": []}
 
-    Якщо буде вибрано окремого провайдера (Tavily / Serper / Google PSE) — реалізацію
-    додамо без зміни сигнатури.
-    """
-    return {
-        "ok": False,
-        "error": "web_search_not_configured",
-        "message": (
-            "Окремий web-search провайдер не налаштовано. "
-            "Використовуй Gemini Grounding (вмикається через settings.llm_investigator_google_grounding)."
-        ),
-        "items": [],
-    }
+
+@mcp.tool()
+def targeted_source_search(
+    query_text: str = "",
+    source: str = "both",
+    days: int = 7,
+    regions: Optional[List[str]] = None,
+    listing_types: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Ініціює таргетний пошук/оновлення в джерелах OLX/Prozorro через pipeline."""
+    try:
+        _init()
+        src = str(source or "both").strip().lower()
+        if src not in ("olx", "prozorro", "both"):
+            src = "both"
+        sources = ["olx", "prozorro"] if src == "both" else [src]
+        safe_days = max(1, min(int(days or 7), 14))
+        regions_list = [str(r).strip() for r in (regions or []) if str(r).strip()]
+        listing_types_list = [str(v).strip() for v in (listing_types or []) if str(v).strip()]
+        metadata = {
+            "trigger": "flx_targeted_source_search",
+            "query_text": str(query_text or "")[:300],
+            "sources": sources,
+        }
+        tq = TaskQueueService(_settings)
+        if tq.is_enabled():
+            dispatched = tq.enqueue_source_load(
+                days=safe_days,
+                sources=sources,
+                regions=regions_list or None,
+                listing_types=listing_types_list or None,
+                metadata=metadata,
+            )
+            return {
+                "ok": True,
+                "mode": "queued",
+                "task_id": dispatched.get("task_id"),
+                "queue": dispatched.get("queue"),
+                "sources": sources,
+                "days": safe_days,
+                "regions": regions_list,
+                "listing_types": listing_types_list,
+            }
+        from business.services.source_data_load_service import run_full_pipeline
+
+        result = run_full_pipeline(
+            settings=_settings,
+            sources=sources,
+            days=safe_days,
+            regions=regions_list or None,
+            listing_types=listing_types_list or None,
+        )
+        return {
+            "ok": True,
+            "mode": "sync",
+            "sources": sources,
+            "days": safe_days,
+            "regions": regions_list,
+            "listing_types": listing_types_list,
+            "result": result,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def main() -> None:

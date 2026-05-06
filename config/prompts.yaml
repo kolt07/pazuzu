@@ -311,6 +311,9 @@ prompts:
         ]
       }}
       All string values inside the JSON must be in Ukrainian. Keep 3–7 steps. Do not fetch data here, only plan.
+      Mandatory planning rule: one of the first two steps must build a "city_baseline" context
+      (population trend, economic profile, transport/geography, business activity anchors), using tools
+      such as flx.web_search / schema / analytics as available.
 
   investigator_step:
     template: |
@@ -339,6 +342,9 @@ prompts:
       Strict rules:
       - All string values in the JSON must be in Ukrainian (except tool name and arg keys defined by schema).
       - Use only tool names from the list. Never invent tools. Never write raw Mongo or HTTP — pass logical fields via tool args; the executor translates.
+      - If database results are missing/weak, first initiate `flx.targeted_source_search` (OLX/Prozorro) before using `flx.web_search`.
+      - After `flx.targeted_source_search` with queued mode, do not continue data analysis immediately; wait for refreshed data and only then query DB again.
+      - Avoid loops: do not repeat the same query-builder call with equivalent filters more than twice without changing strategy.
       - Prefer Shape A when data is needed. Prefer Shape C with next_action="finish" only after the report can be composed.
       - Keep "thought" under 280 characters.
 

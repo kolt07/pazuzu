@@ -49,6 +49,7 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
             "business.tasks.run_source_load_pipeline_task": {"queue": "source_load"},
             "business.tasks.process_olx_llm_task": {"queue": "llm_processing"},
             "business.tasks.process_prozorro_llm_task": {"queue": "llm_processing"},
+            "business.tasks.run_investigation_step": {"queue": "llm_processing"},
         },
     )
     return app

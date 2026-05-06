@@ -68,13 +68,15 @@ class Settings:
         self.llm_investigator_time_budget_seconds = int(os.getenv('LLM_INVESTIGATOR_TIME_BUDGET_SECONDS', '900'))
         self.llm_investigator_google_grounding = os.getenv('LLM_INVESTIGATOR_GOOGLE_GROUNDING', 'true').lower() in ('true', '1', 'yes')
         self.llm_investigator_max_steps_per_task = int(os.getenv('LLM_INVESTIGATOR_MAX_STEPS_PER_TASK', '5'))
+        self.llm_investigator_web_search_provider = os.getenv('LLM_INVESTIGATOR_WEB_SEARCH_PROVIDER', 'duckduckgo').strip().lower()
+        self.llm_investigator_web_search_enabled = os.getenv('LLM_INVESTIGATOR_WEB_SEARCH_ENABLED', 'true').lower() in ('true', '1', 'yes')
         self.flx_static_maps_default_size = os.getenv('FLX_STATIC_MAPS_SIZE', '800x600')
         self.flx_static_maps_default_zoom = int(os.getenv('FLX_STATIC_MAPS_ZOOM', '13'))
         # Список дозволених інструментів для Flx (allow-list, без '*')
         _allowed_tools_raw = os.getenv(
             'FLX_ALLOWED_TOOLS',
             'flx.note_write,flx.notes_read,flx.lessons_search,flx.lessons_save,'
-            'flx.static_map_render,flx.ask_user,flx.report_compose,flx.web_search,'
+            'flx.static_map_render,flx.ask_user,flx.report_compose,flx.targeted_source_search,flx.web_search,'
             'query_builder.execute_query,query_builder.execute_aggregation,'
             'query_builder.save_query_to_temp_collection,query_builder.get_distinct_values,'
             'analytics.execute_analytics,analytics.list_metrics,'
@@ -233,6 +235,10 @@ class Settings:
                                     self.llm_investigator_google_grounding = bool(inv['google_grounding'])
                                 if 'max_steps_per_task' in inv:
                                     self.llm_investigator_max_steps_per_task = int(inv['max_steps_per_task'])
+                                if 'web_search_provider' in inv:
+                                    self.llm_investigator_web_search_provider = str(inv['web_search_provider'] or 'duckduckgo').strip().lower()
+                                if 'web_search_enabled' in inv:
+                                    self.llm_investigator_web_search_enabled = bool(inv['web_search_enabled'])
                                 if 'allowed_tools' in inv and isinstance(inv['allowed_tools'], list):
                                     self.flx_allowed_tools = [str(t).strip() for t in inv['allowed_tools'] if str(t).strip()]
                                 if 'static_maps_size' in inv:

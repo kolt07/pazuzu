@@ -322,6 +322,12 @@ def run_investigation_step(self, session_id: str) -> Dict[str, Any]:
     або вичерпано ліміт ітерацій сесії — таска просто завершується.
     """
     settings = _init_runtime()
+    celery_id = str(getattr(getattr(self, "request", None), "id", "") or "")
+    logger.info(
+        "[flx] run_investigation_step.start session=%s celery_id=%s queue=llm_processing",
+        session_id,
+        celery_id or "—",
+    )
     try:
         from business.services.investigation_service import InvestigationService
 

@@ -17,6 +17,7 @@ from data.repositories.base_repository import BaseRepository
 # planning — будується початковий план (LLM Planner).
 # running — виконує крок (tool call або roundtrip step).
 # awaiting_user — очікує відповідь користувача (ask_user).
+# awaiting_sources — очікує завершення таргетного оновлення/пошуку в джерелах.
 # done — фінальний звіт сформовано.
 # failed — помилка (детально у last_error).
 # cancelled — скасовано користувачем.
@@ -25,6 +26,7 @@ ALLOWED_STATES = {
     "planning",
     "running",
     "awaiting_user",
+    "awaiting_sources",
     "done",
     "failed",
     "cancelled",
