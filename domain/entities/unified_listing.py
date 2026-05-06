@@ -224,6 +224,9 @@ class UnifiedListing(BaseEntity):
             if field == "addresses":
                 addrs = self.get_addresses()
                 row[field] = self._format_addresses_for_export(addrs)
+            elif field == "land_area_sotky":
+                s = self.land_area_sotky
+                row[field] = s if s is not None else ""
             else:
                 value = self.get_property(field)
                 if value is not None and not isinstance(value, (dict, list)):

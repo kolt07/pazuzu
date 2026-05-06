@@ -272,8 +272,12 @@ def _build_unified_filters(
     property_type: Optional[str] = None,
     building_area_sqm_op: Optional[str] = None,
     building_area_sqm_value: Optional[float] = None,
+    land_area_sotky_op: Optional[str] = None,
+    land_area_sotky_value: Optional[float] = None,
     land_area_ha_op: Optional[str] = None,
     land_area_ha_value: Optional[float] = None,
+    land_area_hectares_op: Optional[str] = None,
+    land_area_hectares_value: Optional[float] = None,
     date_filter_days: Optional[int] = None,
     price_per_m2_min: Optional[float] = None,
     price_per_m2_max: Optional[float] = None,
@@ -341,14 +345,25 @@ def _build_unified_filters(
         if op:
             filters["building_area_sqm"] = {op: float(building_area_sqm_value)}
 
-    # Фільтр за площею земельної ділянки: клієнт передає значення в сотках, зберігаємо в м²
+    # Фільтри за площею земельної ділянки.
+    # У БД зберігаємо land_area_sqm (м²), у вхідних параметрах підтримуємо сотки та гектари.
+    # Legacy: land_area_ha_* історично передавався в сотках; зберігаємо backward compatibility.
+    op_map = {"eq": "$eq", "gte": "$gte", "lte": "$lte"}
+    land_sqm_cond: Dict[str, Any] = {}
+    if land_area_sotky_op and land_area_sotky_value is not None:
+        op = op_map.get(land_area_sotky_op)
+        if op:
+            land_sqm_cond[op] = float(land_area_sotky_value) * 100.0
     if land_area_ha_op and land_area_ha_value is not None:
-        op_map = {"eq": "$eq", "gte": "$gte", "lte": "$lte"}
         op = op_map.get(land_area_ha_op)
         if op:
-            # land_area_ha_value у API — у сотках (для зручності), переводимо в м²
-            land_sqm = float(land_area_ha_value) * 100.0
-            filters["land_area_sqm"] = {op: land_sqm}
+            land_sqm_cond[op] = float(land_area_ha_value) * 100.0
+    if land_area_hectares_op and land_area_hectares_value is not None:
+        op = op_map.get(land_area_hectares_op)
+        if op:
+            land_sqm_cond[op] = float(land_area_hectares_value) * 10000.0
+    if land_sqm_cond:
+        filters["land_area_sqm"] = land_sqm_cond
 
     # Фільтр за датою (source_updated_at за останні N днів)
     if date_filter_days is not None and date_filter_days > 0:
@@ -368,7 +383,7 @@ def _build_unified_filters(
         if price_m2_cond:
             filters[price_m2_field] = price_m2_cond
 
-    # Фільтр за ціною за га
+    # Фільтр за ціною за гектар (у UI відображається як ціна за сотку = /100)
     price_ha_field = "price_per_ha_uah" if (price_per_ha_currency or "uah") == "uah" else "price_per_ha_usd"
     if price_per_ha_min is not None or price_per_ha_max is not None:
         price_ha_cond: Dict[str, Any] = {}
@@ -876,8 +891,12 @@ def search_unified(
     property_type: Optional[str] = Query(None, description="Тип оголошення (neruhomist/zemelna_dilyanka/...)"),
     building_area_sqm_op: Optional[str] = Query(None, description="Оператор площі нерухомості (eq/gte/lte)"),
     building_area_sqm_value: Optional[float] = Query(None, description="Значення площі нерухомості (кв. м.)"),
-    land_area_ha_op: Optional[str] = Query(None, description="Оператор площі землі (eq/gte/lte)"),
-    land_area_ha_value: Optional[float] = Query(None, description="Значення площі землі в сотках (с)"),
+    land_area_sotky_op: Optional[str] = Query(None, description="Оператор площі землі в сотках (eq/gte/lte)"),
+    land_area_sotky_value: Optional[float] = Query(None, description="Значення площі землі в сотках (с)"),
+    land_area_hectares_op: Optional[str] = Query(None, description="Оператор площі землі в гектарах (eq/gte/lte)"),
+    land_area_hectares_value: Optional[float] = Query(None, description="Значення площі землі в гектарах (га)"),
+    land_area_ha_op: Optional[str] = Query(None, description="(legacy) оператор площі землі в сотках"),
+    land_area_ha_value: Optional[float] = Query(None, description="(legacy) значення площі землі в сотках"),
     date_filter_days: Optional[int] = Query(None, description="Фільтр за датою: 1, 7 або 30 днів"),
     price_per_m2_min: Optional[float] = Query(None),
     price_per_m2_max: Optional[float] = Query(None),
@@ -908,8 +927,12 @@ def search_unified(
         property_type=property_type,
         building_area_sqm_op=building_area_sqm_op,
         building_area_sqm_value=building_area_sqm_value,
+        land_area_sotky_op=land_area_sotky_op,
+        land_area_sotky_value=land_area_sotky_value,
         land_area_ha_op=land_area_ha_op,
         land_area_ha_value=land_area_ha_value,
+        land_area_hectares_op=land_area_hectares_op,
+        land_area_hectares_value=land_area_hectares_value,
         date_filter_days=date_filter_days,
         price_per_m2_min=price_per_m2_min,
         price_per_m2_max=price_per_m2_max,
@@ -1083,8 +1106,12 @@ class ExportSearchRequest(BaseModel):
     property_type: Optional[str] = None
     building_area_sqm_op: Optional[str] = None
     building_area_sqm_value: Optional[float] = None
+    land_area_sotky_op: Optional[str] = None
+    land_area_sotky_value: Optional[float] = None
     land_area_ha_op: Optional[str] = None
     land_area_ha_value: Optional[float] = None
+    land_area_hectares_op: Optional[str] = None
+    land_area_hectares_value: Optional[float] = None
     date_filter_days: Optional[int] = None
     price_per_m2_min: Optional[float] = None
     price_per_m2_max: Optional[float] = None
@@ -1138,8 +1165,12 @@ def export_search_results(request: Request, body: ExportSearchRequest):
             property_type=body.property_type,
             building_area_sqm_op=body.building_area_sqm_op,
             building_area_sqm_value=body.building_area_sqm_value,
+            land_area_sotky_op=body.land_area_sotky_op,
+            land_area_sotky_value=body.land_area_sotky_value,
             land_area_ha_op=body.land_area_ha_op,
             land_area_ha_value=body.land_area_ha_value,
+            land_area_hectares_op=body.land_area_hectares_op,
+            land_area_hectares_value=body.land_area_hectares_value,
             date_filter_days=body.date_filter_days,
             price_per_m2_min=body.price_per_m2_min,
             price_per_m2_max=body.price_per_m2_max,
@@ -1234,8 +1265,12 @@ def send_export_via_bot(request: Request, body: ExportSearchRequest):
             property_type=body.property_type,
             building_area_sqm_op=body.building_area_sqm_op,
             building_area_sqm_value=body.building_area_sqm_value,
+            land_area_sotky_op=body.land_area_sotky_op,
+            land_area_sotky_value=body.land_area_sotky_value,
             land_area_ha_op=body.land_area_ha_op,
             land_area_ha_value=body.land_area_ha_value,
+            land_area_hectares_op=body.land_area_hectares_op,
+            land_area_hectares_value=body.land_area_hectares_value,
             date_filter_days=body.date_filter_days,
             price_per_m2_min=body.price_per_m2_min,
             price_per_m2_max=body.price_per_m2_max,

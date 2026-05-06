@@ -1589,6 +1589,26 @@ collections:
         type: "number"
         description: "Ціна нерухомості за м² (дол)"
 
+  vast_billing_daily:
+    description: "Кеш добових витрат Vast.ai (type=instance) з GET /api/v0/charges/; один документ на календарний день UTC. Адмін usage-stats: минулі дні з кешу, поточна доба оновлюється з API."
+    mongo_collection: "vast_billing_daily"
+    indexes:
+      - field: "updated_at"
+        unique: false
+        description: "Час останнього запису з API/кешу"
+    fields:
+      _id:
+        type: "string"
+        required: true
+        description: "Календарна дата UTC YYYY-MM-DD"
+      billed_usd:
+        type: "number"
+        required: true
+        description: "Сума instance-charges за день (USD)"
+      updated_at:
+        type: "datetime"
+        required: true
+        description: "Коли оновлено цей день"
 # Допоміжні типи та константи
 field_types:
   - name: "string"

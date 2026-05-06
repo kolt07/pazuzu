@@ -7,6 +7,10 @@ services:
       - "27017:27017"
     volumes:
       - pazuzu_mongo_data:/data/db
+    cpus: "${MONGODB_CPUS:-1.0}"
+    mem_limit: "${MONGODB_MEM_LIMIT:-1536m}"
+    mem_reservation: "${MONGODB_MEM_RESERVATION:-512m}"
+    pids_limit: ${MONGODB_PIDS_LIMIT:-512}
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 10s
@@ -27,6 +31,10 @@ services:
     volumes:
       - ./config/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
       - pazuzu_rabbitmq_data:/var/lib/rabbitmq
+    cpus: "${RABBITMQ_CPUS:-0.75}"
+    mem_limit: "${RABBITMQ_MEM_LIMIT:-1024m}"
+    mem_reservation: "${RABBITMQ_MEM_RESERVATION:-384m}"
+    pids_limit: ${RABBITMQ_PIDS_LIMIT:-512}
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -49,9 +57,14 @@ services:
       - ./config/config.yaml:/app/config/config.yaml:ro
       - ./data:/app/data
       - ./temp:/app/temp
+    cpus: "${PAZUZU_APP_CPUS:-1.5}"
+    mem_limit: "${PAZUZU_APP_MEM_LIMIT:-2g}"
+    mem_reservation: "${PAZUZU_APP_MEM_RESERVATION:-768m}"
+    pids_limit: ${PAZUZU_APP_PIDS_LIMIT:-1024}
     environment:
       PYTHONPATH: /app
       TASK_QUEUE_ENABLED: "true"
+      PAZUZU_VAST_ORCHESTRATOR_IN_WORKER: "false"
       MONGODB_HOST: mongodb
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
@@ -76,9 +89,16 @@ services:
       - ./config/config.yaml:/app/config/config.yaml:ro
       - ./data:/app/data
       - ./temp:/app/temp
+    cpus: "${PAZUZU_SOURCE_WORKER_CPUS:-1.25}"
+    mem_limit: "${PAZUZU_SOURCE_WORKER_MEM_LIMIT:-1536m}"
+    mem_reservation: "${PAZUZU_SOURCE_WORKER_MEM_RESERVATION:-512m}"
+    pids_limit: ${PAZUZU_SOURCE_WORKER_PIDS_LIMIT:-768}
+    shm_size: ${PAZUZU_SOURCE_WORKER_SHM_SIZE:-1gb}
     environment:
       PYTHONPATH: /app
       TASK_QUEUE_ENABLED: "true"
+      OLX_SCRAPER_PHASE1_MAX_THREADS: ${OLX_SCRAPER_PHASE1_MAX_THREADS:-1}
+      OLX_SCRAPER_BROWSER_POOL_SIZE: ${OLX_SCRAPER_BROWSER_POOL_SIZE:-0}
       MONGODB_HOST: mongodb
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
@@ -103,9 +123,15 @@ services:
       - ./config/config.yaml:/app/config/config.yaml:ro
       - ./data:/app/data
       - ./temp:/app/temp
+    cpus: "${PAZUZU_LLM_WORKER_CPUS:-2.0}"
+    mem_limit: "${PAZUZU_LLM_WORKER_MEM_LIMIT:-3g}"
+    mem_reservation: "${PAZUZU_LLM_WORKER_MEM_RESERVATION:-1g}"
+    pids_limit: ${PAZUZU_LLM_WORKER_PIDS_LIMIT:-1024}
     environment:
       PYTHONPATH: /app
       TASK_QUEUE_ENABLED: "true"
+      # Один VllmRuntimeOrchestrator: оренда/idle Vast тільки в цьому контейнері, не в pazuzu-app.
+      PAZUZU_VAST_ORCHESTRATOR_IN_WORKER: "true"
       MONGODB_HOST: mongodb
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
@@ -127,6 +153,10 @@ services:
     command: ["http", "pazuzu-app:8000"]
     ports:
       - "4040:4040"
+    cpus: "${NGROK_CPUS:-0.25}"
+    mem_limit: "${NGROK_MEM_LIMIT:-256m}"
+    mem_reservation: "${NGROK_MEM_RESERVATION:-128m}"
+    pids_limit: ${NGROK_PIDS_LIMIT:-128}
 
 volumes:
   pazuzu_mongo_data:

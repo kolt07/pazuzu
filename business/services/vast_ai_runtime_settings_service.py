@@ -50,9 +50,9 @@ class VastRuntimeSettingsService:
             "ssh_identity_file": "",
             "ssh_binary": "",
             "ssh_instance_log_stream": True,
-            "endpoint_timeout_sec": 1200,
-            "boot_timeout_sec": 1200,
-            "ready_timeout_sec": 1200,
+            "endpoint_timeout_sec": 600,
+            "boot_timeout_sec": 600,
+            "ready_timeout_sec": 300,
             # Якщо resume "сплячого" інстанса зависає, після N секунд робимо міграцію.
             "sleep_wakeup_timeout_sec": 300,
             "sleep_migration_enabled": True,
@@ -149,9 +149,9 @@ class VastRuntimeSettingsService:
         out["ssh_identity_file"] = str(out.get("ssh_identity_file") or "").strip()
         out["ssh_binary"] = str(out.get("ssh_binary") or "").strip()
         out["ssh_instance_log_stream"] = bool(out.get("ssh_instance_log_stream", True))
-        out["endpoint_timeout_sec"] = int(out.get("endpoint_timeout_sec") or 1200)
-        out["boot_timeout_sec"] = int(out.get("boot_timeout_sec") or 1200)
-        out["ready_timeout_sec"] = int(out.get("ready_timeout_sec") or 1200)
+        out["endpoint_timeout_sec"] = max(30, min(600, int(out.get("endpoint_timeout_sec") or 600)))
+        out["boot_timeout_sec"] = max(30, min(600, int(out.get("boot_timeout_sec") or 600)))
+        out["ready_timeout_sec"] = max(30, min(300, int(out.get("ready_timeout_sec") or 300)))
         out["sleep_wakeup_timeout_sec"] = max(0, int(out.get("sleep_wakeup_timeout_sec") or 300))
         out["sleep_migration_enabled"] = bool(out.get("sleep_migration_enabled", True))
         raw_copy_paths = out.get("sleep_migration_copy_paths", ["/workspace/", "/root/.ollama/"])

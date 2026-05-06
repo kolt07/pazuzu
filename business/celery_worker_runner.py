@@ -37,6 +37,9 @@ def main() -> int:
         "--loglevel=info",
         f"--concurrency={threads}",
     ]
+    # prefork: кожен child-процес = окремий VllmRuntimeOrchestrator → дубль оренди Vast.
+    if queue == "llm_processing":
+        cmd.append("--pool=threads")
     os.execvp(cmd[0], cmd)
     return 0
 

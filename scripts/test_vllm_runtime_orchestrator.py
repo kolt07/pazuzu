@@ -106,7 +106,7 @@ class VllmRuntimeOrchestratorTest(unittest.TestCase):
         self.assertFalse(VllmRuntimeOrchestrator._is_rate_limited_error(e400))
 
     def test_sum_instance_rows_usd_filters_and_sums(self):
-        from business.services.vast_billing_service import sum_instance_rows_usd
+        from business.services.vast_billing_service import sum_instance_rows_usd, sum_vast_billing_day_rows_usd
 
         rows = [
             {"type": "instance", "source": "instance-42", "amount": 0.1},
@@ -115,6 +115,7 @@ class VllmRuntimeOrchestratorTest(unittest.TestCase):
         ]
         self.assertAlmostEqual(sum_instance_rows_usd(iter(rows), instance_id="42"), 0.1, places=6)
         self.assertAlmostEqual(sum_instance_rows_usd(iter(rows), instance_id=None), 9.1, places=6)
+        self.assertAlmostEqual(sum_vast_billing_day_rows_usd(iter(rows)), 10.1, places=6)
 
     def test_select_offer_prefers_compatible_gpu_over_cheaper_incompatible(self):
         class _FakeClient:

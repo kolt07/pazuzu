@@ -127,6 +127,16 @@ class Application:
         except Exception:
             return False
 
+    def _vast_rental_supervisor_in_app(self) -> bool:
+        """
+        У режимі RabbitMQ + vllm_remote оркестратор оренди працює тільки в pazuzu-llm-worker
+        (інакше кожен процес має власний singleton → кілька орендованих інстансів).
+        """
+        if not self.task_queue_service or not self.task_queue_service.is_enabled():
+            return True
+        provider = (getattr(self.settings, "llm_parsing_provider", "") or "").strip().lower()
+        return provider != "vllm_remote"
+
     def _start_runtime_supervisor(self) -> None:
         if self.runtime_supervisor_service is not None:
             return
@@ -134,6 +144,7 @@ class Application:
             self.runtime_supervisor_service = VastRuntimeSupervisorService(
                 self.settings,
                 notify_admins_fn=self._notify_admins_sync,
+                orchestrate_vast_rentals=self._vast_rental_supervisor_in_app(),
             )
             self.runtime_supervisor_service.start()
         except Exception as e:

@@ -51,9 +51,12 @@ py scripts/olx_scraper/run_prototype.py
 | `OLX_SCRAPER_OUTPUT_FILE` | Ім’я файлу JSON | `olx_nedvizhimost_page1.json` |
 | `OLX_SCRAPER_DELAY_DETAIL_MIN` / `OLX_SCRAPER_DELAY_DETAIL_MAX` | Затримка перед запитом сторінки оголошення (с) | 2, 10 |
 | `OLX_SCRAPER_DETAIL_TIMEOUT` | Таймаут запиту сторінки оголошення (с) | 45 |
+| `OLX_SCRAPER_BROWSER_DOCKER_SAFE_ARGS` | Додає docker-safe args для Chromium (`--disable-dev-shm-usage`, `--no-sandbox`) | `1` у Docker, інакше `0` |
 | `OLX_SCRAPER_COOKIES` | JSON-рядок куків `[{"name":"...","value":"..."}]` (підміна з браузера) | — |
 | `OLX_SCRAPER_COOKIES_FILE` | Шлях до файлу з JSON куків | — |
 | `OLX_SCRAPER_MAX_PAGES` | Кількість сторінок пошуку (прототип) | 5 |
+| `OLX_SCRAPER_PHASE1_MAX_THREADS` | Потоки Phase 1 (кожен потік тримає свій браузер для detail) | `1` у Docker, інакше `5` |
+| `OLX_SCRAPER_BROWSER_POOL_SIZE` | Експериментальний BrowserPool (sync Playwright). Безпечний лише при `OLX_SCRAPER_PHASE1_MAX_THREADS=1`; інакше автоматично вимикається | `0` |
 
 ## Телефони продавця
 

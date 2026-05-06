@@ -8,11 +8,17 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from business.services.vast_ai_client import VastAiClient
+
+# Док-сторінка Vast: type у /charges/ — instance | volume | serverless (не плутати з invoices/Stripe).
+VAST_BILLING_DAY_TYPE_FILTERS: Tuple[str, ...] = ("instance", "volume", "serverless")
+# Останні N календарних днів UTC (включно з «сьогодні») знімаємо з API; старіші — кеш, щоб не застрягати в неповних сумах.
+VAST_BILLING_RECENT_DAYS_FROM_API: int = 7
 
 
 def _norm_instance_source(instance_id: str) -> str:
@@ -44,6 +50,22 @@ def iter_charge_rows(
         token = data.get("next_token") if isinstance(data, dict) else None
         if not token:
             break
+
+
+def sum_vast_billing_day_rows_usd(rows: Iterator[Dict[str, Any]]) -> float:
+    """
+    Сума `amount` по рядках денного звіту: GPU (instance), сховище (volume), serverless.
+    """
+    allowed = {t.lower() for t in VAST_BILLING_DAY_TYPE_FILTERS}
+    total = 0.0
+    for row in rows:
+        if str(row.get("type") or "").lower() not in allowed:
+            continue
+        try:
+            total += float(row.get("amount") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return round(total, 6)
 
 
 def sum_instance_rows_usd(rows: Iterator[Dict[str, Any]], *, instance_id: Optional[str] = None) -> float:
@@ -90,6 +112,97 @@ def fetch_instance_contract_charges_usd(
         return None, str(e)
 
 
+def fetch_one_calendar_day_instance_charges_usd(
+    api_key: str,
+    d: date,
+    *,
+    client: Optional[VastAiClient] = None,
+    timeout_sec: int = 60,
+) -> Tuple[float, Optional[str]]:
+    """
+    Сума всіх contract-charges з billing API за один календарний день UTC
+    (instance + volume + serverless; див. VAST_BILLING_DAY_TYPE_FILTERS).
+    """
+    key = (api_key or "").strip()
+    if not key:
+        return 0.0, "vast_api_key_empty"
+    gte, lte = _utc_day_unix_bounds(d)
+    filters: Dict[str, Any] = {
+        "day": {"gte": gte, "lte": lte},
+        "type": {"in": list(VAST_BILLING_DAY_TYPE_FILTERS)},
+    }
+    try:
+        c = client or VastAiClient(api_key=key, timeout_sec=timeout_sec)
+        total = sum_vast_billing_day_rows_usd(iter_charge_rows(c, filters))
+        return float(total), None
+    except Exception as e:
+        return 0.0, str(e)
+
+
+_vast_billing_cache_lock = threading.Lock()
+
+
+def sync_vast_billing_daily_cache(
+    api_key: str,
+    *,
+    days: int,
+    sleep_between_sec: float = 0.05,
+    timeout_sec: int = 120,
+) -> Tuple[Dict[str, float], Optional[str]]:
+    """
+    Добові витрати Vast: для минулих днів — з MongoDB (кеш) або з API; для поточної UTC-доби
+    — завжди повне оновлення з API й запис у кеш. Запобігає паралельним подвійним тягненням (lock).
+    """
+    from data.repositories.vast_billing_daily_repository import VastBillingDailyRepository
+
+    key = (api_key or "").strip()
+    out: Dict[str, float] = {}
+    if not key:
+        return {}, "vast_api_key_empty"
+    n = max(1, int(days))
+    d0 = datetime.now(timezone.utc).date()
+    start = d0 - timedelta(days=n - 1)
+    last_err: Optional[str] = None
+    hot_n = max(1, int(VAST_BILLING_RECENT_DAYS_FROM_API))
+
+    with _vast_billing_cache_lock:
+        try:
+            repo = VastBillingDailyRepository()
+            client = VastAiClient(api_key=key, timeout_sec=timeout_sec)
+            for offset in range(n):
+                current = start + timedelta(days=offset)
+                dk = current.strftime("%Y-%m-%d")
+                is_today = current == d0
+                # Дні старіші за «гаряче вікно» могли бути збережені тільки по instance — не довіряємо кешу.
+                days_back = (d0 - current).days
+                in_hot_window = days_back < hot_n
+                day_entry = repo.get_day_entry(dk) or {}
+                cached = day_entry.get("billed_usd")
+                cached_version = int(day_entry.get("charges_schema_version") or 0)
+                is_fresh_schema = cached_version >= int(repo.CHARGES_SCHEMA_VERSION)
+                if not is_today and not in_hot_window and cached is not None and is_fresh_schema:
+                    out[dk] = float(cached)
+                    continue
+                val, err = fetch_one_calendar_day_instance_charges_usd(
+                    key, current, client=client, timeout_sec=timeout_sec
+                )
+                if err:
+                    last_err = err
+                    # Не затираємо кеш нулями при transient-помилці API.
+                    if cached is not None:
+                        out[dk] = float(cached)
+                        continue
+                    out[dk] = 0.0
+                    continue
+                out[dk] = float(val)
+                repo.upsert_day(dk, float(val))
+                if sleep_between_sec > 0 and offset < n - 1:
+                    time.sleep(float(sleep_between_sec))
+        except Exception as e:
+            return out, last_err or str(e)
+    return out, last_err
+
+
 def fetch_gpu_instance_charges_by_calendar_day_usd(
     api_key: str,
     *,
@@ -99,8 +212,7 @@ def fetch_gpu_instance_charges_by_calendar_day_usd(
 ) -> Tuple[Dict[str, float], Optional[str]]:
     """
     Для кожної календарної дати UTC (останні ``days`` днів) — сума instance-charges за цей день.
-
-    Окремий запит на день (вимога API: фільтр day з gte/lte).
+    Кожен день — окремий запит до API (без кешу DB). Використовуйте `sync_vast_billing_daily_cache` для UI.
     """
     key = (api_key or "").strip()
     out: Dict[str, float] = {}
@@ -112,18 +224,12 @@ def fetch_gpu_instance_charges_by_calendar_day_usd(
         client = VastAiClient(api_key=key, timeout_sec=timeout_sec)
         for i in range(max(1, int(days))):
             current = d0 - timedelta(days=(days - 1 - i))
-            gte, lte = _utc_day_unix_bounds(current)
-            filters: Dict[str, Any] = {
-                "day": {"gte": gte, "lte": lte},
-                "type": {"in": ["instance"]},
-            }
-            day_total = 0.0
-            try:
-                day_total = sum_instance_rows_usd(iter_charge_rows(client, filters), instance_id=None)
-            except Exception as e:
-                last_err = str(e)
-                day_total = 0.0
-            out[current.strftime("%Y-%m-%d")] = day_total
+            day_total, err = fetch_one_calendar_day_instance_charges_usd(
+                key, current, client=client, timeout_sec=timeout_sec
+            )
+            if err:
+                last_err = err
+            out[current.strftime("%Y-%m-%d")] = float(day_total)
             if sleep_between_sec > 0:
                 time.sleep(float(sleep_between_sec))
         return out, last_err

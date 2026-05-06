@@ -42,8 +42,12 @@ collections:
         label_uk: "Площа нерухомості, м²"
         value_type: "number"
         allowed_operators: [eq, gte, lte, gt, lt]
+      land_area_sotky:
+        label_uk: "Площа землі, с"
+        value_type: "number"
+        allowed_operators: [eq, gte, lte, gt, lt]
       land_area_ha:
-        label_uk: "Площа землі, га"
+        label_uk: "Площа землі, га (конвертація в с)"
         value_type: "number"
         allowed_operators: [eq, gte, lte, gt, lt]
       price_per_m2_uah:
@@ -55,11 +59,11 @@ collections:
         value_type: "number"
         allowed_operators: [eq, gte, lte, gt, lt]
       price_per_ha_uah:
-        label_uk: "Ціна за га, грн"
+        label_uk: "Ціна за сотку, грн"
         value_type: "number"
         allowed_operators: [eq, gte, lte, gt, lt]
       price_per_ha_usd:
-        label_uk: "Ціна за га, USD"
+        label_uk: "Ціна за сотку, USD"
         value_type: "number"
         allowed_operators: [eq, gte, lte, gt, lt]
 

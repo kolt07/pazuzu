@@ -97,8 +97,12 @@ def build_query_from_flat_params(
     property_type: Optional[str] = None,
     building_area_sqm_op: Optional[str] = None,
     building_area_sqm_value: Optional[float] = None,
+    land_area_sotky_op: Optional[str] = None,
+    land_area_sotky_value: Optional[float] = None,
     land_area_ha_op: Optional[str] = None,
     land_area_ha_value: Optional[float] = None,
+    land_area_hectares_op: Optional[str] = None,
+    land_area_hectares_value: Optional[float] = None,
     date_filter_days: Optional[int] = None,
     status: Optional[str] = None,
     title_contains: Optional[str] = None,
@@ -145,11 +149,28 @@ def build_query_from_flat_params(
             building_area_sqm_op, FilterOperator.EQ
         )
         elements.append(FilterElement(field=phys("building_area_sqm"), operator=op, value=building_area_sqm_value))
+    if land_area_sotky_op and land_area_sotky_value is not None:
+        op = {"eq": FilterOperator.EQ, "gte": FilterOperator.GTE, "lte": FilterOperator.LTE}.get(
+            land_area_sotky_op, FilterOperator.EQ
+        )
+        elements.append(FilterElement(field=phys("land_area_sqm"), operator=op, value=float(land_area_sotky_value) * 100.0))
+    # Legacy: historical API використовував land_area_ha_* для значень у сотках.
     if land_area_ha_op and land_area_ha_value is not None:
         op = {"eq": FilterOperator.EQ, "gte": FilterOperator.GTE, "lte": FilterOperator.LTE}.get(
             land_area_ha_op, FilterOperator.EQ
         )
-        elements.append(FilterElement(field=phys("land_area_ha"), operator=op, value=float(land_area_ha_value)))
+        elements.append(FilterElement(field=phys("land_area_sqm"), operator=op, value=float(land_area_ha_value) * 100.0))
+    if land_area_hectares_op and land_area_hectares_value is not None:
+        op = {"eq": FilterOperator.EQ, "gte": FilterOperator.GTE, "lte": FilterOperator.LTE}.get(
+            land_area_hectares_op, FilterOperator.EQ
+        )
+        elements.append(
+            FilterElement(
+                field=phys("land_area_sqm"),
+                operator=op,
+                value=float(land_area_hectares_value) * 10000.0,
+            )
+        )
 
     if title_contains:
         elements.append(FilterElement(field="title", operator=FilterOperator.CONTAINS, value=title_contains))
@@ -220,8 +241,12 @@ def filter_string_from_flat_params(
     property_type: Optional[str] = None,
     building_area_sqm_op: Optional[str] = None,
     building_area_sqm_value: Optional[float] = None,
+    land_area_sotky_op: Optional[str] = None,
+    land_area_sotky_value: Optional[float] = None,
     land_area_ha_op: Optional[str] = None,
     land_area_ha_value: Optional[float] = None,
+    land_area_hectares_op: Optional[str] = None,
+    land_area_hectares_value: Optional[float] = None,
     date_filter_days: Optional[int] = None,
     status: Optional[str] = None,
     title_contains: Optional[str] = None,
@@ -247,8 +272,12 @@ def filter_string_from_flat_params(
         property_type=property_type,
         building_area_sqm_op=building_area_sqm_op,
         building_area_sqm_value=building_area_sqm_value,
+        land_area_sotky_op=land_area_sotky_op,
+        land_area_sotky_value=land_area_sotky_value,
         land_area_ha_op=land_area_ha_op,
         land_area_ha_value=land_area_ha_value,
+        land_area_hectares_op=land_area_hectares_op,
+        land_area_hectares_value=land_area_hectares_value,
         date_filter_days=date_filter_days,
         status=status,
         title_contains=title_contains,

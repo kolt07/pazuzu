@@ -76,7 +76,7 @@ data_sources:
       - "detail.price - ціна оголошення (UAH)"
       - "detail.llm.property_type - тип нерухомості (витягнуто LLM)"
       - "detail.llm.building_area_sqm - площа будівлі (м²)"
-      - "detail.llm.land_area_ha - площа земельної ділянки (га)"
+      - "detail.llm.land_area_sqm - площа земельної ділянки (м²); для відображення у сотках: /100"
       - "detail.address_refs - нормалізовані адреси (область, місто)"
       - "updated_at - дата останнього оновлення (BSON Date)"
     update_frequency: "Щоденно (автоматичне оновлення за останню добу/тиждень)"
@@ -87,8 +87,8 @@ collections:
     purpose: "Єдиний інтерфейс для пошуку, фільтрації та аналітики оголошень з обох джерел"
     key_metrics:
       - "Ціна (price_uah, price_usd)"
-      - "Площа (building_area_sqm, land_area_ha)"
-      - "Ціна за м²/га (price_per_m2_uah, price_per_ha_uah)"
+      - "Площа (building_area_sqm, land_area_sqm; для землі у UI — сотки)"
+      - "Ціна за м²/сотку (price_per_m2_uah, price_per_ha_uah/100)"
       - "Тип нерухомості (property_type)"
       - "Адреси (addresses[].region, addresses[].settlement)"
     filtering_capabilities:
@@ -124,7 +124,7 @@ collections:
     key_metrics:
       - "Ціна (detail.price або search_data.price)"
       - "Площа будівлі (detail.llm.building_area_sqm)"
-      - "Площа земельної ділянки (detail.llm.land_area_ha)"
+      - "Площа земельної ділянки (detail.llm.land_area_sqm; для UI: сотки = м²/100)"
       - "Тип нерухомості (detail.llm.property_type)"
     filtering_capabilities:
       - "За регіоном/містом через detail.address_refs (використовуй $elemMatch)"
@@ -176,7 +176,7 @@ available_operations:
   - "Експорт даних у Excel файли"
   - "Генерація звітів за період (доба, тиждень, місяць)"
   - "Порівняння даних між джерелами (ProZorro vs OLX)"
-  - "Розрахунок метрик (ціна за м², ціна за га, тощо)"
+  - "Розрахунок метрик (ціна за м², ціна за сотку, тощо)"
 
 response_formats:
   text_answer:

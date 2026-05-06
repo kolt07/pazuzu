@@ -50,6 +50,13 @@ DELAY_DETAIL_MAX = float(os.getenv("OLX_SCRAPER_DELAY_DETAIL_MAX", "10"))
 # Браузер: використовувати встановлений Chrome замість bundled Chromium (краще схожість із звичайним відкриттям).
 BROWSER_USE_CHROME = (os.getenv("OLX_SCRAPER_BROWSER_USE_CHROME", "").strip().lower() in ("1", "true", "yes"))
 
+# У Docker Chromium часто падає без безпечних флагів запуску.
+_IS_DOCKER = Path("/.dockerenv").exists() or os.getenv("RUNNING_IN_DOCKER", "").strip().lower() in ("1", "true", "yes")
+BROWSER_DOCKER_SAFE_ARGS = (
+    os.getenv("OLX_SCRAPER_BROWSER_DOCKER_SAFE_ARGS", "1" if _IS_DOCKER else "0").strip().lower()
+    in ("1", "true", "yes")
+)
+
 # Чекати повного завантаження detail-сторінки: "load" (рекомендовано — JS відрендерить контент) або "domcontentloaded".
 BROWSER_DETAIL_WAIT_UNTIL = os.getenv("OLX_SCRAPER_BROWSER_DETAIL_WAIT", "load").strip().lower() or "load"
 if BROWSER_DETAIL_WAIT_UNTIL not in ("load", "domcontentloaded", "networkidle"):
@@ -66,7 +73,9 @@ MIN_LISTINGS_PER_FULL_PAGE = int(os.getenv("OLX_SCRAPER_MIN_LISTINGS_FULL_PAGE",
 MAX_PARALLEL_REGIONS = int(os.getenv("OLX_SCRAPER_MAX_PARALLEL_REGIONS", "25"))
 
 # Кількість потоків Phase 1: пул завдань (область + категорія), кожен потік бере наступне завдання з пулу; 0 = використати MAX_PARALLEL_REGIONS замість пулу.
-OLX_PHASE1_MAX_THREADS = int(os.getenv("OLX_SCRAPER_PHASE1_MAX_THREADS", "5"))
+OLX_PHASE1_MAX_THREADS = int(os.getenv("OLX_SCRAPER_PHASE1_MAX_THREADS", "1" if _IS_DOCKER else "5"))
+# Розмір BrowserPool (кількість reusable сторінок) для Phase 1; 0 = авто (= OLX_PHASE1_MAX_THREADS).
+BROWSER_POOL_SIZE = int(os.getenv("OLX_SCRAPER_BROWSER_POOL_SIZE", "0"))
 
 # Таймаут одного запиту (секунди)
 REQUEST_TIMEOUT = int(os.getenv("OLX_SCRAPER_TIMEOUT", "25"))

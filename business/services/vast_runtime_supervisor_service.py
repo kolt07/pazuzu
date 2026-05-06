@@ -17,7 +17,6 @@ from typing import Callable, Optional
 from config.settings import Settings
 from data.repositories.olx_listings_repository import OlxListingsRepository
 from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepository
-from business.services.source_data_load_service import is_source_load_running
 from business.services.task_queue_service import TaskQueueService
 from business.services.vast_ai_client import VastAiClient
 from business.services.vllm_runtime_orchestrator import get_shared_vllm_runtime_orchestrator
@@ -36,10 +35,13 @@ class VastRuntimeSupervisorService:
         settings: Settings,
         poll_interval_sec: int = 10,
         notify_admins_fn: Optional[Callable[[str], bool]] = None,
+        *,
+        orchestrate_vast_rentals: bool = True,
     ) -> None:
         self.settings = settings
         self.poll_interval_sec = max(3, int(poll_interval_sec))
         self.notify_admins_fn = notify_admins_fn
+        self._orchestrate_vast_rentals = bool(orchestrate_vast_rentals)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._orchestrator = get_shared_vllm_runtime_orchestrator()
@@ -80,27 +82,19 @@ class VastRuntimeSupervisorService:
                     self._wait_next_tick()
                     continue
 
+                # Один оркестратор оренди: pazuzu-app (без черги) або Celery llm worker (черга + vllm_remote).
+                if not self._orchestrate_vast_rentals:
+                    self._wait_next_tick()
+                    continue
+
                 self._check_low_balance()
                 has_pending = self._has_pending_llm_tasks()
-                source_load_active = self._has_active_source_load_tasks()
-                if source_load_active:
-                    self._orchestrator.mark_source_load_activity()
-                has_instance = bool(self._orchestrator.get_observability_status().get("instance_id"))
 
                 if has_pending:
                     self._orchestrator.ensure_runtime_ready()
-                elif source_load_active and not has_instance:
-                    # Прогрів на старті source-load: інстанс піднімаємо наперед.
-                    self._orchestrator.ensure_runtime_ready()
                 else:
-                    # drain: другий колбек має блокувати destroy, поки є «ініціатори» навантаження.
-                    # Раніше передавався лише is_source_load_running() — True лише для run_full_pipeline
-                    # у процесі pazuzu-app; у Celery-source-worker завжди False → інстанс різало
-                    # через idle_paused_timeout, хоч пайплайн ще працював.
-                    self._orchestrator.handle_pool_drain(
-                        self._has_pending_llm_tasks,
-                        self._has_active_source_load_tasks,
-                    )
+                    # Vast runtime керується виключно чергою LLM.
+                    self._orchestrator.handle_pool_drain(self._has_pending_llm_tasks)
             except Exception as e:
                 logger.warning("Vast runtime supervisor tick failed: %s", e)
             self._wait_next_tick()
@@ -181,9 +175,3 @@ class VastRuntimeSupervisorService:
             pass
         return False
 
-    def _has_active_source_load_tasks(self) -> bool:
-        if is_source_load_running():
-            return True
-        if self._task_queue.is_enabled():
-            return self._task_queue.has_active_source_load_tasks()
-        return False

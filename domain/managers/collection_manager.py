@@ -228,8 +228,23 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
     def _filter_element_to_mongo(self, elem: FilterElement) -> Dict[str, Any]:
         """Перетворює FilterElement на MongoDB умову з використанням фізичних шляхів полів."""
         from utils.source_field_mapper import SourceFieldMapper
-        physical_field = SourceFieldMapper.get_field_path(elem.field, self.COLLECTION_NAME)
+        logical_field = elem.field
         value = elem.value
+        # Нормалізація одиниць площі землі: у БД зберігаємо land_area_sqm (м²),
+        # у фільтрах підтримуємо both: сотки (с) та гектари (га).
+        if logical_field == "land_area_sotky":
+            try:
+                value = float(value) * 100.0
+            except (TypeError, ValueError):
+                value = value
+            logical_field = "land_area_sqm"
+        elif logical_field == "land_area_ha":
+            try:
+                value = float(value) * 10000.0
+            except (TypeError, ValueError):
+                value = value
+            logical_field = "land_area_sqm"
+        physical_field = SourceFieldMapper.get_field_path(logical_field, self.COLLECTION_NAME)
         if physical_field == "source" and isinstance(value, str) and value.strip():
             value = value.strip().lower()
         elem_mapped = FilterElement(field=physical_field, operator=elem.operator, value=value)

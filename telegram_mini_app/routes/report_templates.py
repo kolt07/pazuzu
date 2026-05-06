@@ -129,7 +129,8 @@ def _params_to_flat_kwargs(params: Dict[str, Any]) -> Dict[str, Any]:
     elif isinstance(price, dict) and price.get("op") == "lte":
         price_max = price.get("value")
     building = params.get("building_area_sqm") or {}
-    land = params.get("land_area_ha") or {}
+    land_sotky = params.get("land_area_sotky") or params.get("land_area_ha") or {}
+    land_hectares = params.get("land_area_hectares") or {}
     return {
         "region": params.get("region"),
         "city": params.get("city"),
@@ -140,8 +141,10 @@ def _params_to_flat_kwargs(params: Dict[str, Any]) -> Dict[str, Any]:
         "property_type": params.get("property_type") or None,
         "building_area_sqm_op": building.get("op") if isinstance(building, dict) else None,
         "building_area_sqm_value": building.get("value") if isinstance(building, dict) else None,
-        "land_area_ha_op": land.get("op") if isinstance(land, dict) else None,
-        "land_area_ha_value": land.get("value") if isinstance(land, dict) else None,
+        "land_area_sotky_op": land_sotky.get("op") if isinstance(land_sotky, dict) else None,
+        "land_area_sotky_value": land_sotky.get("value") if isinstance(land_sotky, dict) else None,
+        "land_area_hectares_op": land_hectares.get("op") if isinstance(land_hectares, dict) else None,
+        "land_area_hectares_value": land_hectares.get("value") if isinstance(land_hectares, dict) else None,
         "date_filter_days": params.get("date_filter"),
         "title_contains": params.get("title_contains") or None,
         "description_contains": params.get("description_contains") or None,
@@ -219,7 +222,7 @@ def generate_report_from_template(
 
     output_format = params.get("output_format", "unified_table")
     columns = [
-        "source", "source_id", "status", "property_type", "building_area_sqm", "land_area_ha",
+        "source", "source_id", "status", "property_type", "building_area_sqm", "land_area_sotky",
         "title", "description", "page_url", "price_uah", "price_usd", "addresses", "source_updated_at",
     ]
     headers = {
@@ -228,7 +231,7 @@ def generate_report_from_template(
         "status": "Статус",
         "property_type": "Тип",
         "building_area_sqm": "Площа, м²",
-        "land_area_ha": "Площа землі, га",
+        "land_area_sotky": "Площа землі, с",
         "title": "Назва",
         "description": "Опис",
         "page_url": "Посилання",

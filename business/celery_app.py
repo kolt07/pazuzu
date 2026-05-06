@@ -59,7 +59,9 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
 if Celery is not None:
     celery_app = create_celery_app()
     from business.celery_worker_logging import register_celery_worker_logging
+    from business.celery_vast_worker_hooks import register_vast_runtime_supervisor_hooks
 
     register_celery_worker_logging()
+    register_vast_runtime_supervisor_hooks()
 else:  # pragma: no cover - optional dependency branch
     celery_app = None

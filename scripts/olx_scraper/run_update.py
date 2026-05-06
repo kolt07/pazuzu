@@ -656,6 +656,7 @@ def _phase1_worker(
     llm_seen_urls: Set[str],
     llm_seen_lock: threading.Lock,
     llm_processed_urls_ref: List[str],
+    browser_fetcher: Optional[Any] = None,
 ) -> None:
     """
     Воркер Phase 1: бере завдання з черги (region_name, category_dict), виконує _process_category_raw_only,
@@ -663,7 +664,6 @@ def _phase1_worker(
     Один потік = один воркер = один браузер на потік.
     """
     session = get_session()
-    browser_fetcher: Optional[Any] = None
 
     def run_job(region_name: str, cat: Dict[str, Any]) -> Tuple[int, List[str]]:
         get_list_url = cat.get("get_list_url")
@@ -749,6 +749,10 @@ def _phase1_worker(
                 with source_state_lock:
                     source_inflight_ref[0] = max(0, source_inflight_ref[0] - 1)
 
+    if browser_fetcher is not None:
+        _run_loop()
+        return
+
     from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
     with BrowserPageFetcher(headless=True, log_fn=log_fn) as bf:
         browser_fetcher = bf
@@ -774,11 +778,19 @@ def run_olx_update_raw_only(
     regions: якщо задано — обробляються лише ці області (назви з olx_region_slugs).
     listing_types: якщо задано — лише категорії, чий label містить один із рядків (напр. «Нежитлова», «Земля»).
     max_workers: кількість потоків Phase 1; None = з конфігу (OLX_PHASE1_MAX_THREADS), 0 = не використовувати пул (legacy: по одному потоку на область).
-    llm_process_url_fn: якщо задано — в режимі пулу вільні воркери обробляють LLM-чергу
-        (URL додаються туди одразу після завершення source-задачі категорії).
-    llm_enqueue_region_filter_fn: фільтр областей для додавання URL у LLM-чергу.
     Повертає success, total_listings, loaded_urls, llm_processed_urls.
     """
+    if llm_process_url_fn is not None:
+        raise ValueError(
+            "Inline LLM processing during OLX Phase 1 is disabled. "
+            "Use Phase 2 batch processing only."
+        )
+    if llm_enqueue_region_filter_fn is not None:
+        raise ValueError(
+            "Inline LLM queue filters are disabled. "
+            "Use Phase 2 batch processing only."
+        )
+
     settings = settings or Settings()
     MongoDBConnection.initialize(settings)
     raw_repo = RawOlxListingsRepository()
@@ -839,36 +851,107 @@ def run_olx_update_raw_only(
         log("[OLX raw] Phase 1: пул завдань (область + категорія), %s потоків, %s завдань" % (num_workers, len(job_list)))
         if llm_process_url_fn:
             log("[OLX raw] Phase 1/2: увімкнено динамічний підхват LLM-черги вільними воркерами.")
-        workers = [
-            threading.Thread(
-                target=_phase1_worker,
-                args=(
-                    job_queue,
-                    raw_repo,
-                    log,
-                    cutoff_utc,
-                    max_pages_override,
-                    results_lock,
-                    total_listings_ref,
-                    all_loaded_urls,
-                    source_pending_ref,
-                    source_inflight_ref,
-                    source_state_lock,
-                    llm_process_url_fn,
-                    llm_enqueue_region_filter_fn,
-                    llm_queue,
-                    llm_seen_urls,
-                    llm_seen_lock,
-                    llm_processed_urls,
-                ),
-                name="OLXPhase1-%d" % (i + 1),
-            )
-            for i in range(num_workers)
-        ]
-        for t in workers:
-            t.start()
-        for t in workers:
-            t.join()
+        pool_size_override = int(getattr(scraper_config, "BROWSER_POOL_SIZE", 0) or 0)
+        browser_pool_size = max(1, pool_size_override if pool_size_override > 0 else num_workers)
+        use_shared_pool = browser_pool_size > 0
+
+        if use_shared_pool:
+            try:
+                from scripts.olx_scraper.browser_fetcher import BrowserPagePool
+                with BrowserPagePool(headless=True, pool_size=browser_pool_size, log_fn=log) as browser_fetcher:
+                    # Playwright sync API thread-affine: BrowserPool і його page/context
+                    # мають використовуватися в тому ж потоці, де були створені.
+                    # Для num_workers=1 не запускаємо окремий thread.
+                    if num_workers == 1:
+                        _phase1_worker(
+                            job_queue,
+                            raw_repo,
+                            log,
+                            cutoff_utc,
+                            max_pages_override,
+                            results_lock,
+                            total_listings_ref,
+                            all_loaded_urls,
+                            source_pending_ref,
+                            source_inflight_ref,
+                            source_state_lock,
+                            llm_process_url_fn,
+                            llm_enqueue_region_filter_fn,
+                            llm_queue,
+                            llm_seen_urls,
+                            llm_seen_lock,
+                            llm_processed_urls,
+                            browser_fetcher,
+                        )
+                    else:
+                        workers = [
+                            threading.Thread(
+                                target=_phase1_worker,
+                                args=(
+                                    job_queue,
+                                    raw_repo,
+                                    log,
+                                    cutoff_utc,
+                                    max_pages_override,
+                                    results_lock,
+                                    total_listings_ref,
+                                    all_loaded_urls,
+                                    source_pending_ref,
+                                    source_inflight_ref,
+                                    source_state_lock,
+                                    llm_process_url_fn,
+                                    llm_enqueue_region_filter_fn,
+                                    llm_queue,
+                                    llm_seen_urls,
+                                    llm_seen_lock,
+                                    llm_processed_urls,
+                                    browser_fetcher,
+                                ),
+                                name="OLXPhase1-%d" % (i + 1),
+                            )
+                            for i in range(num_workers)
+                        ]
+                        for t in workers:
+                            t.start()
+                        for t in workers:
+                            t.join()
+            except RuntimeError as e:
+                log(f"[OLX raw] BrowserPool недоступний: {e}")
+                return {"success": False, "total_listings": 0, "loaded_urls": [], "llm_processed_urls": []}
+            except Exception as e:
+                log(f"[OLX raw] Помилка BrowserPool: {e}")
+                return {"success": False, "total_listings": 0, "loaded_urls": [], "llm_processed_urls": []}
+        else:
+            workers = [
+                threading.Thread(
+                    target=_phase1_worker,
+                    args=(
+                        job_queue,
+                        raw_repo,
+                        log,
+                        cutoff_utc,
+                        max_pages_override,
+                        results_lock,
+                        total_listings_ref,
+                        all_loaded_urls,
+                        source_pending_ref,
+                        source_inflight_ref,
+                        source_state_lock,
+                        llm_process_url_fn,
+                        llm_enqueue_region_filter_fn,
+                        llm_queue,
+                        llm_seen_urls,
+                        llm_seen_lock,
+                        llm_processed_urls,
+                    ),
+                    name="OLXPhase1-%d" % (i + 1),
+                )
+                for i in range(num_workers)
+            ]
+            for t in workers:
+                t.start()
+            for t in workers:
+                t.join()
         total_listings = total_listings_ref[0]
     else:
         # Legacy: по одному завданню на область (послідовно з браузером)

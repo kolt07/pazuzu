@@ -1320,7 +1320,8 @@ def get_usage_stats(
     """
     Статистика використання: LLM — вхідні/вихідні токени та орієнтовна вартість (USD);
     Geocoding — виклики API по днях.
-    GPU — час з логів; вартість по днях з Vast billing (charges), якщо задано vast_api_key.
+    GPU — час з логів; вартість по днях з Vast billing /charges/ (instance+volume+serverless; кеш у БД, останні 7 днів UTC
+    та «сьогодні» з API), якщо задано vast_api_key.
     """
     _get_admin_user(request)
     from data.repositories.logs_repository import LogsRepository
@@ -1328,8 +1329,8 @@ def get_usage_stats(
     from config.llm_pricing import estimate_gemini_cost_usd
     from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
     from business.services.vast_billing_service import (
-        fetch_gpu_instance_charges_by_calendar_day_usd,
         sum_billed_usd_last_n_calendar_days,
+        sync_vast_billing_daily_cache,
     )
 
     try:
@@ -1385,7 +1386,7 @@ def get_usage_stats(
         vast_err: Optional[str] = None
         vast_days = max(int(days), 30)
         if vast_key:
-            vast_by_day, vast_err = fetch_gpu_instance_charges_by_calendar_day_usd(
+            vast_by_day, vast_err = sync_vast_billing_daily_cache(
                 vast_key,
                 days=vast_days,
                 sleep_between_sec=0.05,
@@ -1420,6 +1421,12 @@ def get_usage_stats(
             billed_last_month = float(
                 sum_billed_usd_last_n_calendar_days(vast_by_day, n=30)
             )
+            # Одна погоджена з графіком сума Vast за вікно `days` (дні з кеша/API, не дубль з логів)
+            sum_chart_vast = 0.0
+            for j in range(days - 1, -1, -1):
+                dk = (today - timedelta(days=j)).strftime("%Y-%m-%d")
+                sum_chart_vast += float(vast_by_day.get(dk) or 0.0)
+            gpu_total_billed = round(sum_chart_vast, 6)
 
         return {
             "llm": {

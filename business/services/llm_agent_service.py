@@ -205,6 +205,10 @@ AVAILABLE FLATTENED FIELDS (see Data Dictionary for details):
 - priceFinal: Фінальна ціна в UAH (from auction_data.contracts[].value.amount or auction_data.awards[].value.amount)
 - participants_count: Кількість унікальних зареєстрованих учасників (from auction_data.bids[].bidders[].identifier.id - унікальні значення)
 
+For user-facing answers and filter explanations, prefer сотки (с) as land unit:
+- 1 га = 100 с
+- land_area_ha -> сотки: multiply by 100
+
 For filtering by region/city, use analytics-mcp or query-builder-mcp with join to llm_cache.
 
 IMPORTANT - Counting Participants:

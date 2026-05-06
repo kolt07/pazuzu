@@ -2272,12 +2272,16 @@
   }
 
   var adminUsageCharts = { llm: null, geocoding: null, gpuRuntime: null };
+  var adminUsageStatsInFlight = null;
 
   function loadAdminUsageStats() {
     var summaryEl = document.getElementById("admin-usage-stats-summary");
     if (!summaryEl) return;
+    if (adminUsageStatsInFlight) {
+      return adminUsageStatsInFlight;
+    }
     summaryEl.textContent = "Завантаження...";
-    fetch("/api/admin/usage-stats?days=60", { headers: apiHeaders() })
+    adminUsageStatsInFlight = fetch("/api/admin/usage-stats?days=60", { headers: apiHeaders() })
       .then(function (r) { return r.json(); })
       .then(function (data) {
         var llm = data.llm || {};
@@ -2302,19 +2306,23 @@
         var gpuMonthMin = gpu.active_minutes_last_month || 0;
         var gpuCost = gpu.billed_cost_usd_total != null ? gpu.billed_cost_usd_total : (gpu.estimated_cost_usd_total || 0);
         var gpuCostMonth = gpu.billed_cost_usd_last_month != null ? gpu.billed_cost_usd_last_month : (gpu.estimated_cost_usd_last_month || 0);
-        var gpuStr = "GPU runtime: " + gpuTotalMin.toFixed(1) + " хв";
-        if (gpuCost > 0) gpuStr += ", Vast $" + gpuCost.toFixed(4);
-        gpuStr += " (за міс. " + gpuMonthMin.toFixed(1) + " хв";
-        if (gpuCostMonth > 0) gpuStr += ", Vast $" + gpuCostMonth.toFixed(4);
-        gpuStr += ")";
-        gpuStr += ", витрати Vast за 30 днів: $" + gpuCostMonth.toFixed(4);
+        var gpuStr = "GPU runtime: " + gpuTotalMin.toFixed(1) + " хв (за міс. " + gpuMonthMin.toFixed(1) + " хв)";
+        if (gpuCostMonth > 0) {
+          gpuStr += " · Vast 30д (UTC): $" + gpuCostMonth.toFixed(4);
+        } else if (gpuCost > 0) {
+          gpuStr += " · витрати (вікно графіка): $" + gpuCost.toFixed(4);
+        }
         summaryEl.innerHTML = "<strong>" + llmStr + "</strong> &nbsp;|&nbsp; <strong>" + geoStr + "</strong> &nbsp;|&nbsp; <strong>" + gpuStr + "</strong>";
         if (data.error) summaryEl.innerHTML += " <span class=\"admin-hint\">(" + data.error + ")</span>";
         renderAdminUsageCharts(llm.by_day || [], geo.by_day || [], gpu.by_day || []);
       })
       .catch(function (err) {
         summaryEl.textContent = "Помилка: " + (err.message || "невідома");
+      })
+      .finally(function () {
+        adminUsageStatsInFlight = null;
       });
+    return adminUsageStatsInFlight;
   }
 
   function renderAdminUsageCharts(llmByDay, geoByDay, gpuByDay) {
@@ -4421,7 +4429,7 @@
           var descParts = [];
           descParts.push("У " + localityName + " за останній місяць зареєстровано " + totalCount + " схожих оголошень.");
           if (avgVal > 0 && (metricKey === "price_per_m2_uah" || metricKey === "price_per_ha_uah")) {
-            descParts.push("Середня ціна " + (metricKey === "price_per_m2_uah" ? "за м²" : "за га") + ": " + formatPrice(Math.round(avgVal)) + " " + unit + ".");
+            descParts.push("Середня ціна " + (metricKey === "price_per_m2_uah" ? "за м²" : "за сотку") + ": " + formatPrice(Math.round(avgVal)) + " " + unit + ".");
           } else if (avgVal > 0 && metricKey === "price_uah") {
             descParts.push("Середня абсолютна ціна: " + formatPrice(Math.round(avgVal)) + " грн (для об'єктів без площі).");
           }

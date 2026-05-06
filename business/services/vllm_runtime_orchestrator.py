@@ -42,6 +42,10 @@ class VllmRuntimeOrchestrator:
     """Керує lifecycle сесії GPU для batch parsing."""
 
     VAST_RUNTIME_LABEL_DEFAULT = "pazuzu-vllm-runtime"
+    VAST_LIST_CACHE_TTL_SEC = 3
+    VAST_LIST_RATE_LIMIT_INITIAL_BACKOFF_SEC = 5
+    VAST_LIST_RATE_LIMIT_MAX_BACKOFF_SEC = 60
+    VAST_LIST_ERROR_LOG_COOLDOWN_SEC = 30
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -76,6 +80,17 @@ class VllmRuntimeOrchestrator:
             name="VllmRuntimeForcedHealthcheck",
         )
         self._forced_check_thread.start()
+        self._vast_instances_cache: List[Dict[str, Any]] = []
+        self._vast_instances_cache_ts: float = 0.0
+        self._vast_list_rate_limit_until_ts: float = 0.0
+        self._vast_list_rate_limit_backoff_sec: float = 0.0
+        self._vast_list_last_error_log_ts: float = 0.0
+        self._vast_fleet_maintain_thread = threading.Thread(
+            target=self._vast_fleet_maintain_loop,
+            daemon=True,
+            name="VastFleetSingletonMaintain",
+        )
+        self._vast_fleet_maintain_thread.start()
 
     def is_enabled(self) -> bool:
         cfg = self._settings_svc.get_settings()
@@ -96,19 +111,76 @@ class VllmRuntimeOrchestrator:
     def _instances_matching_runtime_label(self, client: VastAiClient, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         want = self._runtime_instance_label(cfg)
         out: List[Dict[str, Any]] = []
-        try:
-            for row in client.list_instances():
-                if not isinstance(row, dict):
-                    continue
-                if str(row.get("label") or "").strip() != want:
-                    continue
-                out.append(row)
-        except Exception as e:
-            self._log_gpu_usage(
-                "gpu_vast_list_failed",
-                {"error": str(e)},
-            )
+        for row in self._list_vast_instances_with_backoff(client):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("label") or "").strip() != want:
+                continue
+            out.append(row)
         return out
+
+    def _list_vast_instances_with_backoff(self, client: VastAiClient) -> List[Dict[str, Any]]:
+        now_ts = time.time()
+        cache_age_sec = now_ts - self._vast_instances_cache_ts
+        if cache_age_sec <= self.VAST_LIST_CACHE_TTL_SEC:
+            return list(self._vast_instances_cache)
+
+        if now_ts < self._vast_list_rate_limit_until_ts:
+            # Після 429 не штурмуємо API, поки триває cooldown; віддаємо останній кеш.
+            return list(self._vast_instances_cache)
+
+        try:
+            rows = client.list_instances()
+            self._vast_instances_cache = [x for x in rows if isinstance(x, dict)]
+            self._vast_instances_cache_ts = now_ts
+            self._vast_list_rate_limit_backoff_sec = 0.0
+            self._vast_list_rate_limit_until_ts = 0.0
+            return list(self._vast_instances_cache)
+        except Exception as e:
+            is_rate_limited = self._is_rate_limited_error(e)
+            if is_rate_limited:
+                next_backoff = self._vast_list_rate_limit_backoff_sec or self.VAST_LIST_RATE_LIMIT_INITIAL_BACKOFF_SEC
+                next_backoff = min(next_backoff * 2 if self._vast_list_rate_limit_backoff_sec else next_backoff, self.VAST_LIST_RATE_LIMIT_MAX_BACKOFF_SEC)
+                self._vast_list_rate_limit_backoff_sec = next_backoff
+                self._vast_list_rate_limit_until_ts = now_ts + next_backoff
+            should_log = (now_ts - self._vast_list_last_error_log_ts) >= self.VAST_LIST_ERROR_LOG_COOLDOWN_SEC
+            if should_log:
+                metadata: Dict[str, Any] = {"error": str(e)}
+                if is_rate_limited:
+                    metadata["stage"] = "rate_limited"
+                    metadata["status"] = 429
+                    metadata["reason"] = (
+                        f"instances_list_cooldown_{int(max(1, self._vast_list_rate_limit_backoff_sec))}s"
+                    )
+                self._log_gpu_usage("gpu_vast_list_failed", metadata)
+                self._vast_list_last_error_log_ts = now_ts
+            return list(self._vast_instances_cache)
+
+    @staticmethod
+    def _vast_fleet_readiness_key(row: Dict[str, Any]) -> tuple:
+        """Ключ сортування: більший tuple = більш готовий інстанс (мережа, стан, int_status)."""
+        if not isinstance(row, dict):
+            return (0, 0, 0, 0)
+        st = VllmRuntimeOrchestrator._extract_vast_instance_state(row)
+        running = 1 if st in ("running", "active", "online") else 0
+        int_st = 0
+        try:
+            v = row.get("int_status")
+            if v is not None and str(v).strip() != "":
+                int_st = int(float(v))
+        except (TypeError, ValueError):
+            int_st = 0
+        has_net = 0
+        for k in ("public_ipaddr", "ssh_host", "ssh_addr", "public_ip"):
+            val = row.get(k)
+            if val is not None and str(val).strip():
+                has_net = 1
+                break
+        try:
+            iid = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            iid = 0
+        return (running, int_st, has_net, iid)
 
     @staticmethod
     def _choose_runtime_instance_to_keep(instances: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -116,20 +188,77 @@ class VllmRuntimeOrchestrator:
             return None
         if len(instances) == 1:
             return instances[0]
+        return max(instances, key=VllmRuntimeOrchestrator._vast_fleet_readiness_key)
 
-        def score(row: Dict[str, Any]) -> tuple:
-            st = str(row.get("cur_state") or row.get("actual_status") or "").lower()
-            running = 1 if st == "running" else 0
-            try:
-                iid = int(row.get("id") or 0)
-            except (TypeError, ValueError):
-                iid = 0
-            return (running, iid)
-
-        return max(instances, key=score)
+    def _try_pivot_to_preferred_vast_instance(
+        self,
+        client: VastAiClient,
+        cfg: Dict[str, Any],
+        keep: Dict[str, Any],
+        our: Dict[str, Any],
+    ) -> bool:
+        """Перемикання на кращий інстанс: до 60 c на bootstrap; інакше False."""
+        keep_id = self._normalize_vast_instance_id(keep.get("id"))
+        our_id = self._normalize_vast_instance_id(our.get("id"))
+        if not keep_id or not our_id or keep_id == our_id:
+            return False
+        if VllmRuntimeOrchestrator._vast_fleet_readiness_key(keep) <= VllmRuntimeOrchestrator._vast_fleet_readiness_key(our):
+            return False
+        t_start = time.time()
+        self._stop_ssh_processes_locked()
+        self._public_endpoint = None
+        self._endpoint = None
+        self._instance_id = keep_id
+        new_sid = self._sessions.start_session(
+            {
+                "state": "starting",
+                "ask_id": "",
+                "attempt": 0,
+                "settings_snapshot": self._safe_settings_snapshot(cfg),
+                "vast_adopt": True,
+                "pivot_from_instance_id": our_id,
+            }
+        )
+        self._session_id = new_sid
+        try:
+            self._execute_contract_boot_steps(
+                client,
+                cfg,
+                keep_id,
+                0,
+                new_sid,
+            )
+        except Exception as e:
+            self._log_gpu_usage(
+                "gpu_vast_pivot_failed",
+                {
+                    "keep_instance_id": keep_id,
+                    "from_instance_id": our_id,
+                    "error": str(e),
+                },
+            )
+            self._instance_id = our_id
+            if new_sid:
+                try:
+                    self._sessions.finish_session(new_sid, "failed")
+                except Exception:
+                    pass
+            return False
+        if (time.time() - t_start) > 60.0:
+            logger.warning("Vast pivot: bootstrap довше 60s (%ss) — далі singleton підтримає fleet", int(time.time() - t_start))
+        try:
+            client.destroy_instance(our_id)
+            self._log_gpu_usage(
+                "gpu_vast_pivot_replaced",
+                {"keep_instance_id": keep_id, "destroyed_instance_id": our_id},
+            )
+        except Exception as e:
+            self._log_gpu_usage("gpu_vast_pivot_destroy_old_failed", {"instance_id": our_id, "error": str(e)})
+        return True
 
     def _enforce_singleton_vast_instances(self, client: VastAiClient, cfg: Dict[str, Any]) -> None:
         """За API Vast залишає не більше одного інстанса з міткою runtime (джерело істини — Vast)."""
+        self._vast_instances_cache_ts = 0.0
         rows = self._instances_matching_runtime_label(client, cfg)
         if len(rows) <= 1:
             return
@@ -137,6 +266,36 @@ class VllmRuntimeOrchestrator:
         if not keep:
             return
         keep_id = self._normalize_vast_instance_id(keep.get("id"))
+        if not keep_id:
+            return
+
+        our_row: Optional[Dict[str, Any]] = None
+        if self._instance_id:
+            for r in rows:
+                if self._normalize_vast_instance_id(r.get("id")) == self._normalize_vast_instance_id(self._instance_id):
+                    our_row = r
+                    break
+        if our_row and keep_id != self._normalize_vast_instance_id(our_row.get("id")):
+            if VllmRuntimeOrchestrator._vast_fleet_readiness_key(keep) > VllmRuntimeOrchestrator._vast_fleet_readiness_key(our_row):
+                if self._try_pivot_to_preferred_vast_instance(client, cfg, keep, our_row):
+                    self._vast_instances_cache_ts = 0.0
+                    rows = self._instances_matching_runtime_label(client, cfg)
+                else:
+                    pass
+
+        if len(rows) <= 1:
+            return
+        self._vast_instances_cache_ts = 0.0
+        rows = self._instances_matching_runtime_label(client, cfg)
+        if len(rows) <= 1:
+            return
+        keep = self._choose_runtime_instance_to_keep(rows)
+        if not keep:
+            return
+        keep_id = self._normalize_vast_instance_id(keep.get("id"))
+        if not keep_id:
+            return
+
         for row in rows:
             rid = self._normalize_vast_instance_id(row.get("id"))
             if not rid or rid == keep_id:
@@ -152,18 +311,44 @@ class VllmRuntimeOrchestrator:
                     "gpu_vast_duplicate_destroyed",
                     {"keep_instance_id": keep_id, "destroyed_instance_id": rid},
                 )
+                if self._instance_id and self._normalize_vast_instance_id(self._instance_id) == rid:
+                    self._instance_id = keep_id
+                    self._public_endpoint = None
+                    self._endpoint = None
             except Exception as e:
                 self._log_gpu_usage(
                     "gpu_vast_duplicate_destroy_failed",
                     {"instance_id": rid, "error": str(e)},
                 )
 
+    def _vast_fleet_maintain_loop(self) -> None:
+        while True:
+            time.sleep(45)
+            try:
+                cfg = self._settings_svc.get_settings()
+                if not cfg.get("is_enabled") or not cfg.get("vast_api_key"):
+                    continue
+                if not self._lock.acquire(blocking=True, timeout=0.2):
+                    continue
+                try:
+                    client = VastAiClient(api_key=cfg["vast_api_key"], timeout_sec=min(60, int(cfg.get("boot_timeout_sec") or 300)))
+                    self._enforce_singleton_vast_instances(client, cfg)
+                finally:
+                    self._lock.release()
+            except Exception as e:
+                logger.debug("Vast fleet maintain: %s", e)
+
     def _get_singleton_runtime_instance(self, client: VastAiClient, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        rows = self._instances_matching_runtime_label(client, cfg)
-        if len(rows) != 1:
-            return None
-        row = rows[0]
-        return row if isinstance(row, dict) else None
+        for attempt in range(1, 4):
+            self._vast_instances_cache_ts = 0.0
+            rows = self._instances_matching_runtime_label(client, cfg)
+            if len(rows) == 1 and isinstance(rows[0], dict):
+                return rows[0]
+            if len(rows) == 0:
+                return None
+            self._enforce_singleton_vast_instances(client, cfg)
+            time.sleep(min(0.4 * attempt, 1.2))
+        return None
 
     @staticmethod
     def _extract_vast_instance_state(payload: Dict[str, Any]) -> str:
@@ -196,7 +381,7 @@ class VllmRuntimeOrchestrator:
         self._instance_id = str(instance_id)
         self._coord_update_state(state="starting", instance_id=self._instance_id, endpoint=None, public_endpoint=None)
         endpoint_timeout_sec = int(
-            cfg.get("endpoint_timeout_sec") or min(1200, int(cfg.get("boot_timeout_sec") or 1200))
+            cfg.get("endpoint_timeout_sec") or min(600, int(cfg.get("boot_timeout_sec") or 600))
         )
         network_info = self._wait_for_network_endpoint_info(
             client,
@@ -844,7 +1029,7 @@ class VllmRuntimeOrchestrator:
         except Exception:
             # Якщо інстанс already running — ігноруємо та переходимо до перевірки endpoint.
             pass
-        endpoint_timeout_sec = int(cfg.get("endpoint_timeout_sec") or min(1200, int(cfg.get("boot_timeout_sec") or 1200)))
+        endpoint_timeout_sec = int(cfg.get("endpoint_timeout_sec") or min(600, int(cfg.get("boot_timeout_sec") or 600)))
         try:
             network_info = self._wait_for_network_endpoint_info(
                 client,
@@ -887,10 +1072,10 @@ class VllmRuntimeOrchestrator:
         )
         self._start_instance_observability(public_endpoint, instance_payload, cfg)
         if self._use_ollama_runtime(cfg):
-            endpoint = self._wait_for_ollama_control_readiness(public_endpoint, int(cfg.get("boot_timeout_sec") or 1200), cfg)
-            endpoint = self._ensure_ollama_model_ready(endpoint, public_endpoint, int(cfg.get("ready_timeout_sec") or 1200), cfg)
+            endpoint = self._wait_for_ollama_control_readiness(public_endpoint, int(cfg.get("boot_timeout_sec") or 600), cfg)
+            endpoint = self._ensure_ollama_model_ready(endpoint, public_endpoint, int(cfg.get("ready_timeout_sec") or 300), cfg)
         else:
-            endpoint = self._wait_for_runtime_readiness(public_endpoint, int(cfg.get("ready_timeout_sec") or 1200), cfg)
+            endpoint = self._wait_for_runtime_readiness(public_endpoint, int(cfg.get("ready_timeout_sec") or 300), cfg)
         self._endpoint = endpoint
         self._instance_paused = False
         self._coord_update_state(
@@ -980,7 +1165,7 @@ class VllmRuntimeOrchestrator:
         copy_paths = self._sleep_migration_copy_paths(cfg)
         destination_instance_id = self._create_instance_with_retry_candidates(client, cfg)
         try:
-            endpoint_timeout_sec = int(cfg.get("endpoint_timeout_sec") or min(1200, int(cfg.get("boot_timeout_sec") or 1200)))
+            endpoint_timeout_sec = int(cfg.get("endpoint_timeout_sec") or min(600, int(cfg.get("boot_timeout_sec") or 600)))
             network_info = self._wait_for_network_endpoint_info(
                 client,
                 destination_instance_id,
@@ -1469,9 +1654,13 @@ class VllmRuntimeOrchestrator:
         model = self._normalize_ollama_model_ref(str(cfg.get("vllm_model") or ""))
         if not model:
             raise RuntimeError("Ollama model is empty in runtime settings.")
-        availability_timeout = min(60, max(20, timeout_sec // 3))
+        stage_deadline = time.time() + max(30, int(timeout_sec))
         repaired_once = False
         while True:
+            remaining_total = int(stage_deadline - time.time())
+            if remaining_total <= 0:
+                raise RuntimeError(f"Ollama model readiness timeout ({timeout_sec}s) for {model}")
+            availability_timeout = min(60, max(10, remaining_total // 3))
             if not self._is_ollama_model_available(endpoint, model, timeout_sec=8):
                 self._log_gpu_usage(
                     "gpu_model_pull_started",
@@ -1482,7 +1671,7 @@ class VllmRuntimeOrchestrator:
                     },
                 )
                 try:
-                    self._trigger_ollama_pull_with_feedback(endpoint, model, timeout_sec)
+                    self._trigger_ollama_pull_with_feedback(endpoint, model, remaining_total)
                 except RuntimeError:
                     fallback_endpoint = self._resolve_runtime_endpoint(public_endpoint, endpoint, phase="ollama_pull_retry")
                     if fallback_endpoint == endpoint:
@@ -1497,17 +1686,19 @@ class VllmRuntimeOrchestrator:
                         },
                     )
                     endpoint = fallback_endpoint
-                    self._trigger_ollama_pull_with_feedback(endpoint, model, timeout_sec)
+                    retry_remaining = max(1, int(stage_deadline - time.time()))
+                    self._trigger_ollama_pull_with_feedback(endpoint, model, retry_remaining)
                 if not self._wait_for_ollama_model_available(endpoint, model, timeout_sec=availability_timeout):
                     raise RuntimeError(f"Ollama pull completed but model is not available: {model}")
 
             # Після pull Ollama може ще довго "розігрівати" модель перед першим generate.
             # Коротке вікно дає хибні fail/startup loops на повільних/мережевих хостах.
-            loadable_timeout = int(cfg.get("model_loadability_timeout_sec") or 240)
+            loadable_timeout = int(cfg.get("model_loadability_timeout_sec") or 300)
+            remaining_total = max(1, int(stage_deadline - time.time()))
             loadable, load_error = self._wait_for_ollama_model_loadable(
                 endpoint,
                 model,
-                timeout_sec=max(75, loadable_timeout),
+                timeout_sec=min(remaining_total, max(75, loadable_timeout)),
             )
             if loadable:
                 break
@@ -1531,7 +1722,8 @@ class VllmRuntimeOrchestrator:
                     "endpoint": endpoint,
                 },
             )
-            self._trigger_ollama_pull_with_feedback(endpoint, model, timeout_sec)
+            repair_remaining = max(1, int(stage_deadline - time.time()))
+            self._trigger_ollama_pull_with_feedback(endpoint, model, repair_remaining)
             if not self._wait_for_ollama_model_available(endpoint, model, timeout_sec=availability_timeout):
                 raise RuntimeError(f"Ollama repair pull completed but model is not available: {model}")
             repaired_once = True
@@ -1951,9 +2143,9 @@ class VllmRuntimeOrchestrator:
         return snap
 
     def _coord_lease_seconds(self, cfg: Dict[str, Any]) -> int:
-        endpoint_timeout = int(cfg.get("endpoint_timeout_sec") or 1200)
-        ready_timeout = int(cfg.get("ready_timeout_sec") or 1200)
-        boot_timeout = int(cfg.get("boot_timeout_sec") or 1200)
+        endpoint_timeout = int(cfg.get("endpoint_timeout_sec") or 600)
+        ready_timeout = int(cfg.get("ready_timeout_sec") or 300)
+        boot_timeout = int(cfg.get("boot_timeout_sec") or 600)
         return max(90, min(1800, max(endpoint_timeout, ready_timeout, boot_timeout) + 120))
 
     def _coord_try_acquire(self, cfg: Dict[str, Any], state: str) -> bool:
@@ -2036,9 +2228,9 @@ class VllmRuntimeOrchestrator:
     def _wait_for_shared_runtime_or_acquire(self, cfg: Dict[str, Any], client: VastAiClient) -> Optional[str]:
         deadline = time.time() + max(
             30,
-            int(cfg.get("endpoint_timeout_sec") or 1200),
-            int(cfg.get("ready_timeout_sec") or 1200),
-            int(cfg.get("boot_timeout_sec") or 1200),
+            int(cfg.get("endpoint_timeout_sec") or 600),
+            int(cfg.get("ready_timeout_sec") or 300),
+            int(cfg.get("boot_timeout_sec") or 600),
         )
         while time.time() < deadline:
             try:

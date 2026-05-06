@@ -75,7 +75,7 @@ def run_olx_clicker_scraper(
     from data.database.connection import MongoDBConnection
     from data.repositories.raw_olx_listings_repository import RawOlxListingsRepository
     from scripts.olx_scraper import config as scraper_config
-    from scripts.olx_scraper.browser_fetcher import _add_olx_cookies_to_context
+    from scripts.olx_scraper.browser_fetcher import _add_olx_cookies_to_context, _build_launch_options
     from scripts.olx_scraper.parser import parse_listings_page, parse_detail_page, detect_antibot_page
     from scripts.olx_scraper.helpers import search_data_from_listing
     from utils.hash_utils import calculate_search_data_hash
@@ -101,13 +101,7 @@ def run_olx_clicker_scraper(
             })
 
     with sync_playwright() as p:
-        launch_options: dict = {
-            "headless": headless,
-            "args": ["--disable-blink-features=AutomationControlled"],
-            "ignore_default_args": ["--enable-automation"],
-        }
-        if getattr(scraper_config, "BROWSER_USE_CHROME", False):
-            launch_options["channel"] = "chrome"
+        launch_options = _build_launch_options(headless, scraper_config)
         browser = p.chromium.launch(**launch_options)
         context = browser.new_context(
             viewport={"width": 1280, "height": 720},

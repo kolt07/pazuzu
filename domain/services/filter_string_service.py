@@ -88,7 +88,17 @@ def get_field_label_to_key(collection: str = "unified_listings") -> Dict[str, st
     """Повертає маппінг label_uk → field key для парсингу рядка."""
     conf = _load_search_fields_config(collection)
     fields = conf.get("fields") or {}
-    return {str(v.get("label_uk", k)): k for k, v in fields.items() if v.get("label_uk")}
+    mapping = {str(v.get("label_uk", k)): k for k, v in fields.items() if v.get("label_uk")}
+    # Backward compatibility for historic labels in saved filter strings.
+    legacy_aliases = {
+        "Площа землі, га": "land_area_ha",
+        "Ціна за га, грн": "price_per_ha_uah",
+        "Ціна за га, USD": "price_per_ha_usd",
+    }
+    for legacy_label, field_key in legacy_aliases.items():
+        if field_key in fields and legacy_label not in mapping:
+            mapping[legacy_label] = field_key
+    return mapping
 
 
 def get_field_key_to_label(collection: str = "unified_listings") -> Dict[str, str]:
