@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{{ report.title|e }}</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --fg: #111827;
+      --muted: #6b7280;
+      --accent: #b8860b;
+      --accent-soft: #fef3c7;
+      --border: #e5e7eb;
+      --section-bg: #fafafa;
+      --warn-bg: #fff7ed;
+      --warn-border: #fdba74;
+      --warn-fg: #9a3412;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f172a;
+        --fg: #e5e7eb;
+        --muted: #9ca3af;
+        --accent: #d4af37;
+        --accent-soft: #3b3215;
+        --border: #1f2937;
+        --section-bg: #111827;
+        --warn-bg: #2a1607;
+        --warn-border: #c2410c;
+        --warn-fg: #fdba74;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px 16px 64px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, "Helvetica Neue", sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+      line-height: 1.55;
+      -webkit-text-size-adjust: 100%;
+    }
+    .container { max-width: 920px; margin: 0 auto; }
+    header {
+      border-bottom: 2px solid var(--accent);
+      padding-bottom: 16px;
+      margin-bottom: 24px;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: var(--accent-soft);
+      padding: 3px 10px;
+      border-radius: 999px;
+      margin-bottom: 8px;
+    }
+    h1 { font-size: 26px; margin: 4px 0 8px; }
+    .meta { color: var(--muted); font-size: 13px; }
+    .summary {
+      font-size: 16px;
+      background: var(--section-bg);
+      padding: 16px 18px;
+      border-left: 3px solid var(--accent);
+      border-radius: 8px;
+      margin-bottom: 28px;
+    }
+    section.flx-section {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 18px;
+      margin: 16px 0;
+      background: var(--section-bg);
+    }
+    section.flx-section h2 { margin: 0 0 8px; font-size: 18px; color: var(--accent); }
+    section.flx-section .narrative { margin: 0 0 12px; }
+    section.flx-section .map-wrap {
+      margin: 12px 0 8px;
+      text-align: center;
+    }
+    section.flx-section .map-wrap img {
+      max-width: 100%;
+      height: auto;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    ul.bullets { margin: 8px 0 0; padding-left: 20px; }
+    ul.bullets li { margin: 4px 0; }
+    .items-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .item-card {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .item-card .name { font-weight: 600; }
+    .item-card .reason { font-size: 13px; color: var(--muted); margin-top: 4px; }
+    .item-card .score { font-size: 12px; color: var(--accent); margin-top: 6px; }
+    .listings { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .listing-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      flex-wrap: wrap;
+    }
+    .listing-row .title { font-weight: 600; flex: 1 1 60%; }
+    .listing-row .address { color: var(--muted); font-size: 13px; }
+    .listing-row .price { font-weight: 600; color: var(--accent); }
+    .listing-row a { color: var(--accent); text-decoration: none; }
+    .listing-row a:hover { text-decoration: underline; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-top: 10px; }
+    .metric { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+    .metric .label { font-size: 12px; color: var(--muted); }
+    .metric .value { font-weight: 600; font-size: 16px; margin-top: 2px; }
+    .warnings {
+      background: var(--warn-bg);
+      border: 1px solid var(--warn-border);
+      color: var(--warn-fg);
+      padding: 12px 14px;
+      border-radius: 8px;
+      margin-top: 24px;
+    }
+    .warnings ul { margin: 6px 0 0; padding-left: 20px; }
+    .sources { margin-top: 20px; font-size: 13px; color: var(--muted); }
+    .sources h3 { font-size: 14px; color: var(--fg); margin: 0 0 6px; }
+    .sources ul { margin: 0; padding-left: 18px; }
+    footer {
+      margin-top: 40px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="badge">Flx · агент-інвестігейтор</div>
+      <h1>{{ report.title|default('Звіт розслідування', true)|e }}</h1>
+      <div class="meta">Згенеровано {{ generated_at|e }}</div>
+    </header>
+
+    {% if report.executive_summary %}
+    <div class="summary">{{ report.executive_summary|e }}</div>
+    {% endif %}
+
+    {% for section in report.sections %}
+    <section class="flx-section" id="section-{{ section.id|e }}">
+      <h2>{{ section.title|e }}</h2>
+
+      {% if section.map_artifact_id %}
+      <div class="map-wrap">
+        <img src="{{ static_map_url_prefix }}{{ section.map_artifact_id|e }}" alt="Карта розділу {{ section.title|e }}" loading="lazy">
+      </div>
+      {% endif %}
+
+      {% if section.narrative %}
+      <p class="narrative">{{ section.narrative|e }}</p>
+      {% endif %}
+
+      {% if section.bullets %}
+      <ul class="bullets">
+        {% for b in section.bullets %}<li>{{ b|e }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+
+      {% if section.items %}
+      <div class="items-grid">
+        {% for it in section.items %}
+        <div class="item-card">
+          <div class="name">{{ it.name|e }}</div>
+          {% if it.reason %}<div class="reason">{{ it.reason|e }}</div>{% endif %}
+          {% if it.score is defined and it.score is not none and it.score != 0 %}
+          <div class="score">Оцінка: {{ '%.2f'|format(it.score) }}</div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if section.listings %}
+      <div class="listings">
+        {% for l in section.listings %}
+        <div class="listing-row">
+          <div class="title">
+            {% if l.url %}<a href="{{ l.url|e }}" target="_blank" rel="noopener">{{ l.title|e }}</a>{% else %}{{ l.title|e }}{% endif %}
+            {% if l.address %}<div class="address">{{ l.address|e }}</div>{% endif %}
+          </div>
+          {% if l.price_uah %}
+          <div class="price">{{ '{:,.0f}'.format(l.price_uah|float).replace(',', ' ') }} грн</div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if section.metrics %}
+      <div class="metrics">
+        {% for m in section.metrics %}
+        <div class="metric">
+          <div class="label">{{ m.label|e }}</div>
+          <div class="value">{{ m.value|e }}</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </section>
+    {% endfor %}
+
+    {% if report.warnings %}
+    <div class="warnings">
+      <strong>Застереження:</strong>
+      <ul>{% for w in report.warnings %}<li>{{ w|e }}</li>{% endfor %}</ul>
+    </div>
+    {% endif %}
+
+    {% if report.sources %}
+    <div class="sources">
+      <h3>Джерела</h3>
+      <ul>{% for s in report.sources %}<li>{{ s|e }}</li>{% endfor %}</ul>
+    </div>
+    {% endif %}
+
+    <footer>
+      Pazuzu Flx · цей звіт згенеровано автоматично; перед прийняттям рішень перевірте дані самостійно.
+    </footer>
+  </div>
+</body>
+</html>

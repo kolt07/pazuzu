@@ -304,3 +304,42 @@ def process_prozorro_llm_task(self, auction_id: str) -> Dict[str, Any]:
         if task_id:
             queue.mark_task_failed(task_id, str(e))
         raise
+
+
+@celery_app.task(
+    bind=True,
+    name="business.tasks.run_investigation_step",
+    soft_time_limit=900,
+    time_limit=1000,
+    autoretry_for=(),
+    max_retries=0,
+)
+def run_investigation_step(self, session_id: str) -> Dict[str, Any]:
+    """Виконує до max_steps_per_task ітерацій циклу розслідування Flx у фоновому процесі.
+
+    Якщо потрібно ще роботи — InvestigationService.run_loop() сам зробить re-enqueue
+    цієї ж таски. Якщо досягнуто термінального стану (done/failed/awaiting_user/cancelled)
+    або вичерпано ліміт ітерацій сесії — таска просто завершується.
+    """
+    settings = _init_runtime()
+    try:
+        from business.services.investigation_service import InvestigationService
+
+        service = InvestigationService(settings)
+        result = service.run_loop(session_id) or {}
+        logger.info(
+            "[flx] run_investigation_step session=%s state=%s note=%s",
+            session_id,
+            result.get("state"),
+            result.get("note"),
+        )
+        return result
+    except Exception as e:
+        logger.exception("[flx] run_investigation_step failed for session=%s: %s", session_id, e)
+        try:
+            from business.services.investigation_service import InvestigationService
+
+            InvestigationService(settings)._sessions.fail(session_id, str(e))
+        except Exception:
+            pass
+        return {"ok": False, "error": str(e)}

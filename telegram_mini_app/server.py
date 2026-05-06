@@ -19,7 +19,7 @@ from business.services.user_service import UserService
 from business.services.prozorro_service import ProZorroService
 from business.services.logging_service import LoggingService
 
-from telegram_mini_app.routes import me, llm, admin, files, search, feedback, report_templates, analytics
+from telegram_mini_app.routes import me, llm, admin, files, search, feedback, report_templates, analytics, investigation
 
 
 def _get_static_file_version(static_dir: Path) -> str:
@@ -78,6 +78,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.prozorro_service = ProZorroService(settings)
     app.state.logging_service = LoggingService()
     app.state.multi_agent_service = None  # леніва ініціалізація в routes/llm.py
+    app.state.investigation_service = None  # леніва ініціалізація в routes/investigation.py
 
     app.include_router(me.router)
     app.include_router(llm.router)
@@ -87,6 +88,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(feedback.router)
     app.include_router(report_templates.router)
     app.include_router(analytics.router)
+    app.include_router(investigation.router)
 
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():

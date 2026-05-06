@@ -60,6 +60,28 @@ class Settings:
         self.llm_assistant_model_name = os.getenv('LLM_ASSISTANT_MODEL_NAME', 'gemini-2.5-flash')
         self.llm_parsing_provider = os.getenv('LLM_PARSING_PROVIDER', 'ollama')
         self.llm_parsing_model_name = os.getenv('LLM_PARSING_MODEL_NAME', 'gemma3:27b')
+        # Flx — агент-інвестігейтор (дослідження локацій, побудова HTML-звітів)
+        self.llm_investigator_provider = os.getenv('LLM_INVESTIGATOR_PROVIDER', 'gemini')
+        self.llm_investigator_model_name = os.getenv('LLM_INVESTIGATOR_MODEL_NAME', 'gemini-2.5-pro')
+        self.llm_investigator_temperature = float(os.getenv('LLM_INVESTIGATOR_TEMPERATURE', '0.4'))
+        self.llm_investigator_max_iterations = int(os.getenv('LLM_INVESTIGATOR_MAX_ITERATIONS', '40'))
+        self.llm_investigator_time_budget_seconds = int(os.getenv('LLM_INVESTIGATOR_TIME_BUDGET_SECONDS', '900'))
+        self.llm_investigator_google_grounding = os.getenv('LLM_INVESTIGATOR_GOOGLE_GROUNDING', 'true').lower() in ('true', '1', 'yes')
+        self.llm_investigator_max_steps_per_task = int(os.getenv('LLM_INVESTIGATOR_MAX_STEPS_PER_TASK', '5'))
+        self.flx_static_maps_default_size = os.getenv('FLX_STATIC_MAPS_SIZE', '800x600')
+        self.flx_static_maps_default_zoom = int(os.getenv('FLX_STATIC_MAPS_ZOOM', '13'))
+        # Список дозволених інструментів для Flx (allow-list, без '*')
+        _allowed_tools_raw = os.getenv(
+            'FLX_ALLOWED_TOOLS',
+            'flx.note_write,flx.notes_read,flx.lessons_search,flx.lessons_save,'
+            'flx.static_map_render,flx.ask_user,flx.report_compose,flx.web_search,'
+            'query_builder.execute_query,query_builder.execute_aggregation,'
+            'query_builder.save_query_to_temp_collection,query_builder.get_distinct_values,'
+            'analytics.execute_analytics,analytics.list_metrics,'
+            'schema.get_collection_info,schema.get_data_dictionary,'
+            'geocoding.geocode_address,geocoding.search_nearby_places',
+        )
+        self.flx_allowed_tools = [t.strip() for t in _allowed_tools_raw.split(',') if t.strip()]
         # Для безкоштовного тарифу Gemini ліміт 5 запитів/хвилину, тому використовуємо 4 для безпеки
         self.llm_rate_limit_calls_per_minute = int(os.getenv('LLM_RATE_LIMIT_CALLS_PER_MINUTE', '0'))  # 0 = без обмежень
         self.llm_api_keys = {
@@ -195,6 +217,28 @@ class Settings:
                             elif 'model_name' in llm_config:
                                 # Якщо llm.parsing не задано — використовувати загальну модель для парсингу
                                 self.llm_parsing_model_name = llm_config['model_name']
+                            if 'investigator' in llm_config:
+                                inv = llm_config['investigator']
+                                if 'provider' in inv:
+                                    self.llm_investigator_provider = inv['provider']
+                                if 'model_name' in inv:
+                                    self.llm_investigator_model_name = inv['model_name']
+                                if 'temperature' in inv:
+                                    self.llm_investigator_temperature = float(inv['temperature'])
+                                if 'max_iterations' in inv:
+                                    self.llm_investigator_max_iterations = int(inv['max_iterations'])
+                                if 'time_budget_seconds' in inv:
+                                    self.llm_investigator_time_budget_seconds = int(inv['time_budget_seconds'])
+                                if 'google_grounding' in inv:
+                                    self.llm_investigator_google_grounding = bool(inv['google_grounding'])
+                                if 'max_steps_per_task' in inv:
+                                    self.llm_investigator_max_steps_per_task = int(inv['max_steps_per_task'])
+                                if 'allowed_tools' in inv and isinstance(inv['allowed_tools'], list):
+                                    self.flx_allowed_tools = [str(t).strip() for t in inv['allowed_tools'] if str(t).strip()]
+                                if 'static_maps_size' in inv:
+                                    self.flx_static_maps_default_size = str(inv['static_maps_size'])
+                                if 'static_maps_zoom' in inv:
+                                    self.flx_static_maps_default_zoom = int(inv['static_maps_zoom'])
                             if 'rate_limit' in llm_config and 'calls_per_minute' in llm_config['rate_limit']:
                                 self.llm_rate_limit_calls_per_minute = llm_config['rate_limit']['calls_per_minute']
                             if 'api_keys' in llm_config:

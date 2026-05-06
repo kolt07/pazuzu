@@ -976,6 +976,18 @@
     var input = document.getElementById("chat-input");
     var text = input && input.value.trim();
     if (!text) return;
+    // Якщо поточний чат — Flx-розслідування, маршрутизуємо повідомлення на окремий API.
+    var __invChat = (function () { var c = getCurrentChat(); return (c && c.kind === "investigation") ? c : null; })();
+    if (__invChat) {
+      input.value = "";
+      if (!__invChat.flx || !__invChat.flx.sessionId) {
+        flxSendInitialQuery(__invChat, text);
+      } else {
+        appendChatMessage("user", text);
+        submitFlxAnswer(__invChat, text, null);
+      }
+      return;
+    }
     if (!getCurrentChat()) createNewChat();
     appendChatMessage("user", text);
     input.value = "";
@@ -1661,6 +1673,9 @@
     });
     var newChatBtn = document.getElementById("sidebar-new-chat");
     if (newChatBtn) newChatBtn.addEventListener("click", createNewChat);
+
+    var newInvestigationBtn = document.getElementById("sidebar-new-investigation");
+    if (newInvestigationBtn) newInvestigationBtn.addEventListener("click", function () { startNewInvestigation(); });
 
     var chatMessagesEl = document.getElementById("chat-messages");
     if (chatMessagesEl) {
@@ -5612,4 +5627,303 @@
       renderNav({ authorized: false });
       showError(err.message || "Не вдалося завантажити профіль.");
     });
+
+  // ============================== Flx (агент-інвестігейтор) ==============================
+  // Окремий тип чат-сесії: kind:"investigation". Усі повідомлення стримляться через SSE
+  // /api/llm/investigation/{session_id}/events. Питання користувачу (ask_user) рендеряться
+  // як окремий блок з кнопками-варіантами і вільним полем; відповідь POST'иться на /answer.
+  // Завершення розслідування додає кнопку "Відкрити звіт" → /api/files/artifact/{aid}?token=...
+
+  var FLX_INVESTIGATION_PREFIX = "flx_inv_";
+  var flxActiveStreams = {};
+  var flxLastSeqByChat = {};
+
+  function startNewInvestigation() {
+    var id = FLX_INVESTIGATION_PREFIX + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+    chatSessions.unshift({
+      id: id,
+      title: "Розслідування Flx",
+      kind: "investigation",
+      messages: [],
+      updatedAt: Date.now(),
+      flx: { sessionId: null, state: "draft" },
+    });
+    saveChatSessions();
+    currentChatId = id;
+    renderChatHistoryList();
+    renderChatMessages();
+    show("screen-home");
+    var input = document.getElementById("chat-input");
+    if (input) {
+      input.value = "";
+      input.placeholder = "Опишіть локацію та мету: напр. 'аптека у Шевченківському районі Києва, бюджет до 200к/міс'";
+      input.focus();
+    }
+    appendFlxSystemMessage("Опишіть деталі розслідування. Я буду показувати хід міркувань і ставити уточнюючі питання, якщо знадобиться.");
+  }
+
+  function getCurrentInvestigationChat() {
+    var chat = getCurrentChat();
+    if (chat && chat.kind === "investigation") return chat;
+    return null;
+  }
+
+  function appendFlxSystemMessage(text) {
+    var container = document.getElementById("chat-messages");
+    if (!container) return;
+    var div = document.createElement("div");
+    div.className = "chat-msg bot chat-message flx-status";
+    var badge = document.createElement("span");
+    badge.className = "flx-badge";
+    badge.textContent = "Flx";
+    div.appendChild(badge);
+    div.appendChild(document.createTextNode(text));
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function appendFlxEvent(chat, ev) {
+    var container = document.getElementById("chat-messages");
+    if (!container) return;
+    var type = ev.type || "status";
+    var payload = ev.payload || {};
+    var div = document.createElement("div");
+    div.className = "chat-msg bot chat-message";
+    var badge = document.createElement("span");
+    badge.className = "flx-badge";
+    badge.textContent = "Flx";
+    div.appendChild(badge);
+
+    if (type === "thinking") {
+      div.classList.add("flx-thinking");
+      div.appendChild(document.createTextNode(payload.content || ""));
+    } else if (type === "note") {
+      div.classList.add("flx-note");
+      var kindMap = { thought: "Думка", observation: "Спостереження", hypothesis: "Гіпотеза", decision: "Рішення", question: "Питання", user_answer: "Відповідь користувача" };
+      var label = kindMap[payload.kind] || "Нотатка";
+      var labelEl = document.createElement("strong");
+      labelEl.textContent = label + ": ";
+      div.appendChild(labelEl);
+      div.appendChild(document.createTextNode(payload.text || ""));
+    } else if (type === "tool_call") {
+      div.classList.add("flx-tool-call");
+      div.appendChild(document.createTextNode("Виклик інструмента: " + (payload.name || "")));
+    } else if (type === "status") {
+      div.classList.add("flx-status");
+      div.appendChild(document.createTextNode(payload.message || ""));
+    } else if (type === "answer") {
+      // Користувач уже відповів — короткий лог
+      div.classList.add("flx-status");
+      div.appendChild(document.createTextNode("Ваша відповідь прийнята."));
+    } else if (type === "question") {
+      renderFlxQuestion(container, chat, payload);
+      return;
+    } else if (type === "report" || type === "done") {
+      renderFlxDone(container, chat, payload);
+      return;
+    } else if (type === "error") {
+      div.classList.add("flx-status");
+      div.style.color = "#c0392b";
+      div.appendChild(document.createTextNode("Помилка: " + (payload.message || "невідома")));
+    } else {
+      // ping / reconnect / ін.
+      return;
+    }
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function renderFlxQuestion(container, chat, payload) {
+    var div = document.createElement("div");
+    div.className = "chat-msg bot chat-message flx-question";
+    var badge = document.createElement("span");
+    badge.className = "flx-badge";
+    badge.textContent = "Flx";
+    div.appendChild(badge);
+    var q = document.createElement("div");
+    q.className = "flx-question-text";
+    q.textContent = payload.question || "Уточнення необхідне";
+    div.appendChild(q);
+    var opts = document.createElement("div");
+    opts.className = "flx-options";
+    (payload.options || []).forEach(function (opt) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "flx-option-btn";
+      b.textContent = opt;
+      b.addEventListener("click", function () { submitFlxAnswer(chat, opt, div); });
+      opts.appendChild(b);
+    });
+    if ((payload.options || []).length) div.appendChild(opts);
+    if (payload.allow_freeform !== false) {
+      var ff = document.createElement("div");
+      ff.className = "flx-freeform";
+      var inp = document.createElement("input");
+      inp.type = "text";
+      inp.placeholder = "Свій варіант...";
+      inp.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") { e.preventDefault(); submitFlxAnswer(chat, inp.value, div); }
+      });
+      var sendB = document.createElement("button");
+      sendB.type = "button";
+      sendB.className = "flx-option-btn";
+      sendB.textContent = "Надіслати";
+      sendB.addEventListener("click", function () { submitFlxAnswer(chat, inp.value, div); });
+      ff.appendChild(inp);
+      ff.appendChild(sendB);
+      div.appendChild(ff);
+    }
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function renderFlxDone(container, chat, payload) {
+    var div = document.createElement("div");
+    div.className = "chat-msg bot chat-message flx-done";
+    var badge = document.createElement("span");
+    badge.className = "flx-badge";
+    badge.textContent = "Flx";
+    div.appendChild(badge);
+    var msg = document.createElement("div");
+    msg.textContent = "Розслідування завершено. Звіт готовий.";
+    div.appendChild(msg);
+    var aid = payload.artifact_id;
+    if (aid && chat && chat.flx && chat.flx.sessionId) {
+      var btn = document.createElement("a");
+      btn.className = "flx-report-btn";
+      btn.textContent = "Відкрити звіт";
+      btn.target = "_blank";
+      btn.rel = "noopener";
+      btn.href = "/api/llm/investigation/" + encodeURIComponent(chat.flx.sessionId) + "/report";
+      btn.addEventListener("click", function () {
+        try {
+          if (window.Telegram && window.Telegram.WebApp && typeof window.Telegram.WebApp.openLink === "function") {
+            window.Telegram.WebApp.openLink(btn.href, { try_instant_view: false });
+          }
+        } catch (e) { /* fallback на default href */ }
+      });
+      div.appendChild(btn);
+    }
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function submitFlxAnswer(chat, answer, questionDiv) {
+    if (!chat || !chat.flx || !chat.flx.sessionId) return;
+    var clean = (answer || "").trim();
+    if (!clean) return;
+    // Дезактивовуємо UI питання
+    if (questionDiv) {
+      var btns = questionDiv.querySelectorAll("button, input");
+      btns.forEach(function (el) { el.disabled = true; });
+    }
+    fetch("/api/llm/investigation/" + encodeURIComponent(chat.flx.sessionId) + "/answer", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ answer: clean }),
+    }).then(function (r) {
+      if (!r.ok) throw new Error("answer_failed");
+      return r.json();
+    }).catch(function (e) {
+      appendFlxSystemMessage("Не вдалося надіслати відповідь: " + (e && e.message ? e.message : e));
+    });
+  }
+
+  function flxSendInitialQuery(chat, text) {
+    appendChatMessage("user", text);
+    appendFlxSystemMessage("Запускаю розслідування...");
+    fetch("/api/llm/investigation/start", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ text: text, chat_id: chat.id }),
+    }).then(function (r) {
+      if (!r.ok) {
+        return r.json().then(function (b) { throw new Error((b && b.detail) || ("HTTP " + r.status)); }, function () { throw new Error("HTTP " + r.status); });
+      }
+      return r.json();
+    }).then(function (data) {
+      if (!data || !data.session_id) throw new Error("no_session_id");
+      chat.flx = chat.flx || {};
+      chat.flx.sessionId = data.session_id;
+      chat.flx.state = "running";
+      chat.title = (text.length > 40 ? text.slice(0, 40) + "…" : text);
+      saveChatSessions();
+      renderChatHistoryList();
+      flxOpenStream(chat, 0);
+    }).catch(function (err) {
+      appendFlxSystemMessage("Помилка старту: " + (err && err.message ? err.message : err));
+    });
+  }
+
+  function flxOpenStream(chat, sinceSeq) {
+    if (!chat || !chat.flx || !chat.flx.sessionId) return;
+    var sid = chat.flx.sessionId;
+    if (flxActiveStreams[sid]) {
+      try { flxActiveStreams[sid].abort(); } catch (e) {}
+    }
+    var ac = new AbortController();
+    flxActiveStreams[sid] = ac;
+    var url = "/api/llm/investigation/" + encodeURIComponent(sid) + "/events?since=" + (sinceSeq || 0);
+    fetch(url, { method: "GET", headers: apiHeaders(), signal: ac.signal })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        if (!r.body || !r.body.getReader) throw new Error("Стрімінг не підтримується");
+        var reader = r.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = "";
+        function processEvent(eventData) {
+          try {
+            var data = JSON.parse(eventData);
+            if (data && typeof data.seq === "number") {
+              flxLastSeqByChat[chat.id] = data.seq;
+            }
+            if (data.type === "reconnect") {
+              setTimeout(function () { flxOpenStream(chat, data.since_seq || flxLastSeqByChat[chat.id] || 0); }, 250);
+              return true;
+            }
+            if (data.type === "ping") return false;
+            appendFlxEvent(chat, data);
+            if (data.type === "done" || data.type === "error") return true;
+          } catch (e) {}
+          return false;
+        }
+        return reader.read().then(function loop(res) {
+          if (res.done) return;
+          buffer += decoder.decode(res.value, { stream: true });
+          var events = buffer.split("\n\n");
+          buffer = events.pop() || "";
+          for (var i = 0; i < events.length; i++) {
+            var lines = events[i].split("\n");
+            for (var j = 0; j < lines.length; j++) {
+              if (lines[j].indexOf("data: ") === 0) {
+                var jsonStr = lines[j].slice(6).trim();
+                if (jsonStr && processEvent(jsonStr)) return;
+              }
+            }
+          }
+          return reader.read().then(loop);
+        });
+      })
+      .catch(function (e) {
+        if (ac.signal.aborted) return;
+        // Авто-реконект після короткої паузи з останнього seq
+        setTimeout(function () { flxOpenStream(chat, flxLastSeqByChat[chat.id] || 0); }, 1500);
+      })
+      .finally(function () {
+        if (flxActiveStreams[sid] === ac) delete flxActiveStreams[sid];
+      });
+  }
+
+  // Resume: при перемиканні на чат-розслідування зі sidebar — підтягуємо стан + ре-стрімимо події.
+  if (typeof switchChat === "function" && !switchChat.__flxWrapped) {
+    var __origSwitch = switchChat;
+    switchChat = function (id) {
+      __origSwitch.apply(this, arguments);
+      var chat = chatSessions.find(function (c) { return c.id === id; });
+      if (chat && chat.kind === "investigation" && chat.flx && chat.flx.sessionId) {
+        flxOpenStream(chat, flxLastSeqByChat[chat.id] || 0);
+      }
+    };
+    switchChat.__flxWrapped = true;
+  }
 })();

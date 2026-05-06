@@ -23,6 +23,7 @@ def start_mcp_servers():
         'mcp_servers.export_mcp_server',
         'mcp_servers.geocoding_mcp_server',
         'mcp_servers.data_update_mcp_server',
+        'mcp_servers.flx_mcp_server',
     ]
     
     processes = []

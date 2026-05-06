@@ -1,5 +1,22 @@
 # Історія розробки
 
+## 2026-05-06 — Flx: агент-інвестігейтор комерційної нерухомості
+
+- **Запит**: Додати окремого агента-розслідувача (псевдонім Flx) для глибокої гео-аналітики комерційної нерухомості: теплові карти цін, кластеризація POI/конкурентів, перспективні локації, підбір активних оголошень, оцінка оренди й окупності, з самовдосконаленням через нотатки та lessons-learned. Запуск — окремою «золотою» кнопкою «Нове розслідування» поряд з «Новий чат».
+- **Дії**:
+  - Конфігурація: додано LLM-роль `investigator` (default Gemini Pro) у `config/settings.py` + `config/config.yaml`, з temperature/max_iterations/time_budget/google_grounding/static_maps_size; розширено `LLMService.get_investigator_provider()` і `generate_text_investigator()`.
+  - Промпти: новий блок `investigator_*` (planner, step, reflection, report, lessons_query) у `config/prompts.yaml` за правилами `prompt-design.mdc` (стислі, JSON-only).
+  - Дані: міграція `scripts/migrations/047_flx_investigation_collections.py` — `investigation_sessions`, `investigation_notes`, `flx_lessons_learned`, `investigation_events` (capped, 32 МБ, ~50k); виклик з `main.py` при старті.
+  - Репозиторії: `data/repositories/investigation_session_repository.py`, `investigation_notes_repository.py`, `investigation_event_repository.py` (tail-cursor для SSE), `flx_lessons_repository.py` (з `$text` пошуком).
+  - Агенти: пакет `business/agents/investigator/` (`planner.py`, `step.py`, `reflection.py`, `reporter.py`) — LLM-only, JSON-only, без побічних ефектів.
+  - Сервіси: `business/services/static_map_service.py` (Google Static Maps PNG → ArtifactService з тіньовою heatmap-емуляцією через бакетовані маркери); `business/services/investigation_service.py` — оркестратор з tools registry (allow-list з `flx_allowed_tools`), циклом `Plan → Step → tool/ask_user/finish → Notes`, фіналізацією через `Reporter` + `Reflection` + Jinja-рендер HTML-звіту.
+  - Celery: `business.tasks.run_investigation_step` з циклом `run_loop`, soft_time_limit 900с, re-enqueue при перевищенні `max_steps_per_task`.
+  - MCP: новий `mcp_servers/flx_mcp_server.py` (note_write/notes_read/lessons_search/lessons_save/static_map_render/ask_user/report_compose/web_search-stub), додано в `scripts/start_mcp_servers.py`.
+  - API: `telegram_mini_app/routes/investigation.py` — `/start`, `/{id}/answer`, `/{id}/cancel`, `/{id}` (state), `/` (list), `/{id}/events` (SSE з `since=seq`), `/{id}/report` (302 на артефакт). Розширено `/api/files/artifact/{id}` для `Content-Type: text/html`/`image/png` з inline-disposition.
+  - HTML-звіт: Jinja-шаблон `telegram_mini_app/static/templates/investigation_report.html.j2` (inline CSS, secure auto-escape, секції з картами/маркерами/listings/metrics/warnings/sources, dark/light mode).
+  - UI: золота преміум-кнопка `+ Нове розслідування` у sidebar (`index.html` + `.btn-premium` у `styles.css` із SVG-іконкою-зірочкою через CSS mask, без emoji в коді), окремий тип сесії `kind:"investigation"` у `app.js` з рендером thinking/note/tool_call/question/done подій, інтерактивним блоком `ask_user` (кнопки + freeform), resume через `flxOpenStream(since=seq)` при перемиканні чату, відкриття звіту в новій вкладці через `Telegram.WebApp.openLink`.
+  - Безпека: allow-list тулз у `Settings.flx_allowed_tools`, `request_id` у логах, перевикористання `QueryBuilder` (deny `$where`/`$regex`) та `SecurityAgent` для первинного запиту.
+
 ## 2026-04-22 — Жорсткий re-acquire coordination lease між retry оренди Vast
 
 - **Запит**: Гарантувати singleton-поведінку оркестратора, щоб при фейлі старту не виникала подвійна оренда Vast двома процесами.

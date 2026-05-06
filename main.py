@@ -82,6 +82,30 @@ class Application:
             MongoDBConnection.initialize(self.settings)
         except Exception as e:
             print(f"Попередження: не вдалося ініціалізувати MongoDB: {e}")
+
+        # Перевірка структури БД для агента-інвестігейтора Flx (ідемпотентно: create_index/capped).
+        # Окремий скрипт зі scripts/migrations/047_*.py — викликаємо його напряму, щоб гарантувати
+        # наявність колекцій/індексів навіть якщо повний набір міграцій ще не пройдено в цьому середовищі.
+        try:
+            from scripts.migrations import _047_flx_investigation_collections as _flx_mig  # type: ignore
+        except Exception:
+            _flx_mig = None
+            try:
+                # Для імен з цифрою на початку імпорт через importlib
+                import importlib.util
+                from pathlib import Path as _Path
+                _mig_path = _Path(__file__).parent / "scripts" / "migrations" / "047_flx_investigation_collections.py"
+                if _mig_path.exists():
+                    spec = importlib.util.spec_from_file_location("flx_investigation_migration", _mig_path)
+                    _flx_mig = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(_flx_mig)
+            except Exception as e:
+                print(f"Попередження: міграція 047 не знайдена: {e}")
+        if _flx_mig is not None:
+            try:
+                _flx_mig.run_migration()
+            except Exception as e:
+                print(f"Попередження: перевірка структури колекцій Flx не вдалася: {e}")
         
         # Тепер створюємо сервіси після ініціалізації MongoDB
         self.logging_service = LoggingService()

@@ -364,14 +364,41 @@ def download_artifact(request: Request, artifact_id: str, token: str = None):
     content_b64 = doc.get("content_base64")
     if not content_b64:
         raise HTTPException(status_code=404, detail="Файл порожній")
-    filename = (doc.get("metadata") or {}).get("filename", "report.xlsx")
+    metadata = doc.get("metadata") or {}
+    filename = metadata.get("filename", "report.xlsx")
     try:
         content = base64.b64decode(content_b64)
     except Exception:
         raise HTTPException(status_code=500, detail="Помилка декодування")
+
+    # Визначаємо content-type і disposition: HTML/PNG показуємо inline у вкладці/iframe.
+    artifact_type = (doc.get("artifact_type") or "").lower()
+    explicit_ct = (metadata.get("content_type") or "").strip().lower()
+    inline_types = {
+        "text/html",
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/svg+xml",
+    }
+    if explicit_ct:
+        media_type = explicit_ct
+    elif artifact_type == "html_investigation_report":
+        media_type = "text/html"
+    elif artifact_type == "static_map":
+        media_type = "image/png"
+    else:
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    if media_type in inline_types:
+        # inline: браузер/iframe відкриває без скачування; ім'я лишається як підказка
+        from urllib.parse import quote as _q
+
+        disposition = f'inline; filename="{_q(filename, safe="")}"; filename*=UTF-8\'\'{_q(filename, safe="")}'
+        return Response(content=content, media_type=media_type, headers={"Content-Disposition": disposition})
     return Response(
         content=content,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=media_type,
         headers={"Content-Disposition": _content_disposition_attachment(filename)},
     )
 

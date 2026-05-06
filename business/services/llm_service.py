@@ -1284,6 +1284,7 @@ class LLMService:
         self.rate_limiter = RateLimiter(self.settings.llm_rate_limit_calls_per_minute)
         self.provider = self._create_provider()  # парсинг описів (Ollama за замовчуванням)
         self._assistant_provider = self._create_assistant_provider()  # intent, generate_text (Gemini за замовчуванням)
+        self._investigator_provider: Optional[BaseLLMProvider] = None  # Lazy: тільки для Flx
         self._logging = None
 
     def _get_logging(self):
@@ -1355,6 +1356,83 @@ class LLMService:
             return AnthropicLLMProvider(api_key, self.rate_limiter)
         else:
             raise ValueError(f"Невідомий провайдер асистента: {provider_name}")
+
+    def _create_investigator_provider(self) -> BaseLLMProvider:
+        """Створює провайдера для агента-інвестігейтора Flx на основі llm_investigator_*."""
+        provider_name = (getattr(self.settings, 'llm_investigator_provider', 'gemini') or 'gemini').lower()
+        api_key = self.settings.llm_api_keys.get(provider_name, '')
+        model_name = getattr(self.settings, 'llm_investigator_model_name', 'gemini-2.5-pro')
+
+        if provider_name == 'ollama':
+            return OllamaLLMProvider(api_key, self.rate_limiter, model_name)
+        if provider_name == 'vllm_remote':
+            try:
+                return VllmRemoteLLMProvider(api_key, self.rate_limiter, model_name)
+            except Exception as e:
+                logger.warning("vllm_remote недоступний для investigator, fallback на ollama: %s", e)
+                return OllamaLLMProvider('', self.rate_limiter, model_name)
+        if not api_key:
+            raise ValueError(f"API ключ для провайдера інвестігейтора {provider_name} не вказано в конфігурації")
+        if provider_name == 'gemini':
+            return GeminiLLMProvider(api_key, self.rate_limiter, model_name)
+        if provider_name == 'openai':
+            return OpenAILLMProvider(api_key, self.rate_limiter)
+        if provider_name == 'anthropic':
+            return AnthropicLLMProvider(api_key, self.rate_limiter)
+        raise ValueError(f"Невідомий провайдер інвестігейтора: {provider_name}")
+
+    def get_investigator_provider(self) -> BaseLLMProvider:
+        """Повертає провайдера для Flx (lazy ініціалізація)."""
+        if self._investigator_provider is None:
+            self._investigator_provider = self._create_investigator_provider()
+        return self._investigator_provider
+
+    def generate_text_investigator(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        _caller: Optional[str] = None,
+    ) -> str:
+        """Генерує текст через провайдера Flx (intent → JSON або вільний текст для розслідувань)."""
+        provider = self.get_investigator_provider()
+        if not hasattr(provider, "generate_text"):
+            return ""
+        if temperature is None:
+            temperature = float(getattr(self.settings, 'llm_investigator_temperature', 0.4))
+        log_svc = self._get_logging()
+        try:
+            raw = provider.generate_text(prompt, system_prompt=system_prompt, temperature=temperature)
+            if log_svc:
+                try:
+                    usage = getattr(provider, "_last_usage", None)
+                    meta = {"prompt_preview": (prompt or "")[:80] + ("..." if len(prompt or "") > 80 else "")}
+                    if _caller:
+                        meta["caller"] = _caller
+                    if isinstance(usage, dict):
+                        meta["input_tokens"] = usage.get("input_tokens", 0)
+                        meta["output_tokens"] = usage.get("output_tokens", 0)
+                    log_svc.log_api_usage(
+                        service="llm",
+                        source=_caller or "llm_service.generate_text_investigator",
+                        from_cache=False,
+                        metadata=meta,
+                    )
+                    log_svc.log_llm_exchange(
+                        request_text=getattr(provider, "_last_request_text", None) or "",
+                        response_text=getattr(provider, "_last_response_text", None) or "",
+                        input_tokens=meta.get("input_tokens", 0),
+                        output_tokens=meta.get("output_tokens", 0),
+                        source=_caller or "llm_service.generate_text_investigator",
+                        provider=(getattr(self.settings, "llm_investigator_provider", None) or "gemini"),
+                        duration_ms=meta.get("duration_ms"),
+                    )
+                except Exception as e:
+                    logger.warning("Не вдалося записати llm_exchange (investigator): %s", e)
+            return raw or ""
+        except Exception as e:
+            logger.warning("generate_text_investigator помилка: %s", e)
+            return ""
     
     def parse_auction_description(self, description: str) -> Dict[str, Any]:
         """
