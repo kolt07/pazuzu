@@ -32,9 +32,10 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
         include=["business.tasks"],
     )
     app.conf.update(
+        task_default_queue="llm_processing",
         task_default_exchange="pazuzu",
         task_default_exchange_type="direct",
-        task_default_routing_key="default",
+        task_default_routing_key="llm_processing",
         task_serializer="json",
         result_serializer="json",
         accept_content=["json"],
@@ -47,9 +48,10 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
         result_expires=3600,
         task_routes={
             "business.tasks.run_source_load_pipeline_task": {"queue": "source_load"},
+            "business.tasks.cadastral_national_cluster_build_task": {"queue": "source_load"},
             "business.tasks.process_olx_llm_task": {"queue": "llm_processing"},
             "business.tasks.process_prozorro_llm_task": {"queue": "llm_processing"},
-            "business.tasks.run_investigation_step": {"queue": "llm_processing"},
+            "business.tasks.run_investigation_step": {"queue": "flx_investigation"},
         },
     )
     return app

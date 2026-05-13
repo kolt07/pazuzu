@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-InvestigatorReflectionAgent — після завершення розслідування генерує lessons-learned.
+InvestigatorReflectionAgent — після завершення дослідження генерує lessons-learned.
 
 Вхід — короткий лог кроків і нотаток. Вихід — JSON для flx_lessons_learned, без записування.
 Збереженням опікується викликач (InvestigationService → FlxLessonsRepository).

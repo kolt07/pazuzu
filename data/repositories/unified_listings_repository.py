@@ -190,6 +190,194 @@ class UnifiedListingsRepository(BaseRepository):
         docs = list(self.collection.find(criteria))
         return [_normalize_doc(d) for d in docs]
 
+    def find_listings(
+        self,
+        region: Optional[str] = None,
+        city: Optional[str] = None,
+        property_type: Optional[str] = None,
+        property_type_contains: Optional[str] = None,
+        city_contains: Optional[str] = None,
+        region_contains: Optional[str] = None,
+        status: Optional[str] = None,
+        source: Optional[str] = None,
+        building_area_min: Optional[float] = None,
+        building_area_max: Optional[float] = None,
+        land_area_min: Optional[float] = None,
+        land_area_max: Optional[float] = None,
+        price_uah_min: Optional[float] = None,
+        price_uah_max: Optional[float] = None,
+        tags: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Універсальна вибірка з unified_listings з опційними точними та substring-фільтрами.
+
+        В реальних даних `property_type` зберігається як «комерційна нерухомість»,
+        «земельна ділянка» тощо — повними фразами. Тому корисніше шукати через
+        `property_type_contains` (substring case-insensitive), а не точне значення.
+        Це і використовує `listings.find_with_fallback` для стратегії `relaxed_*`.
+        """
+        import re as _re
+
+        criteria: Dict[str, Any] = {}
+        if status:
+            criteria["status"] = str(status).strip()
+        if source:
+            criteria["source"] = str(source).strip()
+        if region:
+            criteria["region"] = str(region).strip()
+        if city:
+            criteria["city"] = str(city).strip()
+        if property_type:
+            criteria["property_type"] = str(property_type).strip()
+        if region_contains:
+            criteria["region"] = {"$regex": _re.escape(str(region_contains).strip()), "$options": "i"}
+        if city_contains:
+            criteria["city"] = {"$regex": _re.escape(str(city_contains).strip()), "$options": "i"}
+        if property_type_contains:
+            criteria["property_type"] = {"$regex": _re.escape(str(property_type_contains).strip()), "$options": "i"}
+        if tags:
+            valid_tags = [str(t).strip() for t in tags if str(t).strip()]
+            if valid_tags:
+                criteria["tags"] = {"$in": valid_tags}
+
+        if building_area_min is not None or building_area_max is not None:
+            r: Dict[str, Any] = {}
+            try:
+                if building_area_min is not None:
+                    r["$gte"] = float(building_area_min)
+            except (TypeError, ValueError):
+                pass
+            try:
+                if building_area_max is not None:
+                    r["$lte"] = float(building_area_max)
+            except (TypeError, ValueError):
+                pass
+            if r:
+                criteria["building_area_sqm"] = r
+
+        if land_area_min is not None or land_area_max is not None:
+            r = {}
+            try:
+                if land_area_min is not None:
+                    r["$gte"] = float(land_area_min)
+            except (TypeError, ValueError):
+                pass
+            try:
+                if land_area_max is not None:
+                    r["$lte"] = float(land_area_max)
+            except (TypeError, ValueError):
+                pass
+            if r:
+                criteria["land_area_sqm"] = r
+
+        if price_uah_min is not None or price_uah_max is not None:
+            r = {}
+            try:
+                if price_uah_min is not None:
+                    r["$gte"] = float(price_uah_min)
+            except (TypeError, ValueError):
+                pass
+            try:
+                if price_uah_max is not None:
+                    r["$lte"] = float(price_uah_max)
+            except (TypeError, ValueError):
+                pass
+            if r:
+                criteria["price_uah"] = r
+
+        docs = list(self.collection.find(criteria).limit(max(1, int(limit or 50))))
+        return [_normalize_doc(d) for d in docs]
+
+    def landscape_summary(
+        self,
+        region: Optional[str] = None,
+        city: Optional[str] = None,
+        status: Optional[str] = None,
+        source: Optional[str] = None,
+        region_contains: Optional[str] = None,
+        city_contains: Optional[str] = None,
+        max_per_field: int = 20,
+    ) -> Dict[str, Any]:
+        """
+        Швидкий «landscape»: розподіл по property_type / region / city / source
+        у межах базового scope (без area/price-фільтрів). Використовується
+        `listings.find_with_fallback` коли точні стратегії дали 0, щоб
+        повертати агенту реальні значення з БД.
+        """
+        import re as _re
+
+        criteria: Dict[str, Any] = {}
+        if status:
+            criteria["status"] = str(status).strip()
+        if source:
+            criteria["source"] = str(source).strip()
+        if region:
+            criteria["region"] = str(region).strip()
+        if city:
+            criteria["city"] = str(city).strip()
+        if region_contains:
+            criteria["region"] = {"$regex": _re.escape(str(region_contains).strip()), "$options": "i"}
+        if city_contains:
+            criteria["city"] = {"$regex": _re.escape(str(city_contains).strip()), "$options": "i"}
+
+        total = self.collection.count_documents(criteria)
+        if total == 0:
+            return {"total": 0, "by_property_type": [], "by_region": [], "by_city": [], "by_source": []}
+
+        def _agg(field: str) -> List[Dict[str, Any]]:
+            pipeline = [
+                {"$match": criteria},
+                {"$group": {"_id": f"${field}", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}},
+                {"$limit": max(1, int(max_per_field))},
+            ]
+            out: List[Dict[str, Any]] = []
+            for r in self.collection.aggregate(pipeline):
+                key = r.get("_id")
+                if key is None or key == "":
+                    continue
+                out.append({"value": key, "count": int(r.get("count") or 0)})
+            return out
+
+        return {
+            "total": int(total),
+            "by_property_type": _agg("property_type"),
+            "by_region": _agg("region"),
+            "by_city": _agg("city"),
+            "by_source": _agg("source"),
+        }
+
+    def set_vector_indexed(self, source: str, source_id: str) -> bool:
+        """Позначає документ як проіндексований у векторній БД (Qdrant)."""
+        if not source or not source_id:
+            return False
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        result = self.collection.update_one(
+            {"source": source, "source_id": source_id},
+            {"$set": {"vector_indexed_at": now}},
+        )
+        return bool(result.modified_count) or bool(result.matched_count)
+
+    def find_without_vector_index(
+        self,
+        limit: int = 500,
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Повертає документи без поля `vector_indexed_at` (або зі старішим за оновлення)."""
+        criteria: Dict[str, Any] = {
+            "$or": [
+                {"vector_indexed_at": {"$exists": False}},
+                {"vector_indexed_at": None},
+            ],
+        }
+        if source:
+            criteria["source"] = source
+        docs = list(self.collection.find(criteria).limit(max(1, int(limit))))
+        return [_normalize_doc(d) for d in docs]
+
     def delete_by_source_id(self, source: str, source_id: str) -> int:
         """
         Видаляє оголошення за джерелом та ID в джерелі.

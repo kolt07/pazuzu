@@ -1251,6 +1251,9 @@ collections:
       - field: "parcel_count"
         unique: false
         description: "Кількість ділянок"
+      - field: "partition_key"
+        unique: false
+        description: "Ключ області для національної партиційної побудови кластерів"
     fields:
       cluster_id:
         type: "string"
@@ -1288,6 +1291,76 @@ collections:
         type: "number"
         required: false
         description: "Сумарна площа, м²"
+      partition_key:
+        type: "string"
+        required: false
+        description: "Код області (партиція) для cadastral_national_cluster_build"
+
+  cadastral_polygon_query_cache:
+    description: "Кеш полігон-пошуку кадастрових ділянок за топонімом (query_id, cadastral_numbers)"
+    mongo_collection: "cadastral_polygon_query_cache"
+    indexes:
+      - field: "query_fingerprint"
+        unique: true
+        description: "Хеш запиту (топонім + полігон + фільтри)"
+      - field: "query_id"
+        unique: true
+        description: "Публічний id для пагінації"
+    fields:
+      query_fingerprint:
+        type: "string"
+        required: true
+      query_id:
+        type: "string"
+        required: true
+      toponym:
+        type: "string"
+        required: false
+      cadastral_numbers:
+        type: "array"
+        required: false
+      total_count:
+        type: "number"
+        required: false
+      truncated:
+        type: "boolean"
+        required: false
+      created_at:
+        type: "datetime"
+        required: false
+
+  cadastral_cluster_build_jobs:
+    description: "Прогрес національної кластеризації кадастру (адмін / Celery)"
+    mongo_collection: "cadastral_cluster_build_jobs"
+    indexes:
+      - field: "job_id"
+        unique: true
+        description: "Ідентифікатор задачі"
+    fields:
+      job_id:
+        type: "string"
+        required: true
+      status:
+        type: "string"
+        required: false
+      partitions_total:
+        type: "number"
+        required: false
+      partitions_done:
+        type: "number"
+        required: false
+      parcels_processed:
+        type: "number"
+        required: false
+      clusters_upserted:
+        type: "number"
+        required: false
+      message:
+        type: "string"
+        required: false
+      updated_at:
+        type: "datetime"
+        required: false
 
   real_estate_objects:
     description: "Об'єкти нерухомого майна (ОНМ): земельні ділянки, будівлі, приміщення. Єдина колекція з полем type."
@@ -1609,6 +1682,63 @@ collections:
         type: "datetime"
         required: true
         description: "Коли оновлено цей день"
+
+  flx_strategy_registry:
+    description: "Реєстр стратегій FLX Strategy Engine (rolling_score, історія використання для підказок Planner)."
+    mongo_collection: "flx_strategy_registry"
+    indexes:
+      - field: ["task_fingerprint", "strategy_signature"]
+        unique: true
+        description: "Унікальний ключ відбитка задачі та підпису стратегії"
+      - field: "rolling_score"
+        unique: false
+        description: "Сортування для top-K"
+    fields:
+      task_fingerprint:
+        type: "string"
+        required: true
+        description: "SHA256-префікс нормалізованого запиту"
+      strategy_signature:
+        type: "string"
+        required: true
+        description: "Хеш шаблону стратегії (id + planned_tools)"
+      strategy_id:
+        type: "string"
+        required: true
+      strategy_name:
+        type: "string"
+        required: false
+      strategy_template:
+        type: "object"
+        required: false
+      rolling_score:
+        type: "number"
+        required: false
+      success_rate:
+        type: "number"
+        required: false
+      cost_efficiency:
+        type: "number"
+        required: false
+      usage_count:
+        type: "number"
+        required: false
+      wins:
+        type: "number"
+        required: false
+      total_runs:
+        type: "number"
+        required: false
+      query_exemplar:
+        type: "string"
+        required: false
+      created_at:
+        type: "datetime"
+        required: false
+      updated_at:
+        type: "datetime"
+        required: false
+
 # Допоміжні типи та константи
 field_types:
   - name: "string"

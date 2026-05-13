@@ -287,6 +287,60 @@ def run_full_pipeline(
             "core_completed": False,
         }
 
+        # Попередня нормалізація фільтрів: пишемо у лог невпізнані значення одразу на рівні
+        # pipeline, щоб у task heartbeat було видно, що саме викликач передав некоректно.
+        # Якщо ВСІ передані значення фільтра невпізнані — повертаємо явну помилку замість
+        # тихого «load all», бо тихе зняття фільтра небезпечне (раптом завантажуємо все
+        # коли користувач замовляв точкове оновлення однієї області).
+        if regions or listing_types:
+            try:
+                from scripts.olx_scraper.run_update import (
+                    _normalize_region_filter,
+                    _normalize_listing_types_filter,
+                )
+                from scripts.olx_scraper import config as _scraper_config
+                _avail_regions = list((_scraper_config.get_olx_region_slugs() or {}).keys())
+                norm_regions, unknown_regions = _normalize_region_filter(regions, _avail_regions)
+                norm_types, unknown_types = _normalize_listing_types_filter(listing_types)
+                if regions and unknown_regions:
+                    log(
+                        f"[Source load] Фільтр regions: невпізнано {unknown_regions}. "
+                        f"Канонічні приклади з каталогу: {_avail_regions[:5]}…"
+                    )
+                if listing_types and unknown_types:
+                    log(f"[Source load] Фільтр listing_types: невпізнано {unknown_types}.")
+                if regions and not norm_regions:
+                    err_msg = (
+                        "[Source load] Усі передані regions невпізнані — припиняємо запуск, "
+                        "щоб не завантажити випадково всі дані. "
+                        f"Прийшло: {list(regions)!r}; канонічні: {_avail_regions[:5]}…"
+                    )
+                    log(err_msg)
+                    result["error"] = err_msg
+                    result["skipped_reason"] = "all_regions_invalid"
+                    return result
+                if listing_types and not norm_types:
+                    err_msg = (
+                        "[Source load] Усі передані listing_types невпізнані — припиняємо запуск. "
+                        f"Прийшло: {list(listing_types)!r}."
+                    )
+                    log(err_msg)
+                    result["error"] = err_msg
+                    result["skipped_reason"] = "all_listing_types_invalid"
+                    return result
+                # Підмінюємо вхідні значення на нормалізовані канонічні (часткові випадки):
+                # downstream-функції теж нормалізують, але переписуємо тут, щоб у логах фільтри
+                # відображались однаково на всіх рівнях, а ProZorro-частина одразу отримала правильні
+                # назви для матчингу з normalize_region_name().
+                if regions and norm_regions and set(norm_regions) != set(regions):
+                    log(f"[Source load] regions нормалізовано до канонічних: {norm_regions}")
+                    regions = norm_regions
+                if listing_types and norm_types and set(norm_types) != set(listing_types):
+                    log(f"[Source load] listing_types нормалізовано до підрядків: {norm_types}")
+                    listing_types = norm_types
+            except Exception as _e:
+                logger.warning("Filter normalization skipped: %s", _e)
+
         # ---------- Phase 1: завантаження сирих даних ----------
         log("[Source load] Phase 1: завантаження сирих даних з джерел (без LLM).")
         olx_loaded_urls: List[str] = []

@@ -3,9 +3,9 @@
 Міграція 047: Колекції агента-інвестігейтора Flx.
 
 Створює:
-- investigation_sessions: стан розслідування (план, крок, артефакти).
+- investigation_sessions: стан дослідження (план, крок, артефакти).
 - investigation_notes: записник агента (думки, спостереження, гіпотези).
-- flx_lessons_learned: підсумки попередніх розслідувань для самовдосконалення.
+- flx_lessons_learned: підсумки попередніх досліджувань для самовдосконалення.
 - investigation_events: capped-колекція подій для SSE-каналу прогресу.
 """
 
@@ -29,7 +29,7 @@ def run_migration() -> bool:
         MongoDBConnection.initialize(settings)
         db = MongoDBConnection.get_database()
 
-        # 1) investigation_sessions — основна сесія розслідування
+        # 1) investigation_sessions — основна сесія дослідження
         sessions = db["investigation_sessions"]
         sessions.create_index([("session_id", 1)], unique=True)
         sessions.create_index([("user_id", 1), ("updated_at", -1)])
@@ -41,7 +41,7 @@ def run_migration() -> bool:
             name="ttl_updated_at_30d",
         )
 
-        # 2) investigation_notes — нотатки агента під час розслідування
+        # 2) investigation_notes — нотатки агента під час дослідження
         notes = db["investigation_notes"]
         notes.create_index([("session_id", 1), ("seq", 1)])
         notes.create_index([("created_at", 1)], expireAfterSeconds=60 * 60 * 24 * 30, name="ttl_created_at_30d")

@@ -60,12 +60,31 @@ def _parse_address_components(components: List[Dict[str, Any]]) -> Dict[str, str
     return result
 
 
+def _lat_lng_rect_from_geocode_viewport(vp: Any) -> Optional[Dict[str, Any]]:
+    """Перетворює geometry.viewport / bounds з Geocoding JSON у {southwest,northeast} з lat/lng."""
+    if not isinstance(vp, dict):
+        return None
+    ne = vp.get("northeast") or vp.get("northEast")
+    sw = vp.get("southwest") or vp.get("southWest")
+    if not isinstance(ne, dict) or not isinstance(sw, dict):
+        return None
+    try:
+        return {
+            "northeast": {"latitude": float(ne.get("lat")), "longitude": float(ne.get("lng"))},
+            "southwest": {"latitude": float(sw.get("lat")), "longitude": float(sw.get("lng"))},
+        }
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_place(result: Dict[str, Any]) -> Dict[str, Any]:
     """Нормалізує один результат Geocoding API до нашого формату; додає address_structured."""
     geometry = result.get("geometry") or {}
     location = geometry.get("location") or {}
     components = result.get("address_components") or []
     address_structured = _parse_address_components(components)
+    viewport_ll = _lat_lng_rect_from_geocode_viewport(geometry.get("viewport"))
+    bounds_ll = _lat_lng_rect_from_geocode_viewport(geometry.get("bounds"))
     return {
         "latitude": location.get("lat"),
         "longitude": location.get("lng"),
@@ -74,6 +93,9 @@ def _normalize_place(result: Dict[str, Any]) -> Dict[str, Any]:
         "types": result.get("types") or [],
         "location_type": geometry.get("location_type"),
         "address_structured": address_structured,
+        # Для кадастрового полігон-пошуку (viewport частіше за bounds для топонімів)
+        "viewport_latlng": viewport_ll,
+        "bounds_latlng": bounds_ll,
     }
 
 

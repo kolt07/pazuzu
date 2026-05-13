@@ -13,10 +13,11 @@ from config.settings import Settings
 
 def _resolve_queue_and_threads(argv: list[str]) -> tuple[str, int]:
     queue = str(argv[1] if len(argv) > 1 else "llm_processing").strip() or "llm_processing"
+    queue_tokens = [q.strip() for q in queue.split(",") if q.strip()]
     settings = Settings()
-    if queue == "llm_processing":
+    if "llm_processing" in queue_tokens or "flx_investigation" in queue_tokens:
         threads = int(getattr(settings, "task_queue_llm_worker_threads", 3) or 3)
-    elif queue == "source_load":
+    elif "source_load" in queue_tokens:
         threads = int(getattr(settings, "task_queue_source_worker_threads", 1) or 1)
     else:
         threads = int(os.getenv("TASK_QUEUE_WORKER_THREADS", "1") or 1)
@@ -38,7 +39,8 @@ def main() -> int:
         f"--concurrency={threads}",
     ]
     # prefork: кожен child-процес = окремий VllmRuntimeOrchestrator → дубль оренди Vast.
-    if queue == "llm_processing":
+    queue_tokens = [q.strip() for q in queue.split(",") if q.strip()]
+    if "llm_processing" in queue_tokens or "flx_investigation" in queue_tokens:
         cmd.append("--pool=threads")
     os.execvp(cmd[0], cmd)
     return 0

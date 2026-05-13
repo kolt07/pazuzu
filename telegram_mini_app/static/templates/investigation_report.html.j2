@@ -124,6 +124,29 @@
     .metric { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
     .metric .label { font-size: 12px; color: var(--muted); }
     .metric .value { font-weight: 600; font-size: 16px; margin-top: 2px; }
+    .parcels { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .parcel-row {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .parcel-row .cn { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-weight: 600; color: var(--accent); }
+    .parcel-row .meta { font-size: 13px; color: var(--muted); margin-top: 4px; display: flex; flex-wrap: wrap; gap: 12px; }
+    .parcel-row .meta span { white-space: nowrap; }
+    .parcel-row .meta b { color: var(--fg); font-weight: 600; }
+    .strategy-pill {
+      display: inline-block;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      background: var(--accent-soft);
+      color: var(--accent);
+      padding: 2px 8px;
+      border-radius: 999px;
+      margin-left: 8px;
+      vertical-align: middle;
+    }
     .warnings {
       background: var(--warn-bg);
       border: 1px solid var(--warn-border);
@@ -136,6 +159,40 @@
     .sources { margin-top: 20px; font-size: 13px; color: var(--muted); }
     .sources h3 { font-size: 14px; color: var(--fg); margin: 0 0 6px; }
     .sources ul { margin: 0; padding-left: 18px; }
+    .attachment-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin: 14px 0;
+      background: var(--bg);
+    }
+    .attachment-card h3 { margin: 0 0 8px; font-size: 16px; color: var(--fg); }
+    .attachment-card .att-desc { margin: 0 0 10px; font-size: 14px; color: var(--muted); }
+    .iframe-wrap {
+      margin-top: 10px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .iframe-wrap iframe {
+      width: 100%;
+      height: 420px;
+      border: 0;
+      display: block;
+    }
+    a.att-dl {
+      display: inline-block;
+      margin-top: 6px;
+      padding: 8px 14px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    a.att-dl:hover { text-decoration: underline; }
+    .att-note { font-size: 12px; color: var(--muted); margin-top: 8px; }
     footer {
       margin-top: 40px;
       padding-top: 14px;
@@ -150,7 +207,7 @@
   <div class="container">
     <header>
       <div class="badge">Flx · агент-інвестігейтор</div>
-      <h1>{{ report.title|default('Звіт розслідування', true)|e }}</h1>
+      <h1>{{ report.title|default('Звіт дослідження', true)|e }}</h1>
       <div class="meta">Згенеровано {{ generated_at|e }}</div>
     </header>
 
@@ -158,9 +215,34 @@
     <div class="summary">{{ report.executive_summary|e }}</div>
     {% endif %}
 
+    {% if report.attachments %}
+    <section class="flx-section" id="report-attachments">
+      <h2>Додатки до звіту</h2>
+      <p class="meta">Карти та таблиці зібрано автоматично з даних дослідження (кадастр / оголошення). Для відкриття файлів може знадобитися те саме посилання з токеном, що й для основного HTML.</p>
+      {% for a in report.attachments %}
+      <div class="attachment-card">
+        <h3>{{ a.title|e }}</h3>
+        {% if a.description %}<p class="att-desc">{{ a.description|e }}</p>{% endif %}
+        {% if a.kind == 'static_map' and a.artifact_id %}
+        <div class="map-wrap">
+          <img src="{{ artifact_href(a.artifact_id, a.download_token) }}" alt="{{ a.title|e }}" loading="lazy">
+        </div>
+        {% elif a.kind == 'html_map' and a.artifact_id %}
+        <div class="iframe-wrap">
+          <iframe src="{{ artifact_href(a.artifact_id, a.download_token) }}" title="{{ a.title|e }}" loading="lazy"></iframe>
+        </div>
+        <p class="att-note">Інтерактивна карта (Leaflet + OpenStreetMap). Потрібне підключення до інтернету.</p>
+        {% elif a.kind == 'csv' and a.artifact_id %}
+        <p><a class="att-dl" href="{{ artifact_href(a.artifact_id, a.download_token) }}">Завантажити CSV</a></p>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </section>
+    {% endif %}
+
     {% for section in report.sections %}
     <section class="flx-section" id="section-{{ section.id|e }}">
-      <h2>{{ section.title|e }}</h2>
+      <h2>{{ section.title|e }}{% if section.applied_strategy and section.applied_strategy != 'exact' %}<span class="strategy-pill" title="Стратегія fallback">{{ section.applied_strategy|e }}</span>{% endif %}</h2>
 
       {% if section.map_artifact_id %}
       <div class="map-wrap">
@@ -187,6 +269,27 @@
           {% if it.score is defined and it.score is not none and it.score != 0 %}
           <div class="score">Оцінка: {{ '%.2f'|format(it.score) }}</div>
           {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if section.parcels %}
+      <div class="parcels">
+        {% for p in section.parcels %}
+        <div class="parcel-row">
+          <div class="cn">{{ p.cadastral_number|e }}</div>
+          <div class="meta">
+            {% if p.area_sqm %}<span><b>{{ '{:,.0f}'.format(p.area_sqm|float).replace(',', ' ') }}</b> м²</span>{% endif %}
+            {% if p.purpose_label %}<span>{{ p.purpose_label|e }}</span>{% endif %}
+            {% if p.ownership_form %}<span>Власність: <b>{{ p.ownership_form|e }}</b></span>{% endif %}
+            {% if p.cluster_id and p.cluster_parcel_count and p.cluster_parcel_count > 1 %}
+            <span>Кластер: <b>{{ p.cluster_parcel_count }}</b> діл., {{ '{:,.0f}'.format(p.cluster_total_area_sqm|float).replace(',', ' ') }} м²</span>
+            {% endif %}
+            {% if p.centroid and p.centroid.latitude and p.centroid.longitude %}
+            <span><a href="https://www.google.com/maps?q={{ p.centroid.latitude }},{{ p.centroid.longitude }}" target="_blank" rel="noopener">на карті</a></span>
+            {% endif %}
+          </div>
         </div>
         {% endfor %}
       </div>

@@ -52,6 +52,16 @@ llm:
   #   google_search_grounding: false  # Google Search grounding — несумісний з function tools (langchain-google)
   #   include_thoughts: true    # Відображати хід думок у UI
   #   use_langgraph: false     # LangGraph state machine замість while-циклу (checkpoints, durable execution)
+  #   # Когнітивний шар (explicit state, Long Chain у Mongo, reflection, semantic memory після задачі)
+  #   cognitive_enabled: true
+  #   tool_retrieval_enabled: false   # true — Qdrant mcp_tools_vec + top-k перед bind_tools (потрібен TEI + Qdrant)
+  #   tool_retrieval_top_k: 14
+  #   tool_retrieval_core: [get_allowed_collections, get_data_dictionary, get_collection_info, get_database_schema]
+  #   reflection_enabled: true
+  #   reflection_every_n: 3           # після кожних N пакетів tool calls — критика (LangGraph + while loop)
+  #   reflect_on_tool_failure: true
+  #   chain_compression_threshold: 24
+  #   semantic_memory_enabled: true
   
   # API ключі для різних провайдерів
   api_keys:

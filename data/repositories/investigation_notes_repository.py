@@ -13,19 +13,24 @@ from datetime import datetime, timezone
 from data.repositories.base_repository import BaseRepository
 
 ALLOWED_KINDS = {
-    "thought",       # внутрішня думка перед дією
-    "observation",   # результат tool call (узагальнено)
-    "hypothesis",    # припущення/версія
-    "decision",      # вибір стратегії
-    "question",      # питання, яке агент задає собі/користувачу
-    "user_answer",   # відповідь користувача на ask_user
-    "tool_call",     # лог факту виклику інструмента
-    "tool_error",    # помилка виконання інструмента
+    "thought",            # внутрішня думка перед дією
+    "observation",        # результат tool call (узагальнено)
+    "hypothesis",         # припущення/версія
+    "decision",           # вибір стратегії
+    "question",           # питання, яке агент задає собі/користувачу
+    "user_answer",        # відповідь користувача на ask_user
+    "tool_call",          # лог факту виклику інструмента
+    "tool_error",         # помилка виконання інструмента
+    # Structured findings — додаткові «архівні» нотатки для reporter-агента:
+    # вони зберігають сирий результат тулзи з повним списком ділянок/оголошень,
+    # без труcncate observation-тексту.
+    "cadastral_finding",
+    "listings_finding",
 }
 
 
 class InvestigationNotesRepository(BaseRepository):
-    """Нотатки розслідувань Flx (короткостроковий записник)."""
+    """Нотатки досліджувань Flx (короткостроковий записник)."""
 
     def __init__(self):
         super().__init__("investigation_notes")
@@ -38,8 +43,15 @@ class InvestigationNotesRepository(BaseRepository):
         text: str,
         step_index: int = 0,
         tool_call_summary: Optional[Dict[str, Any]] = None,
+        strategy_id: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Додає одну нотатку. Повертає створений документ."""
+        """Додає одну нотатку. Повертає створений документ.
+
+        `payload` — опційний структурований словник (наприклад, повний результат
+        cadastral.search / listings.find_with_fallback із cadastral_numbers).
+        Використовується reporter-агентом, щоб не парсити обрізаний `text`.
+        """
         if kind not in ALLOWED_KINDS:
             raise ValueError(f"Invalid note kind: {kind}")
         now = datetime.now(timezone.utc)
@@ -51,8 +63,11 @@ class InvestigationNotesRepository(BaseRepository):
             "kind": kind,
             "text": (text or "")[:8000],
             "tool_call_summary": tool_call_summary or None,
+            "strategy_id": str(strategy_id)[:120] if strategy_id else None,
             "created_at": now,
         }
+        if isinstance(payload, dict) and payload:
+            doc["payload"] = payload
         result = self.collection.insert_one(doc)
         doc["_id"] = str(result.inserted_id)
         return doc
@@ -76,6 +91,23 @@ class InvestigationNotesRepository(BaseRepository):
             flt["kind"] = {"$in": list(kinds)}
         cur = self.collection.find(flt).sort([("seq", 1)]).limit(int(limit))
         out = []
+        for doc in cur:
+            doc["_id"] = str(doc["_id"])
+            out.append(doc)
+        return out
+
+    def list_latest_for_session(
+        self,
+        session_id: str,
+        limit: int = 40,
+        kinds: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Останні `limit` нотаток за seq (спочатку найновіші). Для анти-зациклення по тулах."""
+        flt: Dict[str, Any] = {"session_id": session_id}
+        if kinds:
+            flt["kind"] = {"$in": list(kinds)}
+        cur = self.collection.find(flt).sort([("seq", -1)]).limit(int(limit))
+        out: List[Dict[str, Any]] = []
         for doc in cur:
             doc["_id"] = str(doc["_id"])
             out.append(doc)
@@ -106,7 +138,12 @@ class InvestigationNotesRepository(BaseRepository):
             text = str(it.get("text") or "").strip()
             if len(text) > 320:
                 text = text[:320].rstrip() + "…"
-            lines.append(f"[#{seq} step={step} {kind}] {text}")
+            strat = str(it.get("strategy_id") or "").strip()
+            prefix = f"[#{seq} step={step} {kind}"
+            if strat:
+                prefix += f" st={strat}"
+            prefix += "] "
+            lines.append(prefix + text)
         return "\n".join(lines)
 
     def delete_for_session(self, session_id: str) -> int:

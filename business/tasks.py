@@ -105,6 +105,50 @@ def _safe_queue_heartbeat(queue: TaskQueueService, task_id: str, patch: Dict[str
         logger.debug("Task heartbeat update failed (task_id=%s)", task_id, exc_info=True)
 
 
+def _wake_up_flx_sessions_waiting_on(task_id: Optional[str]) -> None:
+    """Push-notify FLX-сесії, які чекали на цей source_load task_id.
+
+    Без цього сесії стоять у ``awaiting_sources`` до наступного 60-сек поллінга
+    в run_loop, тоді як source_load уже міг завершитися за частку секунди (skip/error).
+    """
+    if not task_id:
+        return
+    try:
+        from data.repositories.investigation_session_repository import (
+            InvestigationSessionRepository,
+        )
+        from business.services.orchestration_backend_service import (
+            get_orchestration_backend,
+        )
+
+        repo = InvestigationSessionRepository()
+        sessions = repo.list_awaiting_source_wait_task(task_id)
+        if not sessions:
+            return
+        settings = _init_runtime()
+        backend = get_orchestration_backend(settings)
+        for sess in sessions:
+            sid = str(sess.get("session_id") or "")
+            if not sid:
+                continue
+            try:
+                backend.enqueue(sid, countdown_sec=0)
+                logger.info(
+                    "[source_load] wake_up FLX session=%s task_id=%s",
+                    sid,
+                    task_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[source_load] wake_up failed for session=%s task_id=%s: %s",
+                    sid,
+                    task_id,
+                    e,
+                )
+    except Exception as e:
+        logger.warning("[source_load] wake-up scan failed for task_id=%s: %s", task_id, e)
+
+
 @celery_app.task(bind=True, name="business.tasks.run_source_load_pipeline_task")
 def run_source_load_pipeline_task(
     self,
@@ -126,6 +170,7 @@ def run_source_load_pipeline_task(
         msg = "Queue source_load is disabled by admin."
         if task_id:
             queue.mark_task_failed(task_id, msg)
+        _wake_up_flx_sessions_waiting_on(task_id)
         return {"success": False, "skipped": True, "reason": msg}
     if task_id:
         queue.mark_task_started(task_id)
@@ -163,11 +208,13 @@ def run_source_load_pipeline_task(
                 },
             )
             queue.mark_task_success(task_id, result=result)
+        _wake_up_flx_sessions_waiting_on(task_id)
         return result
     except Exception as e:
         logger.exception("Source-load task failed: %s", e)
         if task_id:
             queue.mark_task_failed(task_id, str(e))
+        _wake_up_flx_sessions_waiting_on(task_id)
         raise
 
 
@@ -315,7 +362,7 @@ def process_prozorro_llm_task(self, auction_id: str) -> Dict[str, Any]:
     max_retries=0,
 )
 def run_investigation_step(self, session_id: str) -> Dict[str, Any]:
-    """Виконує до max_steps_per_task ітерацій циклу розслідування Flx у фоновому процесі.
+    """Виконує до max_steps_per_task ітерацій циклу дослідження Flx у фоновому процесі.
 
     Якщо потрібно ще роботи — InvestigationService.run_loop() сам зробить re-enqueue
     цієї ж таски. Якщо досягнуто термінального стану (done/failed/awaiting_user/cancelled)
@@ -348,4 +395,18 @@ def run_investigation_step(self, session_id: str) -> Dict[str, Any]:
             InvestigationService(settings)._sessions.fail(session_id, str(e))
         except Exception:
             pass
+        return {"ok": False, "error": str(e)}
+
+
+@celery_app.task(name="business.tasks.cadastral_national_cluster_build_task")
+def cadastral_national_cluster_build_task(job_id: str, min_cluster_size: int = 2) -> Dict[str, Any]:
+    """Національна кластеризація по областях (черга source_load)."""
+    try:
+        from business.services.cadastral_national_cluster_job_runner import (
+            run_national_cluster_build_job,
+        )
+
+        return run_national_cluster_build_job(str(job_id), int(min_cluster_size or 2))
+    except Exception as e:
+        logger.exception("cadastral_national_cluster_build_task failed: %s", e)
         return {"ok": False, "error": str(e)}

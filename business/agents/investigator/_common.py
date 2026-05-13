@@ -65,42 +65,67 @@ def call_llm_json(
         return {}
     if not raw or not raw.strip():
         return {}
-    json_text = _extract_json(raw)
-    if not json_text:
-        return {}
-    try:
-        data = json.loads(json_text)
-    except json.JSONDecodeError as e:
-        logger.warning("[%s] Invalid JSON from LLM: %s; raw: %s", caller, e, raw[:200])
+    data = _parse_first_json_object(raw)
+    if data is None:
+        logger.warning("[%s] Invalid JSON from LLM (no parseable object); raw: %s", caller, raw[:300])
         return {}
     if not isinstance(data, dict):
         return {}
     return data
 
 
-def _extract_json(text: str) -> str:
-    """Витягує перший JSON-об'єкт з тексту LLM (підтримує markdown-код-блоки)."""
+def _strip_markdown_fence(text: str) -> str:
+    """Прибирає ``` … ``` оболонку, якщо вона є. Залишає лише вміст."""
     text = (text or "").strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        json_lines = []
-        in_json = False
-        for line in lines:
-            if line.strip().startswith("```"):
-                if not in_json:
-                    in_json = True
-                else:
-                    break
+    if not text.startswith("```"):
+        return text
+    lines = text.split("\n")
+    json_lines: list = []
+    in_block = False
+    for line in lines:
+        if line.strip().startswith("```"):
+            if not in_block:
+                in_block = True
                 continue
-            if in_json:
-                json_lines.append(line)
-        return "\n".join(json_lines).strip()
-    if "{" in text:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return text[start : end + 1]
-    return text
+            break
+        if in_block:
+            json_lines.append(line)
+    return "\n".join(json_lines).strip()
+
+
+def _parse_first_json_object(text: str) -> Optional[Any]:
+    """Витягує і парсить ПЕРШИЙ top-level JSON-об'єкт з тексту.
+
+    LLM іноді повертає два JSON-об'єкти підряд або хвіст пояснень після JSON:
+    ``json.loads`` падає на 'Extra data'. Використовуємо ``raw_decode``: він
+    парсить рівно один об'єкт від поточної позиції; усе, що після — ігнорується.
+
+    Повертає Python-структуру або None, якщо парс невдалий.
+    """
+    body = _strip_markdown_fence(text)
+    if not body:
+        return None
+    decoder = json.JSONDecoder()
+    start = body.find("{")
+    if start < 0:
+        # Можливо, top-level — масив. Підтримуємо обидва варіанти на всякий випадок.
+        start = body.find("[")
+        if start < 0:
+            return None
+    body = body[start:]
+    try:
+        obj, _end = decoder.raw_decode(body)
+        return obj
+    except json.JSONDecodeError as e:
+        logger.debug("raw_decode failed at first attempt: %s; body[:200]=%s", e, body[:200])
+        # Спроба: оригінал міг містити trailing-кому або bare control chars — спробуємо
+        # дуже консервативну санітизацію.
+        cleaned = body.replace("\r", "")
+        try:
+            obj, _end = decoder.raw_decode(cleaned)
+            return obj
+        except json.JSONDecodeError:
+            return None
 
 
 def render_template(template: str, **kwargs: Any) -> str:

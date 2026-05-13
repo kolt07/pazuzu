@@ -431,6 +431,11 @@ class LangChainAgentService:
         self.excel_generated = False
         # Метрики останнього запиту (для observability): iterations, duration_seconds, tool_failures_count, tool_recovery_attempted
         self._last_request_metrics: Dict[str, Any] = {}
+        # Когнітивний шар (explicit state + long chain) для поточного запиту
+        self._cognitive_state_session: Optional[Dict[str, Any]] = None
+        self._last_chain_step_id: Optional[str] = None
+        self._while_loop_tool_rounds: int = 0
+        self._tool_index_ensured: bool = False
     
     def _create_llm(self):
         """Створює базовий LLM (без thinking) для summarize, fallback та інших випадків."""
@@ -520,6 +525,181 @@ class LangChainAgentService:
         if time_budget_exceeded:
             m["time_budget_exceeded"] = True
         return m
+
+    def _apply_tool_retrieval(self, tools_for_request: List[Any], user_query: str) -> List[Any]:
+        """Semantic top-k tools + core allow-list; fallback — повний список."""
+        if not getattr(self.settings, "llm_agent_tool_retrieval_enabled", False):
+            return tools_for_request
+        try:
+            from business.services.tool_semantic_index_service import ToolSemanticIndexService
+
+            ts = ToolSemanticIndexService(self.settings)
+            if not ts.is_configured:
+                return tools_for_request
+            if not self._tool_index_ensured:
+                if ts.collection_point_count() < max(3, len(self.tools) // 4):
+                    synced = ts.sync_tools(self.tools)
+                    logger.info("ToolSemanticIndexService: initial sync %s points", synced)
+                self._tool_index_ensured = True
+            allowed = {t.name for t in tools_for_request}
+            top_k = int(getattr(self.settings, "llm_agent_tool_retrieval_top_k", 14) or 14)
+            names = ts.retrieve_tool_names(user_query or "", allowed_names=allowed, top_k=top_k)
+            core = set(getattr(self.settings, "llm_agent_tool_retrieval_core", []) or [])
+            pick = core | set(names)
+            selected = [t for t in tools_for_request if t.name in pick]
+            if len(selected) < min(5, len(tools_for_request)):
+                return tools_for_request
+            return selected
+        except Exception as e:
+            logger.debug("tool retrieval: %s", e)
+            return tools_for_request
+
+    def _cognitive_merge_after_tools_while_loop(self, summaries: List[Tuple[str, bool, str]], iteration: int) -> None:
+        """Оновлює session cognitive після пакета tool calls (while loop)."""
+        if not getattr(self.settings, "llm_agent_cognitive_enabled", True):
+            return
+        base = self._cognitive_state_session or {}
+        cog, sid = self._cognitive_persist_tool_batch(base, summaries, iteration)
+        self._cognitive_state_session = cog
+        if sid:
+            self._last_chain_step_id = sid
+
+    def _cognitive_merge_after_tools_langgraph(
+        self, cognitive_in: Dict[str, Any], summaries: List[Tuple[str, bool, str]], state: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Використовується з LangGraph tool_node."""
+        if not getattr(self.settings, "llm_agent_cognitive_enabled", True):
+            return cognitive_in, None
+        it = int(state.get("iteration") or 0)
+        cog, sid = self._cognitive_persist_tool_batch(dict(cognitive_in or {}), summaries, it)
+        return cog, sid
+
+    def _cognitive_persist_tool_batch(
+        self, base: Dict[str, Any], summaries: List[Tuple[str, bool, str]], iteration: int
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        from business.domain.cognitive_agent_models import LongChainStepRecord
+        from business.services.cognitive_runtime_service import make_chain_step_id, merge_after_tools
+        from data.repositories.agent_activity_log_repository import AgentActivityLogRepository
+        from data.repositories.agent_reasoning_chain_repository import AgentReasoningChainRepository
+
+        out = merge_after_tools(base, summaries)
+        req = self._current_request_id
+        uid = self._current_user_id
+        sid: Optional[str] = None
+        if req:
+            try:
+                sid = make_chain_step_id()
+                parent = self._last_chain_step_id
+                obs = " | ".join(f"{n}:{x}" for n, _, x in summaries)[:6000]
+                step = LongChainStepRecord(
+                    step_id=sid,
+                    parent_step_id=parent,
+                    goal=str(out.get("goal", ""))[:800],
+                    action="; ".join(n for n, _, _ in summaries)[:800],
+                    observation=obs,
+                    conclusion="",
+                    confidence=float(out.get("confidence") or 0.5),
+                    derived_knowledge="",
+                    next_options="",
+                    iteration=iteration,
+                )
+                AgentReasoningChainRepository().append_step(step.to_mongo_doc(req, uid))
+                AgentActivityLogRepository().log(
+                    request_id=req,
+                    user_id=uid,
+                    agent_name="langchain_agent",
+                    step=AgentActivityLogRepository.STEP_ACTION,
+                    payload={"kind": "cognitive_tool_batch", "step_id": sid, "tools": [x[0] for x in summaries]},
+                )
+            except Exception as e:
+                logger.debug("cognitive persist batch: %s", e)
+                sid = None
+        if sid:
+            self._last_chain_step_id = sid
+        return out, sid
+
+    def _cognitive_build_reflection_message(self, messages: List[Any], cognitive: Dict[str, Any]) -> str:
+        """Текст критики для вузла reflection (українською)."""
+        tail: List[str] = []
+        for m in messages[-10:]:
+            if isinstance(m, ToolMessage):
+                c = getattr(m, "content", "") or ""
+                tail.append(str(c)[:1800])
+        tail_s = "\n---\n".join(tail) if tail else "(немає недавніх ToolMessage)"
+        cog_bits = {
+            "completed_steps": (cognitive or {}).get("completed_steps", [])[-6:],
+            "unknowns": (cognitive or {}).get("unknowns", [])[-5:],
+            "last_tool_failed": (cognitive or {}).get("last_tool_failed"),
+        }
+        prompt = (
+            "[REFLECTION / CRITIQUE]\n"
+            "Проаналізуй останні результати інструментів і внутрішній стан.\n"
+            "Що слабке, чого бракує доказів, які альтернативні кроки варто зробити далі?\n"
+            "Відповідь КОРОТКО українською (до 8 речень). Без JSON, без виклику інструментів.\n\n"
+            f"Останні результати (уривки):\n{tail_s}\n\n"
+            f"Стан (скорочено): {json.dumps(cog_bits, ensure_ascii=False, default=str)[:2500]}"
+        )
+        try:
+            resp = self.llm.invoke([HumanMessage(content=prompt)])
+            txt = _aimessage_to_response_text(resp)
+            if txt and txt.strip():
+                return "[Reflection / критика]\n" + txt.strip()
+        except Exception as e:
+            logger.debug("reflection llm: %s", e)
+        return (
+            "[Reflection / критика]\n"
+            "Перевір невизначеності та при потребі зміни фільтри або інструмент. "
+            "Якщо були помилки — спочатку schema/get_distinct_values або execute_analytics."
+        )
+
+    def _cognitive_maybe_reflect_while_loop(self, log_ctx: str) -> None:
+        """Після пакета tools — періодична reflection у while loop."""
+        if not getattr(self.settings, "llm_agent_cognitive_enabled", True):
+            return
+        if not getattr(self.settings, "llm_agent_reflection_enabled", True):
+            return
+        tr = self._while_loop_tool_rounds
+        every_n = max(1, int(getattr(self.settings, "llm_agent_reflection_every_n", 3) or 3))
+        cog = self._cognitive_state_session or {}
+        failed = bool(cog.get("last_tool_failed"))
+        do_reflect = (failed and getattr(self.settings, "llm_agent_reflect_on_tool_failure", True)) or (
+            tr > 0 and tr % every_n == 0
+        )
+        if not do_reflect:
+            return
+        msg = self._cognitive_build_reflection_message(self.conversation_history, cog)
+        if msg:
+            self.conversation_history.append(HumanMessage(content=msg))
+            logger.info("%sДодано reflection-повідомлення (while loop, tool_rounds=%s)", log_ctx, tr)
+
+    def _cognitive_finalize_session(self, user_query: str, final_text: str, log_ctx: str) -> None:
+        """Compression long chain + semantic memory (best-effort)."""
+        req = self._current_request_id
+        uid = self._current_user_id
+        if not req or not getattr(self.settings, "llm_agent_cognitive_enabled", True):
+            return
+        try:
+            from business.services.cognitive_supervisor_service import CognitiveSupervisorService
+
+            sup = CognitiveSupervisorService()
+            thr = int(getattr(self.settings, "llm_agent_chain_compression_threshold", 24) or 24)
+
+            def _llm_txt(p: str) -> str:
+                r = self.llm.invoke([HumanMessage(content=p)])
+                return _aimessage_to_response_text(r) or ""
+
+            sup.compress_chain_if_needed(request_id=req, threshold=thr, llm_invoke=_llm_txt)
+            if getattr(self.settings, "llm_agent_semantic_memory_enabled", True) and (final_text or "").strip():
+                sup.distill_and_store(
+                    request_id=req,
+                    user_id=uid,
+                    user_query=user_query or "",
+                    final_answer=final_text,
+                    cognitive=self._cognitive_state_session,
+                    llm_invoke=_llm_txt,
+                )
+        except Exception as e:
+            logger.debug("%scognitive finalize: %s", log_ctx, e)
 
     def _summarize_exchanges(self, exchanges: List[Tuple[str, str]]) -> str:
         """Саммарізує список обмінів (ConversationSummaryMemory-стиль) через LLM."""
@@ -2470,12 +2650,18 @@ Important: Use terms from the glossary correctly."""
         if reply_to_text:
             logger.info("%sКористувач відповідає на повідомлення: %s...", log_ctx, (reply_to_text[:80] if reply_to_text else ""))
         logger.info("="*80)
+        result_text = ""
         try:
-            return self._process_query_impl(
+            result_text = self._process_query_impl(
                 user_query, user_id, chat_id, listing_context, stream_callback, thinking_callback,
                 reply_to_text, req_id, log_ctx, start_time, route,
             )
+            return result_text
         finally:
+            try:
+                self._cognitive_finalize_session(user_query, result_text or "", log_ctx)
+            except Exception:
+                pass
             self._current_request_id = None
             self._current_user_id = None
             self._current_chat_id = None
@@ -2502,10 +2688,22 @@ Important: Use terms from the glossary correctly."""
         from business.services.langgraph_agent_runner import build_agent_graph
         max_iter = getattr(self.settings, 'llm_agent_max_iterations', self.MAX_ITERATIONS)
         graph = build_agent_graph(self, list(tools_for_request), max_iterations=max_iter)
-        initial = {"messages": list(self.conversation_history), "iteration": 0}
+        from business.services.cognitive_runtime_service import initial_cognitive_from_user_query
+
+        cog = self._cognitive_state_session or initial_cognitive_from_user_query(user_query)
+        self._cognitive_state_session = dict(cog)
+        initial = {
+            "messages": list(self.conversation_history),
+            "iteration": 0,
+            "cognitive": dict(cog),
+            "tool_rounds": 0,
+        }
         result = graph.invoke(initial)
         messages = result.get("messages", [])
         iteration = result.get("iteration", 0)
+        cognitive_out = result.get("cognitive")
+        if isinstance(cognitive_out, dict):
+            self._cognitive_state_session = cognitive_out
         # Витягуємо останню текстову відповідь
         for msg in reversed(messages):
             if isinstance(msg, AIMessage) and hasattr(msg, 'content') and msg.content:
@@ -2552,6 +2750,7 @@ Important: Use terms from the glossary correctly."""
     ) -> str:
         """Внутрішня реалізація process_query (для єдиного finally зверху)."""
         tools_for_request = self.get_tools_for_route(route or "free_form")
+        tools_for_request = self._apply_tool_retrieval(tools_for_request, user_query)
         time_budget_seconds = getattr(self.settings, "llm_agent_time_budget_seconds", None)
         # Валідація запиту
         is_valid, error_msg = self._validate_query(user_query)
@@ -2562,6 +2761,14 @@ Important: Use terms from the glossary correctly."""
         self.current_user_query = user_query
         self.excel_generated = False
         self.conversation_history = []
+        self._cognitive_state_session = None
+        self._last_chain_step_id = None
+        self._while_loop_tool_rounds = 0
+        self._tool_index_ensured = False
+        if getattr(self.settings, "llm_agent_cognitive_enabled", True):
+            from business.services.cognitive_runtime_service import initial_cognitive_from_user_query
+
+            self._cognitive_state_session = initial_cognitive_from_user_query(user_query)
         
         # Пам'ять: при chat_id — з ChatSessionRepository (персистентна); інакше — in-memory (user_id)
         memory_key = f"{user_id}:{chat_id}" if (user_id and chat_id) else (user_id or "default")
@@ -2741,9 +2948,16 @@ Important: Use terms from the glossary correctly."""
                 logger.info("%sВідправляю запит до LLM...", log_ctx)
                 last_err = None
                 response = None
+                invoke_msgs = list(self.conversation_history)
+                if getattr(self.settings, "llm_agent_cognitive_enabled", True) and self._cognitive_state_session:
+                    from business.services.cognitive_runtime_service import format_cognitive_for_prompt
+
+                    _cog_block = format_cognitive_for_prompt(self._cognitive_state_session)
+                    if _cog_block:
+                        invoke_msgs = [SystemMessage(content=_cog_block)] + invoke_msgs
                 for attempt in range(AGENT_LLM_RETRY_ATTEMPTS + 1):
                     try:
-                        response = llm_with_tools.invoke(self.conversation_history)
+                        response = llm_with_tools.invoke(invoke_msgs)
                         break
                     except Exception as e:
                         last_err = e
@@ -2856,6 +3070,7 @@ Important: Use terms from the glossary correctly."""
                 
                 # Виконуємо tools
                 tool_messages = []
+                cognitive_batch_summaries: List[Tuple[str, bool, str]] = []
                 for tool_call in tool_calls:
                     # Обробляємо різні формати tool_call
                     if isinstance(tool_call, dict):
@@ -3154,9 +3369,22 @@ Important: Use terms from the glossary correctly."""
                         tool_call_id=tool_call_id
                     )
                     tool_messages.append(tool_message)
+                    try:
+                        from business.services.cognitive_runtime_service import summarize_tool_result_for_chain
+
+                        ok = not (isinstance(tool_result, dict) and tool_result.get("success") is False)
+                        cognitive_batch_summaries.append(
+                            (tool_name, ok, summarize_tool_result_for_chain(tool_result))
+                        )
+                    except Exception:
+                        cognitive_batch_summaries.append((tool_name, False, ""))
                 
                 # Додаємо результати tools до історії
                 self.conversation_history.extend(tool_messages)
+                if cognitive_batch_summaries:
+                    self._cognitive_merge_after_tools_while_loop(cognitive_batch_summaries, iteration)
+                self._while_loop_tool_rounds += 1
+                self._cognitive_maybe_reflect_while_loop(log_ctx)
                 
                 # Продовжуємо цикл для отримання наступної відповіді
                 continue

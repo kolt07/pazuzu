@@ -87,3 +87,23 @@ class CadastralParcelLocationIndexRepository(BaseRepository):
     def count_total(self) -> int:
         """Загальна кількість записів у індексі."""
         return self.collection.count_documents({})
+
+    def distinct_oblast_codes(self) -> List[str]:
+        """Унікальні коди області для партиційної кластеризації."""
+        try:
+            raw = self.collection.distinct("oblast_code", {"oblast_code": {"$nin": [None, ""]}})
+        except Exception:
+            return []
+        out = sorted({str(x).strip() for x in raw if x and str(x).strip()})
+        return out
+
+    def cadastral_numbers_for_oblast(self, oblast_code: str) -> List[str]:
+        """Усі кадастрові номери з індексу для області."""
+        oc = str(oblast_code or "").strip()
+        if not oc:
+            return []
+        try:
+            cur = self.collection.find({"oblast_code": oc}, {"cadastral_number": 1})
+            return [str(d["cadastral_number"]).strip() for d in cur if d.get("cadastral_number")]
+        except Exception:
+            return []

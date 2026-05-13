@@ -387,6 +387,10 @@ def download_artifact(request: Request, artifact_id: str, token: str = None):
         media_type = "text/html"
     elif artifact_type == "static_map":
         media_type = "image/png"
+    elif artifact_type in ("report_attachment_html", "html_attachment"):
+        media_type = "text/html"
+    elif artifact_type == "report_attachment_csv":
+        media_type = "text/csv"
     else:
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 

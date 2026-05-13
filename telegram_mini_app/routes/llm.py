@@ -67,6 +67,8 @@ def _get_user_id_and_services(request: Request):
         try:
             from data.database.connection import MongoDBConnection
             MongoDBConnection.initialize(request.app.state.settings)
+            from business.services.agent_runtime_settings_service import AgentRuntimeSettingsService
+            AgentRuntimeSettingsService().apply_mongo_to_settings(request.app.state.settings)
             from business.services.multi_agent_service import MultiAgentService
             logging_svc = request.app.state.logging_service
 

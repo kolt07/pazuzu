@@ -2,7 +2,7 @@
 """
 Репозиторій flx_lessons_learned — довгострокова пам'ять агента Flx.
 
-Кожен запис містить узагальнення попереднього розслідування: що працювало, що ні,
+Кожен запис містить узагальнення попереднього дослідження: що працювало, що ні,
 які стратегії радити в схожих кейсах. Пошук — через MongoDB $text і опційно
 through cosine на полі embedding (in-process).
 """
@@ -14,7 +14,7 @@ from data.repositories.base_repository import BaseRepository
 
 
 class FlxLessonsRepository(BaseRepository):
-    """Підсумки попередніх розслідувань для самовдосконалення Flx."""
+    """Підсумки попередніх досліджувань для самовдосконалення Flx."""
 
     def __init__(self):
         super().__init__("flx_lessons_learned")

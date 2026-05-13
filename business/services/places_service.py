@@ -14,8 +14,15 @@ from config.settings import Settings
 logger = logging.getLogger(__name__)
 
 PLACES_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
+# Place Details (New): https://developers.google.com/maps/documentation/places/web-service/place-details
+PLACES_DETAIL_BASE = "https://places.googleapis.com/v1/places"
 DEFAULT_TIMEOUT = 15
 DEFAULT_LANGUAGE = "uk"
+
+# Мінімальний набір для меж топоніма (FieldMask обов'язковий для Places API New)
+PLACE_DETAILS_FIELD_MASK_BOUNDARY = (
+    "id,formattedAddress,types,location,viewport,addressComponents"
+)
 
 # Поля для FieldMask (мінімальний набір для аналізу)
 DEFAULT_FIELD_MASK = "places.displayName,places.formattedAddress,places.types,places.location"
@@ -152,3 +159,78 @@ class PlacesService:
             "count": len(places),
             "error": None,
         }
+
+    def get_place_details(
+        self,
+        place_id: str,
+        field_mask: Optional[str] = None,
+        language: str = DEFAULT_LANGUAGE,
+    ) -> Dict[str, Any]:
+        """
+        Place Details (New): GET places/{place_id}.
+        place_id — рядок з Geocoding (напр. ChIJ...); додається префікс places/ у шляху.
+        """
+        raw = (place_id or "").strip()
+        if not raw:
+            return {"success": False, "place": None, "error": "place_id порожній"}
+        # GET https://places.googleapis.com/v1/places/ChIJ...
+        pid = raw.removeprefix("places/")
+        url = f"{PLACES_DETAIL_BASE}/{pid}"
+
+        api_key = (self._settings.google_maps_api_key or "").strip()
+        if not api_key:
+            return {
+                "success": False,
+                "place": None,
+                "error": "GOOGLE_MAPS_API_KEY не налаштовано",
+            }
+
+        mask = (field_mask or PLACE_DETAILS_FIELD_MASK_BOUNDARY).strip()
+        headers = {
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": mask,
+        }
+        params = {"languageCode": language}
+        try:
+            resp = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=DEFAULT_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.warning("Places get_place_details failed: %s place_id=%r", e, raw[:40])
+            return {"success": False, "place": None, "error": str(e)}
+
+        viewport_ll = None
+        vp = data.get("viewport") or {}
+        low = vp.get("low") or {}
+        high = vp.get("high") or {}
+        if low and high:
+            try:
+                viewport_ll = {
+                    "southwest": {
+                        "latitude": float(low.get("latitude")),
+                        "longitude": float(low.get("longitude")),
+                    },
+                    "northeast": {
+                        "latitude": float(high.get("latitude")),
+                        "longitude": float(high.get("longitude")),
+                    },
+                }
+            except (TypeError, ValueError):
+                viewport_ll = None
+
+        loc = data.get("location") or {}
+        place_out: Dict[str, Any] = {
+            "id": data.get("id") or f"places/{pid}",
+            "formatted_address": data.get("formattedAddress") or "",
+            "types": data.get("types") or [],
+            "latitude": loc.get("latitude"),
+            "longitude": loc.get("longitude"),
+            "viewport_latlng": viewport_ll,
+            "address_components": data.get("addressComponents") or [],
+        }
+        return {"success": True, "place": place_out, "error": None}

@@ -28,6 +28,7 @@ class CadastralParcelClustersRepository(BaseRepository):
         centroid: Optional[Dict[str, Any]] = None,
         bounds: Optional[Dict[str, Any]] = None,
         total_area_sqm: Optional[float] = None,
+        partition_key: Optional[str] = None,
     ) -> bool:
         """
         Створює або оновлює кластер.
@@ -57,6 +58,8 @@ class CadastralParcelClustersRepository(BaseRepository):
             doc["bounds"] = bounds
         if total_area_sqm is not None:
             doc["total_area_sqm"] = total_area_sqm
+        if partition_key:
+            doc["partition_key"] = str(partition_key).strip()
 
         result = self.collection.update_one(
             {"cluster_id": cluster_id},
@@ -111,6 +114,17 @@ class CadastralParcelClustersRepository(BaseRepository):
             self.collection.create_index([("centroid", "2dsphere")])
         except Exception:
             pass
+        try:
+            self.collection.create_index("partition_key")
+        except Exception:
+            pass
+
+    def delete_by_partition_key(self, partition_key: str) -> int:
+        """Видаляє кластери партиції перед повторною побудовою."""
+        if not partition_key or not str(partition_key).strip():
+            return 0
+        r = self.collection.delete_many({"partition_key": str(partition_key).strip()})
+        return int(r.deleted_count)
 
     def count_total(self) -> int:
         """Загальна кількість кластерів."""
@@ -120,3 +134,64 @@ class CadastralParcelClustersRepository(BaseRepository):
         """Видаляє всі кластери. Повертає кількість видалених."""
         result = self.collection.delete_many({})
         return result.deleted_count
+
+    def find_clusters_near(
+        self,
+        latitude: float,
+        longitude: float,
+        radius_meters: float,
+        purpose: Optional[str] = None,
+        purpose_label: Optional[str] = None,
+        ownership_form: Optional[str] = None,
+        purpose_contains: Optional[str] = None,
+        purpose_label_contains: Optional[str] = None,
+        ownership_form_contains: Optional[str] = None,
+        min_parcel_count: int = 1,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Кластери у радіусі від точки через `$geoWithin: $centerSphere` по `centroid`.
+
+        Геометрія centroid — GeoJSON Point. Конверсія радіуса:
+            radians = meters / 6378100
+        """
+        try:
+            lat = float(latitude)
+            lng = float(longitude)
+            radius_m = max(0.0, float(radius_meters))
+        except (TypeError, ValueError):
+            return []
+        if radius_m <= 0:
+            return []
+        radius_rad = radius_m / 6378100.0
+
+        import re as _re
+
+        criteria: Dict[str, Any] = {
+            "centroid": {
+                "$geoWithin": {"$centerSphere": [[lng, lat], radius_rad]},
+            },
+            "parcel_count": {"$gte": max(1, int(min_parcel_count or 1))},
+        }
+        if purpose:
+            criteria["purpose"] = str(purpose).strip()
+        if purpose_label:
+            criteria["purpose_label"] = str(purpose_label).strip()
+        if ownership_form:
+            criteria["ownership_form"] = str(ownership_form).strip()
+        if purpose_contains:
+            criteria["purpose"] = {"$regex": _re.escape(str(purpose_contains).strip()), "$options": "i"}
+        if purpose_label_contains:
+            criteria["purpose_label"] = {"$regex": _re.escape(str(purpose_label_contains).strip()), "$options": "i"}
+        if ownership_form_contains:
+            criteria["ownership_form"] = {"$regex": _re.escape(str(ownership_form_contains).strip()), "$options": "i"}
+
+        cursor = self.collection.find(criteria).limit(max(1, int(limit or 50)))
+        out: List[Dict[str, Any]] = []
+        for d in cursor:
+            if not d:
+                continue
+            if "_id" in d:
+                d["_id"] = str(d["_id"])
+            out.append(d)
+        return out

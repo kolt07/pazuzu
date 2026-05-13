@@ -19,7 +19,7 @@ from business.services.user_service import UserService
 from business.services.prozorro_service import ProZorroService
 from business.services.logging_service import LoggingService
 
-from telegram_mini_app.routes import me, llm, admin, files, search, feedback, report_templates, analytics, investigation
+from telegram_mini_app.routes import me, llm, admin, files, search, feedback, report_templates, analytics, investigation, mini_app_chats
 
 
 def _get_static_file_version(static_dir: Path) -> str:
@@ -73,6 +73,15 @@ def create_app(settings: Settings) -> FastAPI:
     app.add_middleware(CacheControlMiddleware)
 
     app.state.settings = settings
+    # Runtime-прапорці агента з Mongo (наприклад tool retrieval для Mini App)
+    try:
+        from data.database.connection import MongoDBConnection
+        from business.services.agent_runtime_settings_service import AgentRuntimeSettingsService
+
+        MongoDBConnection.initialize(settings)
+        AgentRuntimeSettingsService().apply_mongo_to_settings(settings)
+    except Exception:
+        pass
     app.state.bot_token = settings.telegram_bot_token or ""
     app.state.user_service = UserService(settings.telegram_users_config_path)
     app.state.prozorro_service = ProZorroService(settings)
@@ -89,6 +98,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(report_templates.router)
     app.include_router(analytics.router)
     app.include_router(investigation.router)
+    app.include_router(mini_app_chats.router)
 
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():

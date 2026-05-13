@@ -417,7 +417,13 @@ class GeminiLLMProvider(BaseLLMProvider):
         system_prompt: Optional[str] = None,
         temperature: float = 0.0,
     ) -> str:
-        """Генерує текст за промптом (Gemini API)."""
+        """Генерує текст за промптом (Gemini API).
+
+        У разі помилки повертає порожній рядок, але обов'язково логує реальну причину
+        (HTTP-код / повідомлення з тіла відповіді), щоб у консолі було видно різницю між
+        квотою, доступом до моделі та іншими помилками. Реальний текст помилки додатково
+        зберігається в ``self._last_response_text`` у форматі ``[error] ...``.
+        """
         self.rate_limiter.wait_if_needed()
         full_content = prompt
         if system_prompt:
@@ -438,8 +444,46 @@ class GeminiLLMProvider(BaseLLMProvider):
             self._last_response_text = out
             return out
         except Exception as e:
-            self._last_response_text = f"[error] {e!s}"
+            err_repr = self._format_gemini_error(e)
+            self._last_response_text = f"[error] {err_repr}"
+            logger.warning(
+                "[gemini] generate_text failed model=%s temperature=%s err=%s",
+                self.model_name,
+                temperature,
+                err_repr,
+            )
             return ""
+
+    @staticmethod
+    def _format_gemini_error(exc: BaseException) -> str:
+        """Форматує помилку Gemini у вигляді ``<HTTP_CODE> <STATUS> <MESSAGE>`` коли можливо."""
+        try:
+            code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            status = getattr(exc, "status", None)
+            message = getattr(exc, "message", None) or str(exc)
+            response = getattr(exc, "response", None)
+            body = None
+            if response is not None:
+                try:
+                    body = response.json()
+                except Exception:
+                    body = getattr(response, "text", None)
+            if isinstance(body, dict):
+                err = body.get("error") if isinstance(body.get("error"), dict) else None
+                if err:
+                    code = code or err.get("code")
+                    status = status or err.get("status")
+                    message = err.get("message") or message
+            parts = []
+            if code is not None:
+                parts.append(str(code))
+            if status:
+                parts.append(str(status))
+            if message:
+                parts.append(str(message)[:600])
+            return " ".join(parts) if parts else f"{type(exc).__name__}: {exc!s}"[:600]
+        except Exception:
+            return f"{type(exc).__name__}: {exc!s}"[:600]
 
 
 class OpenAILLMProvider(BaseLLMProvider):
@@ -1394,7 +1438,7 @@ class LLMService:
         temperature: Optional[float] = None,
         _caller: Optional[str] = None,
     ) -> str:
-        """Генерує текст через провайдера Flx (intent → JSON або вільний текст для розслідувань)."""
+        """Генерує текст через провайдера Flx (intent → JSON або вільний текст для досліджувань)."""
         provider = self.get_investigator_provider()
         if not hasattr(provider, "generate_text"):
             return ""

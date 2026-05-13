@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Репозиторій investigation_events — capped-колекція з подіями розслідувань для SSE.
+Репозиторій investigation_events — capped-колекція з подіями досліджувань для SSE.
 
 Воркер пушить події (status, note, question, done, error), а API-роут SSE
 читає їх tail-cursor'ом за session_id, повертаючи кожну подію з її `seq`.
@@ -25,13 +25,13 @@ ALLOWED_EVENT_TYPES = {
     "question",     # потрібна відповідь користувача (ask_user)
     "answer",       # підтвердження прийняття відповіді користувача
     "report",       # фінальний артефакт звіту
-    "done",         # розслідування завершено
+    "done",         # дослідження завершено
     "error",        # помилка
 }
 
 
 class InvestigationEventRepository(BaseRepository):
-    """Capped-колекція подій розслідування для SSE-каналу."""
+    """Capped-колекція подій дослідження для SSE-каналу."""
 
     def __init__(self):
         super().__init__("investigation_events")
@@ -97,7 +97,7 @@ class InvestigationEventRepository(BaseRepository):
 
         Yields кожну нову подію цієї сесії. Якщо `max_wait_seconds` минуло без
         нових подій — генератор завершується (клієнт може перепідключитись).
-        Терміна завершення розслідування не перевіряємо — це робить роут.
+        Терміна завершення дослідження не перевіряємо — це робить роут.
         """
         try:
             from pymongo import CursorType

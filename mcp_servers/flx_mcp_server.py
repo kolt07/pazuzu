@@ -64,10 +64,10 @@ def note_write(
     step_index: int = 0,
     tool_call_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Записує нотатку (думку/спостереження/гіпотезу/рішення) для активного розслідування.
+    """Записує нотатку (думку/спостереження/гіпотезу/рішення) для активного дослідження.
 
     Args:
-        session_id: Ідентифікатор сесії розслідування.
+        session_id: Ідентифікатор сесії дослідження.
         kind: Тип нотатки: thought | observation | hypothesis | decision | question.
         text: Сама нотатка українською. До 8000 символів.
         step_index: Номер поточного кроку плану (0 — поза кроками).
@@ -131,7 +131,7 @@ def lessons_save(
     recommendations: List[str],
     related_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Зберігає lesson-learned. Зазвичай викликається в кінці розслідування з результату Reflection."""
+    """Зберігає lesson-learned. Зазвичай викликається в кінці дослідження з результату Reflection."""
     try:
         _init()
         lesson_id = _lessons_repo.add_lesson(
@@ -164,7 +164,7 @@ def static_map_render(
     """Рендерить Google Static Maps PNG і повертає artifact_id для подальшого вбудовування у звіт.
 
     Args:
-        session_id: ID розслідування (для прив'язки артефакта в логах).
+        session_id: ID дослідження (для прив'язки артефакта в логах).
         user_id: Користувач-власник (для TTL та доступу).
         center_lat / center_lng: Центр карти (опц.; альтернатива bbox).
         bbox: [min_lat, min_lng, max_lat, max_lng] (опц.; якщо без center).
@@ -210,7 +210,7 @@ def ask_user(
 ) -> Dict[str, Any]:
     """Записує відкрите питання у потік подій і переводить сесію в стан awaiting_user.
 
-    Викликач (executor розслідування) має після цього зупинити цикл і чекати на
+    Викликач (executor дослідження) має після цього зупинити цикл і чекати на
     submit_user_answer. Цей метод сам по собі не блокує виконання.
     """
     try:
@@ -244,7 +244,7 @@ def report_compose(
     try:
         _init()
         report_doc = {
-            "title": str(title)[:200] or "Звіт розслідування Flx",
+            "title": str(title)[:200] or "Звіт дослідження Flx",
             "executive_summary": str(executive_summary)[:2000],
             "sections": sections or [],
             "warnings": warnings or [],

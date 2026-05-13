@@ -237,12 +237,92 @@
     }
   }
 
+  var miniAppChatSyncTimer = null;
+
+  function scheduleMiniAppChatSync() {
+    if (typeof currentUser === "undefined" || !currentUser || !currentUser.authorized) return;
+    try {
+      clearTimeout(miniAppChatSyncTimer);
+      miniAppChatSyncTimer = setTimeout(pushChatsToServer, 2000);
+    } catch (e) {}
+  }
+
+  function pushChatsToServer() {
+    if (typeof currentUser === "undefined" || !currentUser || !currentUser.authorized) return;
+    var chats = chatSessions.map(function (c) {
+      var msgs = (c.messages || []).slice(-80).map(function (m) {
+        return {
+          role: m.role,
+          text: (m.text || "").slice(0, 12000),
+          requestId: m.requestId || null,
+          timestamp: m.timestamp || null,
+          thinking: m.thinking ? String(m.thinking).slice(0, 8000) : null,
+        };
+      });
+      return {
+        chat_id: c.id,
+        title: c.title || "",
+        kind: c.kind || "assistant",
+        messages: msgs,
+        flx: c.flx || null,
+        listing_context: c.listingContext || null,
+        updated_at: c.updatedAt || Date.now(),
+      };
+    });
+    fetch("/api/mini-app/chats/sync", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, apiHeaders()),
+      body: JSON.stringify({ chats: chats.slice(0, 80) }),
+    }).catch(function () {});
+  }
+
+  function mergeServerChatsIntoLocal(serverChats) {
+    if (!serverChats || !serverChats.length) return;
+    serverChats.forEach(function (srv) {
+      var id = srv.chat_id;
+      if (!id) return;
+      var local = chatSessions.find(function (c) { return c.id === id; });
+      var srvT = srv.updated_at ? Date.parse(srv.updated_at) : 0;
+      var locT = local && local.updatedAt ? Number(local.updatedAt) : 0;
+      var mapped = {
+        id: id,
+        title: srv.title || "Чат",
+        kind: srv.kind || "assistant",
+        messages: Array.isArray(srv.messages) ? srv.messages : [],
+        updatedAt: srvT || Date.now(),
+        flx: srv.flx || { sessionId: null, state: "draft" },
+        listingContext: srv.listing_context || null,
+      };
+      if (!local) {
+        chatSessions.push(mapped);
+      } else if (srvT > locT) {
+        Object.assign(local, mapped);
+      }
+    });
+    chatSessions.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+  }
+
+  function fetchAndMergeServerChats(done) {
+    if (typeof currentUser === "undefined" || !currentUser || !currentUser.authorized) {
+      if (typeof done === "function") done();
+      return;
+    }
+    fetch("/api/mini-app/chats?limit=200", { headers: apiHeaders() })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("chats_fetch")); })
+      .then(function (data) {
+        mergeServerChatsIntoLocal((data && data.chats) || []);
+        if (typeof done === "function") done();
+      })
+      .catch(function () { if (typeof done === "function") done(); });
+  }
+
   function saveChatSessions() {
     try {
       localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(chatSessions));
     } catch (e) {
       console.warn("Failed to save chat sessions:", e);
     }
+    scheduleMiniAppChatSync();
   }
 
   function genChatId() {
@@ -254,6 +334,7 @@
     chatSessions.unshift({
       id: id,
       title: "Новий чат",
+      kind: "assistant",
       messages: [],
       updatedAt: Date.now()
     });
@@ -404,6 +485,15 @@
     var idx = chatSessions.findIndex(function (c) { return c.id === id; });
     if (idx === -1) return;
     var chat = chatSessions[idx];
+    if (chat && chat.kind === "investigation") {
+      cancelInvestigationIfActive(chat, "chat_deleted");
+      try {
+        if (chat.flx && chat.flx.sessionId && flxActiveStreams[chat.flx.sessionId]) {
+          flxActiveStreams[chat.flx.sessionId].abort();
+          delete flxActiveStreams[chat.flx.sessionId];
+        }
+      } catch (err) {}
+    }
     var artifactIds = [];
     if (chat && chat.messages) {
       chat.messages.forEach(function (m) {
@@ -423,6 +513,9 @@
       }).catch(function () {});
     }
     chatSessions.splice(idx, 1);
+    if (currentUser && currentUser.authorized) {
+      fetch("/api/mini-app/chats/" + encodeURIComponent(id), { method: "DELETE", headers: apiHeaders() }).catch(function () {});
+    }
     if (currentChatId === id) {
       currentChatId = chatSessions.length > 0 ? chatSessions[0].id : null;
     }
@@ -507,7 +600,24 @@
     if (!container) return;
     container.innerHTML = "";
     var chat = getCurrentChat();
-    if (!chat || !chat.messages.length) return;
+    if (!chat) return;
+    if (chat.kind === "investigation") {
+      if (chat.messages && chat.messages.length) {
+        chat.messages.forEach(function (m) {
+          appendChatMessageDOM(container, m.role, m.text, m.requestId, m.timestamp, m.excelFiles, m.quickActions, m.thinking);
+        });
+      }
+      if (chat.flx && chat.flx.sessionId) {
+        hydrateFlxTimeline(chat).finally(function () {
+          var since = 0;
+          if (typeof chat.flx.lastEventSeq === "number") since = Math.max(since, chat.flx.lastEventSeq);
+          if (typeof flxLastSeqByChat[chat.id] === "number") since = Math.max(since, flxLastSeqByChat[chat.id]);
+          flxOpenStream(chat, since);
+        });
+      }
+      return;
+    }
+    if (!chat.messages || !chat.messages.length) return;
     chat.messages.forEach(function (m) {
       appendChatMessageDOM(container, m.role, m.text, m.requestId, m.timestamp, m.excelFiles, m.quickActions, m.thinking);
     });
@@ -976,7 +1086,7 @@
     var input = document.getElementById("chat-input");
     var text = input && input.value.trim();
     if (!text) return;
-    // Якщо поточний чат — Flx-розслідування, маршрутизуємо повідомлення на окремий API.
+    // Якщо поточний чат — Flx-дослідження, маршрутизуємо повідомлення на окремий API.
     var __invChat = (function () { var c = getCurrentChat(); return (c && c.kind === "investigation") ? c : null; })();
     if (__invChat) {
       input.value = "";
@@ -1658,10 +1768,14 @@
 
   function bindEvents(me) {
     loadChatSessions();
-    if (chatSessions.length > 0 && !currentChatId) {
-      currentChatId = chatSessions[0].id;
-    }
-    renderChatHistoryList();
+    fetchAndMergeServerChats(function () {
+      saveChatSessions();
+      if (chatSessions.length > 0 && !currentChatId) {
+        currentChatId = chatSessions[0].id;
+      }
+      renderChatHistoryList();
+      renderChatMessages();
+    });
     initSidebarCollapse();
     var sendBtn = document.getElementById("chat-send");
     if (sendBtn) sendBtn.addEventListener("click", sendChatMessage);
@@ -1739,8 +1853,10 @@
       if (cadastralResetStale) cadastralResetStale.addEventListener("click", adminCadastralResetStale);
       if (cadastralReset) cadastralReset.addEventListener("click", adminCadastralResetCells);
       var cadastralBuildIndex = document.getElementById("admin-cadastral-build-index");
+      var cadastralBuildClustersNational = document.getElementById("admin-cadastral-build-clusters-national");
       var cadastralBuildClusters = document.getElementById("admin-cadastral-build-clusters");
       var cadastralClearClusters = document.getElementById("admin-cadastral-clear-clusters");
+      if (cadastralBuildClustersNational) cadastralBuildClustersNational.addEventListener("click", startAdminCadastralBuildNationalClusters);
       if (cadastralBuildIndex) cadastralBuildIndex.addEventListener("click", startAdminCadastralBuildIndex);
       if (cadastralBuildClusters) cadastralBuildClusters.addEventListener("click", startAdminCadastralBuildClusters);
       if (cadastralClearClusters) cadastralClearClusters.addEventListener("click", adminCadastralClearClusters);
@@ -1755,6 +1871,7 @@
       var olxClickerRefreshStatsBtn = document.getElementById("admin-olx-clicker-refresh-stats");
       if (olxClickerRefreshStatsBtn) olxClickerRefreshStatsBtn.addEventListener("click", loadAdminOlxClickerStats);
       initAdminVastRuntimeSettings();
+      initAdminAgentRuntimeSettings();
       initAdminQueueControls();
       initAdminScheduler();
       initAdminFeedback();
@@ -2469,6 +2586,58 @@
       });
   }
 
+  function initAdminAgentRuntimeSettings() {
+    var saveBtn = document.getElementById("admin-agent-runtime-save");
+    if (!saveBtn) return;
+    loadAdminAgentRuntimeSettings();
+    saveBtn.addEventListener("click", saveAdminAgentRuntimeSettings);
+  }
+
+  function loadAdminAgentRuntimeSettings() {
+    var statusEl = document.getElementById("admin-agent-runtime-status");
+    var chk = document.getElementById("admin-agent-tool-retrieval-enabled");
+    fetch("/api/admin/agent-runtime-settings", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function (cfg) {
+        if (chk) chk.checked = !!cfg.llm_agent_tool_retrieval_enabled;
+        if (statusEl) {
+          statusEl.textContent = cfg.llm_agent_tool_retrieval_enabled
+            ? "Увімкнено: перед кожним запитом підбирається підмножина MCP tools (Qdrant + embeddings)."
+            : "Вимкнено: усі дозволені tools передаються в модель (як раніше).";
+        }
+      })
+      .catch(function (e) {
+        if (statusEl) statusEl.textContent = "Помилка: " + (e.message || "не вдалося завантажити");
+      });
+  }
+
+  function saveAdminAgentRuntimeSettings() {
+    var statusEl = document.getElementById("admin-agent-runtime-status");
+    var chk = document.getElementById("admin-agent-tool-retrieval-enabled");
+    if (statusEl) statusEl.textContent = "Збереження...";
+    fetch("/api/admin/agent-runtime-settings", {
+      method: "PUT",
+      headers: apiHeaders(),
+      body: JSON.stringify({
+        llm_agent_tool_retrieval_enabled: !!(chk && chk.checked)
+      })
+    })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function () {
+        if (statusEl) statusEl.textContent = "Збережено в Mongo; застосовано до цього сервера.";
+        loadAdminAgentRuntimeSettings();
+      })
+      .catch(function (e) {
+        if (statusEl) statusEl.textContent = "Помилка: " + (e.message || "не вдалося зберегти");
+      });
+  }
+
   function loadAdminCadastralStats() {
     var el = document.getElementById("admin-cadastral-stats");
     if (!el) return;
@@ -2694,6 +2863,100 @@
             .catch(function (err) {
               statusEl.className = "admin-data-update-status error";
               statusEl.textContent = "Помилка: " + (err.message || "Не вдалося отримати статус");
+            });
+        }
+        poll();
+      })
+      .catch(function (err) {
+        statusEl.className = "admin-data-update-status error";
+        statusEl.textContent = "Помилка: " + (err.message || "Не вдалося запустити");
+      });
+  }
+
+  var _cadastralNationalLeafletMap = null;
+  var _cadastralNationalLeafletLayer = null;
+
+  function adminCadastralRefreshClusterMap() {
+    var wrap = document.getElementById("admin-cadastral-national-map");
+    if (!wrap || typeof L === "undefined") return;
+    fetch("/api/admin/cadastral/clusters/geojson?limit=12000", { headers: apiHeaders() })
+      .then(function (r) { return r.json(); })
+      .then(function (gj) {
+        if (!_cadastralNationalLeafletMap) {
+          _cadastralNationalLeafletMap = L.map(wrap).setView([48.5, 31.5], 6);
+          L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19,
+            attribution: "&copy; OpenStreetMap contributors",
+          }).addTo(_cadastralNationalLeafletMap);
+        }
+        if (_cadastralNationalLeafletLayer) {
+          _cadastralNationalLeafletMap.removeLayer(_cadastralNationalLeafletLayer);
+          _cadastralNationalLeafletLayer = null;
+        }
+        _cadastralNationalLeafletLayer = L.geoJSON(gj, {
+          pointToLayer: function (feature, latlng) {
+            return L.circleMarker(latlng, { radius: 3, fillOpacity: 0.7, color: "#1a5fb4", weight: 1 });
+          },
+        }).addTo(_cadastralNationalLeafletMap);
+        try {
+          var b = _cadastralNationalLeafletLayer.getBounds();
+          if (b && b.isValid()) {
+            _cadastralNationalLeafletMap.fitBounds(b, { padding: [24, 24], maxZoom: 8 });
+          }
+        } catch (e) { /* ignore */ }
+        setTimeout(function () { _cadastralNationalLeafletMap.invalidateSize(); }, 200);
+      })
+      .catch(function () { /* ignore */ });
+  }
+
+  function startAdminCadastralBuildNationalClusters() {
+    var statusEl = document.getElementById("admin-cadastral-clusters-status");
+    var wrap = document.getElementById("admin-cadastral-national-progress-wrap");
+    var fill = document.getElementById("admin-cadastral-national-progress-fill");
+    var label = document.getElementById("admin-cadastral-national-progress-label");
+    if (!statusEl) return;
+    if (wrap) wrap.classList.remove("hidden");
+    if (fill) fill.style.width = "0%";
+    if (label) label.textContent = "Національна кластеризація: запуск…";
+    statusEl.classList.remove("hidden");
+    statusEl.className = "admin-data-update-status running";
+    statusEl.textContent = "Запуск національної кластеризації…";
+    fetch("/api/admin/cadastral/clusters/build_national", { method: "POST", headers: apiHeaders() })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (x) {
+        if (!x.ok) {
+          statusEl.className = "admin-data-update-status error";
+          statusEl.textContent = (x.data && x.data.detail) || "Помилка запуску";
+          return;
+        }
+        var jobId = x.data.job_id;
+        function poll() {
+          fetch("/api/admin/cadastral/clusters/national_status?job_id=" + encodeURIComponent(jobId), { headers: apiHeaders() })
+            .then(function (res) { return res.json(); })
+            .then(function (st) {
+              var pct = typeof st.progress_percent === "number" ? st.progress_percent : 0;
+              if (fill) fill.style.width = pct + "%";
+              var parts = (st.partitions_done || 0) + " / " + (st.partitions_total || 0);
+              if (label) {
+                label.textContent = "Партиції: " + parts + " (" + pct + "%) · ділянок: " + (st.parcels_processed || 0) + " · кластерів: " + (st.clusters_upserted || 0);
+              }
+              statusEl.textContent = st.message || st.status || "";
+              if (st.status === "done") {
+                statusEl.className = "admin-data-update-status done";
+                loadAdminCadastralStats();
+                adminCadastralRefreshClusterMap();
+                return;
+              }
+              if (st.status === "error") {
+                statusEl.className = "admin-data-update-status error";
+                loadAdminCadastralStats();
+                return;
+              }
+              setTimeout(poll, 2500);
+            })
+            .catch(function (err) {
+              statusEl.className = "admin-data-update-status error";
+              statusEl.textContent = "Помилка: " + (err.message || "Статус");
             });
         }
         poll();
@@ -5632,21 +5895,58 @@
   // Окремий тип чат-сесії: kind:"investigation". Усі повідомлення стримляться через SSE
   // /api/llm/investigation/{session_id}/events. Питання користувачу (ask_user) рендеряться
   // як окремий блок з кнопками-варіантами і вільним полем; відповідь POST'иться на /answer.
-  // Завершення розслідування додає кнопку "Відкрити звіт" → /api/files/artifact/{aid}?token=...
+  // Завершення дослідження додає кнопку "Відкрити звіт" → /api/files/artifact/{aid}?token=...
 
   var FLX_INVESTIGATION_PREFIX = "flx_inv_";
   var flxActiveStreams = {};
   var flxLastSeqByChat = {};
+  var flxSeqPersistTimer = null;
+
+  function debouncedPersistFlxSeq() {
+    try {
+      clearTimeout(flxSeqPersistTimer);
+      flxSeqPersistTimer = setTimeout(function () {
+        saveChatSessions();
+      }, 400);
+    } catch (e) {}
+  }
+
+  function hydrateFlxTimeline(chat) {
+    if (!chat || !chat.flx || !chat.flx.sessionId) return Promise.resolve();
+    var url = "/api/llm/investigation/" + encodeURIComponent(chat.flx.sessionId) + "/timeline?limit=300";
+    return fetch(url, { headers: apiHeaders() })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("timeline")); })
+      .then(function (data) {
+        var container = document.getElementById("chat-messages");
+        if (!container) return;
+        var items = (data && data.items) || [];
+        var maxSeq = 0;
+        items.forEach(function (row) {
+          if (row && row.source === "event" && typeof row.seq === "number") {
+            maxSeq = Math.max(maxSeq, row.seq);
+          }
+          var ev = { type: row.type, payload: row.payload || {} };
+          if (typeof row.seq === "number") ev.seq = row.seq;
+          appendFlxEvent(chat, ev);
+        });
+        if (maxSeq > 0) {
+          flxLastSeqByChat[chat.id] = maxSeq;
+          if (chat.flx) chat.flx.lastEventSeq = maxSeq;
+          debouncedPersistFlxSeq();
+          scheduleMiniAppChatSync();
+        }
+      });
+  }
 
   function startNewInvestigation() {
     var id = FLX_INVESTIGATION_PREFIX + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
     chatSessions.unshift({
       id: id,
-      title: "Розслідування Flx",
+      title: "Дослідження Flx",
       kind: "investigation",
       messages: [],
       updatedAt: Date.now(),
-      flx: { sessionId: null, state: "draft" },
+      flx: { sessionId: null, state: "draft", lastEventSeq: 0 },
     });
     saveChatSessions();
     currentChatId = id;
@@ -5659,7 +5959,21 @@
       input.placeholder = "Опишіть локацію та мету: напр. 'аптека у Шевченківському районі Києва, бюджет до 200к/міс'";
       input.focus();
     }
-    appendFlxSystemMessage("Опишіть деталі розслідування. Я буду показувати хід міркувань і ставити уточнюючі питання, якщо знадобиться.");
+    appendFlxSystemMessage("Опишіть деталі дослідження. Я буду показувати хід міркувань і ставити уточнюючі питання, якщо знадобиться.");
+  }
+
+  function cancelInvestigationIfActive(chat, reason) {
+    if (!chat || !chat.flx || !chat.flx.sessionId) return;
+    var state = String((chat.flx.state || "")).toLowerCase();
+    if (state === "done" || state === "failed" || state === "cancelled") return;
+    fetch("/api/llm/investigation/" + encodeURIComponent(chat.flx.sessionId) + "/cancel", {
+      method: "POST",
+      headers: apiHeaders(),
+      keepalive: true,
+    }).then(function () {
+      chat.flx.state = "cancelled";
+      saveChatSessions();
+    }).catch(function () {});
   }
 
   function getCurrentInvestigationChat() {
@@ -5685,6 +5999,15 @@
   function appendFlxEvent(chat, ev) {
     var container = document.getElementById("chat-messages");
     if (!container) return;
+    if (chat && chat.flx && typeof ev.seq === "number" && ev.seq > 0) {
+      var prevS = Number(chat.flx.lastEventSeq || 0);
+      if (ev.seq > prevS) {
+        chat.flx.lastEventSeq = ev.seq;
+        flxLastSeqByChat[chat.id] = ev.seq;
+        debouncedPersistFlxSeq();
+        scheduleMiniAppChatSync();
+      }
+    }
     var type = ev.type || "status";
     var payload = ev.payload || {};
     var div = document.createElement("div");
@@ -5695,8 +6018,10 @@
     div.appendChild(badge);
 
     if (type === "thinking") {
+      var thinkText = (payload.content || "").trim();
+      if (!thinkText) return;
       div.classList.add("flx-thinking");
-      div.appendChild(document.createTextNode(payload.content || ""));
+      div.appendChild(document.createTextNode(thinkText));
     } else if (type === "note") {
       div.classList.add("flx-note");
       var kindMap = { thought: "Думка", observation: "Спостереження", hypothesis: "Гіпотеза", decision: "Рішення", question: "Питання", user_answer: "Відповідь користувача" };
@@ -5710,7 +6035,9 @@
       div.appendChild(document.createTextNode("Виклик інструмента: " + (payload.name || "")));
     } else if (type === "status") {
       div.classList.add("flx-status");
-      div.appendChild(document.createTextNode(payload.message || ""));
+      var statusText = (payload.message || "").trim();
+      if (!statusText) return;
+      div.appendChild(document.createTextNode(statusText));
     } else if (type === "answer") {
       // Користувач уже відповів — короткий лог
       div.classList.add("flx-status");
@@ -5719,9 +6046,26 @@
       renderFlxQuestion(container, chat, payload);
       return;
     } else if (type === "report" || type === "done") {
+      if (chat && chat.flx) {
+        if (payload.artifact_id) chat.flx.reportArtifactId = payload.artifact_id;
+        if (payload.download_token) chat.flx.reportToken = payload.download_token;
+        chat.flx.state = "done";
+        saveChatSessions();
+      }
+      // Бекенд шле дві окремі події (report + done) на успішне завершення;
+      // також події можуть прийти повторно через hydrate + SSE-replay після reconnect.
+      // Рендеримо картку лише один раз на DOM-контейнер: при refresh container очищується
+      // і ми відмалюємо картку знову коректно.
+      if (container.querySelector(".flx-done")) {
+        return;
+      }
       renderFlxDone(container, chat, payload);
       return;
     } else if (type === "error") {
+      if (chat && chat.flx) {
+        chat.flx.state = "failed";
+        saveChatSessions();
+      }
       div.classList.add("flx-status");
       div.style.color = "#c0392b";
       div.appendChild(document.createTextNode("Помилка: " + (payload.message || "невідома")));
@@ -5785,23 +6129,47 @@
     badge.textContent = "Flx";
     div.appendChild(badge);
     var msg = document.createElement("div");
-    msg.textContent = "Розслідування завершено. Звіт готовий.";
+    msg.textContent = "Дослідження завершено. Звіт готовий.";
     div.appendChild(msg);
-    var aid = payload.artifact_id;
-    if (aid && chat && chat.flx && chat.flx.sessionId) {
+    var aid = (chat && chat.flx && chat.flx.reportArtifactId) || payload.artifact_id;
+    var token = (chat && chat.flx && chat.flx.reportToken) || payload.download_token;
+    if (aid) {
+      var reportUrl = "/api/files/artifact/" + encodeURIComponent(aid);
+      if (token) reportUrl += "?token=" + encodeURIComponent(token);
+
+      var inlineBtn = document.createElement("button");
+      inlineBtn.type = "button";
+      inlineBtn.className = "flx-option-btn";
+      inlineBtn.textContent = "Показати звіт тут";
+      inlineBtn.addEventListener("click", function () {
+        if (div.querySelector(".flx-report-inline-wrap")) return;
+        var wrap = document.createElement("div");
+        wrap.className = "flx-report-inline-wrap";
+        wrap.style.marginTop = "10px";
+        wrap.style.border = "1px solid #e6e9ef";
+        wrap.style.borderRadius = "10px";
+        wrap.style.overflow = "hidden";
+        wrap.style.background = "#fff";
+
+        var iframe = document.createElement("iframe");
+        iframe.src = reportUrl;
+        iframe.loading = "lazy";
+        iframe.style.width = "100%";
+        iframe.style.height = "70vh";
+        iframe.style.border = "0";
+        iframe.referrerPolicy = "no-referrer";
+        wrap.appendChild(iframe);
+        div.appendChild(wrap);
+        container.scrollTop = container.scrollHeight;
+      });
+      div.appendChild(inlineBtn);
+
       var btn = document.createElement("a");
       btn.className = "flx-report-btn";
-      btn.textContent = "Відкрити звіт";
+      btn.textContent = "Відкрити окремо";
+      btn.href = reportUrl;
       btn.target = "_blank";
-      btn.rel = "noopener";
-      btn.href = "/api/llm/investigation/" + encodeURIComponent(chat.flx.sessionId) + "/report";
-      btn.addEventListener("click", function () {
-        try {
-          if (window.Telegram && window.Telegram.WebApp && typeof window.Telegram.WebApp.openLink === "function") {
-            window.Telegram.WebApp.openLink(btn.href, { try_instant_view: false });
-          }
-        } catch (e) { /* fallback на default href */ }
-      });
+      btn.rel = "noopener noreferrer";
       div.appendChild(btn);
     }
     container.appendChild(div);
@@ -5831,7 +6199,7 @@
 
   function flxSendInitialQuery(chat, text) {
     appendChatMessage("user", text);
-    appendFlxSystemMessage("Запускаю розслідування...");
+    appendFlxSystemMessage("Запускаю дослідження...");
     fetch("/api/llm/investigation/start", {
       method: "POST",
       headers: apiHeaders(),
@@ -5876,6 +6244,11 @@
             var data = JSON.parse(eventData);
             if (data && typeof data.seq === "number") {
               flxLastSeqByChat[chat.id] = data.seq;
+              if (chat && chat.flx) {
+                chat.flx.lastEventSeq = Math.max(Number(chat.flx.lastEventSeq || 0), data.seq);
+                debouncedPersistFlxSeq();
+                scheduleMiniAppChatSync();
+              }
             }
             if (data.type === "reconnect") {
               setTimeout(function () { flxOpenStream(chat, data.since_seq || flxLastSeqByChat[chat.id] || 0); }, 250);
@@ -5914,7 +6287,7 @@
       });
   }
 
-  // Resume: при перемиканні на чат-розслідування зі sidebar — підтягуємо стан + ре-стрімимо події.
+  // Resume: при перемиканні на чат-дослідження зі sidebar — підтягуємо стан + ре-стрімимо події.
   if (typeof switchChat === "function" && !switchChat.__flxWrapped) {
     var __origSwitch = switchChat;
     switchChat = function (id) {
@@ -5926,4 +6299,19 @@
     };
     switchChat.__flxWrapped = true;
   }
+
+  function cancelActiveInvestigationOnPageHide() {
+    var chat = getCurrentInvestigationChat();
+    if (!chat || !chat.flx || !chat.flx.sessionId) return;
+    cancelInvestigationIfActive(chat, "pagehide");
+    try {
+      if (flxActiveStreams[chat.flx.sessionId]) {
+        flxActiveStreams[chat.flx.sessionId].abort();
+        delete flxActiveStreams[chat.flx.sessionId];
+      }
+    } catch (e) {}
+  }
+
+  window.addEventListener("pagehide", cancelActiveInvestigationOnPageHide);
+  window.addEventListener("beforeunload", cancelActiveInvestigationOnPageHide);
 })();

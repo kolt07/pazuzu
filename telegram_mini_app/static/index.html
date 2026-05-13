@@ -9,6 +9,8 @@
   <title>Pazuzu</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -29,9 +31,9 @@
             <button type="button" id="sidebar-collapse-btn" class="btn-sidebar-toggle" title="Згорнути">‹</button>
           </div>
           <div class="sidebar-header-row sidebar-header-row-investigation">
-            <button type="button" id="sidebar-new-investigation" class="btn btn-premium btn-small" title="Нове розслідування Flx">
+            <button type="button" id="sidebar-new-investigation" class="btn btn-premium btn-small" title="Нове дослідження Flx">
               <span class="btn-premium-icon" aria-hidden="true"></span>
-              <span class="btn-premium-label">Нове розслідування</span>
+              <span class="btn-premium-label">Нове дослідження</span>
             </button>
           </div>
         </div>
@@ -142,6 +144,15 @@
           </div>
           <button type="button" id="admin-vast-settings-save" class="btn btn-primary">Зберегти Vast/vLLM параметри</button>
           <div id="admin-vast-settings-status" class="admin-hint" style="margin-top: 0.5rem;"></div>
+        </div>
+        <div class="admin-block" data-admin-tab="config">
+          <h3>LLM-агент (діалог)</h3>
+          <p class="admin-hint">Параметри для чату асистента в Mini App (поточний процес сервера). Потрібні Qdrant + TEI для семантичного підбору інструментів.</p>
+          <div class="filter-group">
+            <label><input type="checkbox" id="admin-agent-tool-retrieval-enabled" /> Увімкнути semantic tool retrieval (top-k інструментів за запитом)</label>
+          </div>
+          <button type="button" id="admin-agent-runtime-save" class="btn btn-primary">Зберегти налаштування агента</button>
+          <div id="admin-agent-runtime-status" class="admin-hint" style="margin-top: 0.5rem;"></div>
         </div>
         <div class="admin-block" data-admin-tab="queues">
           <h3>Стан та керування чергами</h3>
@@ -257,8 +268,14 @@
           <div class="admin-cadastral-index-actions" style="margin-top: 0.5rem;">
             <p class="admin-hint">Після завершення завантаження кадастру: індекс місцезнаходження та кластеризація.</p>
             <button type="button" id="admin-cadastral-build-index" class="btn">Індексація (область/район з номера)</button>
-            <button type="button" id="admin-cadastral-build-clusters" class="btn">Кластеризація ділянок</button>
+            <button type="button" id="admin-cadastral-build-clusters-national" class="btn btn-primary">Кластеризація по Україні (партиції)</button>
+            <button type="button" id="admin-cadastral-build-clusters" class="btn">Кластеризація (одним проходом, RAM)</button>
             <button type="button" id="admin-cadastral-clear-clusters" class="btn btn-danger">Очистити кластери</button>
+          </div>
+          <div id="admin-cadastral-national-progress-wrap" class="hidden" style="margin-top: 0.75rem;">
+            <div class="admin-hint" id="admin-cadastral-national-progress-label">Прогрес національної кластеризації</div>
+            <div class="admin-data-update-progress-bar"><div id="admin-cadastral-national-progress-fill" class="admin-data-update-progress-fill" style="width: 0%;"></div></div>
+            <div id="admin-cadastral-national-map" style="height: 320px; margin-top: 0.5rem; border-radius: 6px; border: 1px solid var(--border-color-strong, #ccc);"></div>
           </div>
           <div id="admin-cadastral-status" class="admin-data-update-status hidden"></div>
           <div id="admin-cadastral-index-status" class="admin-data-update-status hidden"></div>

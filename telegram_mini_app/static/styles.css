@@ -639,7 +639,7 @@ body {
 .btn-primary { background: var(--tg-theme-button-color); color: var(--tg-theme-button-text-color); }
 .btn-danger { background: #c0392b; color: #fff; }
 
-/* Преміум-кнопка "Нове розслідування" Flx — золотий градієнт + пульсуюче світіння */
+/* Преміум-кнопка "Нове дослідження" Flx — золотий градієнт + пульсуюче світіння */
 .btn-premium {
   position: relative;
   background: linear-gradient(135deg, #b8860b 0%, #f4c430 35%, #fff2a8 50%, #f4c430 65%, #b8860b 100%);

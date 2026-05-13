@@ -79,6 +79,12 @@ class TaskQueueControlRequest(BaseModel):
     reason: str = ""
 
 
+class AgentRuntimeFlagsBody(BaseModel):
+    """Прапорці LLM-агента, що зберігаються в Mongo для поточного процесу mini app."""
+
+    llm_agent_tool_retrieval_enabled: bool
+
+
 @router.post("/trace")
 def trace_query(request: Request, body: TraceQueryRequest):
     """
@@ -678,6 +684,41 @@ def update_vast_runtime_settings(request: Request, body: VastRuntimeSettingsUpda
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/agent-runtime-settings")
+def get_agent_runtime_settings(request: Request):
+    """Поточні runtime-прапорці LangChain-агента (злиття Mongo + Settings)."""
+    _get_admin_user(request)
+    try:
+        from data.database.connection import MongoDBConnection
+        from business.services.agent_runtime_settings_service import AgentRuntimeSettingsService
+
+        MongoDBConnection.initialize(request.app.state.settings)
+        svc = AgentRuntimeSettingsService()
+        svc.apply_mongo_to_settings(request.app.state.settings)
+        return svc.get_effective_flags(request.app.state.settings)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/agent-runtime-settings")
+def put_agent_runtime_settings(request: Request, body: AgentRuntimeFlagsBody):
+    """Зберігає прапорці агента в Mongo та застосовує до поточного процесу."""
+    _get_admin_user(request)
+    try:
+        from data.database.connection import MongoDBConnection
+        from business.services.agent_runtime_settings_service import AgentRuntimeSettingsService
+
+        MongoDBConnection.initialize(request.app.state.settings)
+        svc = AgentRuntimeSettingsService()
+        flags = svc.set_tool_retrieval_enabled(
+            request.app.state.settings,
+            body.llm_agent_tool_retrieval_enabled,
+        )
+        return {"success": True, "settings": flags}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/cadastral-scraper/start")
 def start_cadastral_scraper(
     request: Request,
@@ -1179,7 +1220,126 @@ def cadastral_clusters_status(request: Request, task_id: str):
     }
 
 
-@router.post("/cadastral-scraper/reset-cells")
+@router.post("/cadastral/clusters/build_national")
+def cadastral_build_clusters_national(
+    request: Request,
+    min_cluster_size: int = 2,
+):
+    """Національна кластеризація по областях (партиції). job_id для полінгу national_status."""
+    _get_admin_user(request)
+    from data.database.connection import MongoDBConnection
+    from data.repositories.cadastral_cluster_build_jobs_repository import (
+        CadastralClusterBuildJobRepository,
+    )
+
+    job_id = str(uuid.uuid4())
+    MongoDBConnection.initialize(request.app.state.settings)
+    s = request.app.state.settings
+    jobs = CadastralClusterBuildJobRepository()
+    jobs.upsert_job(
+        job_id,
+        status="queued",
+        partitions_total=0,
+        partitions_done=0,
+        parcels_processed=0,
+        clusters_upserted=0,
+        min_cluster_size=int(min_cluster_size or 2),
+        message="У черзі",
+    )
+
+    def _run_inline() -> None:
+        try:
+            from business.services.cadastral_national_cluster_job_runner import (
+                run_national_cluster_build_job,
+            )
+
+            run_national_cluster_build_job(job_id, int(min_cluster_size or 2))
+        except Exception as e:
+            jobs.patch_job(job_id, {"status": "error", "message": str(e)[:2000]})
+
+    if getattr(s, "task_queue_enabled", False):
+        try:
+            from business.tasks import cadastral_national_cluster_build_task
+
+            cadastral_national_cluster_build_task.apply_async(
+                args=[job_id, int(min_cluster_size or 2)],
+                queue="source_load",
+            )
+        except Exception as e:
+            jobs.patch_job(job_id, {"status": "error", "message": f"Celery: {e}"[:2000]})
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        threading.Thread(target=_run_inline, daemon=True, name="CadNationalClusters").start()
+
+    return {"job_id": job_id, "status": "started"}
+
+
+@router.get("/cadastral/clusters/national_status")
+def cadastral_clusters_national_status(request: Request, job_id: str):
+    _get_admin_user(request)
+    from data.database.connection import MongoDBConnection
+    from data.repositories.cadastral_cluster_build_jobs_repository import (
+        CadastralClusterBuildJobRepository,
+    )
+
+    MongoDBConnection.initialize(request.app.state.settings)
+    doc = CadastralClusterBuildJobRepository().get_job(job_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+    total = int(doc.get("partitions_total") or 0)
+    done = int(doc.get("partitions_done") or 0)
+    pct = int(round(100.0 * done / total)) if total > 0 else 0
+    return {
+        "job_id": job_id,
+        "status": doc.get("status"),
+        "message": doc.get("message"),
+        "partitions_total": total,
+        "partitions_done": done,
+        "progress_percent": pct,
+        "parcels_processed": int(doc.get("parcels_processed") or 0),
+        "clusters_upserted": int(doc.get("clusters_upserted") or 0),
+        "current_partition": doc.get("current_partition"),
+        "min_cluster_size": doc.get("min_cluster_size"),
+    }
+
+
+@router.get("/cadastral/clusters/geojson")
+def cadastral_clusters_geojson(request: Request, limit: int = 15000):
+    """GeoJSON Point для центроїдів кластерів (мапа адмінки)."""
+    _get_admin_user(request)
+    from data.database.connection import MongoDBConnection
+    from data.repositories.cadastral_parcel_clusters_repository import (
+        CadastralParcelClustersRepository,
+    )
+
+    MongoDBConnection.initialize(request.app.state.settings)
+    lim = max(1, min(int(limit or 15000), 50000))
+    coll = CadastralParcelClustersRepository().collection
+    feats: list = []
+    for doc in coll.find(
+        {"centroid": {"$exists": True}},
+        {"cluster_id": 1, "centroid": 1, "parcel_count": 1, "partition_key": 1, "purpose": 1},
+    ).limit(lim):
+        cid = doc.get("cluster_id")
+        cen = doc.get("centroid") or {}
+        coords = cen.get("coordinates")
+        if not cid or not isinstance(coords, list) or len(coords) < 2:
+            continue
+        feats.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [float(coords[0]), float(coords[1])]},
+            "properties": {
+                "cluster_id": cid,
+                "parcel_count": doc.get("parcel_count"),
+                "partition_key": doc.get("partition_key"),
+                "purpose": doc.get("purpose"),
+            },
+        })
+    return {
+        "type": "FeatureCollection",
+        "features": feats,
+        "count": len(feats),
+    }
 def reset_cadastral_scraper_cells(request: Request):
     """
     Очищає колекцію cadastral_scraper_cells. Після цього при наступному запуску

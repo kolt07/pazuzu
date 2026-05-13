@@ -117,6 +117,36 @@ class UnifiedListingsService:
         except Exception:
             self._usd_rate = None
 
+    def _index_unified_doc_to_vector(self, unified_doc: Dict[str, Any]) -> None:
+        """
+        Best-effort upsert уніфікованого документа у векторний індекс Qdrant.
+        Помилки тільки логуються — vector-index це secondary store і не блокує sync.
+        """
+        if not unified_doc:
+            return
+        source = unified_doc.get("source")
+        source_id = unified_doc.get("source_id")
+        if not source or not source_id:
+            return
+        try:
+            from business.services.vector_index_service import VectorIndexService
+
+            settings = self.settings
+            if settings is None:
+                from config.settings import Settings  # type: ignore
+                settings = Settings()
+            svc = VectorIndexService.get_instance(settings)
+            if not svc.is_configured:
+                return
+            indexed = svc.upsert_listings([unified_doc])
+            if indexed:
+                try:
+                    self.unified_repo.set_vector_indexed(source, source_id)
+                except Exception as set_err:
+                    logger.debug("vector_indexed_at update failed for %s/%s: %s", source, source_id, set_err)
+        except Exception as e:
+            logger.warning("Vector index upsert failed for %s/%s: %s", source, source_id, e)
+
     def _extract_region_from_query(self, query_text: str) -> Optional[str]:
         """Витягує назву області з query_text (напр. 'Житомирська обл.' або 'Волинська область')."""
         if not query_text or not isinstance(query_text, str):
@@ -775,6 +805,7 @@ class UnifiedListingsService:
                     reo_service.process_listing("olx", olx_url, olx_doc=olx_doc)
                 except Exception as reo_err:
                     logger.warning("Обробка ОНМ для OLX %s: %s", olx_url[:50], reo_err)
+                self._index_unified_doc_to_vector(unified_doc)
             return ok
         except Exception as e:
             logger.error(f"Помилка синхронізації OLX оголошення {olx_url}: {e}", exc_info=True)
@@ -805,6 +836,7 @@ class UnifiedListingsService:
                     reo_service.process_listing("prozorro", auction_id, prozorro_doc=prozorro_doc)
                 except Exception as reo_err:
                     logger.warning("Обробка ОНМ для ProZorro %s: %s", auction_id, reo_err)
+                self._index_unified_doc_to_vector(unified_doc)
             return ok
         except Exception as e:
             logger.error(f"Помилка синхронізації ProZorro аукціону {auction_id}: {e}", exc_info=True)

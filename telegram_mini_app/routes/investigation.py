@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-API маршрути для агента-інвестігейтора Flx (нове розслідування).
+API маршрути для агента-інвестігейтора Flx (нове дослідження).
 
 Endpoints:
 - POST   /api/llm/investigation/start                          → стартує сесію + перший крок
@@ -9,6 +9,8 @@ Endpoints:
 - GET    /api/llm/investigation/{session_id}                   → стан сесії
 - GET    /api/llm/investigation                                → список сесій користувача
 - GET    /api/llm/investigation/{session_id}/events            → SSE-стрім подій (status/note/question/done)
+- GET    /api/llm/investigation/{session_id}/timeline          → JSON: події + нотатки для відновлення UI
+- POST   /api/llm/investigation/{session_id}/skip-source-wait   → пропустити очікування source_load
 - GET    /api/llm/investigation/{session_id}/report            → 302 → /api/files/artifact/{aid}?token=...
 """
 
@@ -80,7 +82,7 @@ def start_investigation(request: Request, body: StartRequest):
         query=text,
     )
     if not result.get("ok"):
-        raise HTTPException(status_code=500, detail=result.get("error") or "Не вдалося стартувати розслідування")
+        raise HTTPException(status_code=500, detail=result.get("error") or "Не вдалося стартувати дослідження")
     return result
 
 
@@ -134,6 +136,35 @@ def list_investigations(request: Request, limit: int = 50):
             "created_at": s.get("created_at").isoformat() if s.get("created_at") else None,
         })
     return {"items": out}
+
+
+@router.get("/{session_id}/timeline")
+def get_investigation_timeline(request: Request, session_id: str, limit: int = 300):
+    """JSON-стрічка подій + нотатки для відновлення UI після перезавантаження."""
+    user_id = _get_user_id(request)
+    svc = _get_service(request)
+    state = svc.get_state(session_id)
+    if not state.get("ok"):
+        raise HTTPException(status_code=404, detail="session_not_found")
+    if str(state["session"].get("user_id")) != str(user_id):
+        raise HTTPException(status_code=403, detail="Немає доступу")
+    items = svc.fetch_timeline(session_id, limit=int(limit))
+    return {"items": items}
+
+
+@router.post("/{session_id}/skip-source-wait")
+def skip_investigation_source_wait(request: Request, session_id: str):
+    user_id = _get_user_id(request)
+    svc = _get_service(request)
+    state = svc.get_state(session_id)
+    if not state.get("ok"):
+        raise HTTPException(status_code=404, detail="session_not_found")
+    if str(state["session"].get("user_id")) != str(user_id):
+        raise HTTPException(status_code=403, detail="Немає доступу")
+    result = svc.skip_source_wait(session_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "skip_failed")
+    return result
 
 
 @router.get("/{session_id}")

@@ -32,6 +32,15 @@
 - **Обробка:** обрані оголошення проходять через LLM (парсинг деталей, об’єкти нерухомості тощо) і потрапляють у колекцію джерела (olx_listings / prozorro_auctions) та в unified_listings.
 - **OLX:** дані в olx_listings та unified_listings потрапляють лише після LLM-обробки; сирі записи не піднімаються в olx_listings до LLM. **ProZorro:** сирі записи піднімаються в prozorro_auctions; обрана підмножина проходить LLM і sync в unified.
 
+### Phase 2.5: Vector-index sync (Qdrant + bge-m3)
+
+- **Тригер:** одразу після успішного `unified_repo.upsert_listing(unified_doc)` у `UnifiedListingsService.sync_olx_listing` / `sync_prozorro_auction`.
+- **Дія:** `VectorIndexService.upsert_listings([unified_doc])` — композує текст із `title/description/property_type/region/oblast/city/tags/price/area/cadastral_numbers`, дістає ембединг через `EmbeddingService` (TEI bge-m3) та upsertить точку у Qdrant-колекцію `unified_listings_vec`.
+- **Кеш:** ембединги кешуються у Mongo `embedding_cache` за SHA-256 хешем тексту + ім'ям моделі (TTL `embeddings_cache_ttl_days` днів). Повторні sync (наприклад при reformat-listing) не витрачають ресурс TEI.
+- **Best-effort:** помилки (Qdrant недоступний, TEI ще не прокинувся, тощо) лише логуються warning-ом і не блокують основний sync — векторний індекс це secondary store.
+- **Позначка:** після успішного upsert `unified_listings.vector_indexed_at` оновлюється.
+- **Backfill:** `py -m scripts.embeddings.build_vector_index --limit ...` для існуючих документів без `vector_indexed_at`. Окремо `py -m scripts.embeddings.build_cadastral_vector_index` — для `cadastral_parcels` та `cadastral_parcel_clusters`.
+
 ### Phase 3: Після оновлення джерела
 
 - Після завершення оновлення та обробки з джерела:

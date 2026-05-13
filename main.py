@@ -106,7 +106,45 @@ class Application:
                 _flx_mig.run_migration()
             except Exception as e:
                 print(f"Попередження: перевірка структури колекцій Flx не вдалася: {e}")
-        
+
+        _chat_mig = None
+        try:
+            import importlib.util
+            from pathlib import Path as _Path2
+
+            _mig_path2 = _Path2(__file__).parent / "scripts" / "migrations" / "048_chat_sessions_sidebar_index.py"
+            if _mig_path2.exists():
+                spec2 = importlib.util.spec_from_file_location("chat_sessions_sidebar_migration", _mig_path2)
+                _chat_mig = importlib.util.module_from_spec(spec2)
+                if spec2.loader:
+                    spec2.loader.exec_module(_chat_mig)
+        except Exception as e:
+            print(f"Попередження: міграція 048 не знайдена: {e}")
+        if _chat_mig is not None:
+            try:
+                _chat_mig.run_migration()
+            except Exception as e:
+                print(f"Попередження: міграція 048 (chat_sessions sidebar index) не вдалася: {e}")
+
+        _emb_cache_mig = None
+        try:
+            import importlib.util
+            from pathlib import Path as _Path3
+
+            _mig_path3 = _Path3(__file__).parent / "scripts" / "migrations" / "049_embedding_cache.py"
+            if _mig_path3.exists():
+                spec3 = importlib.util.spec_from_file_location("embedding_cache_migration", _mig_path3)
+                _emb_cache_mig = importlib.util.module_from_spec(spec3)
+                if spec3.loader:
+                    spec3.loader.exec_module(_emb_cache_mig)
+        except Exception as e:
+            print(f"Попередження: міграція 049 не знайдена: {e}")
+        if _emb_cache_mig is not None:
+            try:
+                _emb_cache_mig.run_migration()
+            except Exception as e:
+                print(f"Попередження: міграція 049 (embedding_cache) не вдалася: {e}")
+
         # Тепер створюємо сервіси після ініціалізації MongoDB
         self.logging_service = LoggingService()
         try:

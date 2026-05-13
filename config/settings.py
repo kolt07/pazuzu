@@ -69,7 +69,9 @@ class Settings:
         self.llm_investigator_google_grounding = os.getenv('LLM_INVESTIGATOR_GOOGLE_GROUNDING', 'true').lower() in ('true', '1', 'yes')
         self.llm_investigator_max_steps_per_task = int(os.getenv('LLM_INVESTIGATOR_MAX_STEPS_PER_TASK', '5'))
         self.llm_investigator_web_search_provider = os.getenv('LLM_INVESTIGATOR_WEB_SEARCH_PROVIDER', 'duckduckgo').strip().lower()
+        self.llm_investigator_web_search_model_name = os.getenv('LLM_INVESTIGATOR_WEB_SEARCH_MODEL_NAME', '').strip()
         self.llm_investigator_web_search_enabled = os.getenv('LLM_INVESTIGATOR_WEB_SEARCH_ENABLED', 'true').lower() in ('true', '1', 'yes')
+        self.flx_source_wait_timeout_seconds = int(os.getenv('FLX_SOURCE_WAIT_TIMEOUT_SECONDS', '3600'))
         self.flx_static_maps_default_size = os.getenv('FLX_STATIC_MAPS_SIZE', '800x600')
         self.flx_static_maps_default_zoom = int(os.getenv('FLX_STATIC_MAPS_ZOOM', '13'))
         # Список дозволених інструментів для Flx (allow-list, без '*')
@@ -81,9 +83,33 @@ class Settings:
             'query_builder.save_query_to_temp_collection,query_builder.get_distinct_values,'
             'analytics.execute_analytics,analytics.list_metrics,'
             'schema.get_collection_info,schema.get_data_dictionary,'
-            'geocoding.geocode_address,geocoding.search_nearby_places',
+            'geocoding.geocode_address,geocoding.search_nearby_places,'
+            'vector.semantic_search_listings,'
+            'cadastral.get_knowledge,cadastral.discover_in_area,cadastral.search,'
+            'cadastral.list_parcels_in_region_polygon,cadastral.list_polygon_query_page,'
+            'cadastral.cluster_parcels,cadastral.get_cluster_meta,cadastral.list_cluster_parcels_page,'
+            'cadastral.get_parcel_summary,cadastral.get_parcel_full,'
+            'listings.find_with_fallback',
         )
         self.flx_allowed_tools = [t.strip() for t in _allowed_tools_raw.split(',') if t.strip()]
+        # FLX Strategy Engine — кілька стратегій, крос-порівняння, реєстр ефективності
+        self.flx_strategy_engine_enabled = os.getenv('FLX_STRATEGY_ENGINE_ENABLED', 'true').lower() in ('true', '1', 'yes')
+        self.flx_strategy_registry_enabled = os.getenv('FLX_STRATEGY_REGISTRY_ENABLED', 'true').lower() in ('true', '1', 'yes')
+        self.flx_strategy_max_candidates = int(os.getenv('FLX_STRATEGY_MAX_CANDIDATES', '4'))
+        self.flx_strategy_registry_ewma_alpha = float(os.getenv('FLX_STRATEGY_REGISTRY_EWMA_ALPHA', '0.35'))
+        self.flx_orchestration_backend = os.getenv('FLX_ORCHESTRATION_BACKEND', 'celery').strip().lower()
+        self.flx_coverage_threshold = float(os.getenv('FLX_COVERAGE_THRESHOLD', '0.75'))
+        # Multi-stage звіт: outline → секція_за_секцією → executive summary.
+        # Це усуває «один промпт з ВСЕ» і дає розгорнутий документ. Вимкнути
+        # → старий single-pass.
+        self.flx_multistage_report = os.getenv('FLX_MULTISTAGE_REPORT', 'true').lower() in ('true', '1', 'yes')
+        self.flx_report_max_sections = int(os.getenv('FLX_REPORT_MAX_SECTIONS', '8'))
+        self.flx_parallel_branches = int(os.getenv('FLX_PARALLEL_BRANCHES', '2'))
+        self.flx_budget_web_searches = int(os.getenv('FLX_BUDGET_WEB_SEARCHES', '40'))
+        self.flx_budget_deep_analysis = int(os.getenv('FLX_BUDGET_DEEP_ANALYSIS', '12'))
+        self.flx_budget_api_calls = int(os.getenv('FLX_BUDGET_API_CALLS', '500'))
+        self.flx_budget_critic_iterations = int(os.getenv('FLX_BUDGET_CRITIC_ITERATIONS', '6'))
+        self.flx_unknown_discovery_enabled = os.getenv('FLX_UNKNOWN_DISCOVERY_ENABLED', 'true').lower() in ('true', '1', 'yes')
         # Для безкоштовного тарифу Gemini ліміт 5 запитів/хвилину, тому використовуємо 4 для безпеки
         self.llm_rate_limit_calls_per_minute = int(os.getenv('LLM_RATE_LIMIT_CALLS_PER_MINUTE', '0'))  # 0 = без обмежень
         self.llm_api_keys = {
@@ -105,6 +131,28 @@ class Settings:
         self.llm_agent_google_search_grounding = os.getenv('LLM_AGENT_GOOGLE_SEARCH_GROUNDING', 'false').lower() in ('true', '1', 'yes')
         self.llm_agent_include_thoughts = os.getenv('LLM_AGENT_INCLUDE_THOUGHTS', 'true').lower() in ('true', '1', 'yes')
         self.llm_agent_use_langgraph = os.getenv('LLM_AGENT_USE_LANGGRAPH', 'false').lower() in ('true', '1', 'yes')
+        # Когнітивний шар LangChain-агента (explicit state, Long Chain, reflection, tool retrieval)
+        self.llm_agent_cognitive_enabled = os.getenv('LLM_AGENT_COGNITIVE_ENABLED', 'true').lower() in ('true', '1', 'yes')
+        self.llm_agent_tool_retrieval_enabled = os.getenv('LLM_AGENT_TOOL_RETRIEVAL_ENABLED', 'false').lower() in ('true', '1', 'yes')
+        self.llm_agent_tool_retrieval_top_k = int(os.getenv('LLM_AGENT_TOOL_RETRIEVAL_TOP_K', '14'))
+        _core = os.getenv(
+            'LLM_AGENT_TOOL_RETRIEVAL_CORE',
+            'get_allowed_collections,get_data_dictionary,get_collection_info,get_database_schema',
+        )
+        self.llm_agent_tool_retrieval_core = [x.strip() for x in _core.split(',') if x.strip()]
+        self.llm_agent_reflection_enabled = os.getenv('LLM_AGENT_REFLECTION_ENABLED', 'true').lower() in ('true', '1', 'yes')
+        self.llm_agent_reflection_every_n = int(os.getenv('LLM_AGENT_REFLECTION_EVERY_N', '3'))
+        self.llm_agent_reflect_on_tool_failure = os.getenv('LLM_AGENT_REFLECT_ON_TOOL_FAILURE', 'true').lower() in (
+            'true',
+            '1',
+            'yes',
+        )
+        self.llm_agent_chain_compression_threshold = int(os.getenv('LLM_AGENT_CHAIN_COMPRESSION_THRESHOLD', '24'))
+        self.llm_agent_semantic_memory_enabled = os.getenv('LLM_AGENT_SEMANTIC_MEMORY_ENABLED', 'true').lower() in (
+            'true',
+            '1',
+            'yes',
+        )
         
         # Налаштування Telegram бота
         self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
@@ -178,7 +226,43 @@ class Settings:
         self.exports_per_user_per_day = int(os.getenv('EXPORTS_PER_USER_PER_DAY', '20'))
         self.artifact_ttl_seconds = int(os.getenv('ARTIFACT_TTL_SECONDS', '3600'))
         self.export_confirm_rows_threshold = int(os.getenv('EXPORT_CONFIRM_ROWS_THRESHOLD', '50000'))
-        
+
+        # Векторна БД (Qdrant) — окрема нода у docker-compose; зберігає semantic-індекси
+        # по unified_listings та cadastral_parcels для FLX-tools `vector.semantic_search_*`.
+        self.qdrant_host = os.getenv('QDRANT_HOST', 'localhost').strip() or 'localhost'
+        self.qdrant_port = int(os.getenv('QDRANT_PORT', '6333'))
+        self.qdrant_grpc_port = int(os.getenv('QDRANT_GRPC_PORT', '6334'))
+        self.qdrant_use_grpc = os.getenv('QDRANT_USE_GRPC', 'false').lower() in ('true', '1', 'yes')
+        self.qdrant_api_key = os.getenv('QDRANT_API_KEY', '').strip()
+        self.vector_collection_listings = os.getenv('VECTOR_COLLECTION_LISTINGS', 'unified_listings_vec').strip()
+        self.vector_collection_cadastral = os.getenv('VECTOR_COLLECTION_CADASTRAL', 'cadastral_parcels_vec').strip()
+        self.vector_collection_mcp_tools = os.getenv('VECTOR_COLLECTION_MCP_TOOLS', 'mcp_tools_vec').strip()
+        self.vector_size = int(os.getenv('VECTOR_SIZE', '1024'))
+        self.vector_distance = os.getenv('VECTOR_DISTANCE', 'cosine').strip().lower()
+
+        # Кадастр: налаштовувані ліміти вибірок для CadastralDomainService.
+        # search → серверна фільтрація + clustering, тягне до search_max_parcels;
+        # discover → reconnaissance, без фільтрів, тягне до discover_max_parcels;
+        # hard_cap — захисна стеля, вище якої жоден агент не зможе підняти ліміт.
+        self.cadastral_search_max_parcels = int(os.getenv('CADASTRAL_SEARCH_MAX_PARCELS', '5000'))
+        self.cadastral_discover_max_parcels = int(os.getenv('CADASTRAL_DISCOVER_MAX_PARCELS', '2000'))
+        self.cadastral_search_hard_cap = int(os.getenv('CADASTRAL_SEARCH_HARD_CAP', '20000'))
+        self.cadastral_max_radius_meters = float(os.getenv('CADASTRAL_MAX_RADIUS_METERS', '50000'))
+        self.cadastral_polygon_max_parcels = int(os.getenv('CADASTRAL_POLYGON_MAX_PARCELS', '80000'))
+        self.cadastral_polygon_page_size_default = int(os.getenv('CADASTRAL_POLYGON_PAGE_SIZE', '200'))
+        self.cadastral_national_partition_max_parcels = int(
+            os.getenv('CADASTRAL_NATIONAL_PARTITION_MAX_PARCELS', '120000')
+        )
+
+        # Embeddings (за замовчуванням — HuggingFace Text Embeddings Inference з bge-m3)
+        self.embeddings_endpoint = os.getenv('EMBEDDINGS_ENDPOINT', 'http://localhost:8089').strip()
+        self.embeddings_model = os.getenv('EMBEDDINGS_MODEL', 'BAAI/bge-m3').strip()
+        self.embeddings_batch_size = int(os.getenv('EMBEDDINGS_BATCH_SIZE', '16'))
+        self.embeddings_timeout_sec = int(os.getenv('EMBEDDINGS_TIMEOUT_SEC', '30'))
+        self.embeddings_cache_enabled = os.getenv('EMBEDDINGS_CACHE_ENABLED', 'true').lower() in ('true', '1', 'yes')
+        self.embeddings_cache_ttl_days = int(os.getenv('EMBEDDINGS_CACHE_TTL_DAYS', '30'))
+        self.embeddings_max_retries = int(os.getenv('EMBEDDINGS_MAX_RETRIES', '3'))
+
         # Завантаження конфігурації з YAML файлу (перезаписує значення за замовчуванням)
         self._load_config()
     
@@ -237,8 +321,12 @@ class Settings:
                                     self.llm_investigator_max_steps_per_task = int(inv['max_steps_per_task'])
                                 if 'web_search_provider' in inv:
                                     self.llm_investigator_web_search_provider = str(inv['web_search_provider'] or 'duckduckgo').strip().lower()
+                                if 'web_search_model_name' in inv:
+                                    self.llm_investigator_web_search_model_name = str(inv.get('web_search_model_name') or '').strip()
                                 if 'web_search_enabled' in inv:
                                     self.llm_investigator_web_search_enabled = bool(inv['web_search_enabled'])
+                                if 'source_wait_timeout_seconds' in inv:
+                                    self.flx_source_wait_timeout_seconds = int(inv['source_wait_timeout_seconds'])
                                 if 'allowed_tools' in inv and isinstance(inv['allowed_tools'], list):
                                     self.flx_allowed_tools = [str(t).strip() for t in inv['allowed_tools'] if str(t).strip()]
                                 if 'static_maps_size' in inv:
@@ -277,6 +365,26 @@ class Settings:
                                     self.llm_agent_include_thoughts = bool(agent_config['include_thoughts'])
                                 if 'use_langgraph' in agent_config:
                                     self.llm_agent_use_langgraph = bool(agent_config['use_langgraph'])
+                                if 'cognitive_enabled' in agent_config:
+                                    self.llm_agent_cognitive_enabled = bool(agent_config['cognitive_enabled'])
+                                if 'tool_retrieval_enabled' in agent_config:
+                                    self.llm_agent_tool_retrieval_enabled = bool(agent_config['tool_retrieval_enabled'])
+                                if 'tool_retrieval_top_k' in agent_config:
+                                    self.llm_agent_tool_retrieval_top_k = int(agent_config['tool_retrieval_top_k'])
+                                if 'tool_retrieval_core' in agent_config and isinstance(agent_config['tool_retrieval_core'], list):
+                                    self.llm_agent_tool_retrieval_core = [
+                                        str(x).strip() for x in agent_config['tool_retrieval_core'] if str(x).strip()
+                                    ]
+                                if 'reflection_enabled' in agent_config:
+                                    self.llm_agent_reflection_enabled = bool(agent_config['reflection_enabled'])
+                                if 'reflection_every_n' in agent_config:
+                                    self.llm_agent_reflection_every_n = int(agent_config['reflection_every_n'])
+                                if 'reflect_on_tool_failure' in agent_config:
+                                    self.llm_agent_reflect_on_tool_failure = bool(agent_config['reflect_on_tool_failure'])
+                                if 'chain_compression_threshold' in agent_config:
+                                    self.llm_agent_chain_compression_threshold = int(agent_config['chain_compression_threshold'])
+                                if 'semantic_memory_enabled' in agent_config:
+                                    self.llm_agent_semantic_memory_enabled = bool(agent_config['semantic_memory_enabled'])
 
                         # Налаштування Telegram бота (в т.ч. парсинг — може перевизначити llm.parsing)
                         if 'telegram' in config:
@@ -388,6 +496,68 @@ class Settings:
                                 self.artifact_ttl_seconds = int(lim['artifact_ttl_seconds'])
                             if 'export_confirm_rows_threshold' in lim:
                                 self.export_confirm_rows_threshold = int(lim['export_confirm_rows_threshold'])
+
+                        # Vector DB (Qdrant) — окрема нода у docker-compose
+                        if 'vector_db' in config:
+                            vdb = config['vector_db'] or {}
+                            if 'host' in vdb:
+                                self.qdrant_host = str(vdb['host']).strip() or self.qdrant_host
+                            if 'port' in vdb:
+                                self.qdrant_port = int(vdb['port'])
+                            if 'grpc_port' in vdb:
+                                self.qdrant_grpc_port = int(vdb['grpc_port'])
+                            if 'use_grpc' in vdb:
+                                self.qdrant_use_grpc = bool(vdb['use_grpc'])
+                            if 'api_key' in vdb:
+                                self.qdrant_api_key = str(vdb['api_key'] or '').strip()
+                            if 'collection_listings' in vdb:
+                                self.vector_collection_listings = str(vdb['collection_listings']).strip()
+                            if 'collection_cadastral' in vdb:
+                                self.vector_collection_cadastral = str(vdb['collection_cadastral']).strip()
+                            if 'collection_mcp_tools' in vdb:
+                                self.vector_collection_mcp_tools = str(vdb['collection_mcp_tools']).strip()
+                            if 'vector_size' in vdb:
+                                self.vector_size = int(vdb['vector_size'])
+                            if 'distance' in vdb:
+                                self.vector_distance = str(vdb['distance']).strip().lower()
+
+                        # Embeddings (TEI / OpenAI-compatible)
+                        if 'embeddings' in config:
+                            emb = config['embeddings'] or {}
+                            if 'endpoint' in emb:
+                                self.embeddings_endpoint = str(emb['endpoint']).strip()
+                            if 'model_name' in emb:
+                                self.embeddings_model = str(emb['model_name']).strip()
+                            if 'batch_size' in emb:
+                                self.embeddings_batch_size = int(emb['batch_size'])
+                            if 'timeout_sec' in emb:
+                                self.embeddings_timeout_sec = int(emb['timeout_sec'])
+                            if 'cache_enabled' in emb:
+                                self.embeddings_cache_enabled = bool(emb['cache_enabled'])
+                            if 'cache_ttl_days' in emb:
+                                self.embeddings_cache_ttl_days = int(emb['cache_ttl_days'])
+                            if 'max_retries' in emb:
+                                self.embeddings_max_retries = int(emb['max_retries'])
+
+                        # Cadastral domain limits
+                        if 'cadastral' in config:
+                            cad = config['cadastral'] or {}
+                            if 'search_max_parcels' in cad:
+                                self.cadastral_search_max_parcels = int(cad['search_max_parcels'])
+                            if 'discover_max_parcels' in cad:
+                                self.cadastral_discover_max_parcels = int(cad['discover_max_parcels'])
+                            if 'search_hard_cap' in cad:
+                                self.cadastral_search_hard_cap = int(cad['search_hard_cap'])
+                            if 'max_radius_meters' in cad:
+                                self.cadastral_max_radius_meters = float(cad['max_radius_meters'])
+                            if 'polygon_max_parcels' in cad:
+                                self.cadastral_polygon_max_parcels = int(cad['polygon_max_parcels'])
+                            if 'polygon_page_size' in cad:
+                                self.cadastral_polygon_page_size_default = int(cad['polygon_page_size'])
+                            if 'national_partition_max_parcels' in cad:
+                                self.cadastral_national_partition_max_parcels = int(
+                                    cad['national_partition_max_parcels']
+                                )
             except Exception as e:
                 print(f"Попередження: не вдалося завантажити конфігурацію з {config_path}: {e}")
                 print("Використовуються значення за замовчуванням або змінні оточення")

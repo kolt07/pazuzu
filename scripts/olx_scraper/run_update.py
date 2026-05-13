@@ -610,26 +610,189 @@ def _process_region_raw_only(
     return total_count, loaded_urls
 
 
+def _normalize_region_filter(
+    regions_filter: Optional[List[str]],
+    available_region_names: List[str],
+) -> Tuple[List[str], List[str]]:
+    """Нормалізує фільтр регіонів до канонічних назв із ``olx_region_slugs``.
+
+    Підтримуються варіанти:
+    - точна канонічна назва ("Київська");
+    - довільний регістр ("київська", "КИЇВСЬКА");
+    - суфікс "область"/"обл." ("Київська область", "Київська обл.");
+    - slug ("ko", "lv", "kiev");
+    - latin-подібний slug-варіант, який тоді ігнорується з попередженням.
+
+    Повертає кортеж (matched, unknown) — обидва списки канонічних рядків з вводу.
+    Якщо ``regions_filter`` порожній/None — повертає (порожній, порожній); викликач сам
+    вирішує, чи це означає «без фільтра» (трактує як None).
+    """
+    if not regions_filter:
+        return [], []
+    try:
+        slugs = scraper_config.get_olx_region_slugs() or {}
+    except Exception:
+        slugs = {}
+    name_by_lower = {name.lower(): name for name in available_region_names}
+    name_by_slug = {str(slug).lower(): name for name, slug in slugs.items() if slug}
+
+    matched_set: List[str] = []
+    seen: Set[str] = set()
+    unknown: List[str] = []
+    for raw in regions_filter:
+        if not raw:
+            continue
+        candidate = str(raw).strip()
+        if not candidate:
+            continue
+        lowered = candidate.lower()
+        for suffix in (" область", " обл.", " обл"):
+            if lowered.endswith(suffix):
+                lowered = lowered[: -len(suffix)].rstrip()
+                break
+        canonical = name_by_lower.get(lowered) or name_by_slug.get(lowered)
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            matched_set.append(canonical)
+        elif not canonical:
+            unknown.append(candidate)
+    return matched_set, unknown
+
+
+def _normalize_listing_types_filter(
+    listing_types_filter: Optional[List[str]],
+) -> Tuple[List[str], List[str]]:
+    """Нормалізує фільтр типів оголошень до значень з ``_get_base_categories()``.
+
+    Допускає:
+    - повне ім'я ("Нежитлова нерухомість", "Земельні ділянки", "Земля — рекреаційні");
+    - короткі узагальнення ("нежитлова", "земля", "комерційна");
+    - довільний регістр.
+
+    Повертає (substring_patterns, unknown). ``substring_patterns`` — це канонічні підрядки,
+    які зіставляються з мітками категорій (case-insensitive).
+    """
+    if not listing_types_filter:
+        return [], []
+    try:
+        base_labels = [str(c.get("label") or "").strip() for c in _get_base_categories()]
+        base_labels = [b for b in base_labels if b]
+    except Exception:
+        base_labels = []
+
+    short_aliases = {
+        # Підрядки беремо узагальнено, щоб патерн зіставлявся з усіма варіантами:
+        # "Нежитлова нерухомість", "Земля — ...", "Земельні ділянки".
+        "нежитлов": "Нежитлов",
+        "комерц": "Нежитлов",
+        "commercial": "Нежитлов",
+        "земл": "Земл",
+        "ділянк": "Земл",
+        "land": "Земл",
+    }
+
+    patterns: List[str] = []
+    seen: Set[str] = set()
+    unknown: List[str] = []
+    base_lower = [b.lower() for b in base_labels]
+    for raw in listing_types_filter:
+        if not raw:
+            continue
+        candidate = str(raw).strip()
+        if not candidate:
+            continue
+        lowered = candidate.lower()
+        pattern: Optional[str] = None
+        # 1) точна канонічна назва бази → беремо як патерн
+        for label, label_lower in zip(base_labels, base_lower):
+            if lowered == label_lower:
+                pattern = label
+                break
+        # 2) короткий алias (нежитлов/земл/...) → стійка коротка підстрока
+        if not pattern:
+            for alias_key, alias_value in short_aliases.items():
+                if alias_key in lowered:
+                    pattern = alias_value
+                    break
+        # 3) користувацький рядок є підрядком якоїсь канонічної мітки — беремо його як патерн,
+        # щоб він зіставився з усіма мітками, що містять його (мульти-збіг).
+        if not pattern:
+            for label_lower in base_lower:
+                if lowered in label_lower:
+                    pattern = candidate
+                    break
+        if pattern and pattern not in seen:
+            seen.add(pattern)
+            patterns.append(pattern)
+        elif not pattern:
+            unknown.append(candidate)
+    return patterns, unknown
+
+
 def _filter_regions_with_categories(
     regions_with_cats: List[Tuple[str, List[Dict[str, Any]]]],
     regions_filter: Optional[List[str]] = None,
     listing_types_filter: Optional[List[str]] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
 ) -> List[Tuple[str, List[Dict[str, Any]]]]:
+    """Фільтрує список (region_name, categories) за областями та/або типами оголошень.
+
+    Перед фільтрацією значення з фільтрів нормалізуються до канонічних
+    (див. ``_normalize_region_filter`` та ``_normalize_listing_types_filter``).
+    Невпізнані значення логуються — після цього порожній набір категорій означає
+    реально невалідний фільтр, а не дрібну розбіжність регістру/суфіксу.
     """
-    Фільтрує список (region_name, categories) за областями та/або типами оголошень.
-    regions_filter: лише ці області (назви як у olx_region_slugs).
-    listing_types_filter: лише категорії, у яких label містить один із рядків (напр. «Нежитлова», «Земля»).
-    """
+
+    def _log(msg: str) -> None:
+        if log_fn:
+            log_fn(msg)
+        else:
+            logger.warning("%s", msg)
+
     if not regions_filter and not listing_types_filter:
         return regions_with_cats
+
+    available_region_names = [r for r, _ in regions_with_cats]
+    normalized_regions, unknown_regions = _normalize_region_filter(
+        regions_filter, available_region_names
+    )
+    normalized_types, unknown_types = _normalize_listing_types_filter(listing_types_filter)
+
+    if regions_filter and unknown_regions:
+        _log(
+            f"[OLX raw] фільтр regions: невпізнано {unknown_regions} (доступні приклади: "
+            f"{available_region_names[:5]}…)"
+        )
+    if listing_types_filter and unknown_types:
+        try:
+            base_labels = [c.get("label") for c in _get_base_categories()]
+        except Exception:
+            base_labels = []
+        _log(
+            f"[OLX raw] фільтр listing_types: невпізнано {unknown_types} (доступні: {base_labels})"
+        )
+
+    if regions_filter and not normalized_regions:
+        _log(
+            "[OLX raw] фільтр regions після нормалізації порожній — повертаємо 0 категорій, "
+            "щоб не завантажити випадково всі регіони."
+        )
+        return []
+    if listing_types_filter and not normalized_types:
+        _log(
+            "[OLX raw] фільтр listing_types після нормалізації порожній — повертаємо 0 категорій, "
+            "щоб не завантажити випадково всі типи."
+        )
+        return []
+
     result = []
     for region_name, cats in regions_with_cats:
-        if regions_filter and region_name not in regions_filter:
+        if normalized_regions and region_name not in normalized_regions:
             continue
-        if listing_types_filter:
+        if normalized_types:
             filtered_cats = [
                 c for c in cats
-                if any(lt.strip() in (c.get("label") or "") for lt in listing_types_filter if lt and lt.strip())
+                if any(p.lower() in (c.get("label") or "").lower() for p in normalized_types)
             ]
             if not filtered_cats:
                 continue
@@ -817,10 +980,22 @@ def run_olx_update_raw_only(
         regions_with_cats,
         regions_filter=regions,
         listing_types_filter=listing_types,
+        log_fn=log,
     )
     if not regions_with_cats:
-        log("[OLX raw] Phase 1: після фільтрації областей/типів немає категорій для обробки.")
-        return {"success": True, "total_listings": 0, "loaded_urls": [], "llm_processed_urls": []}
+        log(
+            "[OLX raw] Phase 1: після фільтрації областей/типів немає категорій для обробки. "
+            f"regions={regions!r} listing_types={listing_types!r}"
+        )
+        return {
+            "success": True,
+            "total_listings": 0,
+            "loaded_urls": [],
+            "llm_processed_urls": [],
+            "skipped_reason": "empty_filter",
+            "regions_filter": list(regions or []),
+            "listing_types_filter": list(listing_types or []),
+        }
 
     num_workers = max_workers if max_workers is not None else getattr(scraper_config, "OLX_PHASE1_MAX_THREADS", 5)
     use_pool = num_workers > 0

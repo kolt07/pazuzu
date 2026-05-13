@@ -2,7 +2,7 @@
 """
 Репозиторій investigation_sessions для агента-інвестігейтора Flx.
 
-Зберігає стан розслідування: початковий запит, план, поточний крок, очікування відповіді
+Зберігає стан дослідження: початковий запит, план, поточний крок, очікування відповіді
 користувача, посилання на артефакт фінального звіту.
 """
 
@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from data.repositories.base_repository import BaseRepository
 
 
-# Дозволені стани сесії розслідування.
+# Дозволені стани сесії дослідження.
 # created — щойно створено, очікує запуск воркера.
 # planning — будується початковий план (LLM Planner).
 # running — виконує крок (tool call або roundtrip step).
@@ -34,7 +34,7 @@ ALLOWED_STATES = {
 
 
 class InvestigationSessionRepository(BaseRepository):
-    """Сесії розслідувань Flx."""
+    """Сесії досліджувань Flx."""
 
     def __init__(self):
         super().__init__("investigation_sessions")
@@ -84,6 +84,26 @@ class InvestigationSessionRepository(BaseRepository):
             self.collection.find({"user_id": str(user_id)})
             .sort([("updated_at", -1)])
             .limit(int(limit))
+        )
+        out = []
+        for doc in cur:
+            doc["_id"] = str(doc["_id"])
+            out.append(doc)
+        return out
+
+    def list_awaiting_source_wait_task(self, task_id: str) -> List[Dict[str, Any]]:
+        """Повертає сесії в стані awaiting_sources, що чекають саме на цей task_id.
+
+        Використовується тасками source_load, щоб одразу після завершення сповістити
+        FLX-сесії, які чекали його результату (push-механізм, без 60-сек поллінгу).
+        """
+        if not task_id:
+            return []
+        cur = self.collection.find(
+            {
+                "state": "awaiting_sources",
+                "pending_source_wait.task_id": str(task_id),
+            }
         )
         out = []
         for doc in cur:

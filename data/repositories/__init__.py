@@ -12,6 +12,9 @@ from data.repositories.app_data_repository import AppDataRepository
 from data.repositories.olx_listings_repository import OlxListingsRepository
 from data.repositories.agent_temp_exports_repository import AgentTempExportsRepository
 from data.repositories.agent_activity_log_repository import AgentActivityLogRepository
+from data.repositories.agent_reasoning_chain_repository import AgentReasoningChainRepository
+from data.repositories.agent_runtime_settings_repository import AgentRuntimeSettingsRepository
+from data.repositories.agent_semantic_memory_repository import AgentSemanticMemoryRepository
 from data.repositories.scheduled_events_repository import ScheduledEventsRepository
 from data.repositories.artifact_repository import ArtifactRepository
 from data.repositories.export_daily_count_repository import ExportDailyCountRepository
@@ -41,6 +44,9 @@ __all__ = [
     'OlxListingsRepository',
     'AgentTempExportsRepository',
     'AgentActivityLogRepository',
+    'AgentReasoningChainRepository',
+    'AgentRuntimeSettingsRepository',
+    'AgentSemanticMemoryRepository',
     'ScheduledEventsRepository',
     'ArtifactRepository',
     'CollectionKnowledgeRepository',

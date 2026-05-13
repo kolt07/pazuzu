@@ -1,8 +1,365 @@
+## 2026-05-13 — Кадастровий домен: полігон-пошук (Google viewport), кеш, FLX-тулзи, національна кластеризація, мапа в адмінці
+- Запит: реалізувати план (розширені cadastral-тулзи для LLM, кеш полігон-запитів, кластеризація з правилами груп КВЦПЗ, партиційна побудова кластерів по Україні з прогресом і Leaflet).
+- Зроблено: Geocoding (viewport/bounds у кеші), Places API New `get_place_details`, `CadastralToponymBoundaryService`, `find_intersecting_polygon` + колекція `cadastral_polygon_query_cache`, методи домену `list_parcels_in_region_polygon` / `list_polygon_query_page`, розширення `cluster_parcels_in_memory`, `cluster_parcels`, `get_cluster_meta`, `list_cluster_parcels_page`, `get_parcel_summary` / `get_parcel_full`; реєстрація тулзів у `InvestigationService` та `FLX_ALLOWED_TOOLS`; партиційна кластеризація за `oblast_code` з полем `partition_key`, Celery-таска `cadastral_national_cluster_build_task`, колекція `cadastral_cluster_build_jobs`, адмін API `build_national`, `national_status`, `geojson`; UI адмінки — прогрес-бар і OSM-карта centroid-ів.
+
+## 2026-05-11 — Корінь проблеми «Турка→Турійськ»: не модель і не БД, а reinforcement loop у промпті
+- Запит користувача: «30 нотаток scope_lock застосовано до listings.find_with_fallback: city: Турка→Турійськ… Як туди ще одне місто вписалось??»
+- Розслідування DB (`unified_listings`, 11.291 док.): у БД є і "Турка" (Львівська, 3 оголошення), і "Турійськ" (Волинська, 2). Профіль `collection_knowledge` для `unified_listings` був порожнім — старий `FIELD_PROFILE_CONFIG` посилався на неіснуючі поля `addresses.region/settlement` (фактично у документі `region`/`city` верхнього рівня). Тобто DB KNOWLEDGE блок у промпті був реально порожній для цієї колекції — джерело "Турки" НЕ в БД.
+- Реальні причини, що провокували LLM:
+  1. **HARD BAN з прикладами міст** у `investigator_step` промпті: «вигадувати локацію (Київ, Львів, Одеса, Ужгород, Турка, …)». Класичний anti-pattern «не думай про слона» — модель бачить «Турка» у списку і починає anchor-генерувати її поряд із «Турійськ».
+  2. **`[guard] Скоригована думка (N замін):` префікс** у `_sanitize_thought_against_scope` записувався у notes. Через 30 ітерацій LLM у своєму `notes_summary` бачив сотні `Турка→Турійськ` корекцій, що ставало feedback-loop'ом і ще більше підказувало плутати.
+  3. **`scope_lock застосовано до …: city: Турка→Турійськ…`** — також записувалось як note kind="decision" і потрапляло у `notes_summary`. Той самий ефект: LLM бачить корекцію → намагається «не повторити» → пише інше популярне місто (Київ/Львів/Одеса) → знову корекція.
+  4. **`hallucination_guard` SSE-event** дублював факт корекції у UI — для користувача це 30 однакових повідомлень, а сама подія для самої моделі сенсу не має.
+- Виправлення (4 шари, всі завершено та підтверджено smoke-тестом):
+  1. **`config/prompts.yaml::investigator_step`** — прибрав конкретні імена міст з HARD BAN, переписав правила навколо нейтральної формули «копіюй з SCOPE дослівно, не заміняй незнайому назву на схожу».
+  2. **`business/agents/investigator/step.py::_format_scope_lock`** — формат LOCKED SCOPE з маркерів `⟨…⟩` (модель плутала з placeholder'ом) переробив на природний `city = "Турійськ"  (копіюй у args[`city`] дослівно: Турійськ)`. Хедер блоку явно каже: «Значення у подвійних лапках — канонічні… НЕ заміняй незнайому на популярнішу».
+  3. **`business/services/investigation_service.py::_sanitize_thought_against_scope`** — прибрав `[guard]`-префікс із поверненого тексту. Сам факт корекції тепер лише у логах.
+  4. **`_sanitize_decision_against_scope`** (новий) + його виклик ДО обробки `decision`. Розширив санітайз з `thought` на ВСІ текстові поля LLM-рішення: `thought`, `ask_user.question`, `ask_user.options[*]`, `final_for_step.observation`. Перший прогін показав що LLM писав «уточніть місто в Київській області» у `ask_user.question` — це і поспрацьовувало силу sanitize.
+  5. **`_apply_scope_lock_to_args`** — прибрав запис `scope_lock застосовано…` у notes/events. Тепер тиха корекція тільки в логах; натомість префікс `⚠️ SCOPE WARNING: …` додається у текст observation (LLM бачить корекцію один раз як останнє свіже повідомлення, а не як накопичену історію).
+  6. **`hallucination_guard` SSE-event** прибрано (теж лише в логах).
+  7. **`CollectionKnowledgeService.FIELD_PROFILE_CONFIG["unified_listings"]`** — застарілі шляхи `addresses.region/settlement` замінено на реальні `region`/`city`/`source`. Після `run_profiling(['unified_listings'])` DB KNOWLEDGE блок став реально корисним: топ-регіони (Київська 1878, Львівська 390, …, Волинська 122), топ-міста (Одеса, Київ, Вишеньки…). Турки серед топу немає.
+- Smoke v7 (`session_id=97396d69-7362-45f0-811b-c97f356590a4`), той самий запит про Турійськ:
+  - У UI/notes: `hallucination_guard` events = **0**, `scope_lock.apply` notes = **0** (раніше 30+34).
+  - У фоновому логу: silent rewrite спрацював **75 разів** (gemini-2.5-flash далі генерує `Київ`/`Львів`/`Коломия`/`Івано-Франківськ` як default — але це уже невидимо для користувача і не reinforce-loop'иться).
+  - Tool calls: **37**, `bad city in args (≠ Турійськ): 0`.
+  - Думки чисті, посилаються на «LOCKED SCOPE»: «Для дослідження ринку комерц. нерух. в Турійськ з заданими параметрами…», «Параметри пошуку чітко визначені згідно з LOCKED SCOPE».
+  - Прогрес: сесія пройшла step 0→1→2 (раніше залипала на step=0 41 ітерацію). Multi-stage reporter відпрацював: 6 секцій (market, listings, cadastral_landscape, promising_parcels, infrastructure, competition), 9 claims, артефакт згенеровано.
+- Ключовий висновок: для слабкої моделі (gemini-2.5-flash) **silent rewrite + чистий контекст** працює, а error-feedback («блок tool, скажи LLM виправ args») — НЕ працює (модель не вчиться між ітераціями, просто пробує нове рандомне місто).
+
+## 2026-05-11 — Smoke-тест FLX (Турійськ, склад/супермаркет ≥1500 м²) — guard rails підтверджено
+- Запит: «Запусти цей запит: Проведи аналітику по м. Турійск (Волинської області) на предмет комерційної нерухомості від 1500 м2 під побудову склада/супермаркета… Видали перед цим всі нотатки флекса… Контролюй логи, ход думок».
+- Перед стартом видалено: investigation_sessions (35), investigation_events (1168), investigation_notes (1449); flx_lessons_learned (21) залишено (memory).
+- Сесія `d3c5666a-ae83-416a-871b-53de416c5753` (`smoke_user_390636278`), state=done за ~5:23, artifact `1de62bf2-8a37-462b-b82b-7e2774384397`.
+- Планувальник: `objective` + 5 self-contained steps + `scope_lock={location:{city:'Турійськ', region:'Волинська'}, property:{type_keyword:'комерц', min_area_sqm:1500.0}, task_keywords:['склад','супермаркет','комерційна нерухомість','земельні ділянки']}` — все коректно.
+- **Antihallucination guards спрацювали 100% часу**:
+  * `thought.hallucination_guard` × **34** події — LLM весь час намагався писати Турка/Турці (Львівська), Дніпро (Дніпропетровська), Ужгород (Закарпатська), Львів — кожна спроба відловлена `_sanitize_thought_against_scope`, у UI/таймлайн пішли вже скориговані `[guard] Скоригована думка (N замін)`.
+  * `scope_lock.apply` × **30** нотаток — `_apply_scope_lock_to_args` примусово перезаписав tool args (city/region) перед кожним `listings.find_with_fallback`. ЖОДЕН tool call не пішов з некоректною локацією.
+- Multi-stage reporter відпрацював: outline_ready (7 секцій) → 7× section_ready → synthesis_done (claims=9) → артефакт `text/html`. Звіт прямо констатує: у м. Турійськ активних оголошень комерц.нерух. ≥1500 м² немає; region_wide дав 20 об'єктів, найбільший — 1289 м².
+- **Знайдені залишкові проблеми (не блокуючі guardrails, окремий work item)**:
+  * Агент 41 ітерацію крутився на `step_index=0`, не позначав крок `final`, не переходив на step 1-4 плану — `_select_next_task_step`/loop-control не закриває step при отриманні негативного fallback-результату.
+  * Агент жодного разу не викликав `cadastral.discover_in_area` (попри готовий scope_lock з area/коди КВЦПЗ доступні через `cadastral.get_knowledge` — викликаний 4×). У промпті для cadastral policy треба зробити явний «після get_knowledge → одразу discover_in_area з scope.city».
+  * Telegram notify skipped через нечисловий `user_id` тестового кейсу — норм для smoke.
+- Висновок: фіксації архітектурні (bind-mounts, scope_lock, thought-guard, multi-stage report) — підтверджено в проді. Наступний раунд — `step.complete` + явна послідовність cadastral.* у промпті.
+
+## 2026-05-11 — Multi-stage report: один промпт → outline + N секцій + synthesis
+- Запит: «Фінальний результат не має бути результатом одного промпту. Має бути комплексний документ через виконання запитів по кожному п.п.».
+- Було: `InvestigatorReportAgent.compose()` робив ОДИН LLM-виклик з гігантським промптом, де LLM мав одночасно сформувати ВСІ sections (market_baseline, listings, cadastral, recommendations…). Результат — поверхневі narrative, часто з втратою деталей з evidence (cadastral_numbers, конкретні listings).
+- Стало (`config/prompts.yaml` + `business/agents/investigator/reporter.py`):
+  - **Stage 1 — OUTLINE** (`investigator_report_outline`): LLM аналізує user_query + scope_lock + evidence_inventory (kinds → counts) і пропонує 4-8 розділів з конкретним `focus`, `evidence_kinds`, `evidence_keywords` для кожного. Це план звіту, що адаптується під тип запиту і доступні дані.
+  - **Stage 2 — SECTIONS** (`investigator_report_section`): для КОЖНОЇ секції з outline'у — окремий LLM-виклик з ВУЗЬКИМ контекстом:
+    * `_filter_evidence(evidence, section_meta)` залишає тільки evidence з потрібними kinds + ранжує за збігом keywords;
+    * у промпт іде лише ~12k символів релевантного evidence (замість 16k змішаного);
+    * секція повертає всі deep-fields: narrative (4-12 речень), bullets, items, listings, parcels (з cadastral_number/centroid/cluster_id), metrics, applied_strategy.
+  - **Stage 3 — SYNTHESIS** (`investigator_report_synthesis`): reduce-крок з готових sections → title, executive_summary, claims (з confidence/evidence_count/source_diversity), warnings, sources.
+- SSE-події progress (`InvestigationService._finalize` push'ить через `progress_callback`):
+  * `report.outline_ready` — UI бачить структуру звіту;
+  * `report.section_ready` (× N) — кожна секція по готовності, з індексом і total;
+  * `report.synthesis_done` — фіналізація.
+- Налаштування `config/settings.py`:
+  * `flx_multistage_report` (env `FLX_MULTISTAGE_REPORT`, default `true`);
+  * `flx_report_max_sections` (env `FLX_REPORT_MAX_SECTIONS`, default `8`).
+- Fallback: якщо будь-який стейдж падає (LLM відмовив / порожній outline) — autoматично back до single-pass через старий промпт `investigator_report` (legacy zero-regression).
+- Передача `scope_lock` (з plan) у всі стейджі — як `scope_lock_block`. Тепер reporter знає, ЯКА локація канонічна, і у промпті прямо сказано: «локація суворо з scope_lock, інші міста в evidence — це ринковий ескейп».
+- Smoke-тест (моковий LLM, 3 секції) — 5 викликів (1+3+1), progress-події push'нулись, title/sections/claims нормалізовано. AST + YAML clean.
+- Перезапуск `pazuzu-llm-worker` (через bind-mount достатньо restart, без rebuild).
+
+---
+
+## 2026-05-11 — Anti-hallucination guard + bind-mount fix
+- Запит: «Я перестворив контейнери. Галюцинації не проходять. Воно пішло шукати Турку Львівської області, а потім Дніпро».
+- **КРИТИЧНА регресія процесу**: `docker-compose.yml` для `pazuzu-app`/`source-worker`/`llm-worker` будувався через `Dockerfile` із `COPY .`, а у volumes був прим'ятий ТІЛЬКИ `config.yaml`. Усі попередні фікси (`scope_lock`, `_normalize_tool_args`, нові промпти) фізично НЕ потрапляли у воркер після `docker restart` — там жив старий образ. Перевірка: `docker exec pazuzu-llm-worker grep "scope_lock" /app/business/agents/investigator/planner.py` повертало нічого до rebuild.
+  - **Фікс**: додано bind-mount усього коду (`business`, `config`, `domain`, `mcp_servers`, `scripts`, `telegram_mini_app`, `utils`, `main.py`) у docker-compose. Тепер `docker restart` достатньо для hot-reload без `compose build`.
+- **`_select_next_task_step` перетирав plan-step[0]**: dynamic research-task із абстрактним goal'ом «Дослідити аспект: future_development» підмінював коректний step плану. Тепер dynamic_step додається ТІЛЬКИ після того, як plan-steps вичерпано (перевірка `cur.get("task_id")` — якщо немає, то це plan-step, не чіпаємо).
+- **scope_lock розширено для cadastral**: LLM кладе `city`/`region`/`region_name`/`oblast_name` як top-level args для `cadastral.search`/`cadastral.discover_in_area` (схема їх не приймає). Тепер `_apply_scope_lock_to_args` викидає ці stray параметри та переносить область у `scope.oblast_name` (з scope_lock або з stray, перевага у scope_lock).
+- **Anti-hallucination guard для `step.thought`** — `_sanitize_thought_against_scope`:
+  * лист маркерів міст (Турка, Львів/Львов, Київ/Києв, Одес, Харків/Харков, Дніпр, Ужгород, …) у всіх відмінках через regex + negative lookahead `(?!ськ)` для виключення регіональних форм;
+  * лист коренів регіонів (Львівськ, Закарпатськ, Київськ, Дніпропетровськ, …);
+  * якщо у думці LLM знайдено НЕ-scope місто/регіон — замінюємо на scope city/region і додаємо префікс `[guard] Скоригована думка (N замін)`;
+  * push SSE-події `phase=hallucination_guard` з повідомленням для UI («LLM спробував згадати X, scope=Турійськ»);
+  * 6/6 юніт-тестів пройшли (включно з відмінком «у Львові» → корінь «Львов», а не «Львів»).
+- **DB knowledge block у step-prompt** (запозичено зі штатного LangChain-агента): новий метод `_get_db_knowledge_block` із 5-хвилинним кешем дзвонить `CollectionKnowledgeService.get_knowledge_for_agent(max_length=3500)` і вставляє у промпт `investigator_step` як `DB KNOWLEDGE` блок. Це дає step-агенту реальну статистику колекцій (топ-міста, топ-property_type, distributions) → менше шансів вигадати «Ужгород» коли у БД його практично немає.
+- Перезапуск `pazuzu-llm-worker`/`pazuzu-source-worker`/`pazuzu-app` через bind-mount (без rebuild).
+
+---
+
+## 2026-05-11 — Bug-fix (раунд 3): scope_lock — програмний guard rail від галюцинацій локації
+- Запит: «ВОНО ЗНОВУ НЕ ПРАЦЮЄ!!! ПЕРЕВІР ЛОГИ!!! Спочатку — виокремлюємо з запиту параметри і потім використовуємо їх».
+- Симптом у логах `pazuzu-llm-worker` (сесія 60b25a43-925c-4542-99dc-313e9c57a244, query про м. Турійськ):
+  - `plan.objective` ОК — «Провести аналітику по м. Турійськ…».
+  - `plan.steps` ОК — усі з «Турійськ».
+  - Попередні фікси (`_normalize_tool_args`, інжекція objective у `step.goal`, HARD BAN у промпті) уже застосовані.
+  - **Проте LLM step-агент усе одно** пише: `city='Ужгород'` (Закарпатська), `city='Турка'` (Львівська), `city='Київ'/'Шевченківський'` — пiдставляє «знайомі» агенту міста замість Турійська. `gemini-2.5-flash` хронічно ігнорує текстові HARD CONSTRAINT-и.
+- **Кореневий діагноз**: один лише text-based guard rail у промпті недостатній для часткових моделей. Потрібен **програмний enforcement** — детермінований шар над LLM, який накладає параметри з user_query поверх args НЕЗАЛЕЖНО від того, що написав LLM. Користувач сформулював явно: «виокремлюємо з запиту параметри і потім використовуємо їх».
+- **Фікс — `scope_lock` (структурований інваріант запиту)**:
+  - `config/prompts.yaml::investigator_planner`: розширено JSON-output. Тепер планер ОБОВ'ЯЗКОВО повертає `scope_lock = { location: {city, region, raw}, property: {type_keyword, intent, min/max_area_sqm}, task_keywords: [...] }`. У промпт додані підказки нормалізації (Турийск→Турійськ/Волинська, склад/супермаркет→type_keyword="комерц" тощо).
+  - `business/agents/investigator/planner.py::_normalize_scope_lock`: бере результат LLM, доповнює regex-fallback'ом (для `м. Турийск` витягне city; для `від 1500 м²` витягне min_area_sqm; для «склад/супермаркет» — `type_keyword="комерц"`). Має словник 30+ українських міст → область (Турійськ/Турка/Ужгород/Львів/Київ/…), тож навіть якщо LLM не повернув scope_lock, regex+словник дадуть надійний результат.
+  - `business/agents/investigator/step.py::decide`: новий параметр `scope_lock` + метод `_format_scope_lock` → `LOCKED SCOPE` блок у промпті. Step-агент тепер БАЧИТЬ конкретні значення `city/region/property_type_contains/area` ПЕРЕД викликом тули.
+  - `config/prompts.yaml::investigator_step`: блок `LOCKED SCOPE (authoritative, executor will OVERRIDE wrong args)`. Прямо вказано: «executor мовчки замінить wrong values на значення зі scope_lock. Краще використай їх одразу».
+  - **Головне — `business/services/investigation_service.py::_apply_scope_lock_to_args`** (новий метод). Викликається в `_handle_tool_call` ПІСЛЯ `_normalize_tool_args`. Логіка:
+    * `listings.find_with_fallback`: `args["city"]/["region"]` перезаписуються значеннями з `scope_lock.location` НАВІТЬ ЯКЩО LLM написав інше. `property_type_contains`/`building_area_min`/`building_area_max` — додаються, якщо LLM їх не вказав (не перезаписуємо явну волю LLM щодо area).
+    * `cadastral.discover_in_area` / `cadastral.search`: якщо немає явних lat/lon і немає `scope.oblast_name` — підставляється `scope_lock.location.region`. Для search заповнюється `filters.min/max_area_sqm` з scope_lock.
+  - Кожен override логуютьcя `[flx-think] scope_lock.apply tool=… overrides=city: Київ→Турійськ, region: Київська→Волинська, …` і записується нотаткою `kind=decision` (видно у timeline).
+- **Семантика — «дослідження» замість «розслідування»**:
+  - Запит користувача: «Перейменуй розслідування на дослідження. Це не кримінальне розслідування а ринкове дослідження».
+  - Масова заміна у `business/`, `config/`, `telegram_mini_app/`, `docs/`, `scripts/migrations/`, `data/repositories/`, `mcp_servers/`:
+    * `розслідуванн` → `дослідженн` (зберігає всі відмінки: -я/-ю/-і/-ям/-і);
+    * `розсліду` → `досліджу` (для дієслів: розслідує→досліджує, розслідуємо→досліджуємо тощо);
+    * Те саме з великої літери.
+  - Зачеплено 21 файл. AST python + YAML валідація пройдені. Назви функцій/класів/файлів (`InvestigatorPlannerAgent`, `investigation_service.py`, `start_investigation`) свідомо НЕ чіпали — це stable API.
+- **Smoke**: Юніт-тести `_normalize_scope_lock` (4 кейси: LLM full / empty+query+regex / empty / Ужгород-АЗС) і `_apply_scope_lock_to_args` (listings override / cadastral fill / cadastral з явним lat/lon — НЕ перезаписуємо) — усі зелені.
+- Перезапуск `pazuzu-llm-worker` / `pazuzu-source-worker` / `pazuzu-app`.
+
+---
+
+## 2026-05-11 — Bug-fix (раунд 2): research_tasks без локації + LLM пише неіснуючі args
+- Запит: «Воно знову це робить, перевір логи докера».
+- Симптоми у логах `pazuzu-llm-worker` (сесія 25e7c0ff-05a9-4356-86c1-14413e819e65, query про м. Турійськ):
+  - `plan.objective` = "м. Турійськ (Волинська обл.)..." — коректний.
+  - `plan.steps[1..5]` — теж нормальні з «Турійськ».
+  - **`plan.steps[0]`** — `"Дослідити часто пропущений аспект: demographics"` БЕЗ локації.
+  - LLM step-агент починає з step 0 і галюцинує: `listings.find_with_fallback(city_name='Одеса', region_name='Одеська область', min_area_sqm=500, ...)`, потім `city_name='Київ'`, `city_name='Львів'` — і tool тихо ігнорує всі ці параметри через `**_: Any`.
+- **Корінь #1 — динамічна підміна step.goal на абстрактний research_task**:
+  - `_run_unknown_discovery` (iteration ≥ 3) додає у `research_tasks` рядки `"Дослідити часто пропущений аспект: {aspect}"` БЕЗ локації/контексту.
+  - `_select_next_task_step` бере найвищий за пріоритетом task з `research_tasks` і **записує його як step.goal**, фактично переписуючи план планувальника. У сесії 25e7c0ff так сталося ще на iteration=0 (`unknown_discovery` спрацював у попередніх ітераціях іншого запуску й залишив research_tasks у сесії).
+  - Step-агент бачить голий `step.goal = "Дослідити часто пропущений аспект: demographics"` і галюцинує локацію.
+- **Корінь #2 — LLM пише неіснуючі параметри тулз**:
+  - `listings.find_with_fallback` приймає `city`, `region`, `building_area_min`, `building_area_max`, але LLM пише `city_name`, `region_name`, `min_area_sqm`, `max_area_sqm`, `listing_type` (нема такого), `tags_contains`, `semantic_query`.
+  - Тула декларує `**_: Any` → невідомі параметри тихо ігноруються → `applied_filters` йде без `city`/`region` → повертається 50 «комерц» з усієї України. LLM думає, що знайшов потрібні дані.
+- **Фікси**:
+  - `business/services/investigation_service.py::_select_next_task_step`: тепер інжектує контекст у `step.goal` (`f"{top.goal} — у рамках мети дослідження: «{plan.objective}»"`) і у `success_criteria` (явна вимога не змінювати локацію/тип). Це усуває проблему навіть для застарілих research_tasks без контексту.
+  - `_run_unknown_discovery`: додає суфікс `(контекст: {objective або query})` до кожного goal — щоб логи й UI також показували, в межах якого дослідження створено task.
+  - Нова мапа `_TOOL_ARG_ALIASES` + метод `_normalize_tool_args` у `_handle_tool_call`. Для `listings.find_with_fallback`:
+    - `city_name` → `city`, `region_name` → `region`, `city_contains`/`region_contains` → `city`/`region`.
+    - `min_area_sqm`/`max_area_sqm` → `building_area_min`/`building_area_max` (для землі є явні `min_land_area_sqm`/`max_land_area_sqm`).
+    - `tags_contains` → `tags`, `semantic_query` → `query_text`.
+    - `listing_type`, `listing_types`, `days_since_published` → DROP (тула не має таких).
+  - У логах кожен ренейм фіксується: `tool_args.normalize tool=listings.find_with_fallback renames=city_name->city, min_area_sqm->building_area_min, ...`.
+- `config/prompts.yaml::investigator_step`: посилено HARD CONSTRAINT блок:
+  - «Якщо `step.goal` абстрактний — використай ЛОКАЦІЮ ТА ПРЕДМЕТ з PRIMARY OBJECTIVE як обов'язкові фільтри. НІКОЛИ не вигадуй».
+  - «HARD BAN: вигадувати локацію (Київ, Львів, Одеса, ...) яку не згадано в PRIMARY OBJECTIVE».
+  - «Якщо тебе тягне написати інше місто — ЗУПИНИСЬ і повернись до objective».
+  - «Common mistakes to AVOID: `city_name`, `region_name`, `min_area_sqm`, `max_area_sqm`, `listing_type`, `listing_types`, `days_since_published`, `tags_contains`, `semantic_query` for `listings.find_with_fallback`».
+- Перезапуск `pazuzu-llm-worker`/`pazuzu-source-worker`/`pazuzu-app` для застосування змін.
+
+## 2026-05-11 — Bug-fix: LLM-агент губить контекст (вигадує Київ/Львів) + рандомні префікси у tool names
+- Запит: «До чого тут бляха Львів та Київ, якщо в запиті мова йде про Волинську область, по якій в нас є оголошення в базі? Перевір логи в докері, щоб виявити причину цього непорозуміння».
+- Симптоми у логах `pazuzu-llm-worker` для сесії 26520dca-e780-4f90-b242-1484e87ab52c (query='Проведи аналітику по м. Турийск ... комерційної нерухомості від 1500 м2 під побудову склада/супермаркета'):
+  - Перший же tool_call: `listings.find_with_fallback(region='Львівська область', ...)` — попри те, що objective = «м. Турійськ» (Волинська обл.).
+  - У step.final писав `observation=Мета дослідження визначена: {objective}` (літеральний плейсхолдер у тексті — LLM імітував шаблон), а потім вигадав мету: «Знайти земельну ділянку для будівництва логістичного центру в Київській області, 5 га».
+  - Іноді тулзи звалися `flx.cadastral.get_knowledge`, іноді `flx.cadastral_get_knowledge`, іноді `cadastral.get_knowledge` — і allow-check падав на двох перших варіантах з повідомленням «Інструмент ... не дозволений».
+  - LLM придумав неіснуючу тулзу `flx.landscape.get_summary`.
+- **Корінь #1 (галюцинація локації)**: `objective` у промпті `investigator_step` лежав у середині шаблону (після всіх policy-блоків), а `step.goal`, який LLM бачив поряд із поточним кроком, був абстрактним («Сформувати попередній список найбільш придатних ділянок-кандидатів») без локації/типу. Step-агент трактував goal як «робити що завгодно у будь-якій локації» і генерував випадкові міста.
+- **Корінь #2 (рандомні префікси)**: registry містить канонічні назви (`cadastral.get_knowledge`, `listings.find_with_fallback`), але allow-check був чисто рядковий — `flx.cadastral.get_knowledge` чи `cadastral_get_knowledge` не мапилися ні на що.
+- **Корінь #3 (винайдені тулзи)**: жодного запобіжника на «`flx.landscape.get_summary` і подібні фантазії» — окрім самого allow-check, що повідомлення давало без пояснення, як правильно.
+- `business/services/investigation_service.py`:
+  - Додано метод `_resolve_tool_name(raw_name)`. Він пробує по черзі: точне співпадіння, з/без префіксу `flx.`, заміна підкреслень на крапки (так `flx.cadastral_get_knowledge` → `cadastral.get_knowledge`). Перший варіант, що знайдено в registry, вважається канонічним. Якщо нічого не зматчилось — повертає сире ім'я (allow-check його відхилить).
+  - `_handle_tool_call`: після резолву логує `tool_name.normalize raw=... -> canonical=...`. Якщо ім'я не зматчилось — повідомлення про відхилення містить і сире ім'я, і нормалізоване, і явну інструкцію: «використовуй ТОЧНО ту назву, без префіксу `flx.` і без заміни крапок на підкреслення».
+- `config/prompts.yaml`:
+  - `investigator_step`: PRIMARY OBJECTIVE винесено у візуально виділений блок ════ на самому верху промпта (одразу після ролі). Додано блок RULES OVER OBJECTIVE з жорсткими інструкціями: «локація з objective — обов'язковий контекст; не підставляй Київ/Львів/Одесу; якщо `step.goal` абстрактний — інтерпретуй його з PRIMARY OBJECTIVE; невідомі тула — не вигадуй».
+  - `investigator_planner`: додано CRITICAL — step.goal SELF-CONTAINED RULE з прикладами ✅/❌. Кожен `step.goal` має містити локацію, тип об'єкта та обмеження з user_query. `success_criteria` теж.
+- Перевірка нормалізації imen tool (unit test через `_resolve_tool_name`): 10 з 11 кейсів зматчились, єдиний `FAIL` — це навмисно `flx.landscape.get_summary` (неіснуюча), яка має падати в allow-check.
+- Воркери `pazuzu-llm-worker`, `pazuzu-source-worker`, `pazuzu-app` перезапущено через `docker compose restart`.
+
+## 2026-05-11 — Cadastral search: server-side push фільтрів + адаптивні ліміти
+- Запит: «Виявлений обмежувач (для окремої задачі) — покращ це під наші задачі».
+- Корінь проблеми (з попереднього smoke-тесту): `CadastralDomainService.search()` завжди тягнув `_resolve_scope_to_parcels(..., limit=MAX_PARCELS_FETCH=800)` без жодного push-фільтра у Mongo, після чого фільтрував in-memory. Наслідок: у щільних локаціях геопошук уже сам по собі повертав 1500-50000 ділянок, з яких ми бачили випадкові 800 — і важливі великі ділянки потрапляли в «обрізану» частину. Особливо проявилось на сценарії «комерційні ≥1500 м² у Турійську»: знайдено 1 ділянку, тоді як насправді у радіусі їх 9 (1 кластер + 8 single).
+- `data/repositories/cadastral_parcels_repository.py`: до `find_within_radius(...)` додано параметр `purpose_codes_in: Optional[List[str]]`. Транслюється у MongoDB-запит як `criteria["purpose"] = {"$in": codes}` (взаємно виключно з `purpose`/`purpose_contains`, бо `$in` — точніший варіант). Перевіряється перед `purpose_label`, area-range та іншими фільтрами, які вже підтримувалися.
+- `config/settings.py` + `config/config.yaml`: нова секція `cadastral`:
+  - `search_max_parcels` (default 5000) — базова стеля для search.
+  - `discover_max_parcels` (default 2000) — базова стеля для reconnaissance (`discover_in_area`).
+  - `search_hard_cap` (default 20000) — абсолютний максимум, до якого search підіймається адаптивно при наявності строгих server-side фільтрів.
+  - `max_radius_meters` (default 50000) — геопросторовий cap.
+  - Env-фолбеки: `CADASTRAL_SEARCH_MAX_PARCELS`, `CADASTRAL_DISCOVER_MAX_PARCELS`, `CADASTRAL_SEARCH_HARD_CAP`, `CADASTRAL_MAX_RADIUS_METERS`.
+- `business/services/cadastral_domain_service.py`:
+  - Видалено константи `MAX_PARCELS_FETCH=800` / `MAX_RADIUS_METERS=50000.0` як module-level. Замість них — `DEFAULT_*` як фолбек, реальні ліміти лежать на інстансі (`_search_default_limit`, `_discover_default_limit`, `_search_hard_cap`, `_max_radius_m`) і читаються з `Settings()` у `__init__`. Допускає інжекцію `settings=...` для тестів.
+  - Додано `_resolve_limit(explicit, default)`: безпечно нормалізує ліміт у межах `[1, search_hard_cap]`.
+  - **Адаптивна стратегія `search()`**:
+    1. Якщо в `filters` є хоча б один строгий server-side предикат (`business_groups`/`purpose_codes` або `min_area_sqm > 0`) — ліміт автоматично піднімається до `search_hard_cap` (20000), бо Mongo сама зменшить набір.
+    2. Без строгих фільтрів — тримається базовий `search_max_parcels` (5000).
+    3. `output.fetch_limit` дозволяє ручне перевизначення (з тим самим hard cap).
+  - **Server-side push** у новому `_fetch_filtered_parcels(...)`:
+    * radius-scope → `find_within_radius(purpose_codes_in=..., area_sqm_min=..., area_sqm_max=..., ownership_form=..., ...)`.
+    * oblast-scope → `_fetch_parcels_by_oblast_filtered(...)`: `cadastral_number IN (resolved from location_index)` + `purpose IN (...)` + `area_sqm` range + `ownership_form` — все в одному `find(...)` без in-memory циклів.
+  - In-memory `_apply_filters` залишився як другий запобіжник (для `purpose_label_regex` з каталогу, який Mongo не приймає, і для `ownership_form_contains`).
+  - **Landscape** будується окремо broad fetch до `discover_max_parcels` (2000) — щоб не змішувати з відфільтрованою вибіркою. `landscape.total_parcels` тепер чесно відображає краєвид незалежно від фільтрів.
+  - Нові поля у відповіді `search`: `fetch_limit`, `scope_truncated`, `server_side_filtered`, `truncation_note` (з конкретною інструкцією — звузити radius або додати строгу умову).
+  - Аналогічні поля додано в `discover_in_area`: `fetch_limit`, `scope_truncated`, `truncation_note`.
+- `scripts/test_cadastral_domain_smoke.py`: оновлено вивід — друкує `fetch_limit`, `scope_truncated`, `server_side_filtered`, `truncation_note`. Перезапуск підтвердив:
+  - **A) commercial≥1500 м²:** з 1 ділянки до **1 кластера (9 360 м², 2 парцелі) + 8 single (1.7-9.85 тис м²)**. server_side_filtered=True, fetch_limit=20000, scope_truncated=False.
+  - **B) commercial+industrial+public_service≥1500 м²:** з 2 ділянок до **6 кластерів (6-17 тис м²) + 15 single (3.9-9.85 тис м²)**.
+  - **D) agricultural-резерв≥1500 м²:** filtered_total_parcels стало 1200 (раніше 252 з 800 broad-fetch), топ-кластер тепер 26 парцелей / 24.0 га (раніше 30 / 21.5 — інший центроїд через ширший охоплений набір).
+  - `discover_in_area` без фільтрів: `total_parcels_in_area=2000, scope_truncated=True, truncation_note` пояснює агенту, що далі — `cadastral.search` з фільтрами автоматично підніме ліміт.
+
+## 2026-05-11 — Smoke-тест CadastralDomainService (Турійськ, супермаркет ≥1500 м²)
+- Запит: «Проведи смок тест. Знайди ділянки (або кластери) в кадастрі в межах міста Турійськ де можна було б розмістити супермаркет площею від 1500 кв. м.»
+- Створено постійний smoke-скрипт `scripts/test_cadastral_domain_smoke.py`: викликає `CadastralDomainService.get_knowledge` (scope=Волинська), `discover_in_area` (Турійськ, radius=6 км) і `search` у 4 сценаріях (commercial-only, commercial+industrial+public_service, без min_area, agricultural-резерв).
+- Результати на реальних даних Mongo (19.86 млн ділянок загалом, 881 771 у Волинській обл.):
+  - **Прямі цільові ділянки (commercial / industrial / public_service, ≥1500 м²):**
+    - `0725581300:05:001:0435` — 9 852 м² (~0.99 га), КВЦПЗ 12.04 («АЗС, СТО, автотранспортна інфраструктура»), приватна, координати 51.11137, 24.60098 (околиця Турійська).
+    - `0725586000:01:001:1245` — 7 354 м², КВЦПЗ 03.02 (громадська забудова, В.03.02), приватна, 51.11052, 24.57809.
+  - **Резерв під зміну цільового призначення (agricultural ≥1500 м², 6 км від центру):** 15 кластерів і 15+ окремих парцелей 0.9-21.5 га. Топ-кластери:
+    - `mem_cluster_0725581300_02_002_0012` — 30 парцелей, 21.46 га, 01.03 (ОСГ), приватна, 51.10452, 24.60549.
+    - `mem_cluster_0725581300_03_002_0020` — 18 парцелей, 13.32 га, 01.03, 51.10083, 24.61097.
+    - `mem_cluster_0725581300_03_002_0007` — 7 парцелей, 5.08 га, 01.03, 51.10606, 24.60839.
+- Підтверджено: `CadastralDomainService.search()` коректно повертає `clusters[]`/`single_parcels[]` з повним переліком `cadastral_numbers`, `total_area_sqm`, `centroid`, `purpose`, `ownership_form`. Сценарій з `business_groups=['mixed_use']` (відсутня група) дав `business_groups_unknown=['mixed_use']` — каталог не приймає неіснуючі групи без падіння.
+- Виявлений limit для покращення: у `search()` `base_parcels = _resolve_scope_to_parcels(..., limit=MAX_PARCELS_FETCH=800)`, тоді як `discover_in_area` у Турійську повернув 1500 ділянок у радіусі 6 км. У великих радіусах/щільних локаціях search працює на subsample. Зафіксовано як кандидат на підняття ліміту (окрема задача).
+
+## 2026-05-11 — Structured findings + country_wide ескалація + parcels[] у звіті
+- Запит: «Цікавий кластер, є цікаві ділянки — ДЕ ВОНИ В РЕЗУЛЬТАТАХ? Мене не цікавлять абстрактні роздуми, конкретні ділянки. Для розуміння цінової політики, якщо нема даних по населеному пункту — то можна зібрати дані по району чи області».
+- Корінь проблеми: `cadastral.search` повертав повний перелік `cadastral_numbers` у `clusters[]`/`single_parcels[]`, але через truncate `observation`-нотатки (4000 символів) і відсутність структурованого зв'язку з reporter-агентом — LLM-репортер бачив лише агрегати, без номерів. Промпт reporter-а взагалі не мав поля `parcels[]` у `promising_locations`, тому навіть якщо LLM знав номери — клав їх нікуди було. Для оголошень така ж проблема: повний `items[]` губився у `text`, а fallback зупинявся на `status_any`/`semantic` без ескалації scope «місто → область → Україна» для оцінки цінового рівня.
+- `data/repositories/investigation_notes_repository.py`: `ALLOWED_KINDS` розширено на `cadastral_finding` і `listings_finding`; `append(...)` приймає опційний `payload: Dict[str, Any]` (структурований словник) і кладе його як окреме поле документа. Reporter читає його у `_build_evidence` без парсингу обрізаного `text`.
+- `business/services/investigation_service.py`:
+  - Після виконання кожного tool-виклику (`_execute_tool`) додатково запускається `_record_structured_findings(...)`. Для `cadastral.search` — створюється нотатка `kind="cadastral_finding"` зі словником `{scope, applied_filters, scope_total_parcels, filtered_total_parcels, clusters[], single_parcels[], semantic_used}` (до 15 кластерів, по 50 cadastral_numbers у кожному + total-лічильник). Для `listings.find_with_fallback` — `kind="listings_finding"` з `{applied_strategy, applied_filters, count, items[], landscape, attempts[]}` (до 30 items). Це гарантує, що повний інвентар знахідок завжди є у Mongo, незалежно від truncate observation-рядка.
+  - `_build_evidence` тепер додатково забирає `cadastral_finding`/`listings_finding` нотатки і прокидає `payload` в evidence-словник (з `kind="cadastral_finding"`/`"listings_finding"`).
+  - `_note_append` теж приймає `payload`.
+  - У `listings.find_with_fallback` додано стратегію `country_wide` (без `region` і `city`, тільки `property_type_contains`/`source`/`status` плюс relax-area) — ескалація після `status_any`, перед `semantic`. Описано як «ринковий орієнтир для цінової мапи, коли локальних даних немає».
+- `business/agents/investigator/reporter.py`:
+  - `_normalize_sections`: підтримка `applied_strategy` і `parcels[]` (через новий `_normalize_parcel`, що нормалізує `cadastral_number`, `area_sqm`, `purpose_label`, `ownership_form`, `centroid{latitude,longitude}`, `cluster_id`, `cluster_total_area_sqm`, `cluster_parcel_count`).
+  - `_format_evidence` для нотаток `kind=cadastral_finding`/`listings_finding` додає окремі рядки з повним переліком cadastral_numbers / listings (URL, ціни, area, region, property_type). Це робить evidence_block самодостатнім — LLM більше не повинен «вгадувати», що було у тулзі.
+  - `evidence_block` truncate підвищено з 8000 до 16000 символів — щоб уміщувалися повні переліки.
+- `config/prompts.yaml`:
+  - `investigator_report` отримав блок **MANDATORY content rules**: для `promising_locations` `parcels[]` ОБОВ'ЯЗКОВО; для `active_listings` `listings[]` ОБОВ'ЯЗКОВО + `applied_strategy` у JSON секції; для `price_overview` явна вимога позначати, чи це локальні дані, чи region/country-wide ескалація.
+  - Схема `sections.promising_locations` дописана полем `parcels: [{cadastral_number, area_sqm, purpose_label, ownership_form, centroid, cluster_id, cluster_total_area_sqm, cluster_parcel_count}]`, а `active_listings` отримала поле `applied_strategy`.
+  - Cadastral policy: додано прямий орієнтир «тягни cadastral_numbers з evidence kind=`cadastral_finding` напряму, не з observation-тексту».
+  - Listings search policy: явна ескалація scope для цінової політики (`region_wide → country_wide → semantic` як NORMAL flow, з обов'язковою позначкою у `narrative`).
+- `telegram_mini_app/static/templates/investigation_report.html.j2`:
+  - Додано CSS для `.parcels`/`.parcel-row` (моноширинний номер, метадані рядком, посилання на Google Maps по центроїду) і `.strategy-pill` (значок fallback-стратегії у заголовку секції).
+  - У циклі `{% for section in report.sections %}` додано рендер `section.parcels[]` після `items` (з повним кадастровим номером, площею, призначенням, формою власності, інфою про кластер, посиланням «на карті»). Стратегію fallback виводимо як pill біля заголовка, якщо `section.applied_strategy != "exact"`.
+- Перевірено: py_compile усіх змінених модулів, ReadLints, smoke-test (`ALLOWED_KINDS` має нові kind-и; `_compose_cadastral_finding_payload` зберігає 50 cn з 60 і ставить `cadastral_numbers_total=60`; `country_wide` стратегія присутня у source; `_normalize_parcel` коректно конвертує).
+
+## 2026-05-11 — Кадастр як домен-API: get_knowledge / discover_in_area / search
+- Запит: «Кадастр не має бути безпосередньо доступним. Необхідно створити обгортку для роботи з ним, що вміє шукати, кластеризувати, індексувати, тощо а також надавати агенту знання про колекцію (доступні коди/типи кадастрових ділянок, тощо)».
+- Проблема: попередній набір тулзів (`cadastral.find_parcels_near`, `find_clusters_near`, `find_by_oblast`, `analyze_parcels_near_location`, `cluster_parcels_in_radius`, `vector.semantic_search_cadastre`) фактично відкривав сирий доступ до колекції. Агент мусив сам обирати фразу/код, без знання, що взагалі є в БД (КВЦПЗ-класифікатор не існував як ресурс), і часто «вигадував» `purpose: "торгівля"` замість офіційного коду `03.07` чи повної фрази. Звіти давали тільки агрегати без `cadastral_numbers`, бо тулзи не задавали обов'язкову форму відповіді.
+- `config/cadastral_kvcpz.yaml`: статичний каталог КВЦПЗ (68 кодів від 01.01 до 19) + 14 бізнес-груп (commercial / industrial / residential / agricultural / public_service / transport / energy_comms / recreation / cultural / forestry / water / defence / reserve / common_use). Кожна група має `purpose_codes`, `label`, `description`, `keyword_hints`.
+- `business/services/cadastral_classification_catalog.py`: thread-safe синглтон-каталог. API: `all_codes()`, `all_business_groups()`, `label_for_code()`, `groups_for_code()`, `codes_for_business_groups()`, `normalize_purpose_filter()` (зводить три способи задання призначення — `purpose_codes` / `business_groups` / `purpose_label_contains` — в єдину форму, з виявленням невідомих груп).
+- `business/services/cadastral_domain_service.py`: фасад над усім кадастром. Інкапсулює `CadastralParcelsRepository`, `CadastralParcelLocationIndexRepository`, `CadastralClusteringService`, `VectorIndexService`, `CadastralClassificationCatalog`. Три публічні методи:
+  - `get_knowledge(scope?, top_n_codes?)` — повертає `classification.codes`, `classification.business_groups` + `db_stats.{total_parcels, by_purpose, by_purpose_label_top, by_ownership_form, by_category}`. Опційний scope (oblast) звужує `db_stats`.
+  - `discover_in_area(scope, limit?)` — reconnaissance: краєвид кадастру у конкретній локації (radius або oblast) БЕЗ фільтрів. Повертає `total_parcels`, `by_business_group`, `by_purpose`, `by_purpose_label_top`, `by_ownership_form`, `by_category`, `by_area_bucket`, `area_stats_sqm`, `suggested_filters` (топ-3 групи з готовими `purpose_codes`).
+  - `search(scope, filters?, output?)` — фільтрований пошук + in-memory кластеризація + ranking. Фільтри високого рівня: `business_groups`, `purpose_codes`, `purpose_label_contains`, `ownership_form[_contains]`, `min/max_area_sqm`, `min_cluster_area_sqm`, `min_cluster_parcels`, `semantic_query` (Qdrant пере-ранжування). Повертає `clusters[]` + `single_parcels[]` з ПОВНИМ переліком `cadastral_numbers`, `total_area_sqm`, `centroid`, плюс `landscape` для контексту і `note_when_empty` з підказкою з landscape, якщо фільтри занадто строгі.
+- `business/services/investigation_service.py`: видалено `_tool_cadastral_find_parcels_near`, `_tool_cadastral_find_clusters_near`, `_tool_cadastral_find_by_oblast`, `_tool_cadastral_analyze_near`, `_tool_cadastral_cluster_in_radius`, `_tool_vector_search_cadastre`, `_slim_parcel`, `_slim_cluster` (~17 KB мертвого коду після рефактору). Додано три тонкі делегати-тулзи: `cadastral.get_knowledge`, `cadastral.discover_in_area`, `cadastral.search` — кожен викликає відповідний метод `CadastralDomainService` через лінивий кешований `self._cadastral_domain()`. У registry-метаданих кожна тулза має детальний `description` зі словником business-груп і прикладами використання, а JSON-Schema приймає лише доменні поля (без сирих regex-аргументів).
+- `config/settings.py`: `FLX_ALLOWED_TOOLS` за замовчуванням оновлено — `vector.semantic_search_cadastre,cadastral.find_parcels_near,cadastral.find_clusters_near,cadastral.find_by_oblast,cadastral.analyze_parcels_near_location,cadastral.cluster_parcels_in_radius` ВИДАЛЕНО; додано `cadastral.get_knowledge,cadastral.discover_in_area,cadastral.search`.
+- `config/prompts.yaml`: розділ **Cadastral policy** переписано під workflow `get_knowledge → discover_in_area → search`. Заборонено `execute_query`/`execute_aggregation` по cadastral-колекціях (QueryBuilder їх не відкриває, але прописано явно). Додано мапінг типових бізнес-запитів («склад/АЗС/супермаркет», «виробництво/завод», «житло», «ферма», «школа/лікарня») → відповідні business_groups. Для семантики прибрано окрему тулзу — тепер `filters.semantic_query` всередині `cadastral.search` пере-ранжує через Qdrant.
+- Перевірено: py_compile усіх змінених модулів, ReadLints без помилок, smoke-test (catalog імпортується, normalize_purpose_filter повертає `purpose_codes` з business_groups, allow-list містить нові тулзи й не містить legacy).
+
+## 2026-05-11 — Fix: дублювання finish-картки FLX у Mini App + неробоча TG-нотифікація
+- Запит: «в чаті результат дублюється двічі. При цьому жодного разу не приходить сповіщення до чату з ботом в ТГ».
+- Дублювання у Mini App: бекенд після успішного завершення шле дві окремі SSE-події (`report` із `artifact_id`+`download_token` і потім `done` із `artifact_id`). У `telegram_mini_app/static/app.js` обидва типи маршрутизувались у `renderFlxDone`, який створював новий `.flx-done` DOM-блок на кожну подію. При reconnect/hydrate ситуація погіршувалась — події повторно приходили з historical timeline і знову рендерились. Фікс: у гілці `type === "report" || type === "done"` тепер перевіряється `container.querySelector(".flx-done")` — якщо картка вже є у поточному контейнері, друга подія ігнорується. При refresh контейнер очищується, тож перший прохід hydrate коректно відмалює картку наново.
+- Telegram-нотифікація не приходила: у `business/services/investigation_service.py::_notify_user_success_in_telegram` весь блок отримання `target_chat` був обгорнутий одним `try/except`. Mini App як `chat_id` сесії передає UUID власного чату (`chat_id: chat.id`, де `chat.id` — внутрішній UUID рядком), не Telegram chat_id. `int(uuid_string)` кидав `ValueError`, виняток ловив зовнішній `except`, і fallback на числовий Telegram `user_id` НІКОЛИ не виконувався — нотифікація мовчки скіпалась. Фікс: розділив `try/except` на дві окремі спроби. Спочатку пробуємо `int(chat_id)`; якщо нечислове — `logger.debug` і йдемо далі. Потім пробуємо `int(user_id)`; якщо й тут не число — `logger.warning` з конкретною причиною. Додав логи для `bot_token` не налаштовано, HTTP non-200 на `sendMessage`, `sendDocument` false і успішну доставку (`info`). Тепер усі сценарії візуально відстежуються в логах воркера.
+
+## 2026-05-11 — Substring-фільтри + reconnaissance-first + landscape для tools
+- Запит: повторний прогон по Турійську далі давав 0 і у `cadastral.analyze_parcels_near_location`, і у `listings.find_with_fallback`. Причина — агент передавав `purpose: "торгівля"` / `property_type: "комерційна"`, а Mongo робив точне співпадіння, тоді як у БД `purpose_label` = повна фраза («Для будівництва та обслуговування будівель торгівлі»), а `property_type` = «комерційна нерухомість». Жорсткий equality відсіював усе.
+- `data/repositories/cadastral_parcels_repository.py` + `cadastral_parcel_clusters_repository.py`: у `find_within_radius` / `find_clusters_near` додано парні `*_contains` аргументи (`purpose_contains`, `purpose_label_contains`, `ownership_form_contains`, `category_contains`) — case-insensitive `$regex` із `re.escape` для безпеки. Точні `purpose`/`purpose_label` залишилися як було.
+- `data/repositories/unified_listings_repository.py`: новий метод `find_listings(...)` — універсальна вибірка з підтримкою точних і substring-фільтрів (`property_type_contains`, `city_contains`, `region_contains`), плюс `landscape_summary(region, status, source, max_per_field)` що повертає розподіл по `property_type`/`region`/`city`/`source` у межах поточного scope.
+- `business/services/investigation_service.py`:
+  - `cadastral.analyze_parcels_near_location` тепер **dual-pass**: спершу `landscape` без жодних фільтрів (повертає `by_purpose_label` із реальними значеннями БД), потім — `filtered` з переданими `*_contains`. Якщо filtered пустий, але landscape має ділянки — додається `note_when_empty` з топ-5 реальних `purpose_label` і інструкцією повторити.
+  - `cadastral.find_parcels_near`, `cadastral.find_clusters_near`, `cadastral.cluster_parcels_in_radius` отримали `*_contains` параметри + оновлені JSON-Schema з description, що згадує справжню форму значень у БД.
+  - `listings.find_with_fallback` переписано через `UnifiedListingsRepository.find_listings`. Розширені стратегії: `exact` → `fuzzy_type` (auto-substring з `property_type`) → `relaxed_area` → `region_wide` → `without_tags` → `status_any` → `semantic`. Якщо все 0, у відповіді додається `landscape` від `landscape_summary` — щоб агент бачив, які значення `property_type/region/city/source` реально існують для цього scope.
+- `config/prompts.yaml`: розділ **Listings search policy** і **Cadastral policy** переписано у стилі «reconnaissance-first»:
+  - Перший cadastral виклик — без `purpose` фільтрів, агент дивиться `landscape.by_purpose_label` і повторює з `purpose_label_contains` (substring).
+  - Для оголошень — ЗАВЖДИ `property_type_contains`, не точне `property_type`. Якщо `applied_strategy: "none"` І `landscape.total == 0` — лише тоді `flx.targeted_source_search`. Якщо `landscape.total > 0`, але стратегії 0 — у БД дані є, скоригувати substring і повторити.
+
+## 2026-05-11 — In-memory кадастрова кластеризація + listings fallback + TEI cpu-1.9
+- Запит: реальний прогон FLX (Турійськ, склад/супермаркет 1500 м²) показав два дефекти — (1) агент пише «оголошень немає», коли в базі є; (2) `cadastral.analyze_parcels_near_location` повертає тільки агрегатну статистику, без жодних cadastral_number і без кластеризації знайдених у радіусі ділянок. Плюс при першому запуску TEI 1.5 падав з `relative URL without a base` (відомий баг HF issue #527, фікс у 1.7+).
+- `docker-compose.yml`: `pazuzu-embeddings` переведено на `ghcr.io/huggingface/text-embeddings-inference:cpu-1.9`, формат команди — канонічна форма `--model-id VALUE` (space-separated, не `=`), бо TEI 1.5/1.6 ламали парсинг `model-id` у деяких комбінаціях env+args.
+- `business/services/cadastral_clustering_service.py`: новий метод `cluster_parcels_in_memory(parcels, min_cluster_size=1, buffer_degrees=None)` — той самий union-find на shapely+STRtree, але БЕЗ запису в БД. Повертає всі групи (одиночні теж, якщо `min_cluster_size=1`) із повним переліком `cadastral_numbers`, `total_area_sqm`, `centroid` (середнє по центроїдах), `area_stats_sqm` (p25/p50/p75), флаг `is_singleton`.
+- `business/services/investigation_service.py`: переписано `_tool_cadastral_analyze_near` — після `find_within_radius` робить in-memory кластеризацію через `CadastralClusteringService.cluster_parcels_in_memory`. Повертає `clusters[]` (групи ≥2) і `single_parcels[]` (одиночки), кожен — з конкретними `cadastral_numbers`, `total_area_sqm`, координатами. Додано параметр `min_total_area_sqm` для відсіювання дрібних. Нова tool `cadastral.cluster_parcels_in_radius` — окремий entrypoint «вибірка + кластеризація + ranking за total_area_sqm + фільтр min_total_area_sqm/min_parcel_count».
+- `business/services/investigation_service.py` + `config/settings.py`: нова tool `listings.find_with_fallback` (додано в default `FLX_ALLOWED_TOOLS`) — багатоступенева стратегія пошуку: exact → relaxed_area (без area-bounds) → region_wide (без city) → without_tags → semantic (через `VectorIndexService.search_listings`). Повертає `applied_strategy`, `applied_filters`, `original_filters`, `attempts[]` з count кожної проби — щоб у звіт можна було чесно записати, наскільки розширювалися критерії.
+- `config/prompts.yaml`: у `investigator_step` додано два розділи правил — **Listings search policy** (агент має використовувати `listings.find_with_fallback` замість прямого `execute_query` для unified_listings; «нічого не знайдено» допустиме лише після `applied_strategy: "none"`; обов'язково згадувати, який fallback спрацював) і **Cadastral policy** (починати з `analyze_parcels_near_location` / `cluster_parcels_in_radius` для запитів «що поблизу»; у звіті обов'язково наводити конкретні `cadastral_numbers` із top-N кластерів і single_parcels, з `parcel_count` та `total_area_sqm`).
+- `docs/developer_glossary.md`: додано терміни **in-memory кадастрова кластеризація**, **listings fallback policy**.
+
+## 2026-05-11 — Qdrant + bge-m3: семантичний пошук джерел та кадастрові FLX-tools
+- Запит: дати FLX-агенту повнотекстовий/семантичний пошук по `unified_listings` та інструменти кадастрової мапи (geo-near, кластери, аналіз перспективних ділянок). Розгорнути окрему ноду векторної БД у `docker-compose.yml`.
+- `docker-compose.yml`: додано сервіси `qdrant` (qdrant/qdrant:v1.12.4, 6333/6334, volume `pazuzu_qdrant_data`) та `pazuzu-embeddings` (TEI cpu-1.5, MODEL_ID=`BAAI/bge-m3`, volume `pazuzu_tei_cache`, healthcheck через bash/TCP). У `pazuzu-app`, `pazuzu-source-worker`, `pazuzu-llm-worker` прокинуто `QDRANT_HOST`, `QDRANT_PORT`, `EMBEDDINGS_ENDPOINT`, `EMBEDDINGS_MODEL`.
+- `requirements.txt`: додано `qdrant-client>=1.12,<2.0`.
+- `config/settings.py`, `config/config.yaml`: секції `vector_db` (host/port/collections/vector_size/distance) та `embeddings` (endpoint/model_name/batch_size/timeout/cache_*). У `FLX_ALLOWED_TOOLS` додано `vector.semantic_search_listings`, `vector.semantic_search_cadastre`, `cadastral.find_parcels_near`, `cadastral.find_clusters_near`, `cadastral.find_by_oblast`, `cadastral.analyze_parcels_near_location`.
+- `business/services/embedding_service.py`: новий синглтон-клієнт TEI (`/embed`) з батчингом, ретраями (5xx/429/мережа), httpx.Client та Mongo-кешем `embedding_cache` (SHA-256 + model_name).
+- `scripts/migrations/049_embedding_cache.py` + `main.py`: ідемпотентна міграція колекції `embedding_cache` (unique index `text_hash+model_name`, TTL по `created_at`).
+- `business/services/vector_index_service.py`: обгортка над qdrant-client. `ensure_collections()` створює `unified_listings_vec` та `cadastral_parcels_vec` (HNSW, cosine), payload-індекси. `upsert_listings/upsert_parcels/upsert_clusters` композять текст з title/description/geo/tags/price/area та шлють embed через `EmbeddingService`. `search_listings/search_parcels` приймають логічні фільтри (region/city/property_type/price_*/area_* для лістингів; purpose/ownership/oblast/area_* для кадастру) і повертають точки з payload + score.
+- `business/services/unified_listings_service.py`: у `sync_olx_listing` та `sync_prozorro_auction` після `unified_repo.upsert_listing(...)` викликається `_index_unified_doc_to_vector(...)` (best-effort, помилки тільки логуються). Після успішного upsert у Qdrant пише `vector_indexed_at` у документ.
+- `data/repositories/unified_listings_repository.py`: `set_vector_indexed(source, source_id)` + `find_without_vector_index(limit, source)` для backfill.
+- `data/repositories/cadastral_parcels_repository.py`: `find_within_radius(lat, lng, radius_m, ...)` через `$geoWithin`/`$centerSphere` по `bounds` (meters → radians /6378100), фільтри purpose/purpose_label/ownership_form/category/area_sqm.
+- `data/repositories/cadastral_parcel_clusters_repository.py`: `find_clusters_near(lat, lng, radius_m, ...)` через `$geoWithin`/`$centerSphere` по `centroid`, з фільтрами призначення/власності та `min_parcel_count`.
+- `business/services/investigation_service.py`: у `_build_tools_registry` зареєстровано шість нових тулз. `cadastral.analyze_parcels_near_location` повертає `total_parcels`, `by_purpose`, `by_ownership`, `area_stats_sqm` (p25/p50/p75) та `top_clusters_nearby` — чиста статистика, без LLM-рішень.
+- `scripts/embeddings/build_vector_index.py` і `scripts/embeddings/build_cadastral_vector_index.py`: CLI з `--limit`, `--batch`, `--source`, `--clusters-only`/`--parcels-only`, `--dry-run` — пакетне backfill-індексування існуючих документів.
+- `docs/developer_glossary.md`, `docs/source_data_load_pipeline.md`: новий розділ про векторний індекс, embedding service та bge-m3.
+
+## 2026-05-11 — Mini App chat sync, FLX timeline, source-wait TTL, Gemini grounded web search
+- Запит: синхронізація ШІ-чатів між пристроями; збереження «ходу думок» FLX після перезавантаження; зняття зависання `awaiting_sources`; прибрати примусове перенаправлення `flx.web_search` → `targeted_source_search`; веб-пошук через Gemini Google Search grounding; ops-скрипт для purge черг.
+- `data/repositories/chat_session_repository.py`: поля `ui_title`, `ui_kind`, `ui_flx`, `ui_messages`, `ui_listing_context` + `list_sidebar_for_user` / `upsert_sidebar_state` / індекс `(user_id, updated_at)`.
+- `telegram_mini_app/routes/mini_app_chats.py` + `server.py`: `GET/POST/DELETE /api/mini-app/chats` для злиття списку чатів із сервером.
+- `telegram_mini_app/static/app.js`: після завантаження — `fetchAndMergeServerChats`, debounced `pushChatsToServer`, `DELETE` при видаленні чату; для FLX — `hydrateFlxTimeline`, `renderChatMessages` відновлює user-повідомлення + таймлайн; `flx.lastEventSeq` і SSE оновлюють курсор.
+- `business/services/investigation_service.py`: `fetch_timeline`, `skip_source_wait`, TTL `flx_source_wait_timeout_seconds` у `_check_source_wait`, прибрано override веб-пошуку на `targeted_source_search`.
+- `telegram_mini_app/routes/investigation.py`: `GET .../timeline`, `POST .../skip-source-wait`.
+- `business/services/web_search_service.py`: провайдер `gemini_grounding` (google-genai + `GoogleSearch`), fallback DuckDuckGo.
+- `config/settings.py`, `config/config.yaml`: `llm_investigator_web_search_model_name`, `flx_source_wait_timeout_seconds`, `web_search_provider: gemini_grounding`.
+- `config/prompts.yaml`: політика інструментів — web search для зовнішніх фактів, targeted source лише за потреби свіжих OLX/Prozorro.
+- `scripts/ops/purge_task_queues.py`: dry-run / purge Rabbit / revoke Mongo active / cancel FLX sessions.
+- `scripts/migrations/048_chat_sessions_sidebar_index.py` + `main.py`: ідемпотентне створення індексу sidebar.
+
+## 2026-05-07 — FLX report inline rendering in Mini App
+- Запит: результат FLX відкривається у зовнішньому браузері і не відображається для користувача.
+- У `telegram_mini_app/static/app.js` для подій `report/done` додано збереження `artifact_id`/`download_token` у стан чату.
+- У `renderFlxDone` додано кнопку `Показати звіт тут`, яка відкриває HTML-звіт вбудовано через `iframe` прямо в чаті Mini App.
+- Залишено окремий лінк `Відкрити окремо`, але прибрано примусовий `Telegram.WebApp.openLink`, щоб не викидати користувача в зовнішній браузер.
+
+## 2026-05-07 — FLX queue starvation fix (dedicated queue)
+- Запит: користувач не бачить прогресу дослідження, хоча сесія стартує.
+- Діагностика: `investigation_sessions` лишались у `running` з `iteration=0`, а `llm_processing` черга була перевантажена OLX LLM задачами (сотні повідомлень), тому `run_investigation_step` не отримував CPU вчасно.
+- У `business/celery_app.py` маршрут `business.tasks.run_investigation_step` перенесено на окрему чергу `flx_investigation`.
+- У `business/services/orchestration_backend_service.py` enqueue для FLX змінено на `queue="flx_investigation"`.
+- У `business/celery_worker_runner.py` додано підтримку `flx_investigation` як LLM-thread pool черги.
+- У `docker-compose.yml` LLM worker тепер слухає `flx_investigation,celery,llm_processing` (пріоритет FLX перед масовим OLX потоком).
+
+## 2026-05-07 — FLX: авто-скасування при закритті чату + Telegram нотифікація результату
+- Запит: якщо користувач закриває чат дослідження — зупиняти дослідження; після успішного завершення надсилати нотифікацію і результат у Telegram.
+- У `telegram_mini_app/static/app.js` додано `cancelInvestigationIfActive(...)` і виклик скасування:
+  - при видаленні investigation-чату в sidebar;
+  - при `pagehide/beforeunload` (закриття/вихід із Mini App) для активного investigation-чату;
+  - також додається abort активного SSE-стріму для відповідної сесії.
+- У `telegram_mini_app/static/app.js` синхронізовано `chat.flx.state` у локальному стані при `done`/`error`, щоб уникати зайвих повторних cancel-викликів для завершених сесій.
+- У `business/services/investigation_service.py` додано `_notify_user_success_in_telegram(...)`, який після успішної фіналізації:
+  - надсилає текстову нотифікацію в Telegram;
+  - надсилає HTML-звіт файлом (`investigation_report_<artifact_id>.html`) через `telegram_mini_app/send_via_bot.py`.
+- Відправка в Telegram зроблена best-effort і не блокує `done`-стан дослідження при помилках доставки.
+
+## 2026-05-07 — FLX investigation queue stall: fallback routing fix
+- Запит: перевірити, чому події FLX-сесії не стартують після постановки задачі в чергу.
+- Діагностика по Docker/RabbitMQ показала `run_investigation_step` повідомлення в default-черзі `celery` при відсутньому consumer, тоді як LLM worker слухає `llm_processing`.
+- У `business/celery_app.py` встановлено безпечний дефолт: `task_default_queue="llm_processing"` і `task_default_routing_key="llm_processing"`, щоб не втрачати задачі в `celery`.
+- У `business/celery_worker_runner.py` додано коректну обробку multi-queue аргументів (`llm_processing,celery`) для вибору concurrency/pool.
+- У `docker-compose.yml` LLM worker переведено на прослуховування `llm_processing,celery` як runtime-fallback для уже застряглих задач.
+
+## 2026-05-07 — FLX Deep Research Upgrade (roles/task-graph/coverage/evidence)
+- Запит: реалізувати повний FLX Deep Research Upgrade із багаторольовою оркестрацією, coverage-driven циклом, critic/contrarian контурами, evidence traceability, budget control та temporal-compatible архітектурою.
+- У `business/services/investigation_service.py` додано research-state поверх поточної сесії: `research_tasks` (priority/dependencies/status), `research_coverage`, `research_budget`, `critic_iterations`, `contrarian_done`, `unknown_discovery_done`, а також stop-criteria за coverage/budget/time.
+- Додано нові доменні контракти `business/domain/flx_research_models.py` для `ResearchTask`, `CoverageAspect`, `ResearchBudget`, `EvidenceClaim` і експортовано їх у `business/domain/__init__.py`.
+- Додано спеціалізовані ролі агентів `Critic/Contrarian/DataExtractor/RiskAnalyst/Valuation/Trend/GeoAnalyst` у `business/agents/investigator/specialized.py` та підключено в `business/agents/investigator/__init__.py`.
+- Додано сервіси глибокого дослідження: `priority_scoring_service.py`, `research_coverage_service.py`, `evidence_graph_service.py`, `flx_memory_adapters_service.py`, `orchestration_backend_service.py` (Celery backend + Temporal-compatible stub).
+- `InvestigationService` переведено на `OrchestrationBackend` abstraction для enqueue/re-enqueue (Celery зараз, Temporal-ready контракт).
+- У фіналізації звіту додано формування та збереження `evidence_graph` і передачу `coverage/evidence_graph` у репортер.
+- Розширено `business/agents/investigator/reporter.py` і промпт `investigator_report` у `config/prompts.yaml`: додано `claims[]` з полями `confidence/evidence_count/source_diversity/contradiction_status`.
+- У `config/prompts.yaml` додано окремі промпти для `investigator_critic`, `investigator_contrarian`, `investigator_data_extractor`, `investigator_risk_analyst`, `investigator_valuation`, `investigator_trend`, `investigator_geo_analyst`.
+- У `config/settings.py` додано параметри deep-research runtime/budget/coverage: `FLX_ORCHESTRATION_BACKEND`, `FLX_COVERAGE_THRESHOLD`, `FLX_PARALLEL_BRANCHES`, `FLX_BUDGET_*`, `FLX_UNKNOWN_DISCOVERY_ENABLED`.
+- Додано тести `tests/test_flx_deep_research_services.py` (priority scoring, coverage updates, budget consumption, evidence graph claims).
+- Додано міграцію індексів `scripts/migrations/ensure_flx_deep_research_indexes.py` для нових полів deep-research у `investigation_sessions` та `investigation_notes`.
+
 # Історія розробки
+
+## 2026-05-07 — FLX Strategy Engine (мульти-стратегії + реєстр)
+
+- **Запит**: Flx самостійно створює й оновлює стратегії для задач; кілька підходів з кроспорівнянням і рейтингом; для «мало оголошень» — стратегія POI (Google Places через існуючі тулзи).
+- **Дії**:
+  - Контракти: `business/domain/flx_strategy_models.py` (StrategyCandidate / StrategyRunResult / Registry).
+  - Оцінка: `business/services/strategy_evaluation_service.py` — детермінований score + ранжування.
+  - Реєстр: `data/repositories/strategy_registry_repository.py`, `business/services/strategy_registry_service.py` (EWMA, top-K hints для Planner).
+  - Planner/Step/Reporter/Prompts: кілька `strategy_candidates`, контекст стратегії у step, `strategy_comparison` у звіті; `config/settings.py` — `FLX_STRATEGY_*`.
+  - Оркестрація: `business/services/investigation_service.py` — послідовне виконання стратегій, накопичення результатів, порівняння перед фіналом, оновлення реєстру; нотатки з `strategy_id`.
+  - Дані: запис у `config/data_dictionary.yaml` для `flx_strategy_registry`; скрипт `scripts/migrations/ensure_flx_strategy_registry_indexes.py`.
+  - Тести: `tests/test_strategy_evaluation_service.py` (unittest).
 
 ## 2026-05-06 — Flx: агент-інвестігейтор комерційної нерухомості
 
-- **Запит**: Додати окремого агента-розслідувача (псевдонім Flx) для глибокої гео-аналітики комерційної нерухомості: теплові карти цін, кластеризація POI/конкурентів, перспективні локації, підбір активних оголошень, оцінка оренди й окупності, з самовдосконаленням через нотатки та lessons-learned. Запуск — окремою «золотою» кнопкою «Нове розслідування» поряд з «Новий чат».
+- **Запит**: Додати окремого агента-досліджувача (псевдонім Flx) для глибокої гео-аналітики комерційної нерухомості: теплові карти цін, кластеризація POI/конкурентів, перспективні локації, підбір активних оголошень, оцінка оренди й окупності, з самовдосконаленням через нотатки та lessons-learned. Запуск — окремою «золотою» кнопкою «Нове дослідження» поряд з «Новий чат».
 - **Дії**:
   - Конфігурація: додано LLM-роль `investigator` (default Gemini Pro) у `config/settings.py` + `config/config.yaml`, з temperature/max_iterations/time_budget/google_grounding/static_maps_size; розширено `LLMService.get_investigator_provider()` і `generate_text_investigator()`.
   - Промпти: новий блок `investigator_*` (planner, step, reflection, report, lessons_query) у `config/prompts.yaml` за правилами `prompt-design.mdc` (стислі, JSON-only).
@@ -14,7 +371,7 @@
   - MCP: новий `mcp_servers/flx_mcp_server.py` (note_write/notes_read/lessons_search/lessons_save/static_map_render/ask_user/report_compose/web_search-stub), додано в `scripts/start_mcp_servers.py`.
   - API: `telegram_mini_app/routes/investigation.py` — `/start`, `/{id}/answer`, `/{id}/cancel`, `/{id}` (state), `/` (list), `/{id}/events` (SSE з `since=seq`), `/{id}/report` (302 на артефакт). Розширено `/api/files/artifact/{id}` для `Content-Type: text/html`/`image/png` з inline-disposition.
   - HTML-звіт: Jinja-шаблон `telegram_mini_app/static/templates/investigation_report.html.j2` (inline CSS, secure auto-escape, секції з картами/маркерами/listings/metrics/warnings/sources, dark/light mode).
-  - UI: золота преміум-кнопка `+ Нове розслідування` у sidebar (`index.html` + `.btn-premium` у `styles.css` із SVG-іконкою-зірочкою через CSS mask, без emoji в коді), окремий тип сесії `kind:"investigation"` у `app.js` з рендером thinking/note/tool_call/question/done подій, інтерактивним блоком `ask_user` (кнопки + freeform), resume через `flxOpenStream(since=seq)` при перемиканні чату, відкриття звіту в новій вкладці через `Telegram.WebApp.openLink`.
+  - UI: золота преміум-кнопка `+ Нове дослідження` у sidebar (`index.html` + `.btn-premium` у `styles.css` із SVG-іконкою-зірочкою через CSS mask, без emoji в коді), окремий тип сесії `kind:"investigation"` у `app.js` з рендером thinking/note/tool_call/question/done подій, інтерактивним блоком `ask_user` (кнопки + freeform), resume через `flxOpenStream(since=seq)` при перемиканні чату, відкриття звіту в новій вкладці через `Telegram.WebApp.openLink`.
   - Безпека: allow-list тулз у `Settings.flx_allowed_tools`, `request_id` у логах, перевикористання `QueryBuilder` (deny `$where`/`$regex`) та `SecurityAgent` для первинного запиту.
 
 ## 2026-04-22 — Жорсткий re-acquire coordination lease між retry оренди Vast
@@ -2873,3 +3230,10 @@
 - У `telegram_mini_app/routes/search.py` ендпоінти `/filters/regions` для `olx/prozorro/unified` переведено на стабільний канонічний список; прибрано динамічне підмішування "брудних" назв з даних.
 - У фільтрах пошуку (`_build_unified_filters`, `_build_olx_filters`, `_build_prozorro_filters`) додано єдину нормалізацію області для lookup і fallback-пошуку, щоб один вибір області покривав варіанти написання.
 - У `domain/managers/collection_manager.py` оновлено перетворення `geo(region ...)` у Mongo-умови: замість жорсткого `^значення` використано канонічний regex для еквівалентних форм топоніма.
+
+## 2026-05-13 — Flx звіт: додатки (карти, CSV)
+- Запит: окрім тексту звіту формувати додатки — теплові/просторові карти кадастрових ділянок, переліки ділянок і оголошень, контакти тощо як частина HTML-звіту.
+- Додано `business/services/flx_report_attachments_builder.py`: після `reporter.compose` збагачує `structured["attachments"]` артефактами з evidence (`cadastral_finding`, `listings_finding`) — CSV (UTF-8 BOM), PNG через `StaticMapService` (центроїди + емуляція heatmap за площею), окремий HTML з Leaflet/OSM.
+- У `business/services/investigation_service.py` виклик збагачення в `_finalize`, розширено `listings` payload полем `contact_hint`, Jinja-рендер з `artifact_href(id, token)`; fallback HTML показує посилання на додатки.
+- Шаблон `telegram_mini_app/static/templates/investigation_report.html.j2` — блок «Додатки до звіту».
+- `telegram_mini_app/routes/files.py` — типи `report_attachment_html`, `report_attachment_csv` для коректного `Content-Type`.

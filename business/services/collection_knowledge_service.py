@@ -28,8 +28,9 @@ FIELD_PROFILE_CONFIG: Dict[str, List[Tuple[str, str]]] = {
         ("land_area_sqm", "numeric"),
         ("property_type", "categorical"),
         ("status", "categorical"),
-        ("addresses.region", "categorical"),
-        ("addresses.settlement", "categorical"),
+        ("region", "categorical"),
+        ("city", "categorical"),
+        ("source", "categorical"),
     ],
     "prozorro_auctions": [
         ("auction_data.value.amount", "numeric"),
