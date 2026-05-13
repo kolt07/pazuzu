@@ -410,3 +410,52 @@ def cadastral_national_cluster_build_task(job_id: str, min_cluster_size: int = 2
     except Exception as e:
         logger.exception("cadastral_national_cluster_build_task failed: %s", e)
         return {"ok": False, "error": str(e)}
+
+
+@celery_app.task(
+    bind=True,
+    name="business.tasks.backfill_real_estate_objects_task",
+    soft_time_limit=86400,
+    time_limit=86500,
+    max_retries=0,
+)
+def backfill_real_estate_objects_task(
+    self,
+    source: Optional[str] = "olx",
+    clear_llm_cache: bool = False,
+    limit: int = 0,
+    batch_size: int = 50,
+    only_without_refs: bool = True,
+    no_cadastral_backfill: bool = True,
+) -> Dict[str, Any]:
+    """Backfill ОНМ для вже збережених unified_listings (без повторного завантаження з OLX/ProZorro).
+
+    Типовий разовий запуск для OLX без посилань на ОНМ (без повного проходу кадастру):
+    ``backfill_real_estate_objects_task.delay(source='olx', only_without_refs=True, no_cadastral_backfill=True)``
+    """
+    _init_runtime()
+    wid = str(getattr(getattr(self, "request", None), "id", "") or "")
+    logger.info(
+        "[reo-backfill] старт celery_id=%s source=%s limit=%s only_without_refs=%s clear_llm_cache=%s",
+        wid or "—",
+        source,
+        limit,
+        only_without_refs,
+        clear_llm_cache,
+    )
+    try:
+        from scripts.backfill_real_estate_objects import run_backfill
+
+        stats = run_backfill(
+            clear_llm_cache=clear_llm_cache,
+            limit=int(limit or 0),
+            batch_size=int(batch_size or 50),
+            source=source or None,
+            backfill_cadastral_all=not bool(no_cadastral_backfill),
+            only_without_refs=bool(only_without_refs),
+        )
+        logger.info("[reo-backfill] завершено celery_id=%s stats=%s", wid or "—", stats)
+        return {"ok": True, "stats": stats}
+    except Exception as e:
+        logger.exception("[reo-backfill] помилка: %s", e)
+        return {"ok": False, "error": str(e)}

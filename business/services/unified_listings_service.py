@@ -798,7 +798,10 @@ class UnifiedListingsService:
                 self.unified_repo.delete_by_source_id("olx", canonical_url)
                 return False
             ok = self.unified_repo.upsert_listing(unified_doc)
-            if ok:
+            unified_stored = ok or bool(
+                self.unified_repo.find_by_source_id("olx", unified_doc.get("source_id") or olx_url)
+            )
+            if unified_stored:
                 try:
                     from business.services.real_estate_objects_service import RealEstateObjectsService
                     reo_service = RealEstateObjectsService()
@@ -806,7 +809,7 @@ class UnifiedListingsService:
                 except Exception as reo_err:
                     logger.warning("Обробка ОНМ для OLX %s: %s", olx_url[:50], reo_err)
                 self._index_unified_doc_to_vector(unified_doc)
-            return ok
+            return bool(ok or unified_stored)
         except Exception as e:
             logger.error(f"Помилка синхронізації OLX оголошення {olx_url}: {e}", exc_info=True)
             raise  # Піднімаємо помилку далі для детального логування в міграції
@@ -829,7 +832,10 @@ class UnifiedListingsService:
         try:
             unified_doc = self._convert_prozorro_to_unified(prozorro_doc)
             ok = self.unified_repo.upsert_listing(unified_doc)
-            if ok:
+            unified_stored = ok or bool(
+                self.unified_repo.find_by_source_id("prozorro", unified_doc.get("source_id") or auction_id)
+            )
+            if unified_stored:
                 try:
                     from business.services.real_estate_objects_service import RealEstateObjectsService
                     reo_service = RealEstateObjectsService()
@@ -837,7 +843,7 @@ class UnifiedListingsService:
                 except Exception as reo_err:
                     logger.warning("Обробка ОНМ для ProZorro %s: %s", auction_id, reo_err)
                 self._index_unified_doc_to_vector(unified_doc)
-            return ok
+            return bool(ok or unified_stored)
         except Exception as e:
             logger.error(f"Помилка синхронізації ProZorro аукціону {auction_id}: {e}", exc_info=True)
             raise  # Піднімаємо помилку далі для детального логування в міграції

@@ -111,7 +111,9 @@ class UnifiedListingsRepository(BaseRepository):
                 {"source": source, "source_id": source_id},
                 update_data,
             )
-            return result.modified_count > 0
+            # modified_count==0, якщо BSON збігся з попереднім (напр. швидкі повторні sync);
+            # ОНМ та інші побічні кроки все одно мають мати змогу відпрацювати.
+            return bool(result.acknowledged and result.matched_count > 0)
         else:
             # Створюємо новий
             listing_data["system_updated_at"] = now

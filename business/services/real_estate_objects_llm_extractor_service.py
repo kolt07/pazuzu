@@ -50,16 +50,18 @@ class RealEstateObjectsLLMExtractorService:
             cached = self.cache_service.repository.find_by_cache_key(cache_key)
             if cached and isinstance(cached.get("result"), dict):
                 objs = cached["result"].get("objects")
-                if isinstance(objs, list):
+                # Не повертаємо порожній кеш: інакше одна невдала/порожня відповідь LLM
+                # «заморожує» ОНМ для цього тексту назавжди.
+                if isinstance(objs, list) and len(objs) > 0:
                     return objs
         if self.llm_service is None:
             return []
         try:
             result = self.llm_service.parse_real_estate_objects(description)
             objects = result.get("objects") or []
-            if isinstance(objects, list) and use_cache:
+            if isinstance(objects, list) and use_cache and len(objects) > 0:
                 self.cache_service.repository.save_result_by_key(cache_key, {"objects": objects})
-            return objects
+            return objects if isinstance(objects, list) else []
         except Exception as e:
             print(f"[RealEstateObjectsLLM] Помилка: {e}")
             return []

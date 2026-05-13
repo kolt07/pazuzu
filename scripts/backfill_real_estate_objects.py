@@ -10,6 +10,7 @@ Backfill: обробка існуючих оголошень для створе
   py scripts/backfill_real_estate_objects.py --limit 100 --batch-size 20
   py scripts/backfill_real_estate_objects.py --source prozorro  # тільки ProZorro
   py scripts/backfill_real_estate_objects.py --source olx       # тільки OLX
+  py scripts/backfill_real_estate_objects.py --source olx --only-without-refs  # лише без ОНМ у unified
 """
 
 import argparse
@@ -39,6 +40,7 @@ def run_backfill(
     batch_size: int = 50,
     source: Optional[str] = None,
     backfill_cadastral_all: bool = True,
+    only_without_refs: bool = False,
 ) -> dict:
     """
     Виконує backfill ОНМ для всіх unified_listings.
@@ -48,6 +50,7 @@ def run_backfill(
         limit: Максимальна кількість оголошень (0 = без обмежень)
         batch_size: Розмір батчу для логування прогресу
         source: Джерело — "olx", "prozorro" або None (обидва)
+        only_without_refs: лише unified_listings без real_estate_object_refs (економія LLM для разового догону)
 
     Returns:
         Словник з статистикою: processed, errors, cleared_cache
@@ -72,6 +75,18 @@ def run_backfill(
     filter_query: dict = {}
     if source:
         filter_query["source"] = source
+    if only_without_refs:
+        no_refs = {
+            "$or": [
+                {"real_estate_object_refs": {"$exists": False}},
+                {"real_estate_object_refs": None},
+                {"real_estate_object_refs": []},
+            ]
+        }
+        if filter_query:
+            filter_query = {"$and": [filter_query, no_refs]}
+        else:
+            filter_query = no_refs
     cursor = unified_repo.collection.find(
         filter_query,
         {"source": 1, "source_id": 1},
@@ -174,6 +189,11 @@ def main():
         action="store_true",
         help="Пропустити перезаповнення всіх земельних ділянок з кадастру.",
     )
+    parser.add_argument(
+        "--only-without-refs",
+        action="store_true",
+        help="Обробляти лише оголошення без real_estate_object_refs у unified_listings.",
+    )
     args = parser.parse_args()
     result = run_backfill(
         clear_llm_cache=args.clear_llm_cache,
@@ -181,6 +201,7 @@ def main():
         batch_size=args.batch_size,
         source=args.source,
         backfill_cadastral_all=not args.no_cadastral_backfill,
+        only_without_refs=args.only_without_refs,
     )
     sys.exit(0 if result["errors"] == 0 else 1)
 
