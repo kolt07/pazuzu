@@ -6,7 +6,7 @@ UnifiedSearchService: централізований пошук по unified_lis
 Використовується на сторінці пошуку та при формуванні звітів.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from domain.models.filter_models import FilterGroup, FindQuery, GeoFilter
 from domain.models.filter_models import FilterElement, FilterGroupType, FilterOperator
@@ -43,6 +43,10 @@ def find(
         sort = [{"field": DEFAULT_SORT_FIELD, "order": DEFAULT_SORT_ORDER}]
     if sort and sort[0].get("field") == "source_updated_at" and len(sort) == 1:
         sort = sort + [{"field": "system_updated_at", "order": sort[0].get("order", DEFAULT_SORT_ORDER)}]
+    from business.services.settlement_criteria_resolver import strip_and_apply_settlement_criteria
+
+    filter_group, geo_filter = strip_and_apply_settlement_criteria(filter_group, geo_filter)
+
     if default_status_active:
         filter_group = _with_default_status(filter_group, COLLECTION)
     query = FindQuery(
@@ -67,19 +71,54 @@ def find_by_filter_string(
     sort: Optional[List[Dict[str, Any]]] = None,
     limit: int = 50,
     skip: int = 0,
+    date_filter_days: Optional[int] = None,
+    source: Optional[str] = None,
 ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[int], Optional[str]]:
     """
     Парсить рядок фільтрів, виконує пошук. При помилці парсингу повертає (None, None, error).
-    
+    Опційно додає до умов AND: період за датою оновлення у джерелі (date_filter_days)
+    та обмеження полем source (як у шаблонах звітів разом із рядком фільтрів).
+
     Returns:
         (list of documents or None, total or None, error message or None)
     """
     parse_result = filter_string_to_models(filter_string, collection=COLLECTION)
     if not parse_result.success:
         return None, None, parse_result.error
+
+    from business.services.settlement_criteria_resolver import strip_and_apply_settlement_criteria
+
+    filter_group_parsed, geo_filter_parsed = strip_and_apply_settlement_criteria(
+        parse_result.filter_group,
+        parse_result.geo_filter,
+    )
+
+    from datetime import datetime, timedelta, timezone
+
+    phys = lambda f: SourceFieldMapper.get_field_path(f, COLLECTION)
+    extra_elems: List[FilterElement] = []
+    if date_filter_days is not None and int(date_filter_days) > 0:
+        since = (datetime.now(timezone.utc) - timedelta(days=int(date_filter_days))).isoformat()
+        extra_elems.append(
+            FilterElement(field=phys("source_updated_at"), operator=FilterOperator.GTE, value=since)
+        )
+    src = (source or "").strip() if isinstance(source, str) else ""
+    if src:
+        extra_elems.append(FilterElement(field=phys("source"), operator=FilterOperator.EQ, value=src))
+
+    final_filter_group: Optional[FilterGroup]
+    if not extra_elems:
+        final_filter_group = filter_group_parsed
+    else:
+        merged: List[Union[FilterElement, FilterGroup]] = []
+        if filter_group_parsed is not None:
+            merged.append(filter_group_parsed)
+        merged.extend(extra_elems)
+        final_filter_group = FilterGroup(group_type=FilterGroupType.AND, items=merged)
+
     data, total = find(
-        filter_group=parse_result.filter_group,
-        geo_filter=parse_result.geo_filter,
+        filter_group=final_filter_group,
+        geo_filter=geo_filter_parsed,
         sort=sort,
         limit=limit,
         skip=skip,

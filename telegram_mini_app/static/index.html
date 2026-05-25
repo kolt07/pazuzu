@@ -30,12 +30,6 @@
             <button type="button" id="sidebar-new-chat" class="btn btn-primary btn-small">+ Новий чат</button>
             <button type="button" id="sidebar-collapse-btn" class="btn-sidebar-toggle" title="Згорнути">‹</button>
           </div>
-          <div class="sidebar-header-row sidebar-header-row-investigation">
-            <button type="button" id="sidebar-new-investigation" class="btn btn-premium btn-small" title="Нове дослідження Flx">
-              <span class="btn-premium-icon" aria-hidden="true"></span>
-              <span class="btn-premium-label">Нове дослідження</span>
-            </button>
-          </div>
         </div>
         <div id="chat-history-list" class="chat-history-list"></div>
       </aside>
@@ -281,6 +275,23 @@
           <div id="admin-cadastral-index-status" class="admin-data-update-status hidden"></div>
           <div id="admin-cadastral-clusters-status" class="admin-data-update-status hidden"></div>
         </div>
+        <div class="admin-block" data-admin-tab="cadastral">
+          <h3>Скрапер mista.ua (населені пункти)</h3>
+          <p class="admin-hint">Довідник ~2751 НП з mista.ua → raw_mista_settlements → імпорт у cities (демографія, колишні назви).</p>
+          <div id="admin-mista-stats" class="admin-hint"></div>
+          <div class="admin-data-update-actions">
+            <button type="button" id="admin-mista-start-test" class="btn">Список (3 стор.) + деталі (10)</button>
+            <button type="button" id="admin-mista-start-list" class="btn">Лише список</button>
+            <button type="button" id="admin-mista-start-details" class="btn">Лише деталі (pending)</button>
+            <button type="button" id="admin-mista-start-full" class="btn btn-primary">Повний скрап</button>
+            <button type="button" id="admin-mista-import" class="btn">Імпорт у cities</button>
+          </div>
+          <div id="admin-mista-progress-wrap" class="hidden" style="margin-top: 0.75rem;">
+            <div class="admin-hint" id="admin-mista-progress-label">Прогрес</div>
+            <div class="admin-data-update-progress-bar"><div id="admin-mista-progress-fill" class="admin-data-update-progress-fill" style="width: 0%;"></div></div>
+          </div>
+          <div id="admin-mista-status" class="admin-data-update-status hidden"></div>
+        </div>
         <div class="admin-block" data-admin-tab="data">
           <h3>Аналітика цін</h3>
           <p class="admin-hint">Перерахувати зведену аналітику (квартилі, середні ціни по містах). Виконується автоматично після оновлення даних.</p>
@@ -424,69 +435,16 @@
                 <option value="7" selected>За тиждень</option>
                 <option value="30">За 30 днів</option>
               </select>
+              <p class="search-filter-hint" style="margin-top: 0.35rem;">Період та джерело додаються до умов пошуку разом із рядком відборів (AND).</p>
             </div>
-            <div class="filter-group">
-              <label>Область:</label>
-              <div class="filter-input-wrapper">
-                <input type="text" id="constructor-region" class="filter-input" placeholder="Оберіть область..." />
-                <div id="constructor-region-dropdown" class="filter-dropdown hidden"></div>
+            <div class="filter-group filter-string-group">
+              <label for="constructor-filter-string">Рядок відборів</label>
+              <p class="search-filter-hint">Той самий формат, що й на сторінці пошуку: можна вставити текст або зібрати умови кнопкою «Створити фільтри».</p>
+              <textarea id="constructor-filter-string" class="filter-textarea filter-string-input" rows="8" placeholder='Наприклад: "Джерело" = olx AND "Активність" = True'></textarea>
+              <div class="filter-string-actions">
+                <button type="button" id="constructor-build-filters" class="btn btn-secondary">Створити фільтри</button>
+                <button type="button" id="constructor-clear-filter-string" class="btn btn-ghost">Очистити рядок</button>
               </div>
-            </div>
-            <div class="filter-group">
-              <label>Місто:</label>
-              <div class="filter-input-wrapper">
-                <input type="text" id="constructor-city" class="filter-input" placeholder="Всі міста" />
-                <div id="constructor-city-dropdown" class="filter-dropdown hidden"></div>
-              </div>
-            </div>
-            <div class="filter-group">
-              <label>Тип:</label>
-              <select id="constructor-property-type" class="filter-select">
-                <option value="">Всі</option>
-                <option value="neruhomist">Нерухомість</option>
-                <option value="zemelna_dilyanka">ЗД</option>
-                <option value="zemelna_dilyanka_z_neruhomistyu">ЗД+Нерухомість</option>
-                <option value="inshe">Інше</option>
-              </select>
-            </div>
-            <div class="filter-group price-filter">
-              <label>Ціна:</label>
-              <select id="constructor-price-op" class="filter-select">
-                <option value="">--</option>
-                <option value="gte">≥</option>
-                <option value="lte">≤</option>
-              </select>
-              <input type="number" id="constructor-price-value" class="filter-input" placeholder="0" min="0" />
-              <select id="constructor-price-currency" class="filter-select">
-                <option value="uah" selected>грн</option>
-                <option value="usd">$</option>
-              </select>
-            </div>
-            <div class="filter-group price-filter">
-              <label>Ціна за м²:</label>
-              <select id="constructor-price-m2-op" class="filter-select">
-                <option value="">--</option>
-                <option value="gte">≥</option>
-                <option value="lte">≤</option>
-              </select>
-              <input type="number" id="constructor-price-m2-value" class="filter-input" placeholder="0" min="0" />
-              <select id="constructor-price-m2-currency" class="filter-select">
-                <option value="uah" selected>грн</option>
-                <option value="usd">$</option>
-              </select>
-            </div>
-            <div class="filter-group price-filter">
-              <label>Ціна за сотку:</label>
-              <select id="constructor-price-ha-op" class="filter-select">
-                <option value="">--</option>
-                <option value="gte">≥</option>
-                <option value="lte">≤</option>
-              </select>
-              <input type="number" id="constructor-price-ha-value" class="filter-input" placeholder="0" min="0" />
-              <select id="constructor-price-ha-currency" class="filter-select">
-                <option value="uah" selected>грн</option>
-                <option value="usd">$</option>
-              </select>
             </div>
             <div class="filter-group">
               <label>Сортування:</label>

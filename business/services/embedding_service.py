@@ -109,7 +109,7 @@ class EmbeddingService:
         return h.hexdigest()
 
     def _cache_get_many(self, hashes: Sequence[str]) -> Dict[str, List[float]]:
-        if not self._cache_coll or not hashes:
+        if self._cache_coll is None or not hashes:
             return {}
         try:
             cursor = self._cache_coll.find(
@@ -139,7 +139,7 @@ class EmbeddingService:
             return {}
 
     def _cache_set_many(self, items: Sequence[Dict[str, Any]]) -> None:
-        if not self._cache_coll or not items:
+        if self._cache_coll is None or not items:
             return
         try:
             now = datetime.now(timezone.utc)

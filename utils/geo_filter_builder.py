@@ -227,8 +227,16 @@ class GeoFilterBuilder:
         refs_path = address_refs_info["path"]
         region_key, city_key = SourceFieldMapper.get_geo_match_keys(collection)
         
-        # Нормалізуємо значення
-        city_variants = self._normalize_city_value(city_value) if city_value else []
+        from utils.settlement_geo_match import get_settlement_match_names, settlement_regex_for_names
+
+        # Нормалізуємо значення (назви НП + аліаси з довідника cities)
+        if city_value:
+            city_variants = get_settlement_match_names(
+                settlement_name=city_value,
+                region=region_value,
+            ) or [city_value]
+        else:
+            city_variants = []
         region_variants = self._normalize_region_value(region_value) if region_value else []
         
         # Крок 4: Автоматична OR логіка
@@ -238,47 +246,22 @@ class GeoFilterBuilder:
         # Умови для міста
         prefix = f"{refs_path}." if refs_path else ""
         if city_variants:
-            for variant in city_variants:
-                regex_pattern = self._build_regex_pattern(variant)
-                field_path = f"{prefix}{city_key}" if prefix else city_key
-                or_conditions.append({
-                    field_path: {
-                        "$regex": regex_pattern,
-                        "$options": "i"
-                    }
-                })
-                
-                # Fallback поля (unified_listings не має fallback)
-                city_fallback = SourceFieldMapper.get_city_fallback_field(collection)
-                if city_fallback:
-                    if "items" in city_fallback:
-                        # Для prozorro_auctions
-                        or_conditions.append({
-                            "auction_data.items": {
-                                "$elemMatch": {
-                                    "address.locality.uk_UA": {
-                                        "$regex": regex_pattern,
-                                        "$options": "i"
-                                    }
-                                }
-                            }
-                        })
-                    elif "resolved_locations" in city_fallback:
-                        # Для olx_listings
-                        or_conditions.append({
-                            city_fallback: {
-                                "$regex": regex_pattern,
-                                "$options": "i"
-                            }
-                        })
-                    elif "location" in city_fallback:
-                        # Для olx_listings - search_data.location
-                        or_conditions.append({
-                            city_fallback: {
-                                "$regex": regex_pattern,
-                                "$options": "i"
-                            }
-                        })
+            settlement_re = settlement_regex_for_names(city_variants)
+            field_path = f"{prefix}{city_key}" if prefix else city_key
+            or_conditions.append({field_path: settlement_re})
+
+            city_fallback = SourceFieldMapper.get_city_fallback_field(collection)
+            if city_fallback:
+                if "items" in city_fallback:
+                    or_conditions.append({
+                        "auction_data.items": {
+                            "$elemMatch": {"address.locality.uk_UA": settlement_re}
+                        }
+                    })
+                elif "resolved_locations" in city_fallback:
+                    or_conditions.append({city_fallback: settlement_re})
+                elif "location" in city_fallback:
+                    or_conditions.append({city_fallback: settlement_re})
         
         # Умови для регіону
         if region_variants:

@@ -38,6 +38,9 @@ EXPECTED_COLLECTIONS = frozenset({
     "cities",
     "streets",
     "buildings",
+    "oblast_rayons",
+    "geo_circles",
+    "raw_mista_settlements",
     # ОНМ та кадастр
     "real_estate_objects",
     "cadastral_parcels",

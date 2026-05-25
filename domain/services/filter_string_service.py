@@ -69,8 +69,17 @@ _GEO_OP_STR = {
 _GEO_TYPE_LABELS = {
     "region": "Область",
     "settlement": "Населений пункт",
+    "settlement_population": "Населення НП",
+    "settlement_area": "Площа НП",
     "city_district": "Район міста",
 }
+
+_BUILDER_HIDDEN_FIELD_KEYS = frozenset({
+    "settlement_population",
+    "settlement_area_sq_km",
+    "settlement_region_context",
+    "settlement_name_context",
+})
 
 
 def _load_search_fields_config(collection: str = "unified_listings") -> Dict[str, Any]:
@@ -171,26 +180,35 @@ def filter_group_to_string(
         parts.append(serialize_group(group))
 
     if geo_filter:
-        geo_parts: List[str] = []
-        root = geo_filter.root
-        if isinstance(root, GeoFilterElement):
-            geo_parts.append(_geo_element_to_str(root))
-        elif isinstance(root, GeoFilterGroup):
-            for it in root.items:
-                if isinstance(it, GeoFilterElement):
-                    geo_parts.append(_geo_element_to_str(it))
-                elif isinstance(it, GeoFilterGroup):
-                    inner = [_geo_element_to_str(x) for x in it.items if isinstance(x, GeoFilterElement)]
-                    if inner:
-                        geo_parts.append("(" + " OR ".join(inner) + ")")
-        if geo_parts:
-            parts.append("(" + " AND ".join("geo(" + p + ")" for p in geo_parts) + ")")
+        geo_str = _geo_filter_to_string(geo_filter.root)
+        if geo_str:
+            parts.append(geo_str)
 
     return " AND ".join(parts) if parts else ""
 
 
+def _geo_filter_to_string(node: Union[GeoFilterElement, GeoFilterGroup]) -> str:
+    """Серіалізує GeoFilter у (geo(...) OR geo(...)) — OR/AND між викликами geo, не всередині."""
+    if isinstance(node, GeoFilterElement):
+        return "geo(" + _geo_element_to_str(node) + ")"
+    if isinstance(node, GeoFilterGroup):
+        inner: List[str] = []
+        for it in node.items:
+            if isinstance(it, (GeoFilterElement, GeoFilterGroup)):
+                part = _geo_filter_to_string(it)
+                if part:
+                    inner.append(part)
+        if not inner:
+            return ""
+        joiner = " OR " if node.group_type == FilterGroupType.OR else " AND "
+        if len(inner) == 1:
+            return inner[0]
+        return "(" + joiner.join(inner) + ")"
+    return ""
+
+
 def _geo_element_to_str(elem: GeoFilterElement) -> str:
-    """Один гео-елемент у рядок: 'Область' INSIDE 'Київська'."""
+    """Один гео-елемент у рядок: 'Область' INSIDE 'Київська' [REGION 'Волинська']."""
     label = _GEO_TYPE_LABELS.get(elem.geo_type, elem.geo_type)
     op = elem.operator
     if op in (GeoFilterOperator.EQ, GeoFilterOperator.INSIDE):
@@ -204,7 +222,12 @@ def _geo_element_to_str(elem: GeoFilterElement) -> str:
     else:
         op_str = str(op.value).upper()
     val_str = "'%s'" % str(elem.value).replace("'", "\\'") if elem.value is not None else "''"
-    return "'%s' %s %s" % (label, op_str, val_str)
+    base = "'%s' %s %s" % (label, op_str, val_str)
+    region_ctx = getattr(elem, "region", None)
+    if elem.geo_type == "settlement" and region_ctx:
+        reg = str(region_ctx).replace("'", "\\'")
+        base += " REGION '%s'" % reg
+    return base
 
 
 def filter_string_to_models(
@@ -241,23 +264,7 @@ def _parse_expression(s: str, label_to_key: Dict[str, str]) -> Tuple[Optional[Fi
     if not s:
         return None, None
 
-    # Витягуємо geo(...)
-    geo_filter = None
-    geo_pattern = re.compile(r"\bgeo\s*\(\s*([^)]+)\s*\)", re.IGNORECASE)
-    geo_matches = list(geo_pattern.finditer(s))
-    if geo_matches:
-        geo_parts = []
-        for m in geo_matches:
-            geo_inner = m.group(1).strip()
-            elem = _parse_geo_element(geo_inner)
-            if elem:
-                geo_parts.append(elem)
-        if geo_parts:
-            geo_filter = _geo_parts_to_filter(geo_parts)
-        s = geo_pattern.sub(" ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        s = re.sub(r"^\s*AND\s+|\s+AND\s*$", "", s).strip()
-        s = re.sub(r"^\(\s*\)\s*$", "", s).strip()
+    s, geo_filter = _extract_geo_filter_from_expression(s)
 
     if not s:
         return None, geo_filter
@@ -376,19 +383,28 @@ def _parse_value(s: str) -> Any:
 
 
 def _parse_geo_element(s: str) -> Optional[GeoFilterElement]:
-    """Парсить один гео-терм: 'Область' INSIDE 'Київська' або 'Район міста' INSIDE 'Солом\\'янський район'.
+    """Парсить один гео-терм: 'Область' INSIDE 'Київська' [REGION 'Волинська область'].
     У лапках підтримується екранування: \\' та \\\\."""
     s = s.strip()
     label_to_geo = {v: k for k, v in _GEO_TYPE_LABELS.items()}
-    # Кваліфіковані лапки: '...' з можливістю \' та \\ всередині
     quoted = r"'((?:[^'\\]|\\.)*)'"
-    pattern = r"^" + quoted + r"\s+(INSIDE|NOT\s+INSIDE|IN_RADIUS)\s+" + quoted + r"\s*(?:(\d+(?:\.\d+)?)\s*km)?$"
+    pattern = (
+        r"^"
+        + quoted
+        + r"\s+(INSIDE|NOT\s+INSIDE|IN_RADIUS)\s+"
+        + quoted
+        + r"(?:\s+REGION\s+"
+        + quoted
+        + r")?"
+        + r"\s*(?:(\d+(?:\.\d+)?)\s*km)?$"
+    )
     alt = re.match(pattern, s, re.IGNORECASE)
     if alt:
         label = _unescape_quoted(alt.group(1))
         op_str = alt.group(2).replace(" ", "_").lower()
         value = _unescape_quoted(alt.group(3))
-        radius = alt.group(4)
+        region_val = _unescape_quoted(alt.group(4)) if alt.group(4) else None
+        radius = alt.group(5)
         geo_type = label_to_geo.get(label, "settlement")
         if "not_inside" in op_str:
             op_enum = GeoFilterOperator.NOT_INSIDE
@@ -399,7 +415,13 @@ def _parse_geo_element(s: str) -> Optional[GeoFilterElement]:
         radius_km = float(radius) if radius else None
         if op_enum == GeoFilterOperator.IN_RADIUS and radius_km:
             return GeoFilterElement(operator=op_enum, geo_type="coordinates", value=value, radius_km=radius_km)
-        return GeoFilterElement(operator=op_enum, geo_type=geo_type, value=value, radius_km=radius_km)
+        return GeoFilterElement(
+            operator=op_enum,
+            geo_type=geo_type,
+            value=value,
+            radius_km=radius_km,
+            region=region_val if geo_type == "settlement" and region_val else None,
+        )
     return None
 
 
@@ -410,13 +432,84 @@ def _unescape_quoted(s: str) -> str:
     return s.replace("\\\\", "\x00").replace("\\'", "'").replace("\x00", "\\")
 
 
-def _geo_parts_to_filter(parts: List[GeoFilterElement]) -> GeoFilter:
-    """Збирає список гео-елементів в один GeoFilter (AND)."""
+def _geo_parts_to_filter(
+    parts: List[GeoFilterElement],
+    *,
+    joiners: Optional[List[FilterGroupType]] = None,
+) -> GeoFilter:
+    """Збирає список гео-елементів в GeoFilter з OR/AND між викликами geo()."""
     if not parts:
         raise ValueError("Порожній гео-фільтр")
     if len(parts) == 1:
         return GeoFilter(root=parts[0])
-    return GeoFilter(root=GeoFilterGroup(group_type=FilterGroupType.AND, items=parts))
+    group_type = FilterGroupType.AND
+    if joiners:
+        if all(j == FilterGroupType.OR for j in joiners):
+            group_type = FilterGroupType.OR
+        elif all(j == FilterGroupType.AND for j in joiners):
+            group_type = FilterGroupType.AND
+    return GeoFilter(root=GeoFilterGroup(group_type=group_type, items=parts))
+
+
+def _extract_geo_filter_from_expression(s: str) -> Tuple[str, Optional[GeoFilter]]:
+    """
+    Витягує geo(...) з виразу, зберігаючи OR/AND між сусідніми викликами.
+    Повертає рядок без geo-частини та GeoFilter.
+    """
+    geo_start = re.compile(r"\bgeo\s*\(\s*", re.IGNORECASE)
+    spans: List[Tuple[int, int, str]] = []
+    pos = 0
+    while True:
+        m = geo_start.search(s, pos)
+        if not m:
+            break
+        start = m.start()
+        i = m.end()
+        depth = 1
+        while i < len(s) and depth > 0:
+            ch = s[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            break
+        inner = s[m.end() : i - 1].strip()
+        spans.append((start, i, inner))
+        pos = i
+
+    if not spans:
+        return s, None
+
+    elems: List[GeoFilterElement] = []
+    for _, _, inner in spans:
+        elem = _parse_geo_element(inner)
+        if elem:
+            elems.append(elem)
+    if not elems:
+        return s, None
+
+    joiners: List[FilterGroupType] = []
+    for idx in range(len(spans) - 1):
+        between = s[spans[idx][1] : spans[idx + 1][0]].strip()
+        between = re.sub(r"^\(+", "", between)
+        between = re.sub(r"\)+$", "", between)
+        between = between.strip()
+        if between.upper() == "OR":
+            joiners.append(FilterGroupType.OR)
+        else:
+            joiners.append(FilterGroupType.AND)
+
+    geo_filter = _geo_parts_to_filter(elems, joiners=joiners or None)
+
+    new_s = s
+    for start, end, _ in reversed(spans):
+        new_s = new_s[:start] + " " + new_s[end:]
+    new_s = re.sub(r"\s+", " ", new_s).strip()
+    new_s = re.sub(r"^\s*AND\s+|\s+AND\s*$", "", new_s).strip()
+    new_s = re.sub(r"^\(\s*\)\s*$", "", new_s).strip()
+    return new_s, geo_filter
 
 
 def get_builder_config(collection: str = "unified_listings") -> Dict[str, Any]:
@@ -431,9 +524,18 @@ def get_builder_config(collection: str = "unified_listings") -> Dict[str, Any]:
     except Exception:
         return {"fields": {}, "geo": {}}
     coll = (data.get("collections") or {}).get(collection) or {}
+    raw_fields = coll.get("fields") or {}
+    fields = {
+        k: v
+        for k, v in raw_fields.items()
+        if k not in _BUILDER_HIDDEN_FIELD_KEYS and not v.get("builder_hidden")
+    }
+    geo_cfg = data.get("geo") or {}
+    labels = dict(_GEO_TYPE_LABELS)
+    labels.update(geo_cfg.get("type_labels_uk") or {})
     return {
-        "fields": coll.get("fields") or {},
-        "geo": data.get("geo") or {},
+        "fields": fields,
+        "geo": {**geo_cfg, "type_labels_uk": labels},
     }
 
 
@@ -494,6 +596,111 @@ def filter_string_from_structure(
     return filter_group_to_string(group, geo_filter=geo_filter, collection=collection)
 
 
+def _append_settlement_criteria_items(
+    items: List[FilterElement],
+    it: Dict[str, Any],
+    *,
+    include_settlement_name: bool = True,
+    include_population: bool = True,
+    include_area: bool = True,
+) -> None:
+    """Додає логічні критерії НП (резолвляться в GeoFilter при пошуку)."""
+    from domain.models.filter_models import FilterOperator as FO
+    from business.services.settlement_criteria_resolver import (
+        SETTLEMENT_AREA_FIELD,
+        SETTLEMENT_NAME_CONTEXT_FIELD,
+        SETTLEMENT_POPULATION_FIELD,
+        SETTLEMENT_REGION_CONTEXT_FIELD,
+    )
+
+    geo_reg = (it.get("geoRegion") or "").strip()
+    if geo_reg:
+        items.append(
+            FilterElement(
+                field=SETTLEMENT_REGION_CONTEXT_FIELD,
+                operator=FO.EQ,
+                value=geo_reg,
+            )
+        )
+    if include_settlement_name:
+        val = it.get("value")
+        if val is not None and isinstance(val, str) and val.strip():
+            items.append(
+                FilterElement(
+                    field=SETTLEMENT_NAME_CONTEXT_FIELD,
+                    operator=FO.EQ,
+                    value=val.strip(),
+                )
+            )
+    if include_population:
+        if it.get("population_min") is not None:
+            items.append(
+                FilterElement(
+                    field=SETTLEMENT_POPULATION_FIELD,
+                    operator=FO.GTE,
+                    value=int(it["population_min"]),
+                )
+            )
+        if it.get("population_max") is not None:
+            items.append(
+                FilterElement(
+                    field=SETTLEMENT_POPULATION_FIELD,
+                    operator=FO.LTE,
+                    value=int(it["population_max"]),
+                )
+            )
+    if include_area:
+        if it.get("area_min") is not None:
+            items.append(
+                FilterElement(
+                    field=SETTLEMENT_AREA_FIELD,
+                    operator=FO.GTE,
+                    value=float(it["area_min"]),
+                )
+            )
+        if it.get("area_max") is not None:
+            items.append(
+                FilterElement(
+                    field=SETTLEMENT_AREA_FIELD,
+                    operator=FO.LTE,
+                    value=float(it["area_max"]),
+                )
+            )
+
+
+def _geo_node_has_criteria(it: Dict[str, Any], geo_type: str) -> bool:
+    if geo_type == "settlement_population":
+        return any(
+            it.get(k) is not None and it.get(k) != ""
+            for k in ("population_min", "population_max", "geoRegion")
+        )
+    if geo_type == "settlement_area":
+        return any(
+            it.get(k) is not None and it.get(k) != ""
+            for k in ("area_min", "area_max", "geoRegion")
+        )
+    if geo_type == "settlement":
+        return any(
+            it.get(k) is not None and it.get(k) != ""
+            for k in (
+                "population_min",
+                "population_max",
+                "area_min",
+                "area_max",
+                "geoRegion",
+            )
+        )
+    return False
+
+
+def _geo_node_has_demographic_criteria(it: Dict[str, Any]) -> bool:
+    """Населення/площа НП (без урахування geoRegion — область іде в geo REGION)."""
+    return any(
+        it.get(k) is not None and it.get(k) != ""
+        for k in ("population_min", "population_max", "area_min", "area_max")
+    )
+
+
 def tree_to_filter_models(root: Dict[str, Any]) -> Tuple[Optional[FilterGroup], Optional[GeoFilter]]:
     """
     Будує FilterGroup та GeoFilter з дерева (root).
@@ -503,6 +710,10 @@ def tree_to_filter_models(root: Dict[str, Any]) -> Tuple[Optional[FilterGroup], 
         return None, None
 
     geo_elems: List[GeoFilterElement] = []
+    try:
+        root_group_type = FilterGroupType((root.get("group_type") or "and").strip().lower())
+    except ValueError:
+        root_group_type = FilterGroupType.AND
 
     def build_group(node: Dict[str, Any]) -> Optional[FilterGroup]:
         gt = (node.get("group_type") or "and").strip().lower()
@@ -517,18 +728,59 @@ def tree_to_filter_models(root: Dict[str, Any]) -> Tuple[Optional[FilterGroup], 
             t = (it.get("type") or "").strip().lower()
             if t == "geo":
                 val = it.get("value")
-                if val is None or (isinstance(val, str) and not val.strip()):
-                    continue
                 geo_type = str(it.get("geo_type") or "region").strip()
+                has_criteria = _geo_node_has_criteria(it, geo_type)
+                val_empty = val is None or (isinstance(val, str) and not str(val).strip())
+                if val_empty and not has_criteria:
+                    continue
                 op_raw = str(it.get("operator") or "inside").strip().lower()
                 op_enum = _GEO_OP_STR.get(op_raw, GeoFilterOperator.INSIDE)
-                geo_elems.append(
-                    GeoFilterElement(
-                        operator=op_enum,
-                        geo_type=geo_type,
-                        value=val.strip() if isinstance(val, str) else val,
+                if geo_type not in ("settlement_population", "settlement_area") and not val_empty:
+                    geo_reg = (it.get("geoRegion") or "").strip() or None
+                    city_id = (it.get("city_id") or it.get("cityId") or "").strip() or None
+                    geo_elems.append(
+                        GeoFilterElement(
+                            operator=op_enum,
+                            geo_type=geo_type,
+                            value=val.strip() if isinstance(val, str) else val,
+                            region=geo_reg if geo_type == "settlement" else None,
+                            city_id=city_id if geo_type == "settlement" else None,
+                        )
                     )
-                )
+                if geo_type == "settlement":
+                    # Назву/область у FilterGroup лише якщо немає value (фільтр за демографією без НП)
+                    if val_empty:
+                        _append_settlement_criteria_items(
+                            items,
+                            it,
+                            include_settlement_name=True,
+                            include_population=False,
+                            include_area=False,
+                        )
+                    elif _geo_node_has_demographic_criteria(it):
+                        _append_settlement_criteria_items(
+                            items,
+                            it,
+                            include_settlement_name=False,
+                            include_population=True,
+                            include_area=True,
+                        )
+                elif geo_type == "settlement_population":
+                    _append_settlement_criteria_items(
+                        items,
+                        it,
+                        include_settlement_name=False,
+                        include_population=True,
+                        include_area=False,
+                    )
+                elif geo_type == "settlement_area":
+                    _append_settlement_criteria_items(
+                        items,
+                        it,
+                        include_settlement_name=False,
+                        include_population=False,
+                        include_area=True,
+                    )
                 continue
             if t == "group":
                 child = build_group(it)
@@ -555,11 +807,16 @@ def tree_to_filter_models(root: Dict[str, Any]) -> Tuple[Optional[FilterGroup], 
     group = build_group(root)
     geo_filter: Optional[GeoFilter] = None
     if geo_elems:
-        geo_filter = (
-            GeoFilter(root=geo_elems[0])
-            if len(geo_elems) == 1
-            else GeoFilter(root=GeoFilterGroup(group_type=FilterGroupType.AND, items=geo_elems))
-        )
+        if len(geo_elems) == 1:
+            geo_filter = GeoFilter(root=geo_elems[0])
+        elif root_group_type == FilterGroupType.OR:
+            geo_filter = GeoFilter(
+                root=GeoFilterGroup(group_type=FilterGroupType.OR, items=geo_elems)
+            )
+        else:
+            geo_filter = GeoFilter(
+                root=GeoFilterGroup(group_type=FilterGroupType.AND, items=geo_elems)
+            )
     return group, geo_filter
 
 

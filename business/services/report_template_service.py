@@ -15,22 +15,10 @@ logger = logging.getLogger(__name__)
 # Ключі параметрів шаблону
 PARAM_SOURCE = "source"
 PARAM_DATE_FILTER = "date_filter"
-PARAM_REGION = "region"
-PARAM_CITY = "city"
-PARAM_PROPERTY_TYPE = "property_type"
-PARAM_PRICE = "price"
-PARAM_PRICE_PER_HA = "price_per_ha"
-PARAM_PRICE_PER_M2 = "price_per_m2"
 PARAM_SORT_FIELD = "sort_field"
 PARAM_SORT_ORDER = "sort_order"
 PARAM_OUTPUT_FORMAT = "output_format"
-
-# Валідні значення
-SOURCES = ("", "olx", "prozorro")
-DATE_FILTERS = (1, 7, 30)
-PROPERTY_TYPES = ("", "neruhomist", "zemelna_dilyanka", "zemelna_dilyanka_z_neruhomistyu", "inshe")
-OUTPUT_FORMATS = ("unified_table", "tabs_by_source")
-CURRENCIES = ("uah", "usd")
+PARAM_FILTER_STRING = "filter_string"
 
 
 def _default_params() -> Dict[str, Any]:
@@ -38,12 +26,7 @@ def _default_params() -> Dict[str, Any]:
     return {
         PARAM_SOURCE: "",
         PARAM_DATE_FILTER: 7,
-        PARAM_REGION: None,
-        PARAM_CITY: None,
-        PARAM_PROPERTY_TYPE: "",
-        PARAM_PRICE: None,
-        PARAM_PRICE_PER_HA: None,
-        PARAM_PRICE_PER_M2: None,
+        PARAM_FILTER_STRING: None,
         PARAM_SORT_FIELD: "source_updated_at",
         PARAM_SORT_ORDER: "desc",
         PARAM_OUTPUT_FORMAT: "unified_table",
@@ -163,20 +146,10 @@ class ReportTemplateService:
         elif days == 30:
             parts.append("за 30 днів")
 
-        region = params.get(PARAM_REGION)
-        city = params.get(PARAM_CITY)
-        if city:
-            parts.append(f"м. {city}")
-        elif region:
-            parts.append(region)
-
-        prop_type = params.get(PARAM_PROPERTY_TYPE)
-        if prop_type == "neruhomist":
-            parts.append("нерухомість")
-        elif prop_type == "zemelna_dilyanka":
-            parts.append("ЗД")
-        elif prop_type == "zemelna_dilyanka_z_neruhomistyu":
-            parts.append("ЗД з нерухомістю")
+        fs = (params.get(PARAM_FILTER_STRING) or "").strip()
+        if fs:
+            snippet = fs[:100] + ("…" if len(fs) > 100 else "")
+            parts.append(f"рядок фільтрів: {snippet}")
 
         return f"Generate a short report template name (max 6-8 words). Report parameters: {', '.join(parts)}. Return only the name, no quotes. The name must be in Ukrainian."
 
@@ -184,17 +157,15 @@ class ReportTemplateService:
         """Формує просту назву без LLM."""
         days = params.get(PARAM_DATE_FILTER, 7)
         source = params.get(PARAM_SOURCE) or "всі"
-        region = params.get(PARAM_REGION) or ""
-        city = params.get(PARAM_CITY) or ""
+        fs = (params.get(PARAM_FILTER_STRING) or "").strip()
         if days == 1:
             period = "Звіт за добу"
         elif days == 7:
             period = "Звіт за тиждень"
         else:
             period = f"Звіт за {days} днів"
-        loc = city or region
-        if loc:
-            return f"{period} ({loc})"
+        if fs:
+            return f"{period} (фільтр)"
         return f"{period} ({source})"
 
     def create_template(

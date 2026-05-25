@@ -105,10 +105,26 @@ class GeoFilterService:
         
         and_items: List[Union[GeoFilterElement, GeoFilterGroup]] = []
 
-        if city or region:
-            city_region_gf = self.from_city_region(city=city, region=region, use_or=True)
-            if city_region_gf:
-                and_items.append(city_region_gf.root)
+        if city and region:
+            # НП у межах області (гомоніми, AND — не OR місто/область)
+            and_items.append(GeoFilterElement(
+                operator=GeoFilterOperator.INSIDE,
+                geo_type="settlement",
+                value=city,
+                region=region,
+            ))
+        elif city:
+            and_items.append(GeoFilterElement(
+                operator=GeoFilterOperator.INSIDE,
+                geo_type="settlement",
+                value=city,
+            ))
+        elif region:
+            and_items.append(GeoFilterElement(
+                operator=GeoFilterOperator.INSIDE,
+                geo_type="region",
+                value=region,
+            ))
         if exclude_city:
             and_items.append(GeoFilterElement(
                 operator=GeoFilterOperator.NE,

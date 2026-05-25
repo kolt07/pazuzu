@@ -23,9 +23,53 @@ from utils.ukraine_regions import (
     normalize_region_for_repository_lookup,
     special_city_from_region,
 )
+from utils.settlement_normalizer import (
+    build_city_filter_options,
+    dedupe_settlement_labels,
+    normalize_settlement_name,
+    parse_settlement_filter_label,
+)
 
 
 router = APIRouter(prefix="/api/search", tags=["search"])
+
+
+def _city_names_for_filter(
+    cities_list: List[Dict[str, Any]],
+    *,
+    region_name: Optional[str] = None,
+    disambiguate_region: bool = False,
+) -> List[str]:
+    """Підписи НП для combobox (унікальність за region_id + name)."""
+    options = build_city_filter_options(
+        cities_list,
+        region_name=region_name,
+        disambiguate_region=disambiguate_region,
+    )
+    return [o["label"] for o in options if o.get("label")]
+
+
+def _city_options_for_filter(
+    cities_list: List[Dict[str, Any]],
+    *,
+    region_name: Optional[str] = None,
+    disambiguate_region: bool = False,
+) -> List[Dict[str, Any]]:
+    return build_city_filter_options(
+        cities_list,
+        region_name=region_name,
+        disambiguate_region=disambiguate_region,
+    )
+
+
+def _strip_population_label(label: str) -> str:
+    """«Кропивницький (250 629 ос.)» → «Кропивницький»."""
+    if not label:
+        return label
+    idx = label.rfind(" (")
+    if idx > 0 and "ос." in label[idx:]:
+        return label[:idx].strip()
+    return label.strip()
 
 
 def _sanitize_json_floats(obj: Any) -> Any:
@@ -92,14 +136,7 @@ def _build_olx_filters(
                     city_obj = geography_service.cities_repo.find_by_name_and_region(city, region_id)
                     if city_obj:
                         city_id = str(city_obj["_id"])
-                else:
-                    # Шукаємо місто без області (менш точно)
-                    all_regions = geography_service.get_all_regions()
-                    for r in all_regions:
-                        city_obj = geography_service.cities_repo.find_by_name_and_region(city, str(r["_id"]))
-                        if city_obj:
-                            city_id = str(city_obj["_id"])
-                            break
+                # Без області місто не резолвимо — уникнення злиття гомонімів
         except Exception:
             pass
         
@@ -185,14 +222,7 @@ def _build_prozorro_filters(
                     city_obj = geography_service.cities_repo.find_by_name_and_region(city, region_id)
                     if city_obj:
                         city_id = str(city_obj["_id"])
-                else:
-                    # Шукаємо місто без області (менш точно)
-                    all_regions = geography_service.get_all_regions()
-                    for r in all_regions:
-                        city_obj = geography_service.cities_repo.find_by_name_and_region(city, str(r["_id"]))
-                        if city_obj:
-                            city_id = str(city_obj["_id"])
-                            break
+                # Без області місто не резолвимо — уникнення злиття гомонімів
         except Exception:
             pass
         
@@ -296,26 +326,13 @@ def _build_unified_filters(
     if source and source.lower() in ("olx", "prozorro"):
         filters["source"] = source.lower()
 
-    # Геофільтри: addresses.region, addresses.settlement
+    # Геофільтри: єдиний шлях через settlement_geo_match (префікси, аліаси, region+settlement AND)
     if region or city:
-        elem_match: Dict[str, Any] = {}
-        if region:
-            r = str(region).strip()
-            if is_special_city_region(r):
-                # Київ, Севастополь — міста зі спеціальним статусом; фільтруємо за settlement
-                city_name = special_city_from_region(r) or r
-                escaped = re.escape(city_name)
-                elem_match["settlement"] = {"$regex": f"^(м\\.\\s*)?{escaped}", "$options": "i"}
-            else:
-                # Канонічний regex покриває "область/обл./о." та відмінки.
-                elem_match["region"] = {"$regex": region_regex or re.escape(r), "$options": "i"}
-        if city:
-            c = str(city).strip()
-            escaped = re.escape(c)
-            # Підтримка "м. Київ" та "Київ"
-            elem_match["settlement"] = {"$regex": f"^(м\\.\\s*)?{escaped}", "$options": "i"}
-        if elem_match:
-            filters["addresses"] = {"$elemMatch": elem_match}
+        from utils.settlement_geo_match import build_unified_listings_city_region_filter
+
+        geo_clause = build_unified_listings_city_region_filter(region=region, city=city)
+        if geo_clause:
+            filters.update(geo_clause)
 
     # Фільтри за ціною (price_uah)
     if price_eq is not None:
@@ -729,15 +746,20 @@ def get_olx_cities(request: Request, region: Optional[str] = Query(None)):
             if region_obj:
                 cities_list = geography_service.get_cities_by_region(str(region_obj["_id"]))
                 if cities_list:
-                    return {"cities": [c["name"] for c in cities_list]}
+                    opts = _city_options_for_filter(cities_list, region_name=region)
+                    return {"cities": [o["label"] for o in opts], "city_options": opts}
         else:
             all_regions = geography_service.get_all_regions()
-            all_cities = []
+            all_cities: List[Dict[str, Any]] = []
             for r in all_regions:
-                cities_list = geography_service.get_cities_by_region(str(r["_id"]))
-                all_cities.extend([c["name"] for c in cities_list])
+                rname = r.get("name")
+                for c in geography_service.get_cities_by_region(str(r["_id"])):
+                    doc = dict(c)
+                    doc["region_name"] = rname
+                    all_cities.append(doc)
             if all_cities:
-                return {"cities": sorted(set(all_cities))}
+                opts = _city_options_for_filter(all_cities, disambiguate_region=True)
+                return {"cities": [o["label"] for o in opts], "city_options": opts}
     except Exception:
         pass
     repo = OlxListingsRepository()
@@ -757,8 +779,11 @@ def get_olx_cities(request: Request, region: Optional[str] = Query(None)):
             {"$sort": {"_id": 1}},
         ]
         for item in repo.collection.aggregate(pipeline):
-            if item.get("_id"):
-                cities.add(item["_id"])
+            raw = item.get("_id")
+            if raw:
+                display = normalize_settlement_name(str(raw)) or str(raw).strip()
+                if display:
+                    cities.add(display)
     except Exception:
         pass
     if not cities:
@@ -781,8 +806,11 @@ def get_olx_cities(request: Request, region: Optional[str] = Query(None)):
                 })
             pipeline.extend([{"$group": {"_id": "$detail.resolved_locations.results.address_structured.city"}}, {"$sort": {"_id": 1}}])
             for item in repo.collection.aggregate(pipeline):
-                if item.get("_id"):
-                    cities.add(item["_id"])
+                raw = item.get("_id")
+                if raw:
+                    display = normalize_settlement_name(str(raw)) or str(raw).strip()
+                    if display:
+                        cities.add(display)
         except Exception:
             pass
     if not cities:
@@ -807,10 +835,12 @@ def get_olx_cities(request: Request, region: Optional[str] = Query(None)):
                     )
                     if not region_part or not region_pattern.search(region_part):
                         continue
-                cities.add(city_part)
+                display = normalize_settlement_name(city_part) or city_part
+                if display:
+                    cities.add(display)
         except Exception:
             pass
-    return {"cities": sorted(list(cities)) if cities else []}
+    return {"cities": dedupe_settlement_labels(cities) if cities else []}
 
 
 @router.get("/prozorro")
@@ -1338,11 +1368,19 @@ _CITIES_WITH_SPECIAL_STATUS = ["Київ", "Севастополь"]
 
 
 @router.get("/unified/filters/cities")
-def get_unified_cities(request: Request, region: Optional[str] = Query(None)):
-    """Отримує список унікальних міст з зведеної таблиці."""
+def get_unified_cities(
+    request: Request,
+    region: Optional[str] = Query(None),
+    catalog_only: Optional[int] = Query(0, description="1 — лише довідник cities, без fallback; без region — порожній список"),
+):
+    """Отримує список НП для геофільтра (після вибору області)."""
     user_id, user_service = _get_validated_user(request)
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
+
+    use_catalog = bool(catalog_only)
+    if use_catalog and not region:
+        return {"cities": [], "city_options": []}
 
     # Київ та Севастополь — міста зі спеціальним статусом; при виборі регіону "Київ" повертаємо місто
     if region and is_special_city_region(region):
@@ -1357,25 +1395,42 @@ def get_unified_cities(request: Request, region: Optional[str] = Query(None)):
             if region_obj:
                 cities_list = geography_service.get_cities_by_region(str(region_obj["_id"]))
                 if cities_list:
-                    return {"cities": [c["name"] for c in cities_list]}
-        else:
+                    opts = _city_options_for_filter(cities_list, region_name=region)
+                    payload = {
+                        "cities": [o["label"] for o in opts],
+                        "city_options": opts,
+                        "catalog_count": len(opts),
+                    }
+                    return _sanitize_json_floats(payload)
+        elif not use_catalog:
             all_regions = geography_service.get_all_regions()
-            all_cities = []
+            all_cities: List[Dict[str, Any]] = []
             for r in all_regions:
-                cities_list = geography_service.get_cities_by_region(str(r["_id"]))
-                all_cities.extend([c["name"] for c in cities_list])
+                rname = r.get("name")
+                for c in geography_service.get_cities_by_region(str(r["_id"])):
+                    doc = dict(c)
+                    doc["region_name"] = rname
+                    all_cities.append(doc)
             if all_cities:
-                result = sorted(set(all_cities))
-                # Додаємо міста зі спеціальним статусом, якщо їх ще немає
+                opts = _city_options_for_filter(all_cities, disambiguate_region=True)
+                labels = [o["label"] for o in opts]
                 for city in _CITIES_WITH_SPECIAL_STATUS:
-                    if city not in result:
-                        result.append(city)
-                        result.sort()
-                return {"cities": result}
-    except Exception:
-        pass
+                    if city not in labels:
+                        labels.append(city)
+                return {"cities": labels, "city_options": opts}
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "get_unified_cities catalog failed region=%s: %s", region, exc
+        )
 
-    # Fallback: агрегація з unified_listings
+    if use_catalog and region:
+        return _sanitize_json_floats({"cities": [], "city_options": [], "catalog_count": 0})
+
+    if use_catalog and not region:
+        return {"cities": [], "city_options": []}
+
+    # Fallback: агрегація з unified_listings (лише без catalog_only)
     repo = UnifiedListingsRepository()
     cities = set()
     try:
@@ -1393,19 +1448,29 @@ def get_unified_cities(request: Request, region: Optional[str] = Query(None)):
             {"$sort": {"_id": 1}},
         ]
         for item in repo.collection.aggregate(pipeline):
-            if item.get("_id"):
-                cities.add(item["_id"])
+            raw = item.get("_id")
+            if raw:
+                display = normalize_settlement_name(str(raw)) or str(raw).strip()
+                if display:
+                    cities.add(display)
     except Exception:
         pass
 
-    result = sorted(list(cities)) if cities else []
-    # Додаємо міста зі спеціальним статусом при завантаженні без області
+    if cities:
+        city_docs = [{"name": n} for n in cities]
+        opts = _city_options_for_filter(
+            city_docs,
+            region_name=region,
+            disambiguate_region=not bool(region),
+        )
+        labels = [o["label"] for o in opts]
+    else:
+        labels = []
     if not region:
         for city in _CITIES_WITH_SPECIAL_STATUS:
-            if city not in result:
-                result.append(city)
-                result.sort()
-    return {"cities": result}
+            if city not in labels:
+                labels.append(city)
+    return {"cities": labels, "city_options": opts if cities else []}
 
 
 @router.get("/unified/filters/districts")
@@ -1830,16 +1895,20 @@ def get_prozorro_cities(request: Request, region: Optional[str] = Query(None)):
             if region_obj:
                 cities_list = geography_service.get_cities_by_region(str(region_obj["_id"]))
                 if cities_list:
-                    return {"cities": [c["name"] for c in cities_list]}
+                    opts = _city_options_for_filter(cities_list, region_name=region)
+                    return {"cities": [o["label"] for o in opts], "city_options": opts}
         else:
-            # Якщо область не вказана, отримуємо всі міста
             all_regions = geography_service.get_all_regions()
-            all_cities = []
+            all_cities: List[Dict[str, Any]] = []
             for r in all_regions:
-                cities_list = geography_service.get_cities_by_region(str(r["_id"]))
-                all_cities.extend([c["name"] for c in cities_list])
+                rname = r.get("name")
+                for c in geography_service.get_cities_by_region(str(r["_id"])):
+                    doc = dict(c)
+                    doc["region_name"] = rname
+                    all_cities.append(doc)
             if all_cities:
-                return {"cities": sorted(set(all_cities))}
+                opts = _city_options_for_filter(all_cities, disambiguate_region=True)
+                return {"cities": [o["label"] for o in opts], "city_options": opts}
     except Exception:
         pass
     
@@ -1865,8 +1934,11 @@ def get_prozorro_cities(request: Request, region: Optional[str] = Query(None)):
         ]
         
         for item in repo.collection.aggregate(pipeline):
-            if item.get("_id"):
-                cities.add(item["_id"])
+            raw = item.get("_id")
+            if raw:
+                display = normalize_settlement_name(str(raw)) or str(raw).strip()
+                if display:
+                    cities.add(display)
     except Exception:
         pass
     
@@ -1889,9 +1961,12 @@ def get_prozorro_cities(request: Request, region: Optional[str] = Query(None)):
             ]
             
             for item in repo.collection.aggregate(pipeline):
-                if item.get("_id"):
-                    cities.add(item["_id"])
+                raw = item.get("_id")
+                if raw:
+                    display = normalize_settlement_name(str(raw)) or str(raw).strip()
+                    if display:
+                        cities.add(display)
         except Exception:
             pass
     
-    return {"cities": sorted(list(cities)) if cities else []}
+    return {"cities": dedupe_settlement_labels(cities) if cities else []}

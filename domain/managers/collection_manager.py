@@ -405,25 +405,38 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
         """Перетворює GeoFilter на MongoDB умову для unified_listings."""
         import re
         from domain.models.filter_models import GeoFilterElement, GeoFilterGroup, GeoFilterOperator
+        from utils.settlement_geo_match import (
+            build_unified_listings_region_match,
+            build_unified_listings_settlement_match,
+        )
         from utils.ukraine_regions import build_region_search_regex
         root = geo_filter.root
-        
+
+        def _settlement_text_match(
+            settlement_value: str,
+            region_value: Optional[str] = None,
+            *,
+            city_id: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            return build_unified_listings_settlement_match(
+                settlement_value,
+                region=region_value,
+                city_id=city_id,
+            )
+
         def process_element(elem: GeoFilterElement) -> Dict[str, Any]:
             # INSIDE / EQ — в межах топоніму (область, місто, район міста)
             if elem.operator in (GeoFilterOperator.INSIDE, GeoFilterOperator.EQ):
                 if elem.geo_type == "settlement":
-                    escaped = re.escape(str(elem.value))
-                    pattern = f"^(м\\.\\s*)?{escaped}"
-                    return {"$or": [
-                        {"city": {"$regex": pattern, "$options": "i"}},
-                        {"addresses": {"$elemMatch": {"settlement": {"$regex": pattern, "$options": "i"}}}},
-                    ]}
+                    region_ctx = getattr(elem, "region", None)
+                    city_id = getattr(elem, "city_id", None)
+                    return _settlement_text_match(
+                        str(elem.value),
+                        region_ctx,
+                        city_id=city_id,
+                    )
                 if elem.geo_type == "region":
-                    region_pattern = build_region_search_regex(str(elem.value)) or re.escape(str(elem.value))
-                    return {"$or": [
-                        {"region": {"$regex": region_pattern, "$options": "i"}},
-                        {"addresses": {"$elemMatch": {"region": {"$regex": region_pattern, "$options": "i"}}}},
-                    ]}
+                    return build_unified_listings_region_match(str(elem.value))
                 if elem.geo_type == "city_district":
                     escaped = re.escape(str(elem.value))
                     return {"$or": [
@@ -433,12 +446,12 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
             # NOT_INSIDE / NE — не в межах топоніму
             if elem.operator in (GeoFilterOperator.NOT_INSIDE, GeoFilterOperator.NE):
                 if elem.geo_type == "settlement":
-                    escaped = re.escape(str(elem.value))
-                    pattern = f"^(м\\.\\s*)?{escaped}"
-                    return {"$and": [
-                        {"$or": [{"city": {"$exists": False}}, {"city": None}, {"city": {"$not": {"$regex": pattern, "$options": "i"}}}]},
-                        {"addresses": {"$not": {"$elemMatch": {"settlement": {"$regex": pattern, "$options": "i"}}}}},
-                    ]}
+                    positive = _settlement_text_match(
+                        str(elem.value),
+                        getattr(elem, "region", None),
+                        city_id=getattr(elem, "city_id", None),
+                    )
+                    return {"$nor": [positive]}
                 if elem.geo_type == "region":
                     region_pattern = build_region_search_regex(str(elem.value)) or re.escape(str(elem.value))
                     return {"$and": [

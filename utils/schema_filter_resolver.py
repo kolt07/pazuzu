@@ -100,129 +100,19 @@ def resolve_geo_filter(filters: Dict[str, Any], entity: str) -> Optional[Dict[st
     city_values = _to_list(cities)
     region_values = _to_list(regions)
 
+    from utils.settlement_geo_match import (
+        resolve_olx_geo_filter,
+        resolve_prozorro_geo_filter,
+        resolve_unified_listings_geo_filter,
+    )
+
     if entity == "unified_listings":
-        return _resolve_geo_filter_unified(city_values, region_values)
+        return resolve_unified_listings_geo_filter(city_values, region_values)
     if entity == "olx_listings":
-        return _resolve_geo_filter_olx(city_values, region_values)
+        return resolve_olx_geo_filter(city_values, region_values)
     if entity == "prozorro_auctions":
-        return _resolve_geo_filter_prozorro(city_values, region_values)
+        return resolve_prozorro_geo_filter(city_values, region_values)
     return None
-
-
-def _resolve_geo_filter_unified(city_values: List[str], region_values: List[str]) -> Optional[Dict[str, Any]]:
-    """
-    unified_listings: addresses з $elemMatch (region, settlement).
-    """
-    or_conditions: List[Dict[str, Any]] = []
-
-    for region in region_values:
-        for rv in _normalize_region_value(region):
-            or_conditions.append({
-                "addresses": {"$elemMatch": {"region": {"$regex": rv, "$options": "i"}}}
-            })
-
-    for city in city_values:
-        c = city.strip()
-        if not c:
-            continue
-        or_conditions.append({
-            "addresses": {"$elemMatch": {"settlement": {"$regex": c, "$options": "i"}}}
-        })
-
-    if not or_conditions:
-        return None
-    return {"$or": or_conditions}
-
-
-def _resolve_geo_filter_olx(city_values: List[str], region_values: List[str]) -> Optional[Dict[str, Any]]:
-    """
-    OLX: пріоритет detail.address_refs з $elemMatch (region.name, city.name),
-    fallback — detail.resolved_locations та search_data.location.
-    """
-    or_conditions: List[Dict[str, Any]] = []
-
-    for region in region_values:
-        for rv in _normalize_region_value(region):
-            or_conditions.append({
-                "detail.address_refs": {"$elemMatch": {"region.name": {"$regex": rv, "$options": "i"}}}
-            })
-        or_conditions.append({"search_data.location": {"$regex": region, "$options": "i"}})
-        or_conditions.append({
-            "detail.resolved_locations": {
-                "$elemMatch": {"results.address_structured.region": {"$regex": region, "$options": "i"}}
-            }
-        })
-
-    for city in city_values:
-        c = city.strip()
-        if not c:
-            continue
-        or_conditions.append({
-            "detail.address_refs": {"$elemMatch": {"city.name": {"$regex": c, "$options": "i"}}}
-        })
-        or_conditions.append({"search_data.location": {"$regex": c, "$options": "i"}})
-        or_conditions.append({
-            "detail.resolved_locations": {
-                "$elemMatch": {"$or": [{"results.address_structured.city": {"$regex": c, "$options": "i"}}, {"results.address_structured.settlement": {"$regex": c, "$options": "i"}}]}
-            }
-        })
-
-    if not or_conditions:
-        return None
-    return {"$or": or_conditions}
-
-
-def _resolve_geo_filter_prozorro(city_values: List[str], region_values: List[str]) -> Optional[Dict[str, Any]]:
-    """
-    ProZorro: auction_data.address_refs з $elemMatch (region.name, city.name).
-    Fallback — llm_result.result.addresses (region, settlement) або auction_data.items[].address.
-    """
-    or_conditions: List[Dict[str, Any]] = []
-
-    for region in region_values:
-        for rv in _normalize_region_value(region):
-            # Пріоритет: address_refs
-            or_conditions.append({
-                "auction_data.address_refs": {"$elemMatch": {"region.name": {"$regex": rv, "$options": "i"}}}
-            })
-        # Fallback 1: llm_result.result.addresses (якщо є join з llm_cache)
-        or_conditions.append({
-            "llm_result.result.addresses": {"$elemMatch": {"region": {"$regex": region, "$options": "i"}}}
-        })
-        # Fallback 2: auction_data.items[].address (основний fallback згідно з правилами)
-        for rv in _normalize_region_value(region):
-            or_conditions.append({
-                "auction_data.items": {
-                    "$elemMatch": {
-                        "address.region.uk_UA": {"$regex": rv, "$options": "i"}
-                    }
-                }
-            })
-
-    for city in city_values:
-        c = city.strip()
-        if not c:
-            continue
-        # Пріоритет: address_refs
-        or_conditions.append({
-            "auction_data.address_refs": {"$elemMatch": {"city.name": {"$regex": c, "$options": "i"}}}
-        })
-        # Fallback 1: llm_result.result.addresses (якщо є join з llm_cache)
-        or_conditions.append({
-            "llm_result.result.addresses": {"$elemMatch": {"settlement": {"$regex": c, "$options": "i"}}}
-        })
-        # Fallback 2: auction_data.items[].address (основний fallback згідно з правилами)
-        or_conditions.append({
-            "auction_data.items": {
-                "$elemMatch": {
-                    "address.locality.uk_UA": {"$regex": c, "$options": "i"}
-                }
-            }
-        })
-
-    if not or_conditions:
-        return None
-    return {"$or": or_conditions}
 
 
 def region_filter_to_geo_filter(region_filter: Optional[Dict[str, str]]) -> Optional[Dict[str, Any]]:

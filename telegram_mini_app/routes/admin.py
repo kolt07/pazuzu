@@ -30,6 +30,9 @@ _cadastral_clusters_tasks: dict = {}
 # Задачі експериментального OLX скрапера (клікер)
 _olx_clicker_tasks: dict = {}
 
+# Задачі скрапера mista.ua (населені пункти)
+_mista_scraper_tasks: dict = {}
+
 
 def _get_admin_user(request: Request):
     init_data = request.headers.get("X-Telegram-Init-Data")
@@ -866,6 +869,213 @@ def cadastral_scraper_stats(request: Request):
             "db_info": None,
             "error": str(e),
         }
+
+
+@router.post("/mista-scraper/start")
+def start_mista_scraper(
+    request: Request,
+    mode: str = Query("full", description="list | details | full"),
+    max_pages: int = Query(0, description="Макс. сторінок списку на область (0 — усі)"),
+    detail_limit: int = Query(0, description="Макс. детальних сторінок (0 — усі pending)"),
+    region: str = Query("", description="Лише одна область (підрядок назви, напр. Волинська)"),
+):
+    """Запускає скрапер mista.ua. Повертає task_id."""
+    _get_admin_user(request)
+    task_id = str(uuid.uuid4())
+    settings = request.app.state.settings
+
+    from data.database.connection import MongoDBConnection
+    MongoDBConnection.initialize(settings)
+
+    _mista_scraper_tasks[task_id] = {
+        "status": "running",
+        "task_kind": "scrape",
+        "message": "Запуск скрапера mista.ua…",
+        "phase": "list",
+        "list_page": 0,
+        "list_rows_total": 0,
+        "details_done": 0,
+        "details_total": 0,
+        "details_errors": 0,
+        "progress_pct": 0,
+    }
+
+    def run_task():
+        try:
+            from scripts.mista_scraper.run_scrape import run_mista_scraper
+
+            def log_fn(msg: str):
+                _mista_scraper_tasks[task_id]["message"] = msg
+
+            def progress_fn(progress: dict):
+                t = _mista_scraper_tasks[task_id]
+                phase = progress.get("phase") or t.get("phase")
+                t["phase"] = phase
+                t["list_page"] = progress.get("list_page", t.get("list_page", 0))
+                t["list_rows_total"] = progress.get("list_rows_total", t.get("list_rows_total", 0))
+                t["region_name"] = progress.get("region_name", t.get("region_name"))
+                t["region_index"] = progress.get("region_index", t.get("region_index", 0))
+                t["regions_total"] = progress.get("regions_total", t.get("regions_total", 0))
+                t["details_done"] = progress.get("details_done", t.get("details_done", 0))
+                t["details_total"] = progress.get("details_total", t.get("details_total", 0))
+                t["details_errors"] = progress.get("details_errors", t.get("details_errors", 0))
+                if progress.get("message"):
+                    t["message"] = progress["message"]
+                if phase == "details":
+                    total = t["details_total"] or 1
+                    t["progress_pct"] = min(100, int(100 * t["details_done"] / total))
+                elif phase == "list" and t.get("regions_total"):
+                    ri = t.get("region_index") or 0
+                    rt = t["regions_total"] or 1
+                    t["progress_pct"] = min(99, int(100 * ri / rt))
+                elif phase == "list" and max_pages:
+                    t["progress_pct"] = min(100, int(100 * t["list_page"] / max_pages))
+                elif phase == "done":
+                    t["progress_pct"] = 100
+
+            result = run_mista_scraper(
+                settings=settings,
+                mode=mode,
+                max_pages=max_pages,
+                detail_limit=detail_limit,
+                region_filter=region.strip() or None,
+                log_fn=log_fn,
+                progress_callback=progress_fn,
+            )
+            t = _mista_scraper_tasks[task_id]
+            t["status"] = "done"
+            t["message"] = result.get("message", "Готово.")
+            t["list_rows_total"] = result.get("list_rows_total", 0)
+            t["details_done"] = result.get("details_done", 0)
+            t["details_total"] = result.get("details_total", 0)
+            t["details_errors"] = result.get("details_errors", 0)
+            t["status_counts"] = result.get("status_counts", {})
+            t["progress_pct"] = 100
+        except Exception as e:
+            _mista_scraper_tasks[task_id]["status"] = "error"
+            _mista_scraper_tasks[task_id]["message"] = f"Помилка: {e!s}"
+
+    threading.Thread(target=run_task, daemon=True, name="MistaScraper").start()
+    return {"task_id": task_id, "status": "started", "mode": mode}
+
+
+@router.get("/mista-scraper/status")
+def mista_scraper_status(request: Request, task_id: str):
+    """Статус задачі скрапера mista.ua."""
+    _get_admin_user(request)
+    if task_id not in _mista_scraper_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    t = _mista_scraper_tasks[task_id]
+    return {
+        "task_id": task_id,
+        "status": t.get("status"),
+        "task_kind": t.get("task_kind"),
+        "message": t.get("message"),
+        "phase": t.get("phase"),
+        "list_page": t.get("list_page", 0),
+        "list_rows_total": t.get("list_rows_total", 0),
+        "details_done": t.get("details_done", 0),
+        "details_total": t.get("details_total", 0),
+        "details_errors": t.get("details_errors", 0),
+        "progress_pct": t.get("progress_pct", 0),
+        "import_created": t.get("import_created", 0),
+        "import_updated": t.get("import_updated", 0),
+        "import_skipped": t.get("import_skipped", 0),
+        "import_errors": t.get("import_errors", 0),
+    }
+
+
+@router.get("/mista-scraper/stats")
+def mista_scraper_stats(request: Request):
+    """Статистика raw_mista_settlements та cities з джерелом mista."""
+    _get_admin_user(request)
+    from data.database.connection import MongoDBConnection
+    from data.repositories.raw_mista_settlements_repository import RawMistaSettlementsRepository
+    from data.repositories.geography_repository import CitiesRepository
+
+    try:
+        MongoDBConnection.initialize(request.app.state.settings)
+        raw_repo = RawMistaSettlementsRepository()
+        cities_repo = CitiesRepository()
+        status_counts = raw_repo.count_by_status()
+        cities_mista = cities_repo.collection.count_documents({"source": "mista"})
+        return {
+            "raw_total": raw_repo.count_total(),
+            "raw_pending_details": raw_repo.count_pending_details(),
+            "status_counts": status_counts,
+            "cities_mista": cities_mista,
+            "parsed": status_counts.get("parsed", 0),
+            "list_only": status_counts.get("list_only", 0),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@router.post("/mista-scraper/import")
+def start_mista_import(request: Request, limit: int = Query(0, description="Ліміт записів (0 — усі parsed)")):
+    """Імпорт parsed → cities. Повертає task_id."""
+    _get_admin_user(request)
+    task_id = str(uuid.uuid4())
+    settings = request.app.state.settings
+
+    from data.database.connection import MongoDBConnection
+    MongoDBConnection.initialize(settings)
+
+    _mista_scraper_tasks[task_id] = {
+        "status": "running",
+        "task_kind": "import",
+        "message": "Імпорт у cities…",
+        "phase": "import",
+        "progress_pct": 0,
+        "import_created": 0,
+        "import_updated": 0,
+        "import_skipped": 0,
+        "import_errors": 0,
+    }
+
+    def run_import():
+        try:
+            from business.services.mista_settlement_import_service import MistaSettlementImportService
+
+            service = MistaSettlementImportService()
+            docs = service.raw_repo.find_parsed(limit=limit if limit else 0)
+            total = len(docs)
+            created = updated = skipped = errors = 0
+
+            for i, doc in enumerate(docs, 1):
+                _mista_scraper_tasks[task_id]["message"] = f"Імпорт: {i}/{total}"
+                _mista_scraper_tasks[task_id]["progress_pct"] = (
+                    min(100, int(100 * i / max(1, total)))
+                )
+                try:
+                    result = service.import_one(doc, dry_run=False)
+                    st = result.get("status")
+                    if st == "created":
+                        created += 1
+                    elif st == "updated":
+                        updated += 1
+                    elif st == "skipped":
+                        skipped += 1
+                except Exception:
+                    errors += 1
+
+            t = _mista_scraper_tasks[task_id]
+            t["status"] = "done"
+            t["import_created"] = created
+            t["import_updated"] = updated
+            t["import_skipped"] = skipped
+            t["import_errors"] = errors
+            t["progress_pct"] = 100
+            t["message"] = (
+                f"Імпорт завершено: +{created} нових, оновлено {updated}, "
+                f"пропущено {skipped}, помилок {errors}"
+            )
+        except Exception as e:
+            _mista_scraper_tasks[task_id]["status"] = "error"
+            _mista_scraper_tasks[task_id]["message"] = f"Помилка: {e!s}"
+
+    threading.Thread(target=run_import, daemon=True, name="MistaImport").start()
+    return {"task_id": task_id, "status": "started"}
 
 
 @router.post("/cadastral-scraper/reset-stale")

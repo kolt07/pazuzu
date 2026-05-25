@@ -61,6 +61,108 @@
     return h;
   }
 
+  /** «Кропивницький (250 629 ос.)» / «Новосілки · Полтавська» → назва НП. */
+  function stripSettlementPopulationLabel(label) {
+    if (!label) return "";
+    var s = String(label).trim();
+    var idx = s.lastIndexOf(" (");
+    if (idx > 0 && s.indexOf("ос.", idx) !== -1) s = s.slice(0, idx).trim();
+    if (s.indexOf(" · ") !== -1) s = s.split(" · ")[0].trim();
+    return s;
+  }
+
+  /** Нормалізація для пошуку НП: NFC, uk lower, латиниця/рос. «и» → кириличні відповідники. */
+  function normalizeSettlementSearchText(value) {
+    if (!value) return "";
+    var s = String(value).trim().normalize("NFC");
+    s = s
+      .replace(/A/g, "\u0410").replace(/a/g, "\u0430")
+      .replace(/B/g, "\u0412")
+      .replace(/E/g, "\u0415").replace(/e/g, "\u0435")
+      .replace(/I/g, "\u0406").replace(/i/g, "\u0456")
+      .replace(/K/g, "\u041a").replace(/k/g, "\u043a")
+      .replace(/M/g, "\u041c").replace(/m/g, "\u043c")
+      .replace(/H/g, "\u041d").replace(/h/g, "\u043d")
+      .replace(/O/g, "\u041e").replace(/o/g, "\u043e")
+      .replace(/P/g, "\u0420").replace(/p/g, "\u0440")
+      .replace(/C/g, "\u0421").replace(/c/g, "\u0441")
+      .replace(/T/g, "\u0422").replace(/t/g, "\u0442")
+      .replace(/X/g, "\u0425").replace(/x/g, "\u0445")
+      .replace(/Y/g, "\u0423").replace(/y/g, "\u0443")
+      .replace(/\u0418/g, "\u0406").replace(/\u0438/g, "\u0456");
+    try {
+      return s.toLocaleLowerCase("uk");
+    } catch (e) {
+      return s.toLowerCase();
+    }
+  }
+
+  function settlementSearchQueryFromInput(raw) {
+    return normalizeSettlementSearchText(stripSettlementPopulationLabel(raw || ""));
+  }
+
+  function matchesSettlementOption(label, query, meta) {
+    if (!query) return true;
+    var parts = [];
+    if (label) parts.push(stripSettlementPopulationLabel(String(label)));
+    if (meta) {
+      if (meta.name) parts.push(String(meta.name));
+      if (meta.label) parts.push(stripSettlementPopulationLabel(String(meta.label)));
+      var aliases = meta.search_aliases;
+      if (aliases && aliases.length) {
+        for (var a = 0; a < aliases.length; a++) parts.push(String(aliases[a]));
+      }
+    }
+    for (var i = 0; i < parts.length; i++) {
+      if (normalizeSettlementSearchText(parts[i]).indexOf(query) !== -1) return true;
+    }
+    return false;
+  }
+
+  function parseSettlementFilterLabel(label) {
+    var name = stripSettlementPopulationLabel(label);
+    var regionShort = null;
+    var raw = String(label || "").trim();
+    var popIdx = raw.lastIndexOf(" (");
+    if (popIdx > 0 && raw.indexOf("ос.", popIdx) !== -1) raw = raw.slice(0, popIdx).trim();
+    if (raw.indexOf(" · ") !== -1) {
+      var parts = raw.split(" · ");
+      regionShort = parts[parts.length - 1].trim() || null;
+    }
+    return { name: name, regionShort: regionShort };
+  }
+
+  /** Один НП на ключ: «ЛЮБЕШІВ», «Любешів», «смт Любешів» → «Любешів». */
+  function dedupeSettlementLabels(names) {
+    if (!names || !names.length) return [];
+    var prefixRe = /^(смт\.?|м\.|місто|с\.|село|селище|пгт\.?)\s+/i;
+    var byKey = {};
+    names.forEach(function (raw) {
+      if (!raw) return;
+      var text = stripSettlementPopulationLabel(String(raw).trim());
+      var stripped = text.replace(prefixRe, "").trim();
+      if (!stripped) return;
+      var key = stripped.toLowerCase();
+      var display = stripped;
+      if (display === display.toUpperCase() && display.length > 1) {
+        display = display.charAt(0) + display.slice(1).toLowerCase();
+      }
+      var existing = byKey[key];
+      if (!existing) {
+        byKey[key] = display;
+        return;
+      }
+      var hasPrefix = prefixRe.test(text);
+      var existingHasPrefix = prefixRe.test(existing);
+      if (existingHasPrefix && !hasPrefix) byKey[key] = display;
+      else if (!existingHasPrefix && hasPrefix) return;
+      else if (existing === existing.toUpperCase() && display !== display.toUpperCase()) byKey[key] = display;
+    });
+    return Object.keys(byKey).map(function (k) { return byKey[k]; }).sort(function (a, b) {
+      return a.localeCompare(b, "uk");
+    });
+  }
+
   var currentScreen = "screen-search";
   var currentUser = null;
 
@@ -231,6 +333,12 @@
       } else {
         chatSessions = [];
       }
+      chatSessions.forEach(function (c) {
+        if (c.kind === "investigation" && c.flx && c.flx.sessionGone && c.flx.sessionId) {
+          if (typeof flxDeadSessionIds !== "undefined") flxDeadSessionIds[c.flx.sessionId] = true;
+          c.flx.sessionId = null;
+        }
+      });
     } catch (e) {
       console.warn("Failed to load chat sessions:", e);
       chatSessions = [];
@@ -296,6 +404,21 @@
       if (!local) {
         chatSessions.push(mapped);
       } else if (srvT > locT) {
+        // Не відновлювати мертву Flx-сесію з сервера після 404 (sessionGone).
+        if (
+          local.kind === "investigation" &&
+          local.flx &&
+          local.flx.sessionGone &&
+          mapped.flx &&
+          mapped.flx.sessionId
+        ) {
+          mapped.flx = Object.assign({}, mapped.flx, {
+            sessionId: null,
+            state: "draft",
+            sessionGone: true,
+            lastEventSeq: local.flx.lastEventSeq || 0,
+          });
+        }
         Object.assign(local, mapped);
       }
     });
@@ -607,12 +730,16 @@
           appendChatMessageDOM(container, m.role, m.text, m.requestId, m.timestamp, m.excelFiles, m.quickActions, m.thinking);
         });
       }
-      if (chat.flx && chat.flx.sessionId) {
-        hydrateFlxTimeline(chat).finally(function () {
-          var since = 0;
-          if (typeof chat.flx.lastEventSeq === "number") since = Math.max(since, chat.flx.lastEventSeq);
-          if (typeof flxLastSeqByChat[chat.id] === "number") since = Math.max(since, flxLastSeqByChat[chat.id]);
-          flxOpenStream(chat, since);
+      if (chat.flx && chat.flx.sessionId && !chat.flx.sessionGone && !flxDeadSessionIds[chat.flx.sessionId]) {
+        flxEnsureSessionExists(chat).then(function (ok) {
+          if (!ok || !chat.flx || !chat.flx.sessionId || chat.flx.sessionGone) return;
+          return hydrateFlxTimeline(chat).finally(function () {
+            if (!chat.flx || !chat.flx.sessionId || chat.flx.sessionGone) return;
+            var since = 0;
+            if (typeof chat.flx.lastEventSeq === "number") since = Math.max(since, chat.flx.lastEventSeq);
+            if (typeof flxLastSeqByChat[chat.id] === "number") since = Math.max(since, flxLastSeqByChat[chat.id]);
+            flxOpenStream(chat, since);
+          });
         });
       }
       return;
@@ -1388,20 +1515,30 @@
     reportConstructorPrefill = prefill || null;
     var modal = document.getElementById("report-constructor-modal");
     if (!modal) return;
-    loadFilterOptions(prefill ? prefill.region : null);
+    var cfs = document.getElementById("constructor-filter-string");
     if (prefill) {
       document.getElementById("constructor-source").value = prefill.source || "";
-      document.getElementById("constructor-date-filter").value = String(prefill.date_filter || 7);
-      document.getElementById("constructor-region").value = prefill.region || "";
-      document.getElementById("constructor-city").value = prefill.city || "";
-      document.getElementById("constructor-property-type").value = prefill.property_type || "";
+      document.getElementById("constructor-date-filter").value = String(
+        prefill.date_filter != null ? prefill.date_filter : 7
+      );
+      if (cfs) cfs.value = prefill.filter_string != null ? String(prefill.filter_string) : "";
+      var sortF = document.getElementById("constructor-sort-field");
+      var sortO = document.getElementById("constructor-sort-order");
+      if (sortF) sortF.value = prefill.sort_field || "source_updated_at";
+      if (sortO) sortO.value = prefill.sort_order || "desc";
+      var outFmt = document.getElementById("constructor-output-format");
+      if (outFmt) outFmt.value = prefill.output_format || "unified_table";
       document.getElementById("constructor-name").value = prefill.name || "";
     } else {
       document.getElementById("constructor-source").value = "";
       document.getElementById("constructor-date-filter").value = "7";
-      document.getElementById("constructor-region").value = "";
-      document.getElementById("constructor-city").value = "";
-      document.getElementById("constructor-property-type").value = "";
+      if (cfs) cfs.value = "";
+      var sortF2 = document.getElementById("constructor-sort-field");
+      var sortO2 = document.getElementById("constructor-sort-order");
+      if (sortF2) sortF2.value = "source_updated_at";
+      if (sortO2) sortO2.value = "desc";
+      var outFmt2 = document.getElementById("constructor-output-format");
+      if (outFmt2) outFmt2.value = "unified_table";
       document.getElementById("constructor-name").value = "";
     }
     modal.classList.remove("hidden");
@@ -1414,31 +1551,16 @@
   }
 
   function getConstructorParams() {
-    var priceOp = document.getElementById("constructor-price-op").value;
-    var priceVal = document.getElementById("constructor-price-value").value;
-    var priceM2Op = document.getElementById("constructor-price-m2-op").value;
-    var priceM2Val = document.getElementById("constructor-price-m2-value").value;
-    var priceHaOp = document.getElementById("constructor-price-ha-op").value;
-    var priceHaVal = document.getElementById("constructor-price-ha-value").value;
+    var fsEl = document.getElementById("constructor-filter-string");
+    var fs = fsEl ? fsEl.value.trim() : "";
     var params = {
       source: document.getElementById("constructor-source").value,
       date_filter: parseInt(document.getElementById("constructor-date-filter").value, 10) || 7,
-      region: document.getElementById("constructor-region").value.trim() || null,
-      city: document.getElementById("constructor-city").value.trim() || null,
-      property_type: document.getElementById("constructor-property-type").value || null,
       sort_field: document.getElementById("constructor-sort-field").value,
       sort_order: document.getElementById("constructor-sort-order").value,
       output_format: document.getElementById("constructor-output-format").value
     };
-    if (priceOp && priceVal) {
-      params.price = { op: priceOp, value: parseFloat(priceVal), currency: document.getElementById("constructor-price-currency").value };
-    }
-    if (priceM2Op && priceM2Val) {
-      params.price_per_m2 = { op: priceM2Op, min: priceM2Op === "gte" ? parseFloat(priceM2Val) : null, max: priceM2Op === "lte" ? parseFloat(priceM2Val) : null, currency: document.getElementById("constructor-price-m2-currency").value };
-    }
-    if (priceHaOp && priceHaVal) {
-      params.price_per_ha = { op: priceHaOp, min: priceHaOp === "gte" ? parseFloat(priceHaVal) : null, max: priceHaOp === "lte" ? parseFloat(priceHaVal) : null, currency: document.getElementById("constructor-price-ha-currency").value };
-    }
+    if (fs) params.filter_string = fs;
     return params;
   }
 
@@ -1464,6 +1586,17 @@
     });
     var cancelBtn = document.getElementById("constructor-cancel");
     if (cancelBtn) cancelBtn.addEventListener("click", closeReportConstructor);
+    var consBuild = document.getElementById("constructor-build-filters");
+    if (consBuild) {
+      consBuild.addEventListener("click", function () { openFilterBuilderModal("constructor-filter-string"); });
+    }
+    var consClearFs = document.getElementById("constructor-clear-filter-string");
+    if (consClearFs) {
+      consClearFs.addEventListener("click", function () {
+        var el = document.getElementById("constructor-filter-string");
+        if (el) el.value = "";
+      });
+    }
     var genNameBtn = document.getElementById("constructor-generate-name");
     if (genNameBtn) genNameBtn.addEventListener("click", function () {
       var params = getConstructorParams();
@@ -1478,48 +1611,6 @@
           if (nameEl && d.name) nameEl.value = d.name;
         });
     });
-    var constRegion = document.getElementById("constructor-region");
-    var constCity = document.getElementById("constructor-city");
-    var constRegionDrop = document.getElementById("constructor-region-dropdown");
-    var constCityDrop = document.getElementById("constructor-city-dropdown");
-    if (constRegion) {
-      constRegion.addEventListener("focus", function () {
-        renderConstructorDropdown("constructor-region", "constructor-region-dropdown", filterOptions.regions, constRegion.value);
-        if (constRegionDrop) constRegionDrop.classList.remove("hidden");
-      });
-      constRegion.addEventListener("input", function () {
-        renderConstructorDropdown("constructor-region", "constructor-region-dropdown", filterOptions.regions, constRegion.value);
-      });
-    }
-    if (constCity) {
-      constCity.addEventListener("focus", function () {
-        renderConstructorDropdown("constructor-city", "constructor-city-dropdown", filterOptions.cities, constCity.value);
-        if (constCityDrop) constCityDrop.classList.remove("hidden");
-      });
-      constCity.addEventListener("input", function () {
-        renderConstructorDropdown("constructor-city", "constructor-city-dropdown", filterOptions.cities, constCity.value);
-      });
-    }
-    if (constRegionDrop) {
-      constRegionDrop.addEventListener("click", function (e) {
-        var item = e.target.closest(".filter-dropdown-item");
-        if (item && item.dataset.value !== undefined) {
-          constRegion.value = item.dataset.value;
-          constRegionDrop.classList.add("hidden");
-          filterLoadingState.cities = false;
-          loadFilterOptions(constRegion.value);
-        }
-      });
-    }
-    if (constCityDrop) {
-      constCityDrop.addEventListener("click", function (e) {
-        var item = e.target.closest(".filter-dropdown-item");
-        if (item && item.dataset.value !== undefined) {
-          constCity.value = item.dataset.value;
-          constCityDrop.classList.add("hidden");
-        }
-      });
-    }
   }
 
   function startGenerateSeven() {
@@ -1860,6 +1951,16 @@
       if (cadastralBuildIndex) cadastralBuildIndex.addEventListener("click", startAdminCadastralBuildIndex);
       if (cadastralBuildClusters) cadastralBuildClusters.addEventListener("click", startAdminCadastralBuildClusters);
       if (cadastralClearClusters) cadastralClearClusters.addEventListener("click", adminCadastralClearClusters);
+      var mistaTest = document.getElementById("admin-mista-start-test");
+      var mistaList = document.getElementById("admin-mista-start-list");
+      var mistaDetails = document.getElementById("admin-mista-start-details");
+      var mistaFull = document.getElementById("admin-mista-start-full");
+      var mistaImport = document.getElementById("admin-mista-import");
+      if (mistaTest) mistaTest.addEventListener("click", function () { startAdminMistaScraper("full", 3, 10); });
+      if (mistaList) mistaList.addEventListener("click", function () { startAdminMistaScraper("list", 0, 0); });
+      if (mistaDetails) mistaDetails.addEventListener("click", function () { startAdminMistaScraper("details", 0, 0); });
+      if (mistaFull) mistaFull.addEventListener("click", function () { startAdminMistaScraper("full", 0, 0); });
+      if (mistaImport) mistaImport.addEventListener("click", startAdminMistaImport);
       var rebuildAnalyticsBtn = document.getElementById("admin-rebuild-analytics");
       if (rebuildAnalyticsBtn) rebuildAnalyticsBtn.addEventListener("click", adminRebuildAnalytics);
       var anomalousPricesBtn = document.getElementById("admin-process-anomalous-prices");
@@ -2005,6 +2106,7 @@
       }
       if (tabName === "cadastral") {
         loadAdminCadastralStats();
+        loadAdminMistaStats();
       }
       if (tabName === "data") {
         loadAdminLlmRegions();
@@ -2752,6 +2854,150 @@
       });
   }
 
+  function loadAdminMistaStats() {
+    var el = document.getElementById("admin-mista-stats");
+    if (!el) return;
+    fetch("/api/admin/mista-scraper/stats", { headers: apiHeaders() })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.error) {
+          el.textContent = "Помилка: " + data.error;
+          return;
+        }
+        var sc = data.status_counts || {};
+        el.textContent =
+          "Raw: " + (data.raw_total || 0) +
+          " | parsed: " + (data.parsed || sc.parsed || 0) +
+          " | list_only: " + (data.list_only || sc.list_only || 0) +
+          " | очікують деталі: " + (data.raw_pending_details || 0) +
+          " | cities (mista): " + (data.cities_mista || 0);
+      })
+      .catch(function () { el.textContent = "Не вдалося завантажити статистику mista."; });
+  }
+
+  function _updateAdminMistaProgress(st) {
+    var wrap = document.getElementById("admin-mista-progress-wrap");
+    var fill = document.getElementById("admin-mista-progress-fill");
+    var label = document.getElementById("admin-mista-progress-label");
+    if (!wrap || !fill) return;
+    wrap.classList.remove("hidden");
+    var pct = st.progress_pct != null ? st.progress_pct : 0;
+    if (st.status === "running" && st.task_kind === "import" && st.details_total === undefined) {
+      pct = st.progress_pct || 0;
+    } else if (st.status === "running" && st.phase === "details" && st.details_total) {
+      pct = Math.min(100, Math.round(100 * (st.details_done || 0) / st.details_total));
+    } else if (st.status === "done") {
+      pct = 100;
+    }
+    fill.style.width = pct + "%";
+    if (label) {
+      if (st.task_kind === "import") {
+        label.textContent = "Імпорт у cities: " + pct + "%";
+      } else if (st.phase === "list") {
+        label.textContent = "Список mista.ua: стор. " + (st.list_page || 0) + ", записів " + (st.list_rows_total || 0);
+      } else if (st.phase === "details") {
+        label.textContent = "Деталі: " + (st.details_done || 0) + "/" + (st.details_total || 0) + " (" + pct + "%)";
+      } else {
+        label.textContent = "Прогрес: " + pct + "%";
+      }
+    }
+  }
+
+  function startAdminMistaScraper(mode, maxPages, detailLimit) {
+    var statusEl = document.getElementById("admin-mista-status");
+    if (!statusEl) return;
+    statusEl.classList.remove("hidden");
+    statusEl.className = "admin-data-update-status running";
+    statusEl.textContent = "Запуск скрапера mista.ua…";
+    var url = "/api/admin/mista-scraper/start?mode=" + encodeURIComponent(mode || "full");
+    if (maxPages) url += "&max_pages=" + maxPages;
+    if (detailLimit) url += "&detail_limit=" + detailLimit;
+    fetch(url, { method: "POST", headers: apiHeaders() })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (x) {
+        if (!x.ok) {
+          statusEl.className = "admin-data-update-status error";
+          statusEl.textContent = (x.data && x.data.detail) || "Помилка запуску";
+          return;
+        }
+        var taskId = x.data.task_id;
+        function poll() {
+          fetch("/api/admin/mista-scraper/status?task_id=" + encodeURIComponent(taskId), { headers: apiHeaders() })
+            .then(function (res) { return res.json(); })
+            .then(function (st) {
+              statusEl.textContent = st.message || st.status;
+              _updateAdminMistaProgress(st);
+              if (st.status === "done") {
+                statusEl.className = "admin-data-update-status done";
+                loadAdminMistaStats();
+                return;
+              }
+              if (st.status === "error") {
+                statusEl.className = "admin-data-update-status error";
+                loadAdminMistaStats();
+                return;
+              }
+              setTimeout(poll, 2000);
+            })
+            .catch(function (err) {
+              statusEl.className = "admin-data-update-status error";
+              statusEl.textContent = "Помилка: " + (err.message || "Не вдалося отримати статус");
+            });
+        }
+        poll();
+      })
+      .catch(function (err) {
+        statusEl.className = "admin-data-update-status error";
+        statusEl.textContent = "Помилка: " + (err.message || "Не вдалося запустити");
+      });
+  }
+
+  function startAdminMistaImport() {
+    var statusEl = document.getElementById("admin-mista-status");
+    if (!statusEl) return;
+    statusEl.classList.remove("hidden");
+    statusEl.className = "admin-data-update-status running";
+    statusEl.textContent = "Запуск імпорту…";
+    fetch("/api/admin/mista-scraper/import", { method: "POST", headers: apiHeaders() })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (x) {
+        if (!x.ok) {
+          statusEl.className = "admin-data-update-status error";
+          statusEl.textContent = (x.data && x.data.detail) || "Помилка запуску";
+          return;
+        }
+        var taskId = x.data.task_id;
+        function poll() {
+          fetch("/api/admin/mista-scraper/status?task_id=" + encodeURIComponent(taskId), { headers: apiHeaders() })
+            .then(function (res) { return res.json(); })
+            .then(function (st) {
+              statusEl.textContent = st.message || st.status;
+              _updateAdminMistaProgress(st);
+              if (st.status === "done") {
+                statusEl.className = "admin-data-update-status done";
+                loadAdminMistaStats();
+                return;
+              }
+              if (st.status === "error") {
+                statusEl.className = "admin-data-update-status error";
+                loadAdminMistaStats();
+                return;
+              }
+              setTimeout(poll, 2000);
+            })
+            .catch(function (err) {
+              statusEl.className = "admin-data-update-status error";
+              statusEl.textContent = "Помилка: " + (err.message || "Не вдалося отримати статус");
+            });
+        }
+        poll();
+      })
+      .catch(function (err) {
+        statusEl.className = "admin-data-update-status error";
+        statusEl.textContent = "Помилка: " + (err.message || "Не вдалося запустити");
+      });
+  }
+
   function startAdminCadastralScraper(maxCells) {
     var statusEl = document.getElementById("admin-cadastral-status");
     if (!statusEl) return;
@@ -3314,7 +3560,7 @@
       filterLoadingState.cities = true;
       var citiesUrl = endpoint + "/filters/cities";
       if (regionToUse) {
-        citiesUrl += "?region=" + encodeURIComponent(regionToUse);
+        citiesUrl += "?catalog_only=1&region=" + encodeURIComponent(regionToUse);
       }
       fetch(citiesUrl, { headers: apiHeaders() })
         .then(function (r) {
@@ -3329,8 +3575,17 @@
         })
         .then(function (data) {
           filterLoadingState.cities = false;
-          if (data && data.cities && Array.isArray(data.cities)) {
-            filterOptions.cities = data.cities;
+          if (data && data.city_options && Array.isArray(data.city_options) && data.city_options.length) {
+            filterOptions.cityOptionsByLabel = {};
+            filterOptions.cities = data.city_options.map(function (o) {
+              var lab = o.label || o.name;
+              if (lab) filterOptions.cityOptionsByLabel[lab] = o;
+              return lab;
+            });
+            console.log("Loaded cities (catalog):", filterOptions.cities.length);
+          } else if (data && data.cities && Array.isArray(data.cities)) {
+            filterOptions.cityOptionsByLabel = {};
+            filterOptions.cities = dedupeSettlementLabels(data.cities);
             console.log("Loaded cities:", filterOptions.cities.length);
           } else {
             filterOptions.cities = [];
@@ -3361,30 +3616,6 @@
     if (cityInput && dropdown && !dropdown.classList.contains("hidden")) {
       renderFilterDropdown("city", filterOptions.cities, cityInput.value);
     }
-  }
-
-  function renderConstructorDropdown(inputId, dropdownId, options, searchTerm) {
-    var dropdown = document.getElementById(dropdownId);
-    var input = document.getElementById(inputId);
-    if (!dropdown || !input) return;
-    var opts = options || [];
-    if (opts.length === 0) {
-      dropdown.innerHTML = "<div class='filter-dropdown-item'>Немає даних</div>";
-      dropdown.classList.remove("hidden");
-      return;
-    }
-    var filtered = opts.filter(function (o) {
-      return !searchTerm || String(o).toLowerCase().indexOf(searchTerm.toLowerCase()) !== -1;
-    });
-    dropdown.innerHTML = "";
-    filtered.forEach(function (opt) {
-      var item = document.createElement("div");
-      item.className = "filter-dropdown-item";
-      item.textContent = String(opt);
-      item.dataset.value = String(opt);
-      dropdown.appendChild(item);
-    });
-    dropdown.classList.remove("hidden");
   }
 
   function renderFilterDropdown(type, options, searchTerm) {
@@ -3428,9 +3659,14 @@
       return;
     }
     
+    var qNorm = type === "city" ? settlementSearchQueryFromInput(searchTerm) : normalizeSettlementSearchText(searchTerm);
     var filtered = optionsToUse.filter(function (opt) {
       if (!opt) return false;
-      return !searchTerm || String(opt).toLowerCase().indexOf(searchTerm.toLowerCase()) !== -1;
+      if (type === "city") {
+        var meta = filterOptions.cityOptionsByLabel && filterOptions.cityOptionsByLabel[opt];
+        return matchesSettlementOption(opt, qNorm, meta);
+      }
+      return !qNorm || normalizeSettlementSearchText(opt).indexOf(qNorm) !== -1;
     });
     
     dropdown.innerHTML = "";
@@ -3446,7 +3682,12 @@
           var input = document.getElementById("filter-" + type);
           if (input) {
             input.value = String(opt);
-            searchState.filters[type] = String(opt);
+            if (type === "city") {
+              var meta = filterOptions.cityOptionsByLabel && filterOptions.cityOptionsByLabel[opt];
+              searchState.filters[type] = (meta && meta.name) ? meta.name : stripSettlementPopulationLabel(String(opt));
+            } else {
+              searchState.filters[type] = String(opt);
+            }
           }
           dropdown.classList.add("hidden");
           if (type === "region") {
@@ -5233,6 +5474,8 @@
 
   var filterBuilderConfig = null;
   var filterTreeRoot = null;
+  /** ID textarea, куди вставляється рядок після «Вставити» в конструкторі фільтрів (пошук або шаблон звіту). */
+  var filterBuilderOutputTextareaId = "filter-string";
 
   function createFilterTreeRoot() {
     return { type: "group", groupType: "and", items: [] };
@@ -5251,6 +5494,9 @@
 
   function renderFilterTree(container, root, fields) {
     if (!container || !root || !fields) return;
+    document.querySelectorAll(".filter-tree-combobox-dropdown").forEach(function (el) {
+      if (el.parentNode) el.parentNode.removeChild(el);
+    });
     container.innerHTML = "";
     var fieldKeys = Object.keys(fields);
 
@@ -5424,15 +5670,30 @@
           var row = document.createElement("div");
           row.className = "filter-tree-row filter-tree-geo";
           var geoType = item.geoType || "region";
+          var geoLabels = (filterBuilderConfig && filterBuilderConfig.geo && filterBuilderConfig.geo.type_labels_uk) || {
+            region: "Область",
+            settlement: "Населений пункт",
+            settlement_population: "Населення НП",
+            settlement_area: "Площа НП",
+            city_district: "Район міста"
+          };
+          var geoTypes = (filterBuilderConfig && filterBuilderConfig.geo && filterBuilderConfig.geo.toponym_precision) ||
+            ["region", "settlement", "settlement_population", "settlement_area", "city_district"];
           var gs = document.createElement("select");
           gs.className = "filter-select";
-          gs.innerHTML = "<option value='region'>Область</option><option value='settlement'>Населений пункт</option><option value='city_district'>Район міста</option>";
-          gs.value = geoType;
+          gs.innerHTML = geoTypes.map(function (t) {
+            return "<option value='" + t + "'>" + (geoLabels[t] || t) + "</option>";
+          }).join("");
+          gs.value = geoTypes.indexOf(geoType) >= 0 ? geoType : geoTypes[0];
           gs.addEventListener("change", function () {
             item.geoType = gs.value;
             item.geoRegion = "";
             item.geoCity = "";
             item.value = "";
+            item.population_min = "";
+            item.population_max = "";
+            item.area_min = "";
+            item.area_max = "";
             renderFilterTree(container, filterTreeRoot, fields);
           });
           var os = document.createElement("select");
@@ -5442,7 +5703,8 @@
           os.addEventListener("change", function () { item.operator = os.value; });
           row.appendChild(gs);
           row.appendChild(os);
-          function addGeoCombobox(label, getUrl, currentVal, onSelect) {
+          function addGeoCombobox(label, getUrl, currentVal, onSelect, comboOpt) {
+            comboOpt = comboOpt || {};
             var wrap = document.createElement("div");
             wrap.className = "filter-tree-geo-combobox";
             var input = document.createElement("input");
@@ -5452,24 +5714,128 @@
             var drop = document.createElement("div");
             drop.className = "filter-tree-combobox-dropdown";
             drop.setAttribute("role", "listbox");
+            document.body.appendChild(drop);
             wrap.appendChild(input);
-            wrap.appendChild(drop);
+            function positionDropdown() {
+              var r = input.getBoundingClientRect();
+              drop.style.left = Math.max(8, r.left) + "px";
+              drop.style.top = (r.bottom + 2) + "px";
+              drop.style.width = Math.max(r.width, 160) + "px";
+              drop.style.maxWidth = (window.innerWidth - 16) + "px";
+            }
+            function closeDropdown() {
+              drop.classList.remove("is-open");
+              drop.style.display = "none";
+              wrap.classList.remove("filter-tree-combobox-open");
+            }
+            function openDropdown() {
+              positionDropdown();
+              wrap.classList.add("filter-tree-combobox-open");
+              drop.classList.add("is-open");
+              drop.style.display = "block";
+            }
             var allOptions = [];
+            var optionByLabel = {};
+            var optionsLoading = false;
+            var optionsLoadError = false;
+            var catalogCount = null;
+            function applyOptions(raw, isCities, cityOptions) {
+              optionByLabel = {};
+              if (isCities && cityOptions && cityOptions.length) {
+                allOptions = cityOptions.map(function (o) {
+                  var lab = o.label || o.name;
+                  if (lab) optionByLabel[lab] = o;
+                  return lab;
+                }).filter(function (lab) { return !!lab; });
+                return;
+              }
+              if (isCities && raw && raw.length) {
+                allOptions = dedupeSettlementLabels(raw);
+                return;
+              }
+              allOptions = isCities ? [] : (raw || []);
+            }
             function loadOptions(cb) {
               var url = typeof getUrl === "function" ? getUrl() : getUrl;
-              if (!url) { allOptions = []; if (cb) cb(); return; }
+              if (!url) {
+                allOptions = [];
+                optionByLabel = {};
+                optionsLoading = false;
+                optionsLoadError = false;
+                catalogCount = 0;
+                if (cb) cb();
+                return;
+              }
+              if (optionsLoading) {
+                if (cb) {
+                  var wait = setInterval(function () {
+                    if (!optionsLoading) { clearInterval(wait); cb(); }
+                  }, 50);
+                }
+                return;
+              }
+              optionsLoading = true;
+              optionsLoadError = false;
+              var isCities = String(url).indexOf("/filters/cities") !== -1;
               fetch(url, { headers: apiHeaders() })
-                .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("Network error")); })
+                .then(function (r) {
+                  if (!r.ok) return Promise.reject(new Error("HTTP " + r.status));
+                  return r.json();
+                })
                 .then(function (data) {
-                  allOptions = (data.regions || data.cities || data.districts || []);
+                  catalogCount = data.catalog_count != null ? data.catalog_count : null;
+                  var raw = data.regions || data.cities || data.districts || [];
+                  applyOptions(raw, isCities, data.city_options);
+                  if (comboOpt.catalogFallback && isCities && !allOptions.length) {
+                    var fb = url.replace(/catalog_only=1&?/, "").replace(/[?&]$/, "");
+                    return fetch(fb, { headers: apiHeaders() })
+                      .then(function (r2) { return r2.ok ? r2.json() : { cities: [] }; })
+                      .then(function (d2) {
+                        applyOptions(d2.cities || [], true, d2.city_options);
+                        optionsLoading = false;
+                        if (cb) cb();
+                      });
+                  }
+                  optionsLoading = false;
                   if (cb) cb();
                 })
-                .catch(function () { allOptions = []; if (cb) cb(); });
+                .catch(function (err) {
+                  console.error("Geo combobox load failed:", url, err);
+                  allOptions = [];
+                  optionByLabel = {};
+                  optionsLoadError = true;
+                  optionsLoading = false;
+                  if (cb) cb();
+                });
             }
             function showDropdown() {
-              var q = (input.value || "").toLowerCase().trim();
-              var filtered = q ? allOptions.filter(function (o) { return String(o).toLowerCase().indexOf(q) !== -1; }) : allOptions;
+              var q = settlementSearchQueryFromInput(input.value || "");
+              var filtered = q ? allOptions.filter(function (o) {
+                return matchesSettlementOption(o, q, optionByLabel[o]);
+              }) : allOptions;
               drop.innerHTML = "";
+              if (optionsLoading && !allOptions.length) {
+                var loadingEl = document.createElement("div");
+                loadingEl.className = "filter-tree-combobox-option filter-tree-combobox-empty";
+                loadingEl.textContent = "Завантаження…";
+                drop.appendChild(loadingEl);
+                openDropdown();
+                return;
+              }
+              if (!filtered.length) {
+                var emptyEl = document.createElement("div");
+                emptyEl.className = "filter-tree-combobox-option filter-tree-combobox-empty";
+                var emptyMsg = "Немає даних";
+                if (optionsLoadError) emptyMsg = "Помилка завантаження списку";
+                else if (optionsLoading) emptyMsg = "Завантаження…";
+                else if (!allOptions.length && catalogCount === 0) emptyMsg = "Каталог НП порожній для цієї області";
+                else if (!allOptions.length) emptyMsg = "Список НП не завантажено — оберіть область ще раз";
+                else if (q) emptyMsg = "Нічого не знайдено (з " + allOptions.length + ")";
+                emptyEl.textContent = emptyMsg;
+                drop.appendChild(emptyEl);
+                openDropdown();
+                return;
+              }
               filtered.slice(0, 150).forEach(function (opt) {
                 var el = document.createElement("div");
                 el.className = "filter-tree-combobox-option";
@@ -5477,33 +5843,55 @@
                 el.textContent = opt;
                 el.addEventListener("mousedown", function (e) { e.preventDefault(); });
                 el.addEventListener("click", function () {
-                  onSelect(opt);
-                  input.value = opt;
-                  drop.style.display = "none";
+                  var meta = optionByLabel[opt];
+                  var picked = meta && meta.name ? meta.name : (comboOpt.stripSettlementValue ? stripSettlementPopulationLabel(opt) : opt);
+                  if (comboOpt.onPickMeta && meta) comboOpt.onPickMeta(meta);
+                  onSelect(picked);
+                  input.value = (meta && meta.label) ? meta.label : opt;
+                  closeDropdown();
                 });
                 drop.appendChild(el);
               });
-              drop.style.display = filtered.length ? "block" : "none";
+              openDropdown();
             }
             input.addEventListener("focus", function () {
-              if (allOptions.length === 0) loadOptions(showDropdown);
-              else showDropdown();
+              loadOptions(showDropdown);
             });
-            input.addEventListener("input", function () { onSelect(input.value.trim()); if (allOptions.length) showDropdown(); });
-            input.addEventListener("keyup", function () { if (allOptions.length) showDropdown(); });
-            input.addEventListener("blur", function () { setTimeout(function () { drop.style.display = "none"; }, 200); });
+            input.addEventListener("input", function () {
+              onSelect(stripSettlementPopulationLabel(input.value.trim()) || input.value.trim());
+              if (allOptions.length) showDropdown();
+              else loadOptions(showDropdown);
+            });
+            input.addEventListener("keyup", function () {
+              if (allOptions.length) showDropdown();
+              else if (!optionsLoading) loadOptions(showDropdown);
+            });
+            input.addEventListener("blur", function () { setTimeout(closeDropdown, 200); });
+            window.addEventListener("resize", function () { if (drop.classList.contains("is-open")) positionDropdown(); });
+            wrap.loadGeoOptions = loadOptions;
+            if (comboOpt.preload) loadOptions();
             if (input.value && allOptions.length === 0) loadOptions();
+            wrap._geoComboboxCleanup = function () {
+              if (drop.parentNode) drop.parentNode.removeChild(drop);
+            };
             return wrap;
           }
           function addRegionSelect(selectedRegion, onChange) {
             var sel = document.createElement("select");
             sel.className = "filter-select";
             sel.innerHTML = "<option value=''>— Область —</option>";
-            sel.value = selectedRegion || "";
+            if (selectedRegion) {
+              var pre = document.createElement("option");
+              pre.value = selectedRegion;
+              pre.textContent = selectedRegion;
+              sel.appendChild(pre);
+              sel.value = selectedRegion;
+            }
             fetch("/api/search/unified/filters/regions", { headers: apiHeaders() })
               .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
               .then(function (data) {
                 (data.regions || []).forEach(function (r) {
+                  if (selectedRegion && r === selectedRegion) return;
                   var o = document.createElement("option");
                   o.value = r;
                   o.textContent = r;
@@ -5528,7 +5916,8 @@
                 sel.innerHTML = "<option value=''>— Місто —</option>";
                 (data.cities || []).forEach(function (c) {
                   var o = document.createElement("option");
-                  o.value = c;
+                  var canon = stripSettlementPopulationLabel(c);
+                  o.value = canon;
                   o.textContent = c;
                   sel.appendChild(o);
                 });
@@ -5538,13 +5927,60 @@
             sel.addEventListener("change", function () { onChange(sel.value); renderFilterTree(container, filterTreeRoot, fields); });
             return sel;
           }
+          function addNumField(placeholder, key) {
+            var inp = document.createElement("input");
+            inp.type = "number";
+            inp.className = "filter-input filter-geo-criteria-input";
+            inp.placeholder = placeholder;
+            inp.min = "0";
+            inp.value = item[key] != null && item[key] !== "" ? String(item[key]) : "";
+            inp.addEventListener("input", function () {
+              item[key] = inp.value === "" ? "" : Number(inp.value);
+            });
+            row.appendChild(inp);
+          }
           if (geoType === "region") {
             row.appendChild(addGeoCombobox("Область", "/api/search/unified/filters/regions", item.value, function (v) { item.value = v; }));
           } else if (geoType === "settlement") {
-            row.appendChild(addRegionSelect(item.geoRegion, function (v) { item.geoRegion = v; item.value = ""; }));
-            row.appendChild(addGeoCombobox("Населений пункт", function () {
-              return "/api/search/unified/filters/cities" + (item.geoRegion ? "?region=" + encodeURIComponent(item.geoRegion) : "");
-            }, item.value, function (v) { item.value = v; }));
+            var regionSel = addRegionSelect(item.geoRegion, function (v) {
+              item.geoRegion = v;
+              item.value = "";
+              item.settlementLabel = "";
+              item.cityId = "";
+            });
+            row.appendChild(regionSel);
+            function settlementCitiesUrl() {
+              var region = (item.geoRegion || (regionSel && regionSel.value) || "").trim();
+              if (!region) return null;
+              if (!item.geoRegion) item.geoRegion = region;
+              return "/api/search/unified/filters/cities?catalog_only=1&region=" + encodeURIComponent(region);
+            }
+            var settlementCombo = addGeoCombobox(
+              item.geoRegion ? "Населений пункт" : "Спочатку оберіть область",
+              settlementCitiesUrl,
+              item.settlementLabel || item.value,
+              function (v) { item.value = v; },
+              {
+                catalogFallback: true,
+                stripSettlementValue: true,
+                preload: !!(item.geoRegion || regionSel.value),
+                onPickMeta: function (meta) {
+                  item.value = meta.name || item.value;
+                  item.cityId = meta.id || "";
+                  item.settlementLabel = meta.label || meta.name || "";
+                }
+              }
+            );
+            settlementCombo.querySelector("input").disabled = !(item.geoRegion || (regionSel && regionSel.value));
+            row.appendChild(settlementCombo);
+          } else if (geoType === "settlement_population") {
+            row.appendChild(addRegionSelect(item.geoRegion, function (v) { item.geoRegion = v; }));
+            addNumField("Насел. від, осіб", "population_min");
+            addNumField("Насел. до, осіб", "population_max");
+          } else if (geoType === "settlement_area") {
+            row.appendChild(addRegionSelect(item.geoRegion, function (v) { item.geoRegion = v; }));
+            addNumField("Площа км² від", "area_min");
+            addNumField("Площа км² до", "area_max");
           } else {
             row.appendChild(addRegionSelect(item.geoRegion, function (v) { item.geoRegion = v; item.geoCity = ""; item.value = ""; }));
             row.appendChild(addCitySelect(item.geoRegion, item.geoCity, function (v) { item.geoCity = v; item.value = ""; }));
@@ -5586,7 +6022,8 @@
     renderGroup(container, root, 0);
   }
 
-  function openFilterBuilderModal() {
+  function openFilterBuilderModal(targetTextareaId) {
+    filterBuilderOutputTextareaId = targetTextareaId || "filter-string";
     var modal = document.getElementById("filter-builder-modal");
     var treeEl = document.getElementById("filter-builder-tree");
     if (!modal || !treeEl) return;
@@ -5722,7 +6159,7 @@
     // Створити фільтри — відкрити модалку конструктора
     var searchBuildFiltersBtn = document.getElementById("search-build-filters");
     if (searchBuildFiltersBtn) {
-      searchBuildFiltersBtn.addEventListener("click", function () { openFilterBuilderModal(); });
+      searchBuildFiltersBtn.addEventListener("click", function () { openFilterBuilderModal("filter-string"); });
     }
     var filterBuilderModal = document.getElementById("filter-builder-modal");
     var filterBuilderInsert = document.getElementById("filter-builder-insert");
@@ -5738,12 +6175,21 @@
             };
           }
           if (node.type === "geo") {
-            return {
+            var geoApi = {
               type: "geo",
               geo_type: node.geoType || "region",
               operator: node.operator || "inside",
               value: node.value != null ? String(node.value).trim() : ""
             };
+            if (node.geoRegion) geoApi.geoRegion = String(node.geoRegion).trim();
+            if (node.geoCity) geoApi.geoCity = String(node.geoCity).trim();
+            if (node.cityId) geoApi.city_id = String(node.cityId).trim();
+            ["population_min", "population_max", "area_min", "area_max"].forEach(function (k) {
+              if (node[k] !== undefined && node[k] !== "" && node[k] !== null) {
+                geoApi[k] = node[k];
+              }
+            });
+            return geoApi;
           }
           if (node.type === "element") {
             var v = node.value;
@@ -5771,7 +6217,8 @@
             return r.json();
           })
           .then(function (data) {
-            var ta = document.getElementById("filter-string");
+            var taId = filterBuilderOutputTextareaId || "filter-string";
+            var ta = document.getElementById(taId);
             if (ta) ta.value = (data.filter_string != null ? data.filter_string : "");
             if (filterBuilderModal) filterBuilderModal.classList.add("hidden");
           })
@@ -5901,6 +6348,8 @@
   var flxActiveStreams = {};
   var flxLastSeqByChat = {};
   var flxSeqPersistTimer = null;
+  /** session_id, які вже дали 404 — не відкривати SSE повторно (навіть після merge з сервера). */
+  var flxDeadSessionIds = {};
 
   function debouncedPersistFlxSeq() {
     try {
@@ -5911,11 +6360,62 @@
     } catch (e) {}
   }
 
+  function flxEnsureSessionExists(chat) {
+    if (!chat || !chat.flx || !chat.flx.sessionId || chat.flx.sessionGone) {
+      return Promise.resolve(false);
+    }
+    if (flxDeadSessionIds[chat.flx.sessionId]) {
+      flxHandleSessionNotFound(chat);
+      return Promise.resolve(false);
+    }
+    var url = "/api/llm/investigation/" + encodeURIComponent(chat.flx.sessionId);
+    return fetch(url, { headers: apiHeaders() })
+      .then(function (r) {
+        if (r.status === 404) {
+          flxHandleSessionNotFound(chat);
+          return false;
+        }
+        return r.ok;
+      })
+      .catch(function () { return false; });
+  }
+
+  function flxHandleSessionNotFound(chat) {
+    if (!chat || !chat.flx) return;
+    var sid = chat.flx.sessionId;
+    if (sid) flxDeadSessionIds[sid] = true;
+    if (flxActiveStreams[sid]) {
+      try { flxActiveStreams[sid].abort(); } catch (e) {}
+      delete flxActiveStreams[sid];
+    }
+    if (!chat.flx._sessionNotFoundNotified) {
+      chat.flx._sessionNotFoundNotified = true;
+      appendFlxSystemMessage(
+        "Сесію дослідження не знайдено (можливо, базу даних очищено). " +
+        "Опишіть запит ще раз — буде створено нове дослідження."
+      );
+    }
+    chat.flx.sessionId = null;
+    chat.flx.state = "draft";
+    chat.flx.sessionGone = true;
+    chat.flx.lastEventSeq = 0;
+    chat.updatedAt = Date.now();
+    delete flxLastSeqByChat[chat.id];
+    saveChatSessions();
+    pushChatsToServer();
+  }
+
   function hydrateFlxTimeline(chat) {
     if (!chat || !chat.flx || !chat.flx.sessionId) return Promise.resolve();
     var url = "/api/llm/investigation/" + encodeURIComponent(chat.flx.sessionId) + "/timeline?limit=300";
     return fetch(url, { headers: apiHeaders() })
-      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("timeline")); })
+      .then(function (r) {
+        if (r.status === 404) {
+          flxHandleSessionNotFound(chat);
+          return Promise.reject(new Error("session_not_found"));
+        }
+        return r.ok ? r.json() : Promise.reject(new Error("timeline"));
+      })
       .then(function (data) {
         var container = document.getElementById("chat-messages");
         if (!container) return;
@@ -5946,7 +6446,7 @@
       kind: "investigation",
       messages: [],
       updatedAt: Date.now(),
-      flx: { sessionId: null, state: "draft", lastEventSeq: 0 },
+      flx: { sessionId: null, state: "draft", lastEventSeq: 0, sessionGone: false },
     });
     saveChatSessions();
     currentChatId = id;
@@ -6214,6 +6714,9 @@
       chat.flx = chat.flx || {};
       chat.flx.sessionId = data.session_id;
       chat.flx.state = "running";
+      chat.flx.sessionGone = false;
+      chat.flx._sessionNotFoundNotified = false;
+      delete flxDeadSessionIds[data.session_id];
       chat.title = (text.length > 40 ? text.slice(0, 40) + "…" : text);
       saveChatSessions();
       renderChatHistoryList();
@@ -6226,6 +6729,10 @@
   function flxOpenStream(chat, sinceSeq) {
     if (!chat || !chat.flx || !chat.flx.sessionId) return;
     var sid = chat.flx.sessionId;
+    if (chat.flx.sessionGone || flxDeadSessionIds[sid]) {
+      flxHandleSessionNotFound(chat);
+      return;
+    }
     if (flxActiveStreams[sid]) {
       try { flxActiveStreams[sid].abort(); } catch (e) {}
     }
@@ -6234,6 +6741,10 @@
     var url = "/api/llm/investigation/" + encodeURIComponent(sid) + "/events?since=" + (sinceSeq || 0);
     fetch(url, { method: "GET", headers: apiHeaders(), signal: ac.signal })
       .then(function (r) {
+        if (r.status === 404) {
+          flxHandleSessionNotFound(chat);
+          return;
+        }
         if (!r.ok) throw new Error("HTTP " + r.status);
         if (!r.body || !r.body.getReader) throw new Error("Стрімінг не підтримується");
         var reader = r.body.getReader();
@@ -6279,8 +6790,13 @@
       })
       .catch(function (e) {
         if (ac.signal.aborted) return;
-        // Авто-реконект після короткої паузи з останнього seq
-        setTimeout(function () { flxOpenStream(chat, flxLastSeqByChat[chat.id] || 0); }, 1500);
+        if (!chat.flx || !chat.flx.sessionId) return;
+        // Авто-реконект після короткої паузи (не для 404 — сесію вже скинуто)
+        setTimeout(function () {
+          if (chat.flx && chat.flx.sessionId) {
+            flxOpenStream(chat, flxLastSeqByChat[chat.id] || 0);
+          }
+        }, 1500);
       })
       .finally(function () {
         if (flxActiveStreams[sid] === ac) delete flxActiveStreams[sid];
@@ -6293,8 +6809,17 @@
     switchChat = function (id) {
       __origSwitch.apply(this, arguments);
       var chat = chatSessions.find(function (c) { return c.id === id; });
-      if (chat && chat.kind === "investigation" && chat.flx && chat.flx.sessionId) {
-        flxOpenStream(chat, flxLastSeqByChat[chat.id] || 0);
+      if (
+        chat &&
+        chat.kind === "investigation" &&
+        chat.flx &&
+        chat.flx.sessionId &&
+        !chat.flx.sessionGone &&
+        !flxDeadSessionIds[chat.flx.sessionId]
+      ) {
+        flxEnsureSessionExists(chat).then(function (ok) {
+          if (ok) flxOpenStream(chat, flxLastSeqByChat[chat.id] || 0);
+        });
       }
     };
     switchChat.__flxWrapped = true;

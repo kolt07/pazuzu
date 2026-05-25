@@ -2,6 +2,9 @@
 
 ## Terms
 
+- **mista.ua (довідник НП)**: зовнішнє джерело демографії та історичних назв населених пунктів України (~2751 НП). Скрапер: `scripts/mista_scraper/` → колекція `raw_mista_settlements` → імпорт у `cities` (`MistaSettlementImportService`). Поля: `population`, `area_sq_km`, `search_aliases` (колишні назви), `mista_id`, `coordinates` тощо.
+- **search_aliases**: масив нормалізованих ключів (`normalize_settlement_key`) для поточної та колишніх назв НП; використовується в `CitiesRepository.find_by_name_and_region` і геопошуку (наприклад «Кіровоград» → «Кропивницький»).
+- **settlement_population / settlement_area_sq_km**: логічні поля фільтра пошуку оголошень (не Mongo-поля `unified_listings`); резолвляться через `SettlementCriteriaResolver` у список НП з `cities`, потім у `GeoFilter` OR по `settlement`.
 - **семантичний пошук**: пошук релевантних документів за змістом запиту, а не за збігом ключових полів. У Pazuzu — над колекцією `unified_listings` (агент може спитати «нерухомість Київ під АЗС» і отримати схожі за контекстом оголошення, навіть якщо точних збігів полів немає) та над кадастром (`cadastral_parcels`/`cadastral_parcel_clusters`). Реалізація: TEI bge-m3 ембединги + Qdrant. FLX-tools: `vector.semantic_search_listings`, `vector.semantic_search_cadastre`.
 - **vector index (Qdrant)**: окрема нода у `docker-compose.yml` (`qdrant/qdrant:v1.12.4`, контейнер `pazuzu-qdrant`, порти 6333/6334, volume `pazuzu_qdrant_data`). Зберігає колекції `unified_listings_vec` та `cadastral_parcels_vec` (HNSW, cosine, 1024d). Доступ — тільки через `business/services/vector_index_service.py` (ensure_collections / upsert_listings / upsert_parcels / upsert_clusters / search_listings / search_parcels). Жодних raw-запитів від агентів — фільтри тільки логічні (region/city/property_type/price_uah_min/max, purpose/ownership_form/oblast/area_sqm_*).
 - **embedding service**: `business/services/embedding_service.py` — синглтон-клієнт HuggingFace Text Embeddings Inference (`pazuzu-embeddings`, TEI cpu-1.5). Робить POST `/embed` із батчингом (`embeddings.batch_size`), ретраями на 5xx/429/мережу та Mongo-кешем `embedding_cache` (SHA-256 hash тексту + `model_name`, унікальний індекс, TTL `embeddings_cache_ttl_days` днів). Помилки не блокують основний sync — vector-index це secondary store.
@@ -61,6 +64,18 @@
 - **rule-based fast path**: перший крок двоступеневої маршрутизації; без виклику LLM, лише перевірка ключових слів та slash-команд. Реалізація: `InterpreterAgent.try_rule_based_routing()`.
 
 - **гайдбук агента-інтерпретатора**: документ `docs/interpreter_agent_handbook.md`, який описує формати даних для збереження в БД: формати дат (ISO 8601, BSON Date), мова (українська), структура результату парсингу опису (адреси, площі, теги), збереження та вивід топонімів, числа та одиниці. Використовується при розробці та налаштуванні парсингу та інтерпретатора.
+
+- **нормалізація НП (settlement normalizer)**: `utils/settlement_normalizer.py` — єдиний модуль для канонічного формату населених пунктів у БД: витяг зі складних рядків (`район, смт X`, `DISTRICT/С.X`), кирилиця + Title Case (`ЛЮБЕШІВ` → `Любешів`), ключ `name_normalized` для exact/fuzzy-порівняння. Використовується в `CitiesRepository`, `toponym_normalizer`, міграції 052.
+
+- **fuzzy-пошук НП**: `business/services/settlement_matching_service.py` — пошук існуючого НП у межах `region_id` через exact key + `SequenceMatcher` (поріг 0.94). Інтегровано в `CitiesRepository.find_or_create` для запобігання новим дублям.
+
+- **м'яке злиття НП**: замість видалення дублів у `cities` — поле `merged_into` на дублі + перенос `streets.city_id`, оновлення `address_refs` та `unified_listings.addresses`. Сервіс: `SettlementDeduplicationService`, міграція `052_settlement_deduplication.py`.
+
+- **район області (oblast_rayon)**: довідник `oblast_rayons` (`region_id`, `name`, `name_normalized`). У `address_refs` — поле `oblast_rayon`. Не плутати з районом міста (`city_district`) та з **geo_circle**.
+
+- **округ / умовна геогрупа (geo_circle)**: довідник `geo_circles` для груп, що не є ні областю, ні районом області (сільрада, С/рада, «район» мегаполісу). Поля: `kind` (`silrada`, `city_district`, `council`, `other`), `scope_bucket`, опційно `region_id`, `parent_city_id`, `parent_rayon_id`. У `address_refs` — `geo_circle` з `_id`, `name`, `kind`.
+
+- **rayon → city resolver**: `utils/rayon_city_resolver.py` — евристика вибору реального НП для переносу вулиць з помилкового запису `cities`, коли туди потрапив не НП, а назва району області; використовує fuzzy-порівняння з активними НП області та явні пари у `FALLBACK_RAYON_TO_CITY` (Києво-Святошинський→Ірпінь, Лиманський→Южне тощо). Міграція: `054_relink_stub_city_streets.py`.
 
 - **тест-агент (agent test runner)**: механізм тестування LLM-помічника. Агент (LLM) генерує 5 тест-кейсів різної складності (від простої виборки до агрегацій), кожен кейс відправляється LLM-помічнику; тест-агент має **прямий доступ до БД** (усі колекції), щоб підрахувати очікувані значення та порівняти з відповіддю помічника та тимчасовими вибірками. Результат: «хід думок» (steps) та короткий звіт по кожному кейсу з виявленням елементів, що не відпрацювали. Запуск: меню Адміністрування → «🧪 Тестування агента». Сервіс: `AgentTestRunnerService`.
 

@@ -170,11 +170,23 @@ def _params_to_search_filters(params: Dict[str, Any]) -> tuple:
 
     filter_string = (params.get("filter_string") or "").strip()
     if filter_string:
+        src = params.get("source")
+        if isinstance(src, str):
+            src = src.strip() or None
+        elif not src:
+            src = None
+        days = params.get("date_filter")
+        try:
+            date_days = int(days) if days is not None else None
+        except (TypeError, ValueError):
+            date_days = None
         docs, total, err = find_by_filter_string(
             filter_string,
             sort=sort_spec,
             limit=10000,
             skip=0,
+            date_filter_days=date_days,
+            source=src,
         )
         if err:
             raise ValueError(err)

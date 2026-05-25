@@ -639,45 +639,6 @@ body {
 .btn-primary { background: var(--tg-theme-button-color); color: var(--tg-theme-button-text-color); }
 .btn-danger { background: #c0392b; color: #fff; }
 
-/* Преміум-кнопка "Нове дослідження" Flx — золотий градієнт + пульсуюче світіння */
-.btn-premium {
-  position: relative;
-  background: linear-gradient(135deg, #b8860b 0%, #f4c430 35%, #fff2a8 50%, #f4c430 65%, #b8860b 100%);
-  background-size: 200% 200%;
-  color: #2a1d00;
-  border: 1px solid rgba(184, 134, 11, 0.7);
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.3);
-  box-shadow: 0 0 0 0 rgba(244, 196, 48, 0);
-  transition: box-shadow 0.25s ease, transform 0.15s ease, background-position 0.5s ease;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4em;
-  justify-content: center;
-}
-.btn-premium:hover,
-.btn-premium:focus {
-  background-position: 100% 0;
-  box-shadow: 0 0 0 3px rgba(244, 196, 48, 0.25), 0 4px 12px rgba(184, 134, 11, 0.35);
-  outline: none;
-}
-.btn-premium:active { transform: translateY(1px); }
-
-/* Маленька іконка-зірочка через CSS, без emoji в HTML/JS */
-.btn-premium-icon {
-  display: inline-block;
-  width: 1em;
-  height: 1em;
-  background: currentColor;
-  -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M12 2l2.39 6.62L21 9.27l-5 4.87L17.18 21 12 17.77 6.82 21 8 14.14l-5-4.87 6.61-.65z'/></svg>") center/contain no-repeat;
-          mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M12 2l2.39 6.62L21 9.27l-5 4.87L17.18 21 12 17.77 6.82 21 8 14.14l-5-4.87 6.61-.65z'/></svg>") center/contain no-repeat;
-  flex-shrink: 0;
-}
-
-.sidebar-header-row-investigation { margin-top: 0.4rem; }
-.sidebar-header-row-investigation .btn-premium { width: 100%; }
-
 .btn-download {
   margin-right: 0.5rem;
   margin-bottom: 0.5rem;
@@ -1157,6 +1118,13 @@ a.file-download-link:active {
   overflow: hidden;
   border-radius: 12px;
   padding: 1.25rem;
+}
+
+/* dropdown НП не обрізати overflow модалки / scroll-контейнера дерева */
+.filter-tree-row.filter-tree-geo {
+  overflow: visible;
+  position: relative;
+  z-index: 1;
 }
 
 .modal-filter-builder h3,
@@ -1657,10 +1625,22 @@ a.file-download-link:active {
   position: relative;
   flex: 1 1 8rem;
   min-width: 5rem;
+  overflow: visible;
+  z-index: 2;
+}
+
+.filter-tree-geo-combobox.filter-tree-combobox-open {
+  z-index: 10050;
 }
 
 .filter-tree-row.filter-tree-geo .filter-select {
   min-width: 6rem;
+}
+
+.filter-tree-row.filter-tree-geo .filter-geo-criteria-input {
+  width: 6.5rem;
+  min-width: 5rem;
+  flex: 0 1 auto;
 }
 
 .filter-tree-geo-combobox .filter-input {
@@ -1669,18 +1649,30 @@ a.file-download-link:active {
 }
 
 .filter-tree-combobox-dropdown {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 100%;
-  margin-top: 2px;
+  display: none;
+  position: fixed;
+  margin-top: 0;
   max-height: 12rem;
   overflow-y: auto;
   background: var(--tg-theme-bg-color, #fff);
   border: 1px solid var(--tg-theme-button-color, #2481cc);
   border-radius: 6px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-  z-index: 100;
+  z-index: 10060;
+}
+
+.filter-tree-combobox-dropdown.is-open {
+  display: block;
+}
+
+.filter-tree-combobox-option.filter-tree-combobox-empty {
+  color: var(--tg-theme-hint-color, #6b7280);
+  cursor: default;
+}
+
+.filter-tree-combobox-option.filter-tree-combobox-empty:hover {
+  background: transparent;
+  color: var(--tg-theme-hint-color, #6b7280);
 }
 
 .filter-tree-combobox-option {

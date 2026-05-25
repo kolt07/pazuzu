@@ -1,3 +1,121 @@
+## 2026-05-25 — Геопошук НП: централізація (усі НП, не лише Іваничі)
+
+- Симптом: гомоніми/аліаси/префікси «смт.» — оголошення не знаходились при геофільтрі; Іваничі — один з кейсів.
+- Корінь: **5 дубльованих реалізацій** з різною логікою (`collection_manager`, `schema_filter_resolver`, `geo_filter_builder`, API `search.py`); region+city давали **OR** замість **AND**; лише `^(м\.)?` без аліасів і `city_id`.
+- Зроблено: `utils/settlement_geo_match.py` — єдине джерело (`get_settlement_match_names`, regex, unified/OLX/ProZorro); усі шляхи переведені на модуль; `build_city_filter_options` — display-форми аліасів для combobox; тести `test_settlement_geo_match.py`.
+
+## 2026-05-21 — Combobox НП: Іваничі у Волинській + пошук за назвою
+
+- Симптом: «Іваничі» є в `cities`, але не видно у combobox і **пошук за назвою не знаходить** (не лише прокрутка).
+- Причини: (1) сортування за label «(N ос.)» зсувало в кінець; (2) порівняння через `toLowerCase()` — латинська `I`, рос. `и` vs укр. `і`; (3) запит по повному label з «(6 918 ос.)»; (4) список НП ще не завантажений під час введення (`allOptions.length === 0`); (5) `catalog_only=1` без області давав `[]`.
+- Зроблено: сортування за `population` у межах області; `normalizeSettlementSearchText` / `matchesSettlementOption` (uk locale, homoglyphs); завантаження cities на `input`; `catalog_only` лише з `region`; strip суфікса в query і haystack.
+- UI: dropdown НП у `position:fixed` на `body` (не обрізається `overflow:hidden` модалки); «Завантаження…» / «Нічого не знайдено»; URL cities з `regionSel.value` якщо `item.geoRegion` ще порожній.
+
+## 2026-05-21 — Скрапер mista: список НП по областях (?obl=)
+
+- Запит: обходити [Пошук НП](https://mista.ua/%D0%9F%D0%BE%D1%88%D1%83%D0%BA_%D0%BD%D0%B0%D1%81%D0%B5%D0%BB%D0%B5%D0%BD%D0%B8%D1%85_%D0%BF%D1%83%D0%BD%D0%BA%D1%82%D1%96%D0%B2) з фільтром області, а не один загальний список на 69 стор.
+- Зроблено: `parse_region_filter_options`, `scrape_list_by_regions`, GET/POST `/?obl=ID`; CLI `--region`; прогрес `region_index/regions_total` в адмін API.
+
+## 2026-05-21 — OR-група геофільтрів: серіалізація та парсинг
+
+- Симптом: коренева OR з кількома НП давала плоский OR контекстних полів + AND усіх geo().
+- Зроблено: `tree_to_filter_models` — geo OR при root OR, REGION у geo(); без дублювання контексту; `_geo_filter_to_string`, парсер зберігає OR між geo().
+
+## 2026-05-21 — Іваничі (Волинська / Рівненська) у геопошуку
+
+- Симптом: «Іваничі» відсутні в combobox Волинської; гомонім у двох областях.
+- Причина: у `cities` не було запису для Волинської; у Рівненській — typo «Іваниничі» (fuzzy 0.875, не збігалось з «Іваничі»).
+- Зроблено: міграція `061_ensure_ivanichi_homonyms.py` — rename Рівненська, create/update Волинська, аліас `іваниничі`.
+
+## 2026-05-21 — Міграція 060 APPLY: repair зліплених адрес
+
+- Аудит до repair: **5396** issues (`city_id_missing_or_wrong` 5334, `homonym_no_region` 62).
+- APPLY: **4276** `unified_listings` оновлено, **5334** `address_city_id_set`; після першого прогону залишилось **62** (`місто Київ` не резолвився в region_id).
+- Додано синонім `місто київ` → `м. Київ` у `ukraine_regions.py`; повторний APPLY: **54** listings, **65** city_id; **audit_issues_after: 0**.
+
+## 2026-05-21 — Міграція 060: repair зліплених адрес + active cities filter
+
+- Проблема: `merged_into: null` виключав ~2906 НП з каталогу (`$exists: false`); геопошук/комbobox порожні; denorm без опори на cities.
+- Зроблено: `active_cities_mongo_clause()`; `repair_homonym_glued_listings` + міграція `060_repair_homonym_glued_addresses.py` (audit → fix unified_listings + address_refs → denorm).
+
+## 2026-05-21 — Гомоніми НП (одна назва, різні області)
+
+- Симптом: «склеєні» однойменні НП; геопошук/денорм плутали області.
+- Зроблено: `GeoFilterElement.region`/`city_id`; Mongo `$elemMatch` region+settlement; API `city_options` з підписом «Назва · Область»; `canon_for` і replacement map лише в межах `region_id`; аудит `059_audit_settlement_homonyms.py`.
+
+## 2026-05-21 — Геопошук: НП, населення, площа
+
+- Симптоми: НП не підвантажуються по області; фільтр населення не працює; населення/площа мали бути окремими гео-умовами.
+- Причини: `nodeToApi` не передавав `geoRegion` і критерії; `catalog_only=1` без fallback; населення/площа на рядку НП.
+- Зроблено: гео-типи `settlement_population`, `settlement_area`; приховані поля в «+ Умова»; fallback cities API; виправлений `tree_to_filter_models`.
+
+## 2026-05-21 — Повний скрап зупинявся на 200 НП (parse_list_max_page)
+
+- Симптом: «Повний скрап» → деталі 200/200 замість ~2751.
+- Причина: `parse_list_max_page` брав max лише з видимих `data-pages` (1–5), ігноруючи `input max=69`.
+- Зроблено: пріоритет `input[max]`; повний список ~69 сторінок.
+
+## 2026-05-21 — Пагінація списку mista.ua (404 на ?page=2)
+
+- Помилка: `404` для `...Пошук_населених_пунктів?page=2` — сайт не використовує query `page`.
+- Зроблено: список через **POST** `reload=ajax`, `cscontent=1`, `citySPG=N` (0-based); `fetch_settlements_list_page`, `ensure_mista_session` (cookies zb); `parse_list_max_page`; тести ajax-параметрів.
+
+## 2026-05-21 — Fix E11000 mista_id duplicate у raw_mista_settlements
+
+- Помилка: усі рядки списку отримували `mista_id: 1` через `setcity=1` з HTML сторінки (не з href НП); також `dup key: { mista_id: null }` через UNIQUE sparse + явний `null` у документах.
+- Зроблено: парсер — `mista_id` лише з href / посилань деталі; репозиторій не пише `mista_id: null` (поле відсутнє); drop unique при старті; міграція `058` — unset null/1, не-унікальний індекс.
+
+## 2026-05-21 — Скрапер mista.ua в адмін-панелі mini app
+
+- Запит: запуск скрапера з адміністрування поряд з кадастром, з прогресом.
+- Зроблено: `run_mista_scraper()` з progress_callback; API `POST/GET /api/admin/mista-scraper/*` (start, status, stats, import); UI на вкладці «Кадастр» (кнопки тест/повний/імпорт, progress bar).
+
+## 2026-05-21 — Довідник НП з mista.ua та геопошук за населенням/площею
+
+- Запит: завантажити з mista.ua демографію та ієрархію НП; колишні назви як аліаси; у геопошуку — фільтри населення/площі НП (відбір оголошень); список НП лише після вибору області.
+- Зроблено: `scripts/mista_scraper/` (list + detail → `raw_mista_settlements`), `MistaSettlementImportService` → `cities`, міграція `057_mista_settlement_metadata.py`, `SettlementCriteriaResolver`, поля в `search_fields.yaml`, UI конструктора фільтрів (насел./площа, `catalog_only=1`), тести parser/resolver/aliases.
+
+## 2026-05-20 — Три «Любешіва» у combobox (смт + регістр)
+
+- Скрін: при пошуку «Любе» у Волинській — `ЛЮБЕШІВ`, `Любешів`, `смт Любешів`.
+- Зроблено: `CitiesRepository.get_by_region` — один НП на ключ; combobox завжди перезавантажує cities при focus; `dedupeSettlementLabels` у `app.js`; міграція `056_force_merge_settlement_duplicates.py` (audit + merge + denorm).
+
+## 2026-05-20 — Дедуплікація НП у filters/cities (UI combobox)
+
+- Запит: у випадаючому списку НП все ще «Боголюби, ЛЮБЕШІВ, Любешів».
+- Причина: API повертав сирі `name` з БД/fallback без злиття за ключем; «Боголюби» — окремий НП (коректно), дубль — лише регістр Любешіва.
+- Зроблено: `dedupe_settlement_labels()` у `settlement_normalizer`; нормалізація в `CitiesRepository.get_by_region`; `/unified|olx|prozorro/filters/cities` — канонічні унікальні назви.
+
+## 2026-05-20 — Виправлення варіантів «Любешів / ЛЮБЕШІВ» у denorm-полях
+
+- Запит: у базі все ще видно 3 варіанти Любешіва.
+- Причина: у `cities` залишався один канонічний запис «Любешів», а в `unified_listings` та `analytics_extracts` — рядки «ЛЮБЕШІВ» (різний регістр), які UI/агрегації показували як окремі значення.
+- Зроблено: `SettlementDeduplicationService.repair_cities_by_computed_key` + `normalize_denormalized_settlements`; міграція `055_repair_settlement_variants.py` (654 unified_listings, 198 analytics_extracts оновлено). Для Любешіва тепер одна форма «Любешів» скрізь.
+
+## 2026-05-20 — Stub cities: вулиці перенесені на реальні НП
+
+- Запит: автоматично перенести вулиці зі stub `cities` після винесення районів у oblast_rayons і прибрати stub-документи.
+- Зроблено: `utils/rayon_city_resolver.py` (fuzzy + `FALLBACK_RAYON_TO_CITY` для Києво-Святошинського, Лиманського), міграція `054_relink_stub_city_streets.py` (перенос через `SettlementDeduplicationService._merge_streets`, оновлення `address_refs` / `unified_listings`). На БД: 7 stub, 12 вулиць relink, 68 unified_listings оновлено. Тести: `tests/test_rayon_city_resolver.py`.
+
+## 2026-05-20 — Райони області та «округи» (geo_circles)
+
+- Запит: винести райони з cities в окрему сутність; додати сутність для умовних груп (сільрада, райони Києва, С/рада тощо), що не є ані областю, ані районом області.
+- Зроблено: колекції **oblast_rayons** і **geo_circles** (уникнення колізій через `scope_bucket`), `utils/rayon_normalizer.py`, репозиторії в `geography_repository.py`, розширено `GeographyService.resolve_address` (поля `oblast_raion` / `geo_circle` у вхідних даних, у refs — `oblast_rayon`, `geo_circle` з `kind`; назви лише району області в полі міста → `oblast_rayons`, без створення НП). Фільтр `CitiesRepository` виключає `is_oblast_rayon_stub`. `config/data_dictionary.yaml` — схеми та вкладені поля `address_refs`. Міграція `053_geo_admin_units.py` — райони в довіднику, stub-мітки для cities з вулицями, оновлення `address_refs`. Тести: `tests/test_rayon_normalizer.py`.
+
+## 2026-05-20 — Нормалізація та дедуплікація населених пунктів (cities)
+
+- Запит: впорядкувати міста/НП у geo-колекціях — прибрати дублі типу «Любешів / ЛЮБЕШІВ / смт Любешів», fuzzy-пошук, нормалізація назв, аудит і м'яка заміна посилань.
+- Зроблено: `utils/settlement_normalizer.py` (extract + Title Case + key), `business/services/settlement_matching_service.py` (fuzzy ≥0.94), `business/services/settlement_deduplication_service.py` (аудит/merge), оновлено `CitiesRepository.find_or_create`/`find_fuzzy_by_name_and_region`, `toponym_normalizer.normalize_settlement`. Міграція `052_settlement_deduplication.py`: 39 груп / 40 дублів злито, 96+ назв нормалізовано, 173 unified_listings оновлено; після обробки duplicate_groups=0. Тести: `tests/test_settlement_normalizer.py`.
+
+## 2026-05-20 — Шаблони звітів: рядок фільтрів як на пошуку, «Як шаблон», період + джерело з рядком AND
+
+- Запит: замінити жорсткі поля області/міста/типу/цін у конструкторі шаблону на рядок відборів (як на сторінці пошуку); кнопка «Як шаблон» має переносити поточний рядок у форму; період і джерело залишаються окремо.
+- Зроблено: `telegram_mini_app/static/index.html`, `app.js` — textarea `constructor-filter-string`, кнопки «Створити фільтри» / «Очистити», ціль textarea для модалки дерева фільтрів (`filterBuilderOutputTextareaId`); `openReportConstructor`/`getConstructorParams`/«Як шаблон» синхронізовані з цим. `domain/services/unified_search_service.find_by_filter_string` — опційні `date_filter_days` та `source`, зливаються AND з розпарсеним рядком; `telegram_mini_app/routes/report_templates.py` передає їх з `params` при генерації. `business/services/report_template_service.py` — дефолтні параметри та генерація назви з урахуванням `filter_string`.
+
+## 2026-05-20 — Telegram mini-app: кнопка «Нове дослідження» Flx прибрана з сайдбару
+- Запит: прибрати з інтерфейсу кнопку старту нового дослідження Flx; логіку Flx не чіпати.
+- Зроблено: видалено рядок з `#sidebar-new-investigation` у `telegram_mini_app/static/index.html` і пов’язані стилі `.btn-premium` / `.sidebar-header-row-investigation` у `styles.css`. У `app.js` залишено `startNewInvestigation()` і підписку на клік через `if (newInvestigationBtn)` — без кнопки обробник просто не вішаться, існуючі дослідження в історії працюють як раніше.
+
 ## 2026-05-13 — OLX: відновлення генерації ОНМ + Celery backfill
 - Запит: перестали генеруватись об'єкти нерухомого майна для OLX; поновити генерацію та разово прогнати по вже завантажених оголошеннях (без оновлення з джерел), бажано через Vast/Celery.
 - Зроблено: кеш ОНМ більше не повертає/не зберігає порожній список `objects` (щоб не «заморожувати» парсинг); `upsert_listing` вважає успіхом оновлення з `matched_count>0`; `sync_olx_listing` / `sync_prozorro_auction` запускають ОНМ і індексацію, якщо запис уже є в unified; Celery-таска `backfill_real_estate_objects_task` (черга `source_load`) + прапорець скрипта `--only-without-refs`.

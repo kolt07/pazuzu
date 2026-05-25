@@ -65,6 +65,9 @@ services:
     # завантаження `1_Pooling/config.json` (issue #527, фіксено у 1.7+).
     # Тримаємо CPU-тег 1.9 і канонічну форму аргументів `--model-id VALUE`
     # (через пробіл, без `=`) — саме так документує HuggingFace.
+    # bge-m3 на CPU під час warmup з'їдає >4GB RAM — при mem_limit=4g Docker OOMKill
+    # (exit 137, restart loop). За замовчуванням 8g; при нестачі RAM на хості —
+    # EMBEDDINGS_MEM_LIMIT=6g і EMBEDDINGS_MAX_BATCH_TOKENS=4096 у .env.
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
     container_name: pazuzu-embeddings
     restart: unless-stopped
@@ -74,12 +77,12 @@ services:
       - "--port"
       - "80"
       - "--max-batch-tokens"
-      - "${EMBEDDINGS_MAX_BATCH_TOKENS:-16384}"
+      - "${EMBEDDINGS_MAX_BATCH_TOKENS:-4096}"
     volumes:
       - pazuzu_tei_cache:/data
     cpus: "${EMBEDDINGS_CPUS:-2.0}"
-    mem_limit: "${EMBEDDINGS_MEM_LIMIT:-4g}"
-    mem_reservation: "${EMBEDDINGS_MEM_RESERVATION:-2g}"
+    mem_limit: "${EMBEDDINGS_MEM_LIMIT:-10g}"
+    mem_reservation: "${EMBEDDINGS_MEM_RESERVATION:-4g}"
     pids_limit: ${EMBEDDINGS_PIDS_LIMIT:-512}
     healthcheck:
       test: ["CMD", "bash", "-lc", "exec 3<>/dev/tcp/localhost/80 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q '200'"]

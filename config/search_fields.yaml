@@ -66,13 +66,42 @@ collections:
         label_uk: "Ціна за сотку, USD"
         value_type: "number"
         allowed_operators: [eq, gte, lte, gt, lt]
+      # Критерії НП (лише для парсингу рядка; у конструкторі — гео-типи нижче)
+      settlement_population:
+        label_uk: "Населення НП, осіб"
+        value_type: "number"
+        allowed_operators: [gte, lte, gt, lt]
+        builder_hidden: true
+      settlement_area_sq_km:
+        label_uk: "Площа НП, км²"
+        value_type: "number"
+        allowed_operators: [gte, lte, gt, lt]
+        builder_hidden: true
+      settlement_region_context:
+        label_uk: "Область (контекст НП)"
+        value_type: "string"
+        allowed_operators: [eq]
+        builder_hidden: true
+      settlement_name_context:
+        label_uk: "Назва НП (контекст)"
+        value_type: "string"
+        allowed_operators: [eq]
+        builder_hidden: true
 
-# Геопошук — окремий елемент. Топонім з точністю до району міста.
+# Геопошук — окремі «ліві» значення (не атрибути рядка НП у таблиці умов).
 geo:
   toponym_precision:
     - region
     - settlement
+    - settlement_population
+    - settlement_area
     - city_district
+  type_labels_uk:
+    region: "Область"
+    settlement: "Населений пункт"
+    settlement_population: "Населення НП"
+    settlement_area: "Площа НП"
+    city_district: "Район міста"
   operators:
     inside:
       label_uk: "в межах"

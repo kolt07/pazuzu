@@ -53,6 +53,22 @@ collections:
       - field: "name_normalized"
         unique: false
         description: "Нормалізована назва для пошуку"
+      - field: "population"
+        unique: false
+        description: "Населення НП (mista.ua)"
+      - field: "area_sq_km"
+        unique: false
+        description: "Площа НП, км²"
+      - field: "search_aliases"
+        unique: false
+        description: "Ключі колишніх назв"
+      - field: "mista_id"
+        unique: true
+        sparse: true
+        description: "ID на mista.ua"
+      - field: "source"
+        unique: false
+        description: "Джерело довідника"
     fields:
       _id:
         type: "ObjectId"
@@ -81,6 +97,201 @@ collections:
         type: "datetime"
         required: true
         description: "Дата оновлення"
+      merged_into:
+        type: "string"
+        required: false
+        description: "ID канонічного НП після м'якого злиття дубля"
+      merged_at:
+        type: "datetime"
+        required: false
+        description: "Дата м'якого злиття в канонічний НП"
+      is_oblast_rayon_stub:
+        type: "boolean"
+        required: false
+        description: "Тимчасовий запис cities після перенесення назви в oblast_rayons (залишено через прив'язані streets)"
+      oblast_rayon_ref_id:
+        type: "string"
+        required: false
+        description: "Відповідний документ oblast_rayons._id для stub"
+      population:
+        type: "integer"
+        required: false
+        description: "Населення, осіб (mista.ua)"
+      population_density:
+        type: "float"
+        required: false
+        description: "Щільність населення, осіб/км²"
+      area_sq_km:
+        type: "float"
+        required: false
+        description: "Площа, км²"
+      postal_code:
+        type: "string"
+        required: false
+        description: "Поштовий індекс"
+      phone_code:
+        type: "string"
+        required: false
+        description: "Телефонний код"
+      coordinates:
+        type: "object"
+        required: false
+        description: "WGS84: lat, lon (десяткові градуси)"
+      elevation_m:
+        type: "integer"
+        required: false
+        description: "Висота над рівнем моря, м"
+      water_body:
+        type: "string"
+        required: false
+        description: "Річка, озеро (море)"
+      founded_year:
+        type: "integer"
+        required: false
+        description: "Рік заснування"
+      city_day:
+        type: "string"
+        required: false
+        description: "День міста (текст з mista)"
+      former_names:
+        type: "array"
+        required: false
+        description: "Колишні назви [{name, period_label?}]"
+      search_aliases:
+        type: "array"
+        required: false
+        description: "Нормалізовані ключі для пошуку (колишні + поточна назва)"
+      settlement_status:
+        type: "string"
+        required: false
+        description: "Тип НП: місто, село, селище"
+      mista_id:
+        type: "integer"
+        required: false
+        description: "ID на mista.ua (setcity)"
+      mista_url:
+        type: "string"
+        required: false
+        description: "URL сторінки НП на mista.ua"
+      oblast_rayon_name:
+        type: "string"
+        required: false
+        description: "Назва району з URL mista (довідково)"
+      source:
+        type: "string"
+        required: false
+        description: "Джерело метаданих (mista)"
+      source_updated_at:
+        type: "datetime"
+        required: false
+        description: "Час останнього оновлення з mista"
+
+  raw_mista_settlements:
+    description: "Сирі дані населених пунктів з mista.ua до імпорту в cities"
+    mongo_collection: "raw_mista_settlements"
+    indexes:
+      - field: "mista_url"
+        unique: true
+      - field: "mista_id"
+        unique: false
+        sparse: true
+      - field: "scrape_status"
+        unique: false
+    fields:
+      mista_url:
+        type: "string"
+        required: true
+      mista_id:
+        type: "integer"
+        required: false
+        description: "ID setcity на mista.ua (не унікальний у raw; унікальний лише в cities)"
+      scrape_status:
+        type: "string"
+        required: false
+        description: "list_only | parsed | import_error"
+      parsed:
+        type: "object"
+        required: false
+        description: "Розпарсені поля з детальної сторінки"
+
+  oblast_rayons:
+    description: "Райони області України (адміністративний підрівень після області, до НП)"
+    mongo_collection: "oblast_rayons"
+    indexes:
+      - field: ["region_id", "name_normalized"]
+        unique: true
+        description: "Один запис на назву в межах області"
+      - field: "region_id"
+        unique: false
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+      name:
+        type: "string"
+        required: true
+        description: "Назва району без хвоста «район» у типових випадках"
+      name_normalized:
+        type: "string"
+        required: true
+      region_id:
+        type: "string"
+        required: true
+      created_at:
+        type: "datetime"
+        required: true
+      updated_at:
+        type: "datetime"
+        required: true
+
+  geo_circles:
+    description: "Умовні географічні групи (округи): сільрада, райони м. Києва, С/рада тощо — не область і не район області"
+    mongo_collection: "geo_circles"
+    indexes:
+      - field: ["scope_bucket", "kind", "name_normalized"]
+        unique: true
+        description: "Унікальність назви в межах контексту (область/місто/район)"
+      - field: "region_id"
+        unique: false
+      - field: "parent_city_id"
+        unique: false
+      - field: "kind"
+        unique: false
+    fields:
+      _id:
+        type: "ObjectId"
+        required: true
+      name:
+        type: "string"
+        required: true
+      name_normalized:
+        type: "string"
+        required: true
+      kind:
+        type: "string"
+        required: true
+        description: "Тип групи: silrada, city_district, council, other"
+      region_id:
+        type: "string"
+        required: false
+      parent_city_id:
+        type: "string"
+        required: false
+        description: "Для підрозділів міста (напр. Печерський як geo_circle у Києві)"
+      parent_rayon_id:
+        type: "string"
+        required: false
+        description: "Опційне зв'язування з oblast_rayons"
+      scope_bucket:
+        type: "string"
+        required: true
+        description: "Нормалізований ключ контексту (область/місто/район) для унікальності"
+      created_at:
+        type: "datetime"
+        required: true
+      updated_at:
+        type: "datetime"
+        required: true
   
   streets:
     description: "Колекція вулиць"
@@ -273,7 +484,7 @@ collections:
             description: "Опис аукціону"
           address_refs:
             type: "array"
-            description: "Посилання на топоніми з колекцій regions, cities, streets, buildings. Кожен елемент містить об'єкт з полями region, city, street, building (якщо є), де кожне поле містить _id та name."
+            description: "Посилання на топоніми: regions, oblast_rayons (опц.), geo_circles (опц.), cities, streets, buildings. Кожен елемент — region, опційно oblast_rayon та geo_circle, city, street, building з _id та name."
             item_type: "object"
             nested_fields:
               region:
@@ -286,6 +497,25 @@ collections:
                   name:
                     type: "string"
                     description: "Назва області"
+              oblast_rayon:
+                type: "object"
+                description: "Район області (колекція oblast_rayons)"
+                nested_fields:
+                  _id:
+                    type: "string"
+                  name:
+                    type: "string"
+              geo_circle:
+                type: "object"
+                description: "Умовна група (сільрада, округ міста тощо, geo_circles)"
+                nested_fields:
+                  _id:
+                    type: "string"
+                  name:
+                    type: "string"
+                  kind:
+                    type: "string"
+                    description: "silrada | city_district | council | other"
               city:
                 type: "object"
                 description: "Посилання на місто"
@@ -661,7 +891,7 @@ collections:
             item_type: "object"
           address_refs:
             type: "array"
-            description: "Посилання на топоніми з колекцій regions, cities, streets, buildings. Кожен елемент містить об'єкт з полями region, city, street, building (якщо є), де кожне поле містить _id та name."
+            description: "Посилання на топоніми: regions, oblast_rayons (опц.), geo_circles (опц.), cities, streets, buildings. Кожен елемент — region, опційно oblast_rayon та geo_circle, city, street, building з _id та name."
             item_type: "object"
             nested_fields:
               region:
@@ -674,6 +904,25 @@ collections:
                   name:
                     type: "string"
                     description: "Назва області"
+              oblast_rayon:
+                type: "object"
+                description: "Район області (колекція oblast_rayons)"
+                nested_fields:
+                  _id:
+                    type: "string"
+                  name:
+                    type: "string"
+              geo_circle:
+                type: "object"
+                description: "Умовна група (сільрада, округ міста тощо, geo_circles)"
+                nested_fields:
+                  _id:
+                    type: "string"
+                  name:
+                    type: "string"
+                  kind:
+                    type: "string"
+                    description: "silrada | city_district | council | other"
               city:
                 type: "object"
                 description: "Посилання на місто"
