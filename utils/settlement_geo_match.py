@@ -111,6 +111,17 @@ def settlement_regex_for_names(names: List[str]) -> Dict[str, Any]:
     return {"$regex": pattern, "$options": "i"}
 
 
+def settlement_substring_regex_for_names(names: List[str]) -> Dict[str, Any]:
+    """Підрядок у полі локації (OLX: «Волинська обл., смт Нововолинськ»)."""
+    cleaned = [str(n).strip() for n in names if n and str(n).strip()]
+    if not cleaned:
+        return {"$regex": "^$", "$options": "i"}
+    if len(cleaned) == 1:
+        return {"$regex": re.escape(cleaned[0]), "$options": "i"}
+    alt = "|".join(re.escape(n) for n in cleaned)
+    return {"$regex": alt, "$options": "i"}
+
+
 def region_regex_mongo(region: Optional[str]) -> Optional[Dict[str, Any]]:
     if not region:
         return None
@@ -149,6 +160,7 @@ def build_unified_listings_settlement_match(
     if not names:
         names = [str(settlement_value)]
     settlement_re = settlement_regex_for_names(names)
+    location_re = settlement_substring_regex_for_names(names)
 
     if region_re:
         or_parts.append({"$and": [{"city": settlement_re}, {"region": region_re}]})
@@ -160,9 +172,39 @@ def build_unified_listings_settlement_match(
                 }
             }
         })
+        or_parts.append({
+            "$and": [
+                {"region": region_re},
+                {"addresses": {"$elemMatch": {"settlement": settlement_re}}},
+            ]
+        })
+        or_parts.append({
+            "$and": [
+                {"region": region_re},
+                {"search_data.location": location_re},
+            ]
+        })
+        or_parts.append({
+            "$and": [
+                {"search_data.location": location_re},
+                {"search_data.location": region_re},
+            ]
+        })
+        or_parts.append({
+            "detail.address_refs": {
+                "$elemMatch": {
+                    "city.name": settlement_re,
+                    "region.name": region_re,
+                }
+            }
+        })
     else:
         or_parts.append({"city": settlement_re})
         or_parts.append({"addresses": {"$elemMatch": {"settlement": settlement_re}}})
+        or_parts.append({"search_data.location": location_re})
+        or_parts.append({
+            "detail.address_refs": {"$elemMatch": {"city.name": settlement_re}}
+        })
 
     if not or_parts:
         return {"_id": {"$exists": False}}

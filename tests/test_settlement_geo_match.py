@@ -6,6 +6,7 @@ import json
 from domain.managers.collection_manager import UnifiedListingsCollectionManager
 from domain.models.filter_models import GeoFilter, GeoFilterElement, GeoFilterOperator
 from utils.settlement_geo_match import (
+    build_unified_listings_settlement_match,
     get_settlement_match_names,
     resolve_unified_listings_geo_filter,
     settlement_regex,
@@ -51,6 +52,13 @@ def test_geo_settlement_mongo_uses_city_id():
     s = json.dumps(mongo, ensure_ascii=False)
     assert "city_id" in s
     assert "abc123" in s
+
+
+def test_settlement_match_includes_location_substring():
+    mongo = build_unified_listings_settlement_match("Нововолинськ", region="Волинська область")
+    s = json.dumps(mongo, ensure_ascii=False)
+    assert "search_data.location" in s
+    assert "detail.address_refs" in s
 
 
 def test_get_settlement_match_names_without_db():

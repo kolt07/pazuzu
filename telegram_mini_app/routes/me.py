@@ -37,6 +37,8 @@ def me(request: Request):
     authorized = user_service.is_user_authorized(user_id)
     is_admin = user_service.is_admin(user_id)
     nickname = user_service.get_user_nickname(user_id)
+    settings = getattr(request.app.state, "settings", None)
+    maps_key = (getattr(settings, "google_maps_api_key", None) or "").strip() if settings else ""
     return {
         "user_id": user_id,
         "username": user_obj.get("username"),
@@ -45,4 +47,5 @@ def me(request: Request):
         "authorized": authorized,
         "is_admin": is_admin,
         "nickname": nickname,
+        "maps_api_key": maps_key if maps_key else None,
     }

@@ -17,6 +17,10 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 project_root = Path(__file__).resolve().parent.parent.parent
+# scripts/mista_scraper/config.py інакше затіняє пакет config/
+_script_dir = str(Path(__file__).resolve().parent)
+while _script_dir in sys.path:
+    sys.path.remove(_script_dir)
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 

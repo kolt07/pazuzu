@@ -9,7 +9,11 @@ from typing import Any, Dict, List, Optional
 from business.services.settlement_matching_service import display_name_quality
 from data.repositories.geography_repository import CitiesRepository, RegionsRepository
 from data.repositories.raw_mista_settlements_repository import RawMistaSettlementsRepository
-from utils.settlement_normalizer import normalize_settlement_key, normalize_settlement_name
+from utils.settlement_normalizer import (
+    normalize_settlement_key,
+    normalize_settlement_name,
+    settlement_name_from_mista_url,
+)
 from utils.ukraine_regions import normalize_region_for_repository_lookup
 
 
@@ -102,9 +106,23 @@ class MistaSettlementImportService:
         }
         return {k: v for k, v in meta.items() if v is not None}
 
+    def _resolve_import_name(self, raw_doc: Dict[str, Any], parsed: Dict[str, Any]) -> Optional[str]:
+        mista_url = parsed.get("mista_url") or raw_doc.get("mista_url") or ""
+        for candidate in (
+            parsed.get("name"),
+            raw_doc.get("name"),
+            settlement_name_from_mista_url(mista_url),
+        ):
+            if not candidate:
+                continue
+            name = normalize_settlement_name(str(candidate))
+            if name:
+                return name
+        return None
+
     def import_one(self, raw_doc: Dict[str, Any], *, dry_run: bool = False) -> Dict[str, Any]:
         parsed = raw_doc.get("parsed") or {}
-        name = normalize_settlement_name(parsed.get("name") or raw_doc.get("name") or "")
+        name = self._resolve_import_name(raw_doc, parsed)
         region_name = parsed.get("region_name") or raw_doc.get("region_name")
         region_id = self._resolve_region_id(region_name)
         if not name or not region_id:

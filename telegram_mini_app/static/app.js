@@ -1,6 +1,9 @@
 (function () {
   "use strict";
 
+  /** Тимчасово: приховати вкладку «Мапа» в навігації (екран, API, showMap — без змін). */
+  var MAP_TAB_UI_ENABLED = false;
+
   var Tg = window.Telegram && window.Telegram.WebApp;
   var initData = "";
   
@@ -71,7 +74,7 @@
     return s;
   }
 
-  /** Нормалізація для пошуку НП: NFC, uk lower, латиниця/рос. «и» → кириличні відповідники. */
+  /** Нормалізація для пошуку НП: NFC, uk lower, латинські homoglyphs → кирилиця (без и→і). */
   function normalizeSettlementSearchText(value) {
     if (!value) return "";
     var s = String(value).trim().normalize("NFC");
@@ -88,8 +91,7 @@
       .replace(/C/g, "\u0421").replace(/c/g, "\u0441")
       .replace(/T/g, "\u0422").replace(/t/g, "\u0442")
       .replace(/X/g, "\u0425").replace(/x/g, "\u0445")
-      .replace(/Y/g, "\u0423").replace(/y/g, "\u0443")
-      .replace(/\u0418/g, "\u0406").replace(/\u0438/g, "\u0456");
+      .replace(/Y/g, "\u0423").replace(/y/g, "\u0443");
     try {
       return s.toLocaleLowerCase("uk");
     } catch (e) {
@@ -101,11 +103,17 @@
     return normalizeSettlementSearchText(stripSettlementPopulationLabel(raw || ""));
   }
 
+  function settlementSearchQueryForApi(raw) {
+    var parsed = parseSettlementFilterLabel(raw || "");
+    return settlementSearchQueryFromInput(parsed.name || raw || "");
+  }
+
   function matchesSettlementOption(label, query, meta) {
     if (!query) return true;
     var parts = [];
     if (label) parts.push(stripSettlementPopulationLabel(String(label)));
     if (meta) {
+      if (meta.search_text) parts.push(String(meta.search_text));
       if (meta.name) parts.push(String(meta.name));
       if (meta.label) parts.push(stripSettlementPopulationLabel(String(meta.label)));
       var aliases = meta.search_aliases;
@@ -119,17 +127,55 @@
     return false;
   }
 
+  function buildSettlementOptionSearchText(meta, label) {
+    var chunks = [];
+    if (label) chunks.push(stripSettlementPopulationLabel(String(label)));
+    if (meta) {
+      if (meta.name) chunks.push(String(meta.name));
+      if (meta.label) chunks.push(stripSettlementPopulationLabel(String(meta.label)));
+      var aliases = meta.search_aliases;
+      if (aliases && aliases.length) {
+        for (var i = 0; i < aliases.length; i++) chunks.push(String(aliases[i]));
+      }
+    }
+    return chunks.map(function (c) { return normalizeSettlementSearchText(c); }).filter(Boolean).join(" ");
+  }
+
   function parseSettlementFilterLabel(label) {
     var name = stripSettlementPopulationLabel(label);
     var regionShort = null;
     var raw = String(label || "").trim();
     var popIdx = raw.lastIndexOf(" (");
     if (popIdx > 0 && raw.indexOf("ос.", popIdx) !== -1) raw = raw.slice(0, popIdx).trim();
-    if (raw.indexOf(" · ") !== -1) {
+    if (raw.indexOf(", ") !== -1) {
+      var commaParts = raw.split(", ");
+      name = commaParts.slice(0, -1).join(", ").trim() || name;
+      regionShort = commaParts[commaParts.length - 1].trim() || null;
+    } else if (raw.indexOf(" · ") !== -1) {
       var parts = raw.split(" · ");
       regionShort = parts[parts.length - 1].trim() || null;
     }
     return { name: name, regionShort: regionShort };
+  }
+
+  function formatSettlementPickerLabel(name, region) {
+    var n = stripSettlementPopulationLabel(name || "");
+    if (!region) return n;
+    var short = String(region).trim().replace(/\s+область$/i, "").trim();
+    if (!short) return n;
+    if (!/обл\.?$/i.test(short) && short.toLowerCase().indexOf("область") === -1) {
+      short = short + " обл.";
+    }
+    return n + ", " + short;
+  }
+
+  function settlementPickerDisplayValue(item) {
+    if (!item) return "";
+    if (item.settlementLabel) return String(item.settlementLabel);
+    if (item.value && item.geoRegion) {
+      return formatSettlementPickerLabel(item.value, item.geoRegion);
+    }
+    return item.value != null ? String(item.value) : "";
   }
 
   /** Один НП на ключ: «ЛЮБЕШІВ», «Любешів», «смт Любешів» → «Любешів». */
@@ -142,7 +188,7 @@
       var text = stripSettlementPopulationLabel(String(raw).trim());
       var stripped = text.replace(prefixRe, "").trim();
       if (!stripped) return;
-      var key = stripped.toLowerCase();
+      var key = normalizeSettlementSearchText(stripped) || stripped.toLowerCase();
       var display = stripped;
       if (display === display.toUpperCase() && display.length > 1) {
         display = display.charAt(0) + display.slice(1).toLowerCase();
@@ -864,7 +910,7 @@
 
   function show(id) {
     currentScreen = id || "screen-home";
-    ["screen-loading", "screen-error", "screen-home", "screen-admin", "screen-files", "screen-search", "screen-detail"].forEach(function (sid) {
+    ["screen-loading", "screen-error", "screen-home", "screen-admin", "screen-files", "screen-search", "screen-map", "screen-detail"].forEach(function (sid) {
       var el = document.getElementById(sid);
       if (el) {
         if (sid === id) {
@@ -874,8 +920,8 @@
         }
       }
     });
-    // Модалка фільтрів лише для екрану пошуку — при переході на інший екран закриваємо її
-    if (id !== "screen-search") {
+    // Модалка фільтрів для пошуку та мапи — на інших екранах закриваємо
+    if (id !== "screen-search" && id !== "screen-map") {
       var filterModal = document.getElementById("filter-builder-modal");
       if (filterModal) filterModal.classList.add("hidden");
     }
@@ -917,7 +963,20 @@
         showSearch(); 
       });
       nav.appendChild(aSearch);
-      
+
+      if (MAP_TAB_UI_ENABLED) {
+        var aMap = document.createElement("a");
+        aMap.href = "#";
+        aMap.textContent = "Мапа";
+        aMap.classList.add("secondary");
+        aMap.setAttribute("data-screen", "screen-map");
+        aMap.addEventListener("click", function (e) {
+          e.preventDefault();
+          showMap();
+        });
+        nav.appendChild(aMap);
+      }
+
       var a1 = document.createElement("a");
       a1.href = "#";
       a1.textContent = "AI-асистент";
@@ -3751,7 +3810,7 @@
       .then(function (data) {
         console.log("Received data:", data);
         if (loadingEl) loadingEl.classList.add("hidden");
-        renderSearchResults(data.items || [], data.total || 0);
+        renderSearchResults(data.items || [], data.total || 0, data.geo_search_hint);
       })
       .catch(function (err) {
         console.error("Search error:", err);
@@ -3799,7 +3858,165 @@
     return rawTitle;
   }
 
-  function renderSearchResults(items, total) {
+  function buildSearchItemCard(item, opts) {
+    opts = opts || {};
+    var card = document.createElement("div");
+    card.className = "search-item-card";
+
+    var headerRow = document.createElement("div");
+    headerRow.className = "search-item-header-row";
+    var title = document.createElement("div");
+    title.className = "search-item-title";
+    title.textContent = fixTitlePriceDisplay(item.title || "", item.price_usd) || "Без назви";
+    headerRow.appendChild(title);
+    if (item.source) {
+      var sourceBadge = document.createElement("span");
+      sourceBadge.className = "search-item-source-badge search-item-source-" + item.source;
+      sourceBadge.textContent = item.source === "olx" ? "OLX" : "ProZorro";
+      headerRow.appendChild(sourceBadge);
+    }
+    card.appendChild(headerRow);
+
+    var details = document.createElement("div");
+    details.className = "search-item-details";
+
+    var badgeToShow = (SHOW_ANALYTICS_UI && item.price_indicator) ? item.price_indicator : (item.price_notes || null);
+    var badgeSource = item.price_indicator_source || null;
+    var mainMetric = (item.price_per_m2_uah && item.price_per_m2_uah > 0) ? "m2" : (item.price_per_ha_uah && item.price_per_ha_uah > 0) ? "ha" : "price";
+    var indLabels = { "вигідна": "✓ Вигідна", "нижче середньої": "↓ Нижче середньої", "середня": "— Середня", "вище середньої": "↑ Вище середньої", "дорога": "↑ Дорога", "аномально низька": "⚠ Аномально низька", "аномально висока": "⚠ Аномально висока" };
+    function formatBadgeText(ind, src) {
+      var base = indLabels[ind] || ind;
+      if (src === "city") return base + " (місто)";
+      if (src === "region") return base + " (область)";
+      return base;
+    }
+    function addPriceRow(container, label, text, isMain) {
+      var wrap = document.createElement("div");
+      wrap.className = "search-item-price-row";
+      var priceEl = document.createElement("span");
+      priceEl.className = "search-item-price";
+      priceEl.textContent = label + text;
+      wrap.appendChild(priceEl);
+      if (badgeToShow && isMain) {
+        var badge = document.createElement("span");
+        var isIndicator = indLabels.hasOwnProperty(badgeToShow);
+        var indicatorClass = (badgeToShow || "").replace(/\s+/g, "-");
+        badge.className = "search-item-price-indicator search-item-price-" + (isIndicator ? indicatorClass : "anomalous");
+        badge.textContent = formatBadgeText(badgeToShow, badgeSource);
+        wrap.appendChild(badge);
+      }
+      container.appendChild(wrap);
+    }
+
+    if (item.price !== null && item.price !== undefined) {
+      var baseText = item.price_text || formatPrice(item.price) + " ₴";
+      if (item.price_usd !== null && item.price_usd !== undefined) {
+        baseText += " (~" + formatPrice(item.price_usd) + " $)";
+      }
+      addPriceRow(details, "Ціна: ", baseText, mainMetric === "price");
+    }
+    if (item.price_per_m2_uah !== null && item.price_per_m2_uah !== undefined) {
+      var textPpm2 = formatPrice(item.price_per_m2_uah) + " ₴/м²";
+      if (item.price_per_m2_usd !== null && item.price_per_m2_usd !== undefined) {
+        textPpm2 += " (" + formatPrice(item.price_per_m2_usd) + " $/м²)";
+      }
+      addPriceRow(details, "Ціна за м²: ", textPpm2, mainMetric === "m2");
+    }
+    if (item.price_per_ha_uah !== null && item.price_per_ha_uah !== undefined) {
+      var pricePerSotka = item.price_per_ha_uah / 100;
+      var textPpha = formatPrice(pricePerSotka) + " ₴/с";
+      if (item.price_per_ha_usd !== null && item.price_per_ha_usd !== undefined) {
+        textPpha += " (" + formatPrice(item.price_per_ha_usd / 100) + " $/с)";
+      }
+      addPriceRow(details, "Ціна за сотку: ", textPpha, mainMetric === "ha");
+    }
+
+    var location = [];
+    if (item.city) location.push(item.city);
+    if (item.region) location.push(item.region);
+    if (location.length === 0 && item.location) location.push(item.location);
+    if (location.length > 0) {
+      var loc = document.createElement("div");
+      loc.className = "search-item-location";
+      loc.textContent = "📍 " + location.join(", ");
+      details.appendChild(loc);
+    }
+
+    var areaVal = item.area_m2 || item.building_area_sqm;
+    var landSotky = item.land_area_sotky != null ? item.land_area_sotky : (item.land_area_sqm != null ? item.land_area_sqm / 100 : null);
+    if (areaVal) {
+      var area = document.createElement("div");
+      area.className = "search-item-area";
+      area.textContent = "Площа: " + areaVal + " м²";
+      details.appendChild(area);
+    }
+    if (landSotky) {
+      var land = document.createElement("div");
+      land.className = "search-item-area";
+      land.textContent = "Земля: " + (Number(landSotky) === landSotky ? landSotky.toFixed(1) : landSotky) + " с";
+      details.appendChild(land);
+    }
+    if (item.floor !== null && item.floor !== undefined && item.floor !== "") {
+      var floorEl = document.createElement("div");
+      floorEl.className = "search-item-floor";
+      floorEl.textContent = "Поверх: " + item.floor;
+      details.appendChild(floorEl);
+    }
+    if (item.tags && item.tags.length > 0) {
+      var tagsWrap = document.createElement("div");
+      tagsWrap.className = "search-item-tags";
+      tagsWrap.textContent = "Теги: " + item.tags.join(", ");
+      details.appendChild(tagsWrap);
+    }
+    if (item.status) {
+      var status = document.createElement("div");
+      status.className = "search-item-status";
+      status.textContent = "Статус: " + item.status;
+      details.appendChild(status);
+    }
+    var dateStr = item.updated_at || item.last_updated || item.date_modified || item.date_created;
+    if (dateStr) {
+      var dateEl = document.createElement("div");
+      dateEl.className = "search-item-date";
+      dateEl.textContent = "🕒 Оновлено: " + formatDate(dateStr);
+      details.appendChild(dateEl);
+    }
+    if (item.related_objects_count != null && item.related_objects_count > 0) {
+      var relEl = document.createElement("div");
+      relEl.className = "search-item-related";
+      relEl.textContent = "Пов'язаних об'єктів: " + item.related_objects_count;
+      details.appendChild(relEl);
+    }
+
+    card.appendChild(details);
+    card.addEventListener("click", function () {
+      if (typeof opts.onCardClick === "function") {
+        opts.onCardClick(item);
+        return;
+      }
+      var detailSource = item.source || "olx";
+      var detailId = item.source_id || item.id || item.url || item.auction_id;
+      var searchScreen = document.getElementById("screen-search");
+      if (searchScreen) searchState.searchScrollTop = searchScreen.scrollTop;
+      searchState.lastDetailSource = detailSource;
+      showDetail(detailSource, detailId);
+    });
+    return card;
+  }
+
+  function renderListingCards(items, containerEl, opts) {
+    if (!containerEl) return;
+    containerEl.innerHTML = "";
+    if (!items || items.length === 0) {
+      containerEl.innerHTML = "<div class='no-results'>Нічого не знайдено</div>";
+      return;
+    }
+    items.forEach(function (item) {
+      containerEl.appendChild(buildSearchItemCard(item, opts || {}));
+    });
+  }
+
+  function renderSearchResults(items, total, geoSearchHint) {
     var itemsEl = document.getElementById("search-items");
     var paginationEl = document.getElementById("search-pagination");
     var countEl = document.getElementById("search-results-count");
@@ -3818,160 +4035,15 @@
     }
     
     if (items.length === 0) {
-      itemsEl.innerHTML = "<div class='no-results'>Нічого не знайдено</div>";
+      var emptyMsg = geoSearchHint
+        ? String(geoSearchHint)
+        : "Нічого не знайдено";
+      itemsEl.innerHTML = "<div class='no-results'>" + escapeHtml(emptyMsg) + "</div>";
       if (paginationEl) paginationEl.innerHTML = "";
       return;
     }
     
-    itemsEl.innerHTML = "";
-    items.forEach(function (item) {
-      var card = document.createElement("div");
-      card.className = "search-item-card";
-      
-      var headerRow = document.createElement("div");
-      headerRow.className = "search-item-header-row";
-      var title = document.createElement("div");
-      title.className = "search-item-title";
-      title.textContent = fixTitlePriceDisplay(item.title || "", item.price_usd) || "Без назви";
-      headerRow.appendChild(title);
-      if (item.source) {
-        var sourceBadge = document.createElement("span");
-        sourceBadge.className = "search-item-source-badge search-item-source-" + item.source;
-        sourceBadge.textContent = item.source === "olx" ? "OLX" : "ProZorro";
-        headerRow.appendChild(sourceBadge);
-      }
-      card.appendChild(headerRow);
-      
-      var details = document.createElement("div");
-      details.className = "search-item-details";
-      
-      var badgeToShow = (SHOW_ANALYTICS_UI && item.price_indicator) ? item.price_indicator : (item.price_notes || null);
-      var badgeSource = item.price_indicator_source || null;
-      var mainMetric = (item.price_per_m2_uah && item.price_per_m2_uah > 0) ? "m2" : (item.price_per_ha_uah && item.price_per_ha_uah > 0) ? "ha" : "price";
-      var indLabels = { "вигідна": "✓ Вигідна", "нижче середньої": "↓ Нижче середньої", "середня": "— Середня", "вище середньої": "↑ Вище середньої", "дорога": "↑ Дорога", "аномально низька": "⚠ Аномально низька", "аномально висока": "⚠ Аномально висока" };
-      function formatBadgeText(ind, src) {
-        var base = indLabels[ind] || ind;
-        if (src === "city") return base + " (місто)";
-        if (src === "region") return base + " (область)";
-        return base;
-      }
-      function addPriceRow(container, label, text, isMain) {
-        var wrap = document.createElement("div");
-        wrap.className = "search-item-price-row";
-        var priceEl = document.createElement("span");
-        priceEl.className = "search-item-price";
-        priceEl.textContent = label + text;
-        wrap.appendChild(priceEl);
-        if (badgeToShow && isMain) {
-          var badge = document.createElement("span");
-          var isIndicator = indLabels.hasOwnProperty(badgeToShow);
-          var indicatorClass = (badgeToShow || "").replace(/\s+/g, "-");
-          badge.className = "search-item-price-indicator search-item-price-" + (isIndicator ? indicatorClass : "anomalous");
-          badge.textContent = formatBadgeText(badgeToShow, badgeSource);
-          wrap.appendChild(badge);
-        }
-        container.appendChild(wrap);
-      }
-
-      if (item.price !== null && item.price !== undefined) {
-        var baseText = item.price_text || formatPrice(item.price) + " ₴";
-        if (item.price_usd !== null && item.price_usd !== undefined) {
-          baseText += " (~" + formatPrice(item.price_usd) + " $)";
-        }
-        addPriceRow(details, "Ціна: ", baseText, mainMetric === "price");
-      }
-
-      if (item.price_per_m2_uah !== null && item.price_per_m2_uah !== undefined) {
-        var textPpm2 = formatPrice(item.price_per_m2_uah) + " ₴/м²";
-        if (item.price_per_m2_usd !== null && item.price_per_m2_usd !== undefined) {
-          textPpm2 += " (" + formatPrice(item.price_per_m2_usd) + " $/м²)";
-        }
-        addPriceRow(details, "Ціна за м²: ", textPpm2, mainMetric === "m2");
-      }
-
-      if (item.price_per_ha_uah !== null && item.price_per_ha_uah !== undefined) {
-        var pricePerSotka = item.price_per_ha_uah / 100;
-        var textPpha = formatPrice(pricePerSotka) + " ₴/с";
-        if (item.price_per_ha_usd !== null && item.price_per_ha_usd !== undefined) {
-          textPpha += " (" + formatPrice(item.price_per_ha_usd / 100) + " $/с)";
-        }
-        addPriceRow(details, "Ціна за сотку: ", textPpha, mainMetric === "ha");
-      }
-      
-      var location = [];
-      if (item.city) location.push(item.city);
-      if (item.region) location.push(item.region);
-      if (location.length === 0 && item.location) location.push(item.location);
-      
-      if (location.length > 0) {
-        var loc = document.createElement("div");
-        loc.className = "search-item-location";
-        loc.textContent = "📍 " + location.join(", ");
-        details.appendChild(loc);
-      }
-      
-      var areaVal = item.area_m2 || item.building_area_sqm;
-      var landSotky = item.land_area_sotky != null ? item.land_area_sotky : (item.land_area_sqm != null ? item.land_area_sqm / 100 : null);
-      if (areaVal) {
-        var area = document.createElement("div");
-        area.className = "search-item-area";
-        area.textContent = "Площа: " + areaVal + " м²";
-        details.appendChild(area);
-      }
-      if (landSotky) {
-        var land = document.createElement("div");
-        land.className = "search-item-area";
-        land.textContent = "Земля: " + (Number(landSotky) === landSotky ? landSotky.toFixed(1) : landSotky) + " с";
-        details.appendChild(land);
-      }
-      if (item.floor !== null && item.floor !== undefined && item.floor !== "") {
-        var floorEl = document.createElement("div");
-        floorEl.className = "search-item-floor";
-        floorEl.textContent = "Поверх: " + item.floor;
-        details.appendChild(floorEl);
-      }
-      if (item.tags && item.tags.length > 0) {
-        var tagsWrap = document.createElement("div");
-        tagsWrap.className = "search-item-tags";
-        var tagsText = item.tags.join(", ");
-        tagsWrap.textContent = "Теги: " + tagsText;
-        details.appendChild(tagsWrap);
-      }
-      if (item.status) {
-        var status = document.createElement("div");
-        status.className = "search-item-status";
-        status.textContent = "Статус: " + item.status;
-        details.appendChild(status);
-      }
-      
-      // Додаємо дату оновлення
-      var dateStr = item.updated_at || item.last_updated || item.date_modified || item.date_created;
-      if (dateStr) {
-        var dateEl = document.createElement("div");
-        dateEl.className = "search-item-date";
-        dateEl.textContent = "🕒 Оновлено: " + formatDate(dateStr);
-        details.appendChild(dateEl);
-      }
-      if (item.related_objects_count != null && item.related_objects_count > 0) {
-        var relEl = document.createElement("div");
-        relEl.className = "search-item-related";
-        relEl.textContent = "Пов'язаних об'єктів: " + item.related_objects_count;
-        details.appendChild(relEl);
-      }
-      
-      card.appendChild(details);
-      
-      card.addEventListener("click", function () {
-        var detailSource = item.source || "olx";
-        var detailId = item.source_id || item.id || item.url || item.auction_id;
-        var searchScreen = document.getElementById("screen-search");
-        if (searchScreen) searchState.searchScrollTop = searchScreen.scrollTop;
-        searchState.lastDetailSource = detailSource;
-        showDetail(detailSource, detailId);
-      });
-      
-      itemsEl.appendChild(card);
-    });
+    renderListingCards(items, itemsEl);
     
     // Пагінація (20 оголошень на сторінку)
     if (paginationEl) paginationEl.innerHTML = "";
@@ -4018,6 +4090,566 @@
           searchState.searchScrollTop = undefined;
         });
       }
+    }
+  }
+
+  // --- Map tab ---
+  var mapState = {
+    mapInstance: null,
+    markerClusterer: null,
+    mapMarkers: [],
+    mapIdleTimer: null,
+    mapsApiKey: null,
+    clusterFilterListingIds: null,
+    lastItems: [],
+    initialized: false,
+    returnToMapAfterDetail: false,
+    sortField: "source_updated_at",
+    sortOrder: "desc",
+    loadMode: "filter",
+    suppressIdle: false,
+    fetchAbort: null,
+    appliedFilterString: null,
+    mapReady: false,
+    lastViewportKey: null,
+    itemsById: {}
+  };
+
+  var MAP_UA_CENTER = { lat: 49.0, lng: 31.5 };
+  var MAP_DEFAULT_ZOOM = 6;
+
+  function updateMapFilterSummary() {
+    var el = document.getElementById("map-filter-summary-text");
+    var ta = document.getElementById("map-filter-string");
+    if (!el) return;
+    var text = (ta && ta.value) ? ta.value.trim() : "";
+    el.textContent = text ? (text.length > 80 ? text.slice(0, 80) + "…" : text) : "Рядок відборів не задано";
+  }
+
+  function syncMapFilterFromSearch() {
+    var searchTa = document.getElementById("filter-string");
+    var mapTa = document.getElementById("map-filter-string");
+    if (searchTa && mapTa && !mapTa.value.trim() && searchTa.value.trim()) {
+      mapTa.value = searchTa.value;
+    }
+    updateMapFilterSummary();
+  }
+
+  function loadScriptOnce(src, flagKey) {
+    return new Promise(function (resolve, reject) {
+      if (flagKey === "maps" && window.google && window.google.maps) {
+        resolve();
+        return;
+      }
+      if (flagKey === "clusterer" && window.markerClusterer && window.markerClusterer.MarkerClusterer) {
+        resolve();
+        return;
+      }
+      var existing = document.querySelector('script[data-map-loader="' + flagKey + '"]');
+      if (existing) {
+        existing.addEventListener("load", function () { resolve(); });
+        existing.addEventListener("error", reject);
+        return;
+      }
+      var s = document.createElement("script");
+      s.src = src;
+      s.async = true;
+      s.setAttribute("data-map-loader", flagKey);
+      s.onload = function () { resolve(); };
+      s.onerror = reject;
+      document.head.appendChild(s);
+    });
+  }
+
+  function ensureGoogleMapsJs(apiKey) {
+    return new Promise(function (resolve, reject) {
+      if (window.google && window.google.maps && typeof window.google.maps.Map === "function") {
+        resolve();
+        return;
+      }
+      var existing = document.querySelector('script[data-map-loader="maps-callback"]');
+      if (existing) {
+        existing.addEventListener("load", function () {
+          if (window.google && window.google.maps) resolve();
+          else reject(new Error("Google Maps API не ініціалізувався"));
+        });
+        existing.addEventListener("error", function () { reject(new Error("Помилка завантаження скрипта Maps")); });
+        return;
+      }
+      var callbackName = "__pazuzuGoogleMapsReady";
+      window[callbackName] = function () {
+        try { delete window[callbackName]; } catch (e) { window[callbackName] = undefined; }
+        if (window.google && window.google.maps) resolve();
+        else reject(new Error("Google Maps API не ініціалізувався"));
+      };
+      var s = document.createElement("script");
+      s.src = "https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(apiKey) + "&callback=" + callbackName;
+      s.async = true;
+      s.defer = true;
+      s.setAttribute("data-map-loader", "maps-callback");
+      s.onerror = function () {
+        try { delete window[callbackName]; } catch (e) { window[callbackName] = undefined; }
+        reject(new Error("Помилка завантаження скрипта Maps"));
+      };
+      document.head.appendChild(s);
+    });
+  }
+
+  function ensureMapScripts(apiKey) {
+    return ensureGoogleMapsJs(apiKey);
+  }
+
+  function getMapsApiKeyFromBootstrap() {
+    if (window.__PAZUZU_MAPS_API_KEY) return window.__PAZUZU_MAPS_API_KEY;
+    if (currentUser && currentUser.maps_api_key) return currentUser.maps_api_key;
+    if (mapState.mapsApiKey) return mapState.mapsApiKey;
+    return null;
+  }
+
+  function startMapWithApiKey(apiKey) {
+    mapState.mapsApiKey = apiKey;
+    var canvas = document.getElementById("map-canvas");
+    var errBox = document.getElementById("map-canvas-error");
+    if (!apiKey) {
+      showMapCanvasError("GOOGLE_MAPS_API_KEY не налаштовано. Додайте ключ у config.yaml / GOOGLE_MAPS_API_KEY і увімкніть Maps JavaScript API у GCP.");
+      return Promise.resolve();
+    }
+    if (canvas) canvas.style.visibility = "visible";
+    if (errBox) errBox.classList.add("hidden");
+    return ensureMapScripts(apiKey).then(function () {
+      initGoogleMapInstance();
+    }).catch(function (err) {
+      showMapCanvasError("Не вдалося завантажити Google Maps: " + (err.message || "перевірте Maps JavaScript API"));
+    });
+  }
+
+  function createMapMarkerIcon(source) {
+    var isOlx = (source || "").toLowerCase() === "olx";
+    return {
+      path: google.maps.SymbolPath.CIRCLE,
+      fillColor: isOlx ? "#FFEB3B" : "#1976D2",
+      fillOpacity: 1,
+      strokeColor: isOlx ? "#000000" : "#FFFFFF",
+      strokeWeight: 1,
+      scale: 14
+    };
+  }
+
+  function createClusterMapMarker(point) {
+    var src = (point.source || "").toLowerCase();
+    var isOlx = src === "olx";
+    var count = point.count || 0;
+    var scale = 18 + Math.min(14, Math.round(Math.log(count + 1) * 6));
+    var m = new google.maps.Marker({
+      position: { lat: point.lat, lng: point.lng },
+      label: {
+        text: String(count),
+        color: isOlx ? "#000000" : "#FFFFFF",
+        fontSize: "11px",
+        fontWeight: "bold"
+      },
+      icon: {
+        path: google.maps.SymbolPath.CIRCLE,
+        fillColor: isOlx ? "#FFEB3B" : "#1976D2",
+        fillOpacity: 0.92,
+        strokeColor: isOlx ? "#000000" : "#FFFFFF",
+        strokeWeight: 2,
+        scale: scale
+      },
+      title: count + " оголошень",
+      zIndex: 1000 + count
+    });
+    m.__mapMeta = point;
+    m.addListener("click", function () {
+      var meta = m.__mapMeta || {};
+      var ids = {};
+      (meta.listing_ids || []).forEach(function (lid) { ids[lid] = true; });
+      mapState.clusterFilterListingIds = ids;
+      var filtered = (mapState.lastItems || []).filter(function (it) {
+        var lid = it.id != null ? String(it.id) : (it.source + ":" + it.source_id);
+        return ids[lid];
+      });
+      renderMapListings(filtered, filtered.length, true);
+    });
+    return m;
+  }
+
+  function createGoogleMapMarker(markerData) {
+    var src = (markerData.source || "").toLowerCase();
+    var labelText = markerData.label || (src === "olx" ? "OLX" : "Przr");
+    var m = new google.maps.Marker({
+      position: { lat: markerData.lat, lng: markerData.lng },
+      label: {
+        text: labelText,
+        color: src === "olx" ? "#000000" : "#FFFFFF",
+        fontSize: "10px",
+        fontWeight: "bold"
+      },
+      icon: createMapMarkerIcon(src),
+      title: labelText
+    });
+    m.__mapMeta = markerData;
+    m.addListener("click", function () {
+      var meta = m.__mapMeta || {};
+      if (meta.source && meta.source_id) {
+        mapState.returnToMapAfterDetail = true;
+        showDetail(meta.source, meta.source_id);
+      }
+    });
+    return m;
+  }
+
+  function clearMapMarkers() {
+    mapState.mapMarkers.forEach(function (m) {
+      if (m && m.setMap) m.setMap(null);
+    });
+    mapState.mapMarkers = [];
+    mapState.markerClusterer = null;
+  }
+
+  function renderMapPoints(mapPoints) {
+    if (!mapState.mapInstance || !window.google || !window.google.maps) return;
+    clearMapMarkers();
+    if (!mapPoints || !mapPoints.length) return;
+
+    mapPoints.forEach(function (pt) {
+      var gm;
+      if (pt.type === "cluster") {
+        gm = createClusterMapMarker(pt);
+      } else {
+        gm = createGoogleMapMarker(pt);
+      }
+      gm.setMap(mapState.mapInstance);
+      mapState.mapMarkers.push(gm);
+    });
+  }
+
+  function indexMapItems(items) {
+    var byId = {};
+    (items || []).forEach(function (it) {
+      var lid = it.id != null ? String(it.id) : (it.source + ":" + it.source_id);
+      byId[lid] = it;
+    });
+    mapState.itemsById = byId;
+  }
+
+  function getMapZoom() {
+    if (!mapState.mapInstance) return MAP_DEFAULT_ZOOM;
+    var z = mapState.mapInstance.getZoom();
+    return typeof z === "number" ? z : MAP_DEFAULT_ZOOM;
+  }
+
+  function viewportRequestKey(bbox, zoom) {
+    if (!bbox) return "";
+    return [
+      zoom,
+      bbox.sw_lat.toFixed(4),
+      bbox.sw_lng.toFixed(4),
+      bbox.ne_lat.toFixed(4),
+      bbox.ne_lng.toFixed(4),
+      getMapFilterString()
+    ].join("|");
+  }
+
+  function renderMapListings(items, totalInViewport, isClusterSubset) {
+    var itemsEl = document.getElementById("map-items");
+    var countEl = document.getElementById("map-results-count");
+    if (!itemsEl) return;
+    if (countEl) {
+      var txt = isClusterSubset
+        ? ("У кластері: " + (items ? items.length : 0) + " " + pluralizeListings(items ? items.length : 0))
+        : ("У видимій області: " + (totalInViewport != null ? totalInViewport : (items ? items.length : 0)) + " " + pluralizeListings(totalInViewport != null ? totalInViewport : (items ? items.length : 0)));
+      countEl.textContent = txt;
+      countEl.classList.remove("hidden");
+    }
+    renderListingCards(items || [], itemsEl, {
+      onCardClick: function (item) {
+        mapState.returnToMapAfterDetail = true;
+        showDetail(item.source || "olx", item.source_id || item.id);
+      }
+    });
+  }
+
+  function getMapBboxFromBounds(bounds) {
+    if (!bounds) return null;
+    var ne = bounds.getNorthEast();
+    var sw = bounds.getSouthWest();
+    return {
+      sw_lat: sw.lat(),
+      sw_lng: sw.lng(),
+      ne_lat: ne.lat(),
+      ne_lng: ne.lng()
+    };
+  }
+
+  function getMapFilterString() {
+    var filterTa = document.getElementById("map-filter-string");
+    return (filterTa && filterTa.value) ? filterTa.value.trim() : "";
+  }
+
+  function abortMapFetch() {
+    if (mapState.fetchAbort) {
+      mapState.fetchAbort.abort();
+      mapState.fetchAbort = null;
+    }
+  }
+
+  function mapFetchQuery(body) {
+    abortMapFetch();
+    mapState.fetchAbort = new AbortController();
+    return fetch("/api/map/query", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, apiHeaders()),
+      body: JSON.stringify(body),
+      signal: mapState.fetchAbort.signal
+    }).then(function (r) {
+      if (!r.ok) {
+        return r.json().then(function (d) { throw new Error(d.detail || r.statusText); });
+      }
+      return r.json();
+    });
+  }
+
+  function fitMapToBounds(boundsObj) {
+    if (!mapState.mapInstance || !boundsObj) return;
+    var b = new google.maps.LatLngBounds(
+      { lat: boundsObj.sw_lat, lng: boundsObj.sw_lng },
+      { lat: boundsObj.ne_lat, lng: boundsObj.ne_lng }
+    );
+    mapState.suppressIdle = true;
+    mapState.mapInstance.fitBounds(b, 48);
+    google.maps.event.addListenerOnce(mapState.mapInstance, "idle", function () {
+      mapState.suppressIdle = false;
+      mapState.loadMode = "viewport";
+    });
+  }
+
+  function fitMapToMarkers(markers) {
+    if (!mapState.mapInstance || !markers || !markers.length) return;
+    var b = new google.maps.LatLngBounds();
+    markers.forEach(function (m) {
+      b.extend({ lat: m.lat, lng: m.lng });
+    });
+    mapState.suppressIdle = true;
+    mapState.mapInstance.fitBounds(b, 48);
+    google.maps.event.addListenerOnce(mapState.mapInstance, "idle", function () {
+      mapState.suppressIdle = false;
+      mapState.loadMode = "viewport";
+    });
+  }
+
+  function applyMapQueryResponse(data, options) {
+    options = options || {};
+    mapState.lastItems = data.items || [];
+    indexMapItems(mapState.lastItems);
+    var points = data.map_points || data.markers || [];
+    renderMapPoints(points);
+    renderMapListings(
+      mapState.lastItems,
+      data.total_in_viewport,
+      !!options.isClusterSubset
+    );
+    updateMapFilterSummary();
+    if (options.fitBounds && data.bounds) {
+      fitMapToBounds(data.bounds);
+    } else if (options.fitBounds && data.markers && data.markers.length) {
+      fitMapToMarkers(data.markers);
+    } else if (options.fitBounds) {
+      mapState.loadMode = "viewport";
+    }
+  }
+
+  /** Зміна фільтрів: усі маркери за фільтром + центрування карти. */
+  function loadMapForFilter() {
+    if (!mapState.mapInstance) return;
+    var filterString = getMapFilterString();
+    mapState.appliedFilterString = filterString;
+    mapState.loadMode = "filter";
+    mapState.clusterFilterListingIds = null;
+    mapState.lastViewportKey = null;
+
+    var loadingEl = document.getElementById("map-loading");
+    var errEl = document.getElementById("map-filter-string-error");
+    if (loadingEl) loadingEl.classList.remove("hidden");
+    if (errEl) { errEl.textContent = ""; errEl.classList.add("hidden"); }
+
+    mapFetchQuery({
+      mode: "filter",
+      filter_string: filterString,
+      zoom: getMapZoom(),
+      sort_field: mapState.sortField,
+      sort_order: mapState.sortOrder,
+      limit: 500
+    })
+      .then(function (data) {
+        if (loadingEl) loadingEl.classList.add("hidden");
+        applyMapQueryResponse(data, { fitBounds: true });
+      })
+      .catch(function (err) {
+        if (err && err.name === "AbortError") return;
+        if (loadingEl) loadingEl.classList.add("hidden");
+        var itemsEl = document.getElementById("map-items");
+        if (itemsEl) itemsEl.innerHTML = "<div class='error'>Помилка: " + (err.message || "Не вдалося завантажити") + "</div>";
+        if (errEl) {
+          errEl.textContent = err.message || "Помилка запиту";
+          errEl.classList.remove("hidden");
+        }
+      });
+  }
+
+  /** Pan/zoom: лише видима зона, карту не рухаємо. */
+  function loadMapViewport() {
+    if (!mapState.mapInstance || mapState.suppressIdle) return;
+    var bounds = mapState.mapInstance.getBounds();
+    if (!bounds) return;
+    var bbox = getMapBboxFromBounds(bounds);
+    if (!bbox) return;
+    var zoom = getMapZoom();
+    var vkey = viewportRequestKey(bbox, zoom);
+    if (vkey && vkey === mapState.lastViewportKey) return;
+    mapState.lastViewportKey = vkey;
+
+    var loadingEl = document.getElementById("map-loading");
+    var errEl = document.getElementById("map-filter-string-error");
+    if (loadingEl) loadingEl.classList.remove("hidden");
+
+    mapFetchQuery({
+      mode: "viewport",
+      filter_string: getMapFilterString(),
+      bbox: bbox,
+      zoom: zoom,
+      sort_field: mapState.sortField,
+      sort_order: mapState.sortOrder,
+      limit: 200
+    })
+      .then(function (data) {
+        if (loadingEl) loadingEl.classList.add("hidden");
+        if (mapState.clusterFilterListingIds) return;
+        applyMapQueryResponse(data, { fitBounds: false });
+      })
+      .catch(function (err) {
+        if (err && err.name === "AbortError") return;
+        if (loadingEl) loadingEl.classList.add("hidden");
+        if (errEl) {
+          errEl.textContent = err.message || "Помилка запиту";
+          errEl.classList.remove("hidden");
+        }
+      });
+  }
+
+  function onMapIdle() {
+    if (mapState.suppressIdle) return;
+    if (mapState.loadMode !== "viewport") return;
+    scheduleMapViewportReload();
+  }
+
+  function scheduleMapViewportReload() {
+    if (mapState.mapIdleTimer) clearTimeout(mapState.mapIdleTimer);
+    mapState.mapIdleTimer = setTimeout(function () {
+      mapState.mapIdleTimer = null;
+      loadMapViewport();
+    }, 700);
+  }
+
+  function initGoogleMapInstance() {
+    var canvas = document.getElementById("map-canvas");
+    var errBox = document.getElementById("map-canvas-error");
+    if (!canvas || mapState.mapInstance) return;
+
+    mapState.mapInstance = new google.maps.Map(canvas, {
+      center: MAP_UA_CENTER,
+      zoom: MAP_DEFAULT_ZOOM,
+      mapTypeControl: false,
+      streetViewControl: false,
+      fullscreenControl: true
+    });
+
+    mapState.mapInstance.addListener("idle", onMapIdle);
+    mapState.mapInstance.addListener("dragstart", function () {
+      mapState.loadMode = "viewport";
+      mapState.clusterFilterListingIds = null;
+      mapState.lastViewportKey = null;
+    });
+    mapState.mapInstance.addListener("zoom_changed", function () {
+      mapState.lastViewportKey = null;
+    });
+    mapState.mapReady = true;
+    if (errBox) errBox.classList.add("hidden");
+    loadMapForFilter();
+  }
+
+  function showMapCanvasError(msg) {
+    var errBox = document.getElementById("map-canvas-error");
+    var canvas = document.getElementById("map-canvas");
+    if (errBox) {
+      errBox.textContent = msg;
+      errBox.classList.remove("hidden");
+    }
+    if (canvas) canvas.style.visibility = "hidden";
+  }
+
+  function initMapScreen() {
+    syncMapFilterFromSearch();
+    var bootstrapKey = getMapsApiKeyFromBootstrap();
+    if (bootstrapKey) {
+      return startMapWithApiKey(bootstrapKey);
+    }
+    return fetch("/api/map/config", { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) {
+          return r.json().catch(function () { return {}; }).then(function (d) {
+            throw new Error((d && d.detail) ? String(d.detail) : ("HTTP " + r.status));
+          });
+        }
+        return r.json();
+      })
+      .then(function (data) {
+        window.__PAZUZU_MAPS_API_KEY = data.maps_api_key || null;
+        return startMapWithApiKey(data.maps_api_key);
+      })
+      .catch(function (err) {
+        var hint = (err && err.message) ? err.message : "невідома помилка";
+        if (hint.indexOf("404") !== -1) {
+          hint += ". Перезапустіть mini-app сервер (додано /api/map).";
+        }
+        showMapCanvasError("Не вдалося отримати конфігурацію карти: " + hint);
+      });
+  }
+
+  function showMap() {
+    show("screen-map");
+    syncMapFilterFromSearch();
+    updateMapFilterSummary();
+    if (!mapState.initialized) {
+      mapState.initialized = true;
+      bindMapEvents();
+    }
+    initMapScreen();
+    if (mapState.mapInstance) {
+      google.maps.event.trigger(mapState.mapInstance, "resize");
+      var fs = getMapFilterString();
+      if (fs !== mapState.appliedFilterString) {
+        loadMapForFilter();
+      }
+    }
+  }
+
+  function bindMapEvents() {
+    var runBtn = document.getElementById("map-run-search");
+    var buildBtn = document.getElementById("map-build-filters");
+    var filterTa = document.getElementById("map-filter-string");
+    if (runBtn) {
+      runBtn.addEventListener("click", function () {
+        mapState.clusterFilterListingIds = null;
+        updateMapFilterSummary();
+        loadMapForFilter();
+      });
+    }
+    if (buildBtn) {
+      buildBtn.addEventListener("click", function () { openFilterBuilderModal("map-filter-string"); });
+    }
+    if (filterTa) {
+      filterTa.addEventListener("input", updateMapFilterSummary);
     }
   }
 
@@ -5686,14 +6318,36 @@
           }).join("");
           gs.value = geoTypes.indexOf(geoType) >= 0 ? geoType : geoTypes[0];
           gs.addEventListener("change", function () {
-            item.geoType = gs.value;
-            item.geoRegion = "";
+            var prevType = item.geoType || "region";
+            var nextType = gs.value;
+            var preservedRegion = (item.geoRegion || "").trim()
+              || (prevType === "region" ? String(item.value || "").trim() : "");
+            item.geoType = nextType;
             item.geoCity = "";
-            item.value = "";
             item.population_min = "";
             item.population_max = "";
             item.area_min = "";
             item.area_max = "";
+            if (nextType === "region") {
+              item.geoRegion = preservedRegion;
+              item.value = preservedRegion;
+              item.settlementLabel = "";
+              item.cityId = "";
+            } else if (
+              nextType === "settlement"
+              || nextType === "settlement_population"
+              || nextType === "settlement_area"
+            ) {
+              item.geoRegion = preservedRegion;
+              item.value = "";
+              item.settlementLabel = "";
+              item.cityId = "";
+            } else {
+              item.geoRegion = preservedRegion;
+              item.value = "";
+              item.settlementLabel = "";
+              item.cityId = "";
+            }
             renderFilterTree(container, filterTreeRoot, fields);
           });
           var os = document.createElement("select");
@@ -5736,27 +6390,73 @@
             }
             var allOptions = [];
             var optionByLabel = {};
+            var settlementOptionCache = {};
             var optionsLoading = false;
             var optionsLoadError = false;
             var catalogCount = null;
+            var catalogSize = null;
+            var catalogRawMistaParsed = null;
+            var searchDebounceTimer = null;
+            var remotePending = false;
+            var remoteRequestId = 0;
+            function rememberSettlementOptions(opts) {
+              (opts || []).forEach(function (o) {
+                var lab = o.picker_label || o.label;
+                if (!lab) return;
+                var meta = Object.assign({}, o);
+                meta.search_text = buildSettlementOptionSearchText(meta, lab);
+                settlementOptionCache[lab] = meta;
+              });
+            }
+            function applySettlementSearchOptions(opts) {
+              rememberSettlementOptions(opts);
+              optionByLabel = {};
+              allOptions = [];
+              (opts || []).forEach(function (o) {
+                var lab = o.picker_label || o.label;
+                if (!lab) return;
+                optionByLabel[lab] = settlementOptionCache[lab];
+                allOptions.push(lab);
+              });
+            }
+            function settlementOptionsForQuery(q) {
+              var labels = Object.keys(settlementOptionCache);
+              if (!q) return labels;
+              return labels.filter(function (o) {
+                return matchesSettlementOption(o, q, settlementOptionCache[o]);
+              });
+            }
             function applyOptions(raw, isCities, cityOptions) {
               optionByLabel = {};
               if (isCities && cityOptions && cityOptions.length) {
                 allOptions = cityOptions.map(function (o) {
                   var lab = o.label || o.name;
-                  if (lab) optionByLabel[lab] = o;
+                  if (lab) {
+                    var meta = Object.assign({}, o);
+                    meta.search_text = buildSettlementOptionSearchText(meta, lab);
+                    optionByLabel[lab] = meta;
+                  }
                   return lab;
                 }).filter(function (lab) { return !!lab; });
                 return;
               }
               if (isCities && raw && raw.length) {
                 allOptions = dedupeSettlementLabels(raw);
+                allOptions.forEach(function (lab) {
+                  var name = stripSettlementPopulationLabel(lab);
+                  optionByLabel[lab] = {
+                    name: name,
+                    label: lab,
+                    search_text: buildSettlementOptionSearchText({ name: name, label: lab }, lab),
+                  };
+                });
                 return;
               }
               allOptions = isCities ? [] : (raw || []);
             }
             function loadOptions(cb) {
-              var url = typeof getUrl === "function" ? getUrl() : getUrl;
+              remotePending = false;
+              var url = typeof getUrl === "function" ? getUrl(input) : getUrl;
               if (!url) {
                 allOptions = [];
                 optionByLabel = {};
@@ -5765,6 +6465,18 @@
                 catalogCount = 0;
                 if (cb) cb();
                 return;
+              }
+              if (comboOpt.remoteSearch) {
+                var qRemote = settlementSearchQueryForApi(input.value || "");
+                if (!qRemote || qRemote.length < (comboOpt.minQueryLen || 2)) {
+                  allOptions = [];
+                  optionByLabel = {};
+                  optionsLoading = false;
+                  optionsLoadError = false;
+                  catalogCount = 0;
+                  if (cb) cb();
+                  return;
+                }
               }
               if (optionsLoading) {
                 if (cb) {
@@ -5776,17 +6488,32 @@
               }
               optionsLoading = true;
               optionsLoadError = false;
-              var isCities = String(url).indexOf("/filters/cities") !== -1;
+              var urlStr = String(url);
+              var isSettlementSearch = urlStr.indexOf("/settlements/search") !== -1;
+              var isCities = urlStr.indexOf("/filters/cities") !== -1;
+              var fetchId = isSettlementSearch ? ++remoteRequestId : 0;
               fetch(url, { headers: apiHeaders() })
                 .then(function (r) {
                   if (!r.ok) return Promise.reject(new Error("HTTP " + r.status));
                   return r.json();
                 })
                 .then(function (data) {
+                  if (isSettlementSearch && fetchId !== remoteRequestId) {
+                    return;
+                  }
+                  if (isSettlementSearch) {
+                    applySettlementSearchOptions(data.options || []);
+                    catalogCount = data.count != null ? data.count : allOptions.length;
+                    catalogSize = data.catalog_size != null ? data.catalog_size : catalogSize;
+                    catalogRawMistaParsed = data.raw_mista_parsed != null ? data.raw_mista_parsed : catalogRawMistaParsed;
+                    optionsLoading = false;
+                    if (cb) cb();
+                    return;
+                  }
                   catalogCount = data.catalog_count != null ? data.catalog_count : null;
                   var raw = data.regions || data.cities || data.districts || [];
                   applyOptions(raw, isCities, data.city_options);
-                  if (comboOpt.catalogFallback && isCities && !allOptions.length) {
+                  if (comboOpt.catalogFallback && isCities && !allOptions.length && !comboOpt.catalogOnly) {
                     var fb = url.replace(/catalog_only=1&?/, "").replace(/[?&]$/, "");
                     return fetch(fb, { headers: apiHeaders() })
                       .then(function (r2) { return r2.ok ? r2.json() : { cities: [] }; })
@@ -5796,10 +6523,16 @@
                         if (cb) cb();
                       });
                   }
+                  if (comboOpt.catalogOnly && isCities && !allOptions.length) {
+                    optionsLoadError = true;
+                  }
                   optionsLoading = false;
                   if (cb) cb();
                 })
                 .catch(function (err) {
+                  if (isSettlementSearch && fetchId !== remoteRequestId) {
+                    return;
+                  }
                   console.error("Geo combobox load failed:", url, err);
                   allOptions = [];
                   optionByLabel = {};
@@ -5809,12 +6542,25 @@
                 });
             }
             function showDropdown() {
-              var q = settlementSearchQueryFromInput(input.value || "");
-              var filtered = q ? allOptions.filter(function (o) {
-                return matchesSettlementOption(o, q, optionByLabel[o]);
-              }) : allOptions;
+              var q = comboOpt.remoteSearch
+                ? settlementSearchQueryForApi(input.value || "")
+                : settlementSearchQueryFromInput(input.value || "");
+              if (comboOpt.remoteSearch && (!q || q.length < (comboOpt.minQueryLen || 2))) {
+                drop.innerHTML = "";
+                var hintEl = document.createElement("div");
+                hintEl.className = "filter-tree-combobox-option filter-tree-combobox-empty";
+                hintEl.textContent = "Введіть щонайменше " + (comboOpt.minQueryLen || 2) + " символи";
+                drop.appendChild(hintEl);
+                openDropdown();
+                return;
+              }
+              var filtered = comboOpt.remoteSearch
+                ? (allOptions.length ? allOptions : settlementOptionsForQuery(q))
+                : (q ? allOptions.filter(function (o) {
+                    return matchesSettlementOption(o, q, optionByLabel[o]);
+                  }) : allOptions);
               drop.innerHTML = "";
-              if (optionsLoading && !allOptions.length) {
+              if ((optionsLoading || remotePending) && !filtered.length) {
                 var loadingEl = document.createElement("div");
                 loadingEl.className = "filter-tree-combobox-option filter-tree-combobox-empty";
                 loadingEl.textContent = "Завантаження…";
@@ -5826,11 +6572,37 @@
                 var emptyEl = document.createElement("div");
                 emptyEl.className = "filter-tree-combobox-option filter-tree-combobox-empty";
                 var emptyMsg = "Немає даних";
-                if (optionsLoadError) emptyMsg = "Помилка завантаження списку";
-                else if (optionsLoading) emptyMsg = "Завантаження…";
-                else if (!allOptions.length && catalogCount === 0) emptyMsg = "Каталог НП порожній для цієї області";
-                else if (!allOptions.length) emptyMsg = "Список НП не завантажено — оберіть область ще раз";
-                else if (q) emptyMsg = "Нічого не знайдено (з " + allOptions.length + ")";
+                if (optionsLoadError) {
+                  emptyMsg = "Помилка завантаження списку НП";
+                } else if (optionsLoading) {
+                  emptyMsg = "Завантаження…";
+                } else if (comboOpt.remoteSearch) {
+                  if (!q || q.length < (comboOpt.minQueryLen || 2)) {
+                    emptyMsg = "Введіть щонайменше " + (comboOpt.minQueryLen || 2) + " символи";
+                  } else if (
+                    catalogCount === 0
+                    && typeof catalogSize === "number"
+                    && catalogSize < 50
+                    && !settlementOptionsForQuery(q).length
+                  ) {
+                    if (typeof catalogRawMistaParsed === "number" && catalogRawMistaParsed > catalogSize) {
+                      emptyMsg = "Довідник cities порожній (" + catalogSize + " НП), але є "
+                        + catalogRawMistaParsed + " записів mista.ua — у адмінці натисніть «Імпорт у cities»";
+                    } else {
+                      emptyMsg = "Довідник НП майже порожній (" + catalogSize + " записів). Імпортуйте cities або MONGODB_HOST=host.docker.internal";
+                    }
+                  } else {
+                    emptyMsg = "Нічого не знайдено в довіднику НП";
+                  }
+                } else if (!allOptions.length && catalogCount === 0) {
+                  emptyMsg = comboOpt.catalogOnly
+                    ? "Каталог НП порожній (перевірте підключення до API)"
+                    : "Каталог НП порожній";
+                } else if (!allOptions.length) {
+                  emptyMsg = "Список НП не завантажено";
+                } else if (q) {
+                  emptyMsg = "Нічого не знайдено";
+                }
                 emptyEl.textContent = emptyMsg;
                 drop.appendChild(emptyEl);
                 openDropdown();
@@ -5843,32 +6615,67 @@
                 el.textContent = opt;
                 el.addEventListener("mousedown", function (e) { e.preventDefault(); });
                 el.addEventListener("click", function () {
-                  var meta = optionByLabel[opt];
+                  var meta = optionByLabel[opt] || settlementOptionCache[opt];
                   var picked = meta && meta.name ? meta.name : (comboOpt.stripSettlementValue ? stripSettlementPopulationLabel(opt) : opt);
                   if (comboOpt.onPickMeta && meta) comboOpt.onPickMeta(meta);
                   onSelect(picked);
-                  input.value = (meta && meta.label) ? meta.label : opt;
+                  input.value = (meta && (meta.picker_label || meta.label)) ? (meta.picker_label || meta.label) : opt;
                   closeDropdown();
                 });
                 drop.appendChild(el);
               });
               openDropdown();
             }
+            function scheduleRemoteLoad() {
+              if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+              remotePending = true;
+              searchDebounceTimer = setTimeout(function () {
+                searchDebounceTimer = null;
+                loadOptions(showDropdown);
+              }, comboOpt.remoteSearch ? 220 : 0);
+            }
             input.addEventListener("focus", function () {
-              loadOptions(showDropdown);
+              if (comboOpt.remoteSearch) {
+                var qFocus = settlementSearchQueryForApi(input.value || "");
+                if (qFocus && qFocus.length >= (comboOpt.minQueryLen || 2)) {
+                  loadOptions(showDropdown);
+                } else {
+                  showDropdown();
+                }
+              } else {
+                loadOptions(showDropdown);
+              }
             });
             input.addEventListener("input", function () {
-              onSelect(stripSettlementPopulationLabel(input.value.trim()) || input.value.trim());
+              var raw = input.value.trim();
+              if (comboOpt.remoteSearch) {
+                var parsed = parseSettlementFilterLabel(raw);
+                onSelect(parsed.name || raw);
+                if (typeof item !== "undefined" && item) {
+                  var pickedLabel = item.settlementLabel ? String(item.settlementLabel).trim() : "";
+                  if (!pickedLabel || raw !== pickedLabel) {
+                    item.geoRegion = "";
+                    item.cityId = "";
+                    item.settlementLabel = "";
+                  }
+                }
+                showDropdown();
+                scheduleRemoteLoad();
+                return;
+              }
+              onSelect(stripSettlementPopulationLabel(raw) || raw);
               if (allOptions.length) showDropdown();
               else loadOptions(showDropdown);
             });
             input.addEventListener("keyup", function () {
+              if (comboOpt.remoteSearch) return;
               if (allOptions.length) showDropdown();
               else if (!optionsLoading) loadOptions(showDropdown);
             });
             input.addEventListener("blur", function () { setTimeout(closeDropdown, 200); });
             window.addEventListener("resize", function () { if (drop.classList.contains("is-open")) positionDropdown(); });
             wrap.loadGeoOptions = loadOptions;
+            wrap.showDropdown = showDropdown;
             if (comboOpt.preload) loadOptions();
             if (input.value && allOptions.length === 0) loadOptions();
             wrap._geoComboboxCleanup = function () {
@@ -5876,7 +6683,8 @@
             };
             return wrap;
           }
-          function addRegionSelect(selectedRegion, onChange) {
+          function addRegionSelect(selectedRegion, onChange, regionOpts) {
+            regionOpts = regionOpts || {};
             var sel = document.createElement("select");
             sel.className = "filter-select";
             sel.innerHTML = "<option value=''>— Область —</option>";
@@ -5900,7 +6708,10 @@
                 sel.value = selectedRegion || "";
               })
               .catch(function () {});
-            sel.addEventListener("change", function () { onChange(sel.value); renderFilterTree(container, filterTreeRoot, fields); });
+            sel.addEventListener("change", function () {
+              onChange(sel.value);
+              if (!regionOpts.skipTreeRender) renderFilterTree(container, filterTreeRoot, fields);
+            });
             return sel;
           }
           function addCitySelect(regionVal, selectedCity, onChange) {
@@ -5940,39 +6751,41 @@
             row.appendChild(inp);
           }
           if (geoType === "region") {
-            row.appendChild(addGeoCombobox("Область", "/api/search/unified/filters/regions", item.value, function (v) { item.value = v; }));
+            row.appendChild(addGeoCombobox(
+              "Область",
+              "/api/search/unified/filters/regions",
+              item.value,
+              function (v) {
+                item.value = v;
+                item.geoRegion = v;
+              }
+            ));
           } else if (geoType === "settlement") {
-            var regionSel = addRegionSelect(item.geoRegion, function (v) {
-              item.geoRegion = v;
-              item.value = "";
-              item.settlementLabel = "";
-              item.cityId = "";
-            });
-            row.appendChild(regionSel);
-            function settlementCitiesUrl() {
-              var region = (item.geoRegion || (regionSel && regionSel.value) || "").trim();
-              if (!region) return null;
-              if (!item.geoRegion) item.geoRegion = region;
-              return "/api/search/unified/filters/cities?catalog_only=1&region=" + encodeURIComponent(region);
-            }
+            var settlementValueCell = document.createElement("div");
+            settlementValueCell.className = "filter-tree-value-cell filter-tree-settlement-picker-cell";
             var settlementCombo = addGeoCombobox(
-              item.geoRegion ? "Населений пункт" : "Спочатку оберіть область",
-              settlementCitiesUrl,
-              item.settlementLabel || item.value,
+              "Населений пункт",
+              function (comboInput) {
+                var q = comboInput ? settlementSearchQueryForApi(comboInput.value) : "";
+                if (!q || q.length < 2) return null;
+                return "/api/search/unified/filters/settlements/search?q=" + encodeURIComponent(q);
+              },
+              settlementPickerDisplayValue(item),
               function (v) { item.value = v; },
               {
-                catalogFallback: true,
+                remoteSearch: true,
+                minQueryLen: 2,
                 stripSettlementValue: true,
-                preload: !!(item.geoRegion || regionSel.value),
                 onPickMeta: function (meta) {
                   item.value = meta.name || item.value;
+                  item.geoRegion = meta.region || "";
                   item.cityId = meta.id || "";
-                  item.settlementLabel = meta.label || meta.name || "";
+                  item.settlementLabel = meta.picker_label || meta.label || meta.name || "";
                 }
               }
             );
-            settlementCombo.querySelector("input").disabled = !(item.geoRegion || (regionSel && regionSel.value));
-            row.appendChild(settlementCombo);
+            settlementValueCell.appendChild(settlementCombo);
+            row.appendChild(settlementValueCell);
           } else if (geoType === "settlement_population") {
             row.appendChild(addRegionSelect(item.geoRegion, function (v) { item.geoRegion = v; }));
             addNumField("Насел. від, осіб", "population_min");
@@ -6221,6 +7034,12 @@
             var ta = document.getElementById(taId);
             if (ta) ta.value = (data.filter_string != null ? data.filter_string : "");
             if (filterBuilderModal) filterBuilderModal.classList.add("hidden");
+            if (taId === "map-filter-string") {
+              updateMapFilterSummary();
+              if (currentScreen === "screen-map" && mapState.mapReady) {
+                loadMapForFilter();
+              }
+            }
           })
           .catch(function (err) { alert(err.message || "Помилка формування рядка"); });
       });
@@ -6233,7 +7052,12 @@
     var backBtn = document.getElementById("detail-back");
     if (backBtn) {
       backBtn.addEventListener("click", function () {
-        showSearch();
+        if (mapState.returnToMapAfterDetail) {
+          mapState.returnToMapAfterDetail = false;
+          showMap();
+        } else {
+          showSearch();
+        }
       });
     }
 
@@ -6317,6 +7141,10 @@
     })
     .then(function (me) {
       currentUser = me;
+      if (me.maps_api_key) {
+        window.__PAZUZU_MAPS_API_KEY = me.maps_api_key;
+        mapState.mapsApiKey = me.maps_api_key;
+      }
       if (!me.authorized) {
         showError("Ваш користувач не авторизований. Зверніться до адміністратора.");
         // Все одно показуємо навігацію, щоб користувач міг бачити меню

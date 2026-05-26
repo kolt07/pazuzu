@@ -218,6 +218,32 @@ class GeographyService:
         """Отримує всі міста в області."""
         return self.cities_repo.get_by_region(region_id)
 
+    def search_settlements_catalog(
+        self,
+        query: str,
+        *,
+        limit: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """Пошук НП у довіднику cities з назвою області (для autocomplete)."""
+        from utils.settlement_normalizer import build_settlement_picker_options
+
+        cities = self.cities_repo.search_by_name_prefix(query, limit=limit)
+        if not cities:
+            return []
+
+        region_ids = {
+            str(c.get("region_id"))
+            for c in cities
+            if c.get("region_id")
+        }
+        regions_by_id: Dict[str, Dict[str, Any]] = {}
+        for rid in region_ids:
+            doc = self.regions_repo.find_by_id(rid)
+            if doc:
+                regions_by_id[rid] = doc
+
+        return build_settlement_picker_options(cities, regions_by_id=regions_by_id)
+
     def get_oblast_rayons_by_region(self, region_id: str) -> List[Dict[str, Any]]:
         return self.oblast_rayons_repo.get_by_region(region_id)
 

@@ -208,6 +208,80 @@ def normalize_settlement_key(name: Optional[str]) -> str:
     return value
 
 
+def settlement_name_from_mista_url(url: Optional[str]) -> Optional[str]:
+    """Назва НП з останнього сегмента шляху mista.ua (fallback при порожньому parsed.name)."""
+    if not url:
+        return None
+    try:
+        from urllib.parse import unquote
+
+        path = unquote(str(url).split("mista.ua", 1)[-1].split("?", 1)[0])
+        parts = [p for p in path.strip("/").split("/") if p]
+        if len(parts) < 3 or parts[0] != "Україна":
+            return None
+        slug = parts[-1].replace("_", " ").strip()
+        if "," in slug:
+            slug = slug.split(",", 1)[0].strip()
+        return normalize_settlement_name(slug) or slug or None
+    except Exception:
+        return None
+
+
+def settlement_prefix_regex_pattern(normalized_key: str) -> str:
+    """
+    Префіксний regex для MongoDB: и/і взаємозамінні (різне кодування в БД і вводі).
+    """
+    if not normalized_key:
+        return "^$"
+    parts: list[str] = []
+    for ch in normalized_key:
+        if ch in ("\u0438", "\u0456"):
+            parts.append("[\u0438\u0456]")
+        else:
+            parts.append(re.escape(ch))
+    return "^" + "".join(parts)
+
+
+def settlement_typo_n_variant(normalized_key: str) -> Optional[str]:
+    """
+  Додатковий ключ для пошуку: зайва «н» перед -ичі/-ичи (напр. іваничі → іваниничі).
+    """
+    if not normalized_key:
+        return None
+    m = re.match(r"^(.*?)ич([\u0456\u0438])$", normalized_key)
+    if not m:
+        return None
+    return f"{m.group(1)}инич{m.group(2)}"
+
+
+def settlement_search_or_clauses(normalized_key: str) -> List[Dict[str, Any]]:
+    """Умови $or для prefix-пошуку НП у cities (ім'я, aliases, и/і, typo-н)."""
+    if not normalized_key:
+        return []
+    keys: List[str] = [normalized_key]
+    typo = settlement_typo_n_variant(normalized_key)
+    if typo and typo not in keys:
+        keys.append(typo)
+    patterns: List[str] = []
+    simple = f"^{re.escape(normalized_key)}"
+    flex = settlement_prefix_regex_pattern(normalized_key)
+    patterns.append(simple)
+    if flex != simple:
+        patterns.append(flex)
+    if typo:
+        patterns.append(f"^{re.escape(typo)}")
+
+    or_clauses: List[Dict[str, Any]] = []
+    for pat in patterns:
+        or_clauses.append({"name_normalized": {"$regex": pat}})
+        or_clauses.append({"search_aliases": {"$regex": pat}})
+    or_clauses.append({"name": {"$regex": flex, "$options": "i"}})
+    for k in keys:
+        or_clauses.append({"search_aliases": k})
+        or_clauses.append({"name_normalized": k})
+    return or_clauses
+
+
 def normalize_settlement_name(raw: Optional[str]) -> Optional[str]:
     """
     Повна нормалізація для збереження в БД: витяг + форматування display name.
@@ -231,6 +305,112 @@ def region_short_label(region_name: Optional[str]) -> str:
     if s.endswith(" область"):
         return s[: -len(" область")].strip()
     return s
+
+
+def format_settlement_picker_label(
+    name: str,
+    region_name: Optional[str] = None,
+) -> str:
+    """Підпис для autocomplete: «Іваничі, Волинська обл.»."""
+    base = normalize_settlement_name(name) or (name or "").strip()
+    if not base:
+        return ""
+    if not region_name:
+        return base
+    short = region_short_label(region_name)
+    if not short:
+        return base
+    if not short.lower().endswith(" обл.") and "область" not in short.lower():
+        short = f"{short} обл."
+    return f"{base}, {short}"
+
+
+def parse_settlement_picker_label(label: str) -> tuple[str, Optional[str]]:
+    """
+    Розбір підпису picker → (назва НП, фрагмент області для resolve).
+    Підтримує «Назва, Область обл.» та legacy «Назва · Область».
+    """
+    if not label:
+        return "", None
+    s = str(label).strip()
+    idx = s.rfind(" (")
+    if idx > 0 and "ос." in s[idx:]:
+        s = s[:idx].strip()
+    if ", " in s:
+        name_part, reg_part = s.rsplit(", ", 1)
+        return name_part.strip(), (reg_part.strip() or None)
+    if " · " in s:
+        return parse_settlement_filter_label(s)
+    return s, None
+
+
+def resolve_region_from_picker_fragment(region_part: Optional[str]) -> Optional[str]:
+    """«Волинська обл.» → «Волинська область» (канон для geoRegion)."""
+    if not region_part:
+        return None
+    from utils.ukraine_regions import normalize_region_to_canonical
+
+    raw = str(region_part).strip()
+    if not raw:
+        return None
+    canon = normalize_region_to_canonical(raw)
+    if canon:
+        return canon
+    if "область" not in raw.lower() and not raw.lower().endswith(" обл."):
+        canon = normalize_region_to_canonical(f"{raw} область")
+        if canon:
+            return canon
+    return raw
+
+
+def build_settlement_picker_options(
+    cities: Iterable[Dict[str, Any]],
+    *,
+    regions_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Опції для autocomplete НП з дизамбігуацією області."""
+    regions_by_id = regions_by_id or {}
+    options: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for doc in cities:
+        if not doc:
+            continue
+        cid = str(doc.get("_id") or doc.get("id") or "")
+        name = normalize_settlement_name(doc.get("name")) or (doc.get("name") or "").strip()
+        if not name:
+            continue
+        rid = str(doc.get("region_id") or "")
+        reg_doc = regions_by_id.get(rid) if rid else None
+        reg = (reg_doc or {}).get("name") or doc.get("region_name") or doc.get("region")
+        dedupe_key = (cid or f"{rid}:{normalize_settlement_key(name)}", rid)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        picker_label = format_settlement_picker_label(name, reg)
+        aliases = doc.get("search_aliases") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        options.append({
+            "id": cid,
+            "name": name,
+            "region": reg,
+            "region_id": rid or None,
+            "picker_label": picker_label,
+            "label": picker_label,
+            "population": doc.get("population"),
+            "search_aliases": list(aliases) if aliases else [],
+        })
+
+    options.sort(
+        key=lambda o: (
+            -(o.get("population") or 0),
+            (o.get("name") or "").casefold(),
+            (o.get("region") or "").casefold(),
+        )
+    )
+    return options
 
 
 def format_settlement_filter_label(

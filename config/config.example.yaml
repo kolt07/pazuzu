@@ -173,7 +173,8 @@ mini_app:
   # Публічний HTTPS URL застосунку — для кнопки меню та команди /app (напр. https://your-domain.com або https://xxxx.ngrok.io)
   base_url: ""
 
-# Google Maps API (геокодування: адреси, топоніми, назви ЖК/ТРЦ тощо)
+# Google Maps API (геокодування, Places, Static Maps, mini-app «Мапа» — Maps JavaScript API)
+# У GCP увімкніть: Geocoding API, Places API (New), Maps JavaScript API (для вкладки Мапа в mini-app)
 google_maps:
   api_key: ""
 

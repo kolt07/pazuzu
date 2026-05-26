@@ -1083,7 +1083,74 @@ def search_by_filter(
         "limit": body.limit,
         "skip": body.skip,
     }
+    hint = _geo_search_hint_when_empty(body.filter_string or "", total or 0)
+    if hint:
+        payload["geo_search_hint"] = hint
     return _sanitize_json_floats(payload)
+
+
+def _geo_search_hint_when_empty(filter_string: str, total: int) -> Optional[str]:
+    """Підказка, якщо геофільтр по НП коректний, але оголошень у БД немає."""
+    if total > 0 or not (filter_string or "").strip():
+        return None
+    from domain.services.filter_string_service import filter_string_to_models
+    from domain.models.filter_models import GeoFilterElement, GeoFilterGroup
+    from data.database.connection import MongoDBConnection
+    from utils.settlement_geo_match import build_unified_listings_settlement_match
+
+    parsed = filter_string_to_models(filter_string)
+    if not parsed.success or not parsed.geo_filter:
+        return None
+
+    def _walk(node):
+        if isinstance(node, GeoFilterElement):
+            if node.geo_type == "settlement" and node.value:
+                yield node
+        elif isinstance(node, GeoFilterGroup):
+            for it in node.items:
+                yield from _walk(it)
+
+    root = parsed.geo_filter.root
+    elems = list(_walk(root))
+    if not elems:
+        return None
+
+    try:
+        db = MongoDBConnection.get_database()
+    except Exception:
+        return None
+
+    for el in elems:
+        region = getattr(el, "region", None)
+        city_id = getattr(el, "city_id", None)
+        mongo = build_unified_listings_settlement_match(
+            str(el.value),
+            region=region,
+            city_id=city_id,
+        )
+        n = db.unified_listings.count_documents(mongo)
+        if n == 0:
+            from business.services.geography_service import GeographyService
+            from utils.ukraine_regions import normalize_region_for_repository_lookup
+
+            gs = GeographyService()
+            in_catalog = False
+            if region:
+                reg = gs.regions_repo.find_by_name(
+                    normalize_region_for_repository_lookup(region) or region
+                )
+                if reg:
+                    found = gs.cities_repo.find_by_name_and_region(
+                        str(el.value), str(reg["_id"])
+                    )
+                    in_catalog = bool(found)
+            if in_catalog:
+                return (
+                    f"Населений пункт «{el.value}» є в довіднику"
+                    + (f" ({region})" if region else "")
+                    + ", але в зведеній таблиці немає жодного оголошення з цією адресою."
+                )
+    return None
 
 
 @router.get("/filter-fields")
@@ -1471,6 +1538,60 @@ def get_unified_cities(
             if city not in labels:
                 labels.append(city)
     return {"cities": labels, "city_options": opts if cities else []}
+
+
+@router.get("/unified/filters/settlements/search")
+def search_unified_settlements(
+    request: Request,
+    q: Optional[str] = Query(None, description="Префікс назви НП (мін. 2 символи)"),
+    limit: Optional[int] = Query(25, ge=1, le=50),
+):
+    """Autocomplete НП по довіднику cities (усі області, з дизамбігуацією)."""
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+
+    query = (q or "").strip()
+    if len(query) < 2:
+        return _sanitize_json_floats({"options": [], "count": 0})
+
+    try:
+        from business.services.geography_service import GeographyService
+
+        geography_service = GeographyService()
+        options = geography_service.search_settlements_catalog(
+            query,
+            limit=int(limit or 25),
+        )
+        catalog_size = geography_service.cities_repo.collection.count_documents(
+            geography_service.cities_repo._active_city_filter()
+        )
+        raw_parsed = 0
+        if catalog_size < 100:
+            try:
+                from data.database.connection import MongoDBConnection
+
+                raw_parsed = MongoDBConnection.get_database()["raw_mista_settlements"].count_documents(
+                    {"scrape_status": "parsed"}
+                )
+            except Exception:
+                raw_parsed = 0
+        payload: Dict[str, Any] = {
+            "options": options,
+            "count": len(options),
+            "catalog_size": catalog_size,
+        }
+        if catalog_size < 100 and raw_parsed > catalog_size:
+            payload["catalog_hint"] = "mista_import_pending"
+            payload["raw_mista_parsed"] = raw_parsed
+        return _sanitize_json_floats(payload)
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "search_unified_settlements failed q=%s: %s", query, exc
+        )
+        return _sanitize_json_floats({"options": [], "count": 0})
 
 
 @router.get("/unified/filters/districts")

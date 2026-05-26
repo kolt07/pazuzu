@@ -1,3 +1,74 @@
+## 2026-05-26 — Геофільтр НП: не втрачати оголошення (location, meta)
+
+- Запит: перевірити, що вибір «Нововолинськ» у фільтрі знаходить усі релевантні оголошення.
+- Причина: strict-фільтр лише `^НП` у `city`; OLX часто має «Волинська обл., смт Нововолинськ» у `search_data.location`; при вводі скидались `geoRegion`/`cityId`.
+- Виправлено: `settlement_substring_regex_for_names`, гілки `search_data.location`, `detail.address_refs`, addresses+root region; UI не скидає meta, якщо текст = обраний picker_label; `scripts/check_settlement_listing_coverage.py`.
+
+## 2026-05-26 — Autocomplete НП: Docker — імпорт mista → cities
+
+- Симптом: «Довідник НП майже порожній (6 записів)», пошук Нововолинськ/Іваничі не працює.
+- Причина: у Docker `raw_mista_settlements` було 2751, у `cities` — 6; імпорт пропускав усі записи (`parsed.name` порожній).
+- Виправлено: `settlement_name_from_mista_url` + fallback у `MistaSettlementImportService`; імпорт у контейнері → 2690 cities; міграція 061 створює Рівненські Іваничі; API `raw_mista_parsed` + підказка «Імпорт у cities»; `scripts/check_settlement_autocomplete_e2e.py`.
+
+## 2026-05-25 — Autocomplete НП: Рівненські Іваничі + загальний пошук
+
+- Симптом: не знаходить Іваничі (Рівненська); інші НП теж не шукались.
+- Причини: (1) на фронті лишалась глобальна и→і у `normalizeSettlementSearchText`; (2) у БД typo «Іваниничі» не збігається з префіксом «Іваничі»; (3) Docker-каталог з 6 НП.
+- Виправлено: прибрано и→і на фронті; `settlement_search_or_clauses` (и/і у regex, exact alias, typo-н іваниничі); міграція 061 додає alias `іваничі`.
+
+## 2026-05-25 — Autocomplete НП: відкат глобальної и→і
+
+- Помилка: глобальна заміна «и»→«і» в `normalize_settlement_key` зламала пошук Київ, Миколаїв та інших НП (не лише Іваничі).
+- Залишено: `settlement_prefix_regex_pattern` — и/і взаємозамінні лише в MongoDB regex; фронт показує `allOptions` з API, кеш — fallback.
+
+## 2026-05-25 — Autocomplete НП: «Іваничі» після «Івани»
+
+- Симптом: підказки є на «Івани», на повному «Іваничі» — порожньо.
+- Причина: у БД інколи «и»/«і» на кінці назви; UI скидав список після порожньої відповіді API.
+
+## 2026-05-25 — Mini-app: редагування фільтра з НП (querySelector)
+
+- Симптом: при відкритті конструктора фільтрів з уже заданим «Населений пункт» — `Cannot read properties of undefined (reading 'querySelector')`.
+- Причина: `getUrl` для autocomplete НП звертався до `settlementCombo` до завершення `addGeoCombobox`; при наявному `input.value` одразу викликався `loadOptions()` → `getUrl()`.
+- Виправлено: `loadOptions` передає `input` у `getUrl(input)`; callback НП читає значення з `comboInput`, без циклічного посилання на wrap.
+
+## 2026-05-25 — Mini-app: приховано вкладку «Мапа» в UI
+
+- Запит: тимчасово не показувати мапу в інтерфейсі, функціонал не видаляти.
+- Зроблено: `MAP_TAB_UI_ENABLED = false` у `app.js` — пункт навігації «Мапа» не рендериться; `#screen-map`, API `/api/map/*`, `showMap()` лишаються.
+
+## 2026-05-25 — Mini-app: вкладка «Мапа» (режими filter / viewport)
+
+- Запит: окрема вкладка з Google Maps, маркерами оголошень (OLX жовтий/Przr синій), кластеризацією, списком у viewport і фільтрами як у пошуку.
+- Зроблено: `ListingMapPlacementService` (адреса → кадастр → центр НП/вулиця); API `GET /api/map/config`, `POST /api/map/query`; екран `#screen-map` + MarkerClusterer; рефакторинг карток `buildSearchItemCard` / `renderListingCards`; тести `tests/test_listing_map_placement.py`; `utils/geo_centroid.py`, `CitiesRepository.find_coordinates`.
+- UX/швидкість: `mode=filter` — геокодування + `fitBounds` при «Шукати»/зміні фільтра; `mode=viewport` — без Geocoding, лише збережені координати в bbox, карта не стрибає при pan/zoom; `suppressIdle` під час програмного центрування; AbortController для скасування запитів.
+- Кластеризація на сервері (`utils/map_grid_cluster.py`): API повертає `map_points` (≤120), без сотень маркерів на клієнт; прибрано MarkerClusterer; debounce viewport + dedupe за bbox/zoom; логи `map/query` у Docker.
+
+## 2026-05-25 — Autocomplete НП: порожній Docker-каталог
+
+- API 200 + «Нічого не знайдено»: у контейнері `pazuzu-mongodb` було 5 НП (без Іваничей); на хості localhost — ~2947. Рішення: `MONGODB_HOST=host.docker.internal` у `.env` або імпорт/migrations у Docker; міграція 061 додає Іваничі (Волинська). У відповіді search — `catalog_size`; race fix на фронті.
+
+## 2026-05-25 — Геофільтр НП: прибрано повідомлення про «область»
+
+- Autocomplete НП без вибору області: виправлено тексти помилок («Нічого не знайдено в довіднику» замість «каталог порожній для області»), focus/input показують «Завантаження…», cache-bust app.js.
+
+## 2026-05-25 — Геофільтр НП: одне поле з підказками по областях
+
+- Замість «область → НП» у конструкторі фільтрів — одне поле справа; autocomplete `GET /unified/filters/settlements/search?q=`.
+- Підказки: «Іваничі, Волинська обл.» / «Іваничі, Рівненська обл.» (гомоніми).
+- `format_settlement_picker_label`, `CitiesRepository.search_by_name_prefix`, `GeographyService.search_settlements_catalog`.
+
+## 2026-05-25 — Combobox НП (геофільтр): Іваничі не в підказках
+
+- Симптом: при гео-умові «Населений пункт» + Волинська введення «Іваничі» не знаходить у dropdown (не оголошення).
+- Причини в UI: (1) зміна типу geo «Область»→«Населений пункт» скидала `geoRegion`; (2) `renderFilterTree` при зміні області перестворював combobox; (3) `catalogFallback` підміняв порожній каталог списком з оголошень (без Іваничей); (4) `optionByLabel` порожній без `city_options`.
+- Зроблено: збереження `geoRegion` при зміні типу; reload списку НП без повного re-render; `catalogOnly` без fallback; `search_text` для пошуку; sync `geoRegion` з полем області.
+
+## 2026-05-25 — Діагностика Іваничі: збій на етапі даних, не UI
+
+- Перевірка ланцюжка: cities OK, `/filters/cities` OK, `unified_listings` — **0** оголошень Volyn+Іваничі (236 оголошень по області без цього НП).
+- Зроблено: `scripts/check_settlement_search_chain.py`; API `geo_search_hint` при 0 результатів; `CITY_ID` у рядку geo-фільтра; UI показує підказку замість «Нічого не знайдено».
+
 ## 2026-05-25 — Геопошук НП: централізація (усі НП, не лише Іваничі)
 
 - Симптом: гомоніми/аліаси/префікси «смт.» — оголошення не знаходились при геофільтрі; Іваничі — один з кейсів.

@@ -12,6 +12,7 @@ from utils.settlement_normalizer import (
     normalize_settlement_key,
     normalize_settlement_name,
     is_district_only_name,
+    settlement_search_or_clauses,
 )
 
 
@@ -232,6 +233,47 @@ class CitiesRepository(BaseRepository):
         self.update_by_id(existing["_id"], {"$set": updates})
         existing.update(updates)
         return existing
+
+    def find_coordinates(
+        self,
+        settlement: str,
+        region_name: str,
+    ) -> Optional[Dict[str, float]]:
+        """
+        Координати центру НП з cities.coordinates (mista.ua), якщо є.
+
+        Returns:
+            {"lat": float, "lon": float} або None
+        """
+        if not settlement or not region_name:
+            return None
+        regions_repo = RegionsRepository()
+        region_doc = regions_repo.find_by_name(region_name)
+        if not region_doc:
+            return None
+        region_id = str(region_doc.get("_id", ""))
+        if not region_id:
+            return None
+        city_doc = self.find_by_name_and_region(settlement, region_id)
+        if not city_doc:
+            return None
+        coords = city_doc.get("coordinates")
+        if not isinstance(coords, dict):
+            return None
+        lat = coords.get("lat")
+        lon = coords.get("lon")
+        if lat is None:
+            lat = coords.get("latitude")
+        if lon is None:
+            lon = coords.get("longitude")
+        if lon is None:
+            lon = coords.get("lng")
+        if lat is None or lon is None:
+            return None
+        try:
+            return {"lat": float(lat), "lon": float(lon)}
+        except (TypeError, ValueError):
+            return None
     
     @staticmethod
     def _prefer_settlement_display(current: Optional[str], candidate: Optional[str]) -> bool:
@@ -283,6 +325,40 @@ class CitiesRepository(BaseRepository):
         result.sort(
             key=lambda d: (d.get("population") is None, -(d.get("population") or 0)),
         )
+        return result
+
+    def search_by_name_prefix(
+        self,
+        query: str,
+        *,
+        limit: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """Пошук НП за префіксом назви або search_aliases (усі області)."""
+        self._ensure_indexes()
+        key = normalize_settlement_key(query)
+        if not key or len(key) < 2:
+            return []
+
+        or_clauses = settlement_search_or_clauses(key)
+        filt = self._active_city_filter({"$or": or_clauses} if or_clauses else {})
+        docs = self.find_many(
+            filter=filt,
+            sort=[("population", -1), ("name", 1)],
+            limit=max(limit * 2, limit),
+        )
+        result: List[Dict[str, Any]] = []
+        for doc in docs:
+            raw_name = doc.get("name") or ""
+            if is_district_only_name(raw_name):
+                continue
+            display = normalize_settlement_name(raw_name)
+            if not display:
+                continue
+            doc = dict(doc)
+            doc["name"] = display
+            result.append(doc)
+            if len(result) >= limit:
+                break
         return result
 
     def find_matching_criteria(

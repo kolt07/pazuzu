@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response as StarletteResponse
 import hashlib
+import json
 import os
 
 from config.settings import Settings
@@ -19,7 +20,7 @@ from business.services.user_service import UserService
 from business.services.prozorro_service import ProZorroService
 from business.services.logging_service import LoggingService
 
-from telegram_mini_app.routes import me, llm, admin, files, search, feedback, report_templates, analytics, investigation, mini_app_chats
+from telegram_mini_app.routes import me, llm, admin, files, search, map, feedback, report_templates, analytics, investigation, mini_app_chats
 
 
 def _get_static_file_version(static_dir: Path) -> str:
@@ -94,6 +95,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(admin.router)
     app.include_router(files.router)
     app.include_router(search.router)
+    app.include_router(map.router)
     app.include_router(feedback.router)
     app.include_router(report_templates.router)
     app.include_router(analytics.router)
@@ -120,6 +122,11 @@ def create_app(settings: Settings) -> FastAPI:
                     'src="/static/app.js"',
                     f'src="/static/app.js?v={static_version}"'
                 )
+                maps_key = (getattr(settings, "google_maps_api_key", None) or "").strip()
+                maps_bootstrap = (
+                    f'<script>window.__PAZUZU_MAPS_API_KEY={json.dumps(maps_key or None)};</script>'
+                )
+                html_content = html_content.replace("</head>", maps_bootstrap + "\n</head>")
                 return Response(content=html_content, media_type="text/html")
             return FileResponse(html_path)
 

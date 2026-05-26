@@ -111,7 +111,7 @@ def run_migration(dry_run: bool = False) -> bool:
             if not dry_run:
                 aliases = _merge_aliases(
                     typo_doc.get("search_aliases"),
-                    [TYPO_KEY, "Яневичі"],
+                    [TYPO_KEY, CANONICAL_KEY, "Яневичі"],
                 )
                 updates = {
                     "name": CANONICAL_NAME,
@@ -123,6 +123,55 @@ def run_migration(dry_run: bool = False) -> bool:
                 cities_repo.update_by_id(typo_doc["_id"], {"$set": updates})
         else:
             stats["actions"].append({"action": "rename_rivne_typo", "status": "not_found"})
+
+        # --- Рівненська: створити канонічний запис, якщо відсутній у mista/каталозі ---
+        rivne_doc = cities_repo.find_by_name_and_region(CANONICAL_NAME, rivne_id)
+        if not rivne_doc:
+            rivne_doc = cities_repo.find_one(
+                {
+                    "region_id": rivne_id,
+                    "$or": [
+                        {"name_normalized": TYPO_KEY},
+                        {"name": "Іваниничі"},
+                        {"search_aliases": CANONICAL_KEY},
+                    ],
+                }
+            )
+        if rivne_doc:
+            stats["actions"].append(
+                {
+                    "action": "update_rivne",
+                    "city_id": str(rivne_doc["_id"]),
+                    "name": rivne_doc.get("name"),
+                }
+            )
+            if not dry_run:
+                aliases = _merge_aliases(
+                    rivne_doc.get("search_aliases"),
+                    [TYPO_KEY, CANONICAL_KEY, "Яневичі"],
+                )
+                updates = {
+                    "name": CANONICAL_NAME,
+                    "name_normalized": CANONICAL_KEY,
+                    "search_aliases": aliases,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+                updates.update({k: v for k, v in RIVNE_IVANICHI_META.items() if v is not None})
+                cities_repo.update_by_id(rivne_doc["_id"], {"$set": updates})
+        else:
+            stats["actions"].append({"action": "create_rivne", "name": CANONICAL_NAME, "region_id": rivne_id})
+            if not dry_run:
+                now = datetime.now(timezone.utc)
+                doc = {
+                    "name": CANONICAL_NAME,
+                    "name_normalized": CANONICAL_KEY,
+                    "region_id": rivne_id,
+                    "search_aliases": [TYPO_KEY, "Яневичі"],
+                    "created_at": now,
+                    "updated_at": now,
+                    **RIVNE_IVANICHI_META,
+                }
+                cities_repo.create(doc)
 
         # --- Волинська: створити або оновити канонічний запис ---
         volyn_doc = cities_repo.find_by_name_and_region(CANONICAL_NAME, volyn_id)

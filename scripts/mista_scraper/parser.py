@@ -10,7 +10,11 @@ from urllib.parse import unquote, urljoin
 from bs4 import BeautifulSoup
 
 from utils.coordinates_dms import parse_dms_coordinates
-from utils.settlement_normalizer import normalize_settlement_key, normalize_settlement_name
+from utils.settlement_normalizer import (
+    normalize_settlement_key,
+    normalize_settlement_name,
+    settlement_name_from_mista_url,
+)
 
 _BASE = "https://mista.ua"
 
@@ -310,6 +314,8 @@ def parse_detail_page(html: str, *, mista_url: str = "") -> Dict[str, Any]:
     region_name = fields.get("Область", "").strip()
     city_raw = fields.get("Місто", "").strip()
     city_name = normalize_settlement_name(city_raw) or city_raw
+    if not city_name and mista_url:
+        city_name = settlement_name_from_mista_url(mista_url)
 
     pop_m = _INT_RE.search(fields.get("Населення", ""))
     population = int(pop_m.group(1)) if pop_m else None

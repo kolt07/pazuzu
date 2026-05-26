@@ -536,6 +536,34 @@
           </div>
         </div>
       </div>
+      <div id="screen-map" class="hidden">
+        <p class="intro intro-map">Оголошення на карті за поточними фільтрами та видимою областю</p>
+        <div class="map-layout">
+          <div class="map-canvas-wrap">
+            <div id="map-canvas" class="map-canvas" role="application" aria-label="Карта оголошень"></div>
+            <div id="map-canvas-error" class="map-canvas-error hidden"></div>
+          </div>
+          <div class="map-panel">
+            <div class="search-results-toolbar map-toolbar">
+              <div class="search-filter-summary">
+                <span id="map-filter-summary-text" class="search-filter-summary-text">Рядок відборів не задано</span>
+                <button type="button" id="map-run-search" class="btn btn-primary">Шукати</button>
+                <button type="button" id="map-build-filters" class="btn btn-secondary">Створити фільтри</button>
+              </div>
+              <div class="filter-group filter-string-group map-filter-string-group">
+                <label for="map-filter-string" class="filter-string-label">Рядок відборів</label>
+                <textarea id="map-filter-string" class="filter-textarea filter-string-input" rows="4" placeholder='Наприклад: "Джерело" = olx AND geo(\'Область\' INSIDE \'Київська\')'></textarea>
+                <span id="map-filter-string-error" class="filter-string-error hidden" role="alert"></span>
+              </div>
+            </div>
+            <div id="map-results" class="map-results">
+              <div id="map-loading" class="hidden">Завантаження...</div>
+              <div id="map-results-count" class="search-results-count hidden"></div>
+              <div id="map-items" class="search-items map-items"></div>
+            </div>
+          </div>
+        </div>
+      </div>
       <div id="filter-builder-modal" class="modal-overlay hidden">
         <div class="modal-content modal-filter-builder">
           <h3>Фільтри</h3>
@@ -555,6 +583,6 @@
     </div>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260526-settlement-geo-match"></script>
 </body>
 </html>

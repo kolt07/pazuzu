@@ -227,6 +227,9 @@ def _geo_element_to_str(elem: GeoFilterElement) -> str:
     if elem.geo_type == "settlement" and region_ctx:
         reg = str(region_ctx).replace("'", "\\'")
         base += " REGION '%s'" % reg
+    city_id = getattr(elem, "city_id", None)
+    if elem.geo_type == "settlement" and city_id:
+        base += " CITY_ID '%s'" % str(city_id).replace("'", "\\'")
     return base
 
 
@@ -396,6 +399,9 @@ def _parse_geo_element(s: str) -> Optional[GeoFilterElement]:
         + r"(?:\s+REGION\s+"
         + quoted
         + r")?"
+        + r"(?:\s+CITY_ID\s+"
+        + quoted
+        + r")?"
         + r"\s*(?:(\d+(?:\.\d+)?)\s*km)?$"
     )
     alt = re.match(pattern, s, re.IGNORECASE)
@@ -404,7 +410,8 @@ def _parse_geo_element(s: str) -> Optional[GeoFilterElement]:
         op_str = alt.group(2).replace(" ", "_").lower()
         value = _unescape_quoted(alt.group(3))
         region_val = _unescape_quoted(alt.group(4)) if alt.group(4) else None
-        radius = alt.group(5)
+        city_id_val = _unescape_quoted(alt.group(5)) if alt.group(5) else None
+        radius = alt.group(6)
         geo_type = label_to_geo.get(label, "settlement")
         if "not_inside" in op_str:
             op_enum = GeoFilterOperator.NOT_INSIDE
@@ -421,6 +428,7 @@ def _parse_geo_element(s: str) -> Optional[GeoFilterElement]:
             value=value,
             radius_km=radius_km,
             region=region_val if geo_type == "settlement" and region_val else None,
+            city_id=city_id_val if geo_type == "settlement" and city_id_val else None,
         )
     return None
 
