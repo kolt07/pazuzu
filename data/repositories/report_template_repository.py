@@ -85,6 +85,32 @@ class ReportTemplateRepository(BaseRepository):
             pass
         return None
 
+    def update(
+        self,
+        template_id: str,
+        user_id: int,
+        name: str,
+        params: Dict[str, Any],
+    ) -> bool:
+        """
+        Оновлює назву та параметри шаблону.
+        Не дозволяє змінювати системні (is_default=True).
+        """
+        from bson import ObjectId
+
+        try:
+            oid = ObjectId(template_id)
+        except Exception:
+            return False
+        doc = self.collection.find_one({"_id": oid, "user_id": user_id})
+        if not doc or doc.get("is_default"):
+            return False
+        result = self.collection.update_one(
+            {"_id": oid, "user_id": user_id},
+            {"$set": {"name": name, "params": params}},
+        )
+        return result.matched_count > 0
+
     def delete(self, template_id: str, user_id: int) -> bool:
         """
         Видаляє шаблон. Не дозволяє видаляти системні (is_default=True).

@@ -17,6 +17,7 @@ from business.services.real_estate_objects_llm_extractor_service import RealEsta
 from business.services.geocoding_service import GeocodingService
 from config.settings import Settings
 from utils.address_parser import parse_prozorro_item_address
+from utils.real_estate_objects_validator import filter_extracted_objects
 
 logger = logging.getLogger(__name__)
 
@@ -103,16 +104,44 @@ class RealEstateObjectsService:
                 parts.append("Текст з картки оголошення (опис сторінки відсутній):")
                 parts.append(raw_snippet)
 
-        llm = detail.get("llm", {})
-        if isinstance(llm, dict):
-            addrs = llm.get("addresses") or []
-            for a in addrs:
-                if isinstance(a, dict):
-                    line = ", ".join(str(v) for v in a.values() if v)
-                    if line:
-                        parts.append(f"Адреса: {line}")
+        return "\n".join(parts)
+
+    def _build_evidence_text_from_olx(self, olx_doc: Dict[str, Any]) -> str:
+        """
+        Текст оголошення для перевірки ОНМ (без адрес з detail.llm — вони часто
+        провокують LLM створювати зайві об'єкти, яких немає в описі).
+        """
+        parts = []
+        search_data = olx_doc.get("search_data", {}) or {}
+        detail = olx_doc.get("detail", {}) or {}
+
+        title = (search_data.get("title") or "").strip()
+        if title:
+            parts.append(title)
+        loc = (search_data.get("location") or "").strip()
+        if loc:
+            parts.append(loc)
+
+        for p in detail.get("parameters") or []:
+            if isinstance(p, dict):
+                lv = (p.get("label") or "").strip()
+                vv = (p.get("value") or "").strip()
+                if lv or vv:
+                    parts.append(f"{lv}: {vv}")
+
+        desc = (detail.get("description") or "").strip()
+        if desc:
+            parts.append(desc)
+        else:
+            raw_snippet = (search_data.get("raw_snippet") or "").strip()
+            if raw_snippet:
+                parts.append(raw_snippet)
 
         return "\n".join(parts)
+
+    def _build_evidence_text_from_prozorro(self, prozorro_doc: Dict[str, Any]) -> str:
+        """Текст аукціону для перевірки ОНМ (заголовок, опис, предмети)."""
+        return self._build_description_from_prozorro(prozorro_doc)
 
     def _extract_objects_from_prozorro_items(
         self, prozorro_doc: Dict[str, Any]
@@ -505,6 +534,8 @@ class RealEstateObjectsService:
         if source not in ("olx", "prozorro"):
             return []
         objects_raw: List[Dict[str, Any]] = []
+        evidence_text = ""
+        from_llm = False
 
         # Якщо документ джерела не передано — пробуємо підвантажити з колекції, щоб мати повний опис для LLM
         if not prozorro_doc and source == "prozorro":
@@ -513,25 +544,44 @@ class RealEstateObjectsService:
             olx_doc = self._get_olx_repo().find_by_url(source_id)
 
         if prozorro_doc:
+            evidence_text = self._build_evidence_text_from_prozorro(prozorro_doc)
             objects_raw = self._extract_objects_from_prozorro_items(prozorro_doc)
             if not objects_raw:
                 description = self._build_description_from_prozorro(prozorro_doc)
                 if description.strip():
                     objects_raw = self.llm_extractor.extract_objects(description, use_cache=use_cache) or []
+                    from_llm = True
         elif olx_doc:
+            evidence_text = self._build_evidence_text_from_olx(olx_doc)
             description = self._build_description_from_olx(olx_doc)
             if description.strip():
                 objects_raw = self.llm_extractor.extract_objects(description, use_cache=use_cache) or []
+                from_llm = True
         else:
             unified = self.unified_repo.find_by_source_id(source, source_id)
             if not unified:
                 return []
             # Fallback: тільки title + description з unified (менше контексту)
-            description = f"{unified.get('title') or ''}\n{unified.get('description') or ''}"
+            evidence_text = f"{unified.get('title') or ''}\n{unified.get('description') or ''}"
+            description = evidence_text
             if description.strip():
                 objects_raw = self.llm_extractor.extract_objects(description, use_cache=use_cache) or []
+                from_llm = True
+
+        if from_llm and objects_raw and evidence_text.strip():
+            before = len(objects_raw)
+            objects_raw = filter_extracted_objects(objects_raw, evidence_text)
+            if before != len(objects_raw):
+                logger.info(
+                    "ОНМ фільтр %s %s: %s → %s об'єктів (після перевірки текстом)",
+                    source,
+                    source_id[:60],
+                    before,
+                    len(objects_raw),
+                )
 
         if not objects_raw:
+            self.unified_repo.update_real_estate_object_refs(source, source_id, [])
             return []
         refs: List[Dict[str, Any]] = []
         created_ids: List[str] = []

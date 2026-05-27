@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 API: шаблони звітів користувачів.
-Список, створення, видалення, зміна порядку, генерація звіту, генерація назви через LLM.
+Список, створення, оновлення, видалення, зміна порядку, генерація звіту, генерація назви через LLM.
 """
 
 import base64
@@ -73,6 +73,30 @@ def create_template(request: Request, body: CreateTemplateRequest):
     user_id = _get_user_id(request)
     service = _get_report_template_service(request)
     template_id = service.create_template(user_id=user_id, name=body.name, params=body.params)
+    return {"template_id": template_id, "name": body.name}
+
+
+class UpdateTemplateRequest(BaseModel):
+    name: str
+    params: Dict[str, Any]
+
+
+@router.put("/{template_id}")
+def update_template(request: Request, template_id: str, body: UpdateTemplateRequest):
+    """Оновлює користувацький шаблон звіту."""
+    user_id = _get_user_id(request)
+    service = _get_report_template_service(request)
+    ok = service.update_template(
+        template_id=template_id,
+        user_id=user_id,
+        name=body.name,
+        params=body.params,
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail="Неможливо змінити системний шаблон або шаблон не знайдено",
+        )
     return {"template_id": template_id, "name": body.name}
 
 

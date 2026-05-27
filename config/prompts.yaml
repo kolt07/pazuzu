@@ -229,10 +229,12 @@ prompts:
 
       Rules:
       - If the listing describes several objects (e.g. land plot + building, several premises) – extract each one separately.
-      - `land_plot`: for land plots. Always fill `cadastral_number` if it appears. `area_sqm` is area in m² (for land use the formula above).
-      - `building`: architectural object with an address. 1 address = 1 building. `building_type` is chosen from context. House number (`address.building`) must be extracted if present (e.g. "вул. Хрещатик, 15" → `building: "15"`).
+      - If the text only states a count without details (e.g. "5 ділянок" without cadastral numbers or separate addresses) – return `objects: []` or at most that many `land_plot` entries **only** when cadastral numbers or distinct addresses are present for each.
+      - Do **not** create one object per location hint, search card field, or generic region/city alone.
+      - `land_plot`: for land plots. Always fill `cadastral_number` if it appears in the text. Without cadastral number in the text – do not add `land_plot`.
+      - `building`: only when the text names a street (and building number if given). 1 distinct address in text = 1 building.
       - `premises`: separate space inside a building. Use `floor`, `premises_type`, `area_sqm`. For warehouse/industrial buildings one building may have one premises.
-      - Use only information from the description. Do not invent data.
+      - Use only information from the description. Do not invent cadastral numbers, addresses, or object names.
       - Return **only** valid JSON without explanations. All text values must be in Ukrainian.
 
   olx_parsing:

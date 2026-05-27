@@ -81,13 +81,23 @@ def _normalize_region(region: str) -> str:
 
 
 def extract_cadastral_number(text: str) -> str:
-    """Витягує кадастровий номер з тексту."""
+    """Витягує перший кадастровий номер з тексту."""
+    nums = extract_cadastral_numbers(text)
+    return nums[0] if nums else ''
+
+
+def extract_cadastral_numbers(text: str) -> List[str]:
+    """Витягує всі унікальні кадастрові номери з тексту (порядок збережено)."""
     if not text:
-        return ''
-    match = _CADASTRAL_PATTERN.search(text)
-    if match:
-        return match.group(1).strip()
-    return ''
+        return []
+    seen: set[str] = set()
+    result: List[str] = []
+    for match in _CADASTRAL_PATTERN.finditer(text):
+        num = match.group(1).strip()
+        if num and num not in seen:
+            seen.add(num)
+            result.append(num)
+    return result
 
 
 def extract_building_area_sqm(text: str) -> str:

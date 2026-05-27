@@ -177,6 +177,16 @@ class ReportTemplateService:
         """Створює шаблон звіту."""
         return self.repo.create(user_id=user_id, name=name, params=params, is_default=False)
 
+    def update_template(
+        self,
+        template_id: str,
+        user_id: int,
+        name: str,
+        params: Dict[str, Any],
+    ) -> bool:
+        """Оновлює користувацький шаблон (не системний)."""
+        return self.repo.update(template_id, user_id, name, params)
+
     def delete_template(self, template_id: str, user_id: int) -> bool:
         """Видаляє шаблон (не для системних)."""
         return self.repo.delete(template_id, user_id)

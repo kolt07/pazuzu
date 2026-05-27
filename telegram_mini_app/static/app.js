@@ -1426,6 +1426,7 @@
 
   var reportTemplates = [];
   var reportConstructorPrefill = null;
+  var reportConstructorEditId = null;
 
   function showFiles() {
     show("screen-files");
@@ -1474,6 +1475,12 @@
       genBtn.addEventListener("click", function () { generateReportFromTemplate(t._id); });
       actions.appendChild(genBtn);
       if (!t.is_default) {
+        var editBtn = document.createElement("button");
+        editBtn.type = "button";
+        editBtn.className = "btn btn-small btn-secondary";
+        editBtn.textContent = "Редагувати";
+        editBtn.addEventListener("click", function () { editReportTemplate(t); });
+        actions.appendChild(editBtn);
         var delBtn = document.createElement("button");
         delBtn.type = "button";
         delBtn.className = "btn btn-small btn-danger";
@@ -1570,10 +1577,53 @@
       .catch(function (err) { alert(err.message); });
   }
 
-  function openReportConstructor(prefill) {
+  function templateToConstructorPrefill(t) {
+    var params = t.params || {};
+    return {
+      name: t.name || "",
+      source: params.source || "",
+      date_filter: params.date_filter != null ? params.date_filter : 7,
+      filter_string: params.filter_string != null ? String(params.filter_string) : "",
+      sort_field: params.sort_field || "source_updated_at",
+      sort_order: params.sort_order || "desc",
+      output_format: params.output_format || "unified_table"
+    };
+  }
+
+  function editReportTemplate(template) {
+    if (!template || template.is_default) return;
+    openReportConstructor(templateToConstructorPrefill(template), template._id);
+  }
+
+  function setConstructorNameFieldEditable() {
+    var nameEl = document.getElementById("constructor-name");
+    if (!nameEl) return;
+    nameEl.readOnly = false;
+    nameEl.disabled = false;
+    nameEl.removeAttribute("readonly");
+    nameEl.removeAttribute("disabled");
+  }
+
+  function updateReportConstructorUi() {
+    var titleEl = document.getElementById("report-constructor-title");
+    var saveBtn = document.getElementById("constructor-save");
+    if (titleEl) {
+      titleEl.textContent = reportConstructorEditId
+        ? "Редагування шаблону звіту"
+        : "Конструктор шаблону звіту";
+    }
+    if (saveBtn) {
+      saveBtn.textContent = reportConstructorEditId ? "Зберегти зміни" : "Зберегти шаблон";
+    }
+  }
+
+  function openReportConstructor(prefill, editId) {
     reportConstructorPrefill = prefill || null;
+    reportConstructorEditId = editId || null;
     var modal = document.getElementById("report-constructor-modal");
     if (!modal) return;
+    setConstructorNameFieldEditable();
+    updateReportConstructorUi();
     var cfs = document.getElementById("constructor-filter-string");
     if (prefill) {
       document.getElementById("constructor-source").value = prefill.source || "";
@@ -1587,7 +1637,8 @@
       if (sortO) sortO.value = prefill.sort_order || "desc";
       var outFmt = document.getElementById("constructor-output-format");
       if (outFmt) outFmt.value = prefill.output_format || "unified_table";
-      document.getElementById("constructor-name").value = prefill.name || "";
+      var nameEl = document.getElementById("constructor-name");
+      if (nameEl) nameEl.value = prefill.name || "";
     } else {
       document.getElementById("constructor-source").value = "";
       document.getElementById("constructor-date-filter").value = "7";
@@ -1598,15 +1649,22 @@
       if (sortO2) sortO2.value = "desc";
       var outFmt2 = document.getElementById("constructor-output-format");
       if (outFmt2) outFmt2.value = "unified_table";
-      document.getElementById("constructor-name").value = "";
+      var nameElEmpty = document.getElementById("constructor-name");
+      if (nameElEmpty) nameElEmpty.value = "";
     }
     modal.classList.remove("hidden");
+    var focusName = document.getElementById("constructor-name");
+    if (focusName && typeof focusName.focus === "function") {
+      setTimeout(function () { focusName.focus(); }, 0);
+    }
   }
 
   function closeReportConstructor() {
     var modal = document.getElementById("report-constructor-modal");
     if (modal) modal.classList.add("hidden");
     reportConstructorPrefill = null;
+    reportConstructorEditId = null;
+    updateReportConstructorUi();
   }
 
   function getConstructorParams() {
@@ -1631,12 +1689,23 @@
       var name = document.getElementById("constructor-name").value.trim();
       if (!name) { alert("Введіть назву шаблону"); return; }
       var params = getConstructorParams();
-      fetch("/api/report-templates/", {
-        method: "POST",
+      var isEdit = !!reportConstructorEditId;
+      var url = isEdit
+        ? "/api/report-templates/" + encodeURIComponent(reportConstructorEditId)
+        : "/api/report-templates/";
+      fetch(url, {
+        method: isEdit ? "PUT" : "POST",
         headers: apiHeaders(),
         body: JSON.stringify({ name: name, params: params })
       })
-        .then(function (r) { return r.json(); })
+        .then(function (r) {
+          if (!r.ok) {
+            return r.json().then(function (d) {
+              throw new Error(d.detail || "Помилка збереження");
+            });
+          }
+          return r.json();
+        })
         .then(function () {
           closeReportConstructor();
           loadReportTemplates();

@@ -418,7 +418,7 @@
       </div>
       <div id="report-constructor-modal" class="modal hidden">
         <div class="modal-content report-constructor">
-          <h3>Конструктор шаблону звіту</h3>
+          <h3 id="report-constructor-title">Конструктор шаблону звіту</h3>
           <div class="constructor-fields">
             <div class="filter-group">
               <label>Джерело даних <span class="required">*</span>:</label>
@@ -466,8 +466,15 @@
               </select>
             </div>
             <div class="filter-group name-row">
-              <label>Назва шаблону:</label>
-              <input type="text" id="constructor-name" class="filter-input" placeholder="Назва шаблону" />
+              <label for="constructor-name">Назва шаблону:</label>
+              <input
+                type="text"
+                id="constructor-name"
+                class="filter-input"
+                name="constructor-name"
+                autocomplete="off"
+                placeholder="Введіть назву шаблону"
+              />
               <button type="button" id="constructor-generate-name" class="btn btn-secondary">Згенерувати</button>
             </div>
           </div>

@@ -414,10 +414,8 @@ class UnifiedListingsRepository(BaseRepository):
         Returns:
             True якщо оновлено
         """
-        if not refs:
-            return False
         result = self.collection.update_one(
             {"source": source, "source_id": source_id},
-            {"$set": {"real_estate_object_refs": refs}},
+            {"$set": {"real_estate_object_refs": refs or []}},
         )
-        return result.modified_count > 0
+        return result.matched_count > 0
