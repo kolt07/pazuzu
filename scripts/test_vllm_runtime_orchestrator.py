@@ -117,6 +117,32 @@ class VllmRuntimeOrchestratorTest(unittest.TestCase):
         self.assertAlmostEqual(sum_instance_rows_usd(iter(rows), instance_id=None), 9.1, places=6)
         self.assertAlmostEqual(sum_vast_billing_day_rows_usd(iter(rows)), 10.1, places=6)
 
+    def test_range_sum_prorates_contract_to_window(self):
+        from datetime import date
+
+        from business.services.vast_billing_service import (
+            _utc_day_unix_bounds,
+            sum_vast_billing_range_rows_usd,
+        )
+
+        contract_start = date(2026, 5, 1)
+        contract_end = date(2026, 5, 10)
+        c_gte, _ = _utc_day_unix_bounds(contract_start)
+        _, c_lte = _utc_day_unix_bounds(contract_end)
+        row = {
+            "type": "instance",
+            "source": "instance-1",
+            "start": c_gte,
+            "end": c_lte,
+            "amount": 100.0,
+        }
+        win_start = date(2026, 5, 8)
+        win_end = date(2026, 5, 10)
+        w_gte, _ = _utc_day_unix_bounds(win_start)
+        _, w_lte = _utc_day_unix_bounds(win_end)
+        total = sum_vast_billing_range_rows_usd(iter([row]), win_gte=w_gte, win_lte=w_lte)
+        self.assertAlmostEqual(total, 30.0, delta=1.5)
+
     def test_select_offer_prefers_compatible_gpu_over_cheaper_incompatible(self):
         class _FakeClient:
             def search_offers(self, filters):

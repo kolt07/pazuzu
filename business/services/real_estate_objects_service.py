@@ -470,12 +470,10 @@ class RealEstateObjectsService:
 
     def _format_address_from_llm(self, addr: Dict[str, Any]) -> str:
         """Формує рядок адреси з LLM-об'єкта для геокодування."""
-        parts = []
-        for k in ("region", "district", "settlement", "street", "building"):
-            v = addr.get(k)
-            if v:
-                parts.append(str(v))
-        return ", ".join(parts) if parts else addr.get("formatted_address") or ""
+        from utils.address_geo_enrichment import format_address_line_from_llm
+
+        line = format_address_line_from_llm(addr)
+        return line or addr.get("formatted_address") or ""
 
     def _create_building_doc(
         self,

@@ -52,19 +52,135 @@ def iter_charge_rows(
             break
 
 
-def sum_vast_billing_day_rows_usd(rows: Iterator[Dict[str, Any]]) -> float:
+def _parse_epoch(val: Any) -> Optional[int]:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _prorate_amount_usd(
+    amount: float,
+    seg_start: int,
+    seg_end: int,
+    win_start: int,
+    win_end: int,
+) -> float:
+    """Частка amount на перетин інтервалів [seg_start, seg_end] та [win_start, win_end] (unix sec)."""
+    if seg_end < win_start or seg_start > win_end:
+        return 0.0
+    overlap_start = max(seg_start, win_start)
+    overlap_end = min(seg_end, win_end)
+    seg_len = max(1, seg_end - seg_start)
+    overlap_len = max(0, overlap_end - overlap_start)
+    if overlap_len <= 0:
+        return 0.0
+    if overlap_len >= seg_len:
+        return amount
+    return amount * (overlap_len / seg_len)
+
+
+def _row_usd_for_utc_window(row: Dict[str, Any], win_gte: int, win_lte: int) -> float:
     """
-    Сума `amount` по рядках денного звіту: GPU (instance), сховище (volume), serverless.
+    Внесок рядка charges у вікно UTC (календарна доба).
+    Якщо є items (gpu/disk/...) — пропорція по start/end кожного item; інакше — по рядку контракту.
+    """
+    items = row.get("items")
+    if isinstance(items, list) and items:
+        subtotal = 0.0
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            istart = _parse_epoch(it.get("start"))
+            iend = _parse_epoch(it.get("end"))
+            if istart is None or iend is None:
+                continue
+            try:
+                amt = float(it.get("amount") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            subtotal += _prorate_amount_usd(amt, istart, iend, win_gte, win_lte)
+        return subtotal
+    cstart = _parse_epoch(row.get("start"))
+    cend = _parse_epoch(row.get("end"))
+    if cstart is not None and cend is not None:
+        try:
+            amt = float(row.get("amount") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return _prorate_amount_usd(amt, cstart, cend, win_gte, win_lte)
+    try:
+        return float(row.get("amount") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _row_usd_contract_total(row: Dict[str, Any]) -> float:
+    """Повна сума контракту за рядком (items або amount)."""
+    items = row.get("items")
+    if isinstance(items, list) and items:
+        subtotal = 0.0
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                subtotal += float(it.get("amount") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return subtotal
+    try:
+        return float(row.get("amount") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _charge_row_dedupe_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        str(row.get("type") or "").lower(),
+        str(row.get("source") or ""),
+        _parse_epoch(row.get("start")),
+        _parse_epoch(row.get("end")),
+    )
+
+
+def sum_vast_billing_day_rows_usd(
+    rows: Iterator[Dict[str, Any]],
+    *,
+    day: Optional[date] = None,
+) -> float:
+    """
+    Сума витрат за календарну UTC-добу (instance + volume + serverless).
+    Параметр ``day`` збережено для сумісності, але сума рахується напряму по amount.
     """
     allowed = {t.lower() for t in VAST_BILLING_DAY_TYPE_FILTERS}
     total = 0.0
     for row in rows:
         if str(row.get("type") or "").lower() not in allowed:
             continue
-        try:
-            total += float(row.get("amount") or 0.0)
-        except (TypeError, ValueError):
+        # /charges/ з day.gte/day.lte повертає суму amount вже для запитаного вікна.
+        # Додаткова пропорція по часу тут дає заниження денних сум.
+        total += _row_usd_contract_total(row)
+    return round(total, 6)
+
+
+def sum_vast_billing_range_rows_usd(
+    rows: Iterator[Dict[str, Any]],
+) -> float:
+    """
+    Сума charges за один запит з діапазоном day.gte..lte (без подвійного підсумовування днів).
+    Дедуплікація рядків за type+source+start+end.
+    """
+    allowed = {t.lower() for t in VAST_BILLING_DAY_TYPE_FILTERS}
+    seen: set[Tuple[Any, ...]] = set()
+    total = 0.0
+    for row in rows:
+        if str(row.get("type") or "").lower() not in allowed:
             continue
+        key = _charge_row_dedupe_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += _row_usd_contract_total(row)
     return round(total, 6)
 
 
@@ -133,7 +249,38 @@ def fetch_one_calendar_day_instance_charges_usd(
     }
     try:
         c = client or VastAiClient(api_key=key, timeout_sec=timeout_sec)
-        total = sum_vast_billing_day_rows_usd(iter_charge_rows(c, filters))
+        total = sum_vast_billing_day_rows_usd(iter_charge_rows(c, filters), day=d)
+        return float(total), None
+    except Exception as e:
+        return 0.0, str(e)
+
+
+def fetch_calendar_range_charges_usd(
+    api_key: str,
+    start: date,
+    end: date,
+    *,
+    client: Optional[VastAiClient] = None,
+    timeout_sec: int = 60,
+) -> Tuple[float, Optional[str]]:
+    """
+    Сума charges за календарний інтервал UTC [start, end] включно — один запит до API.
+    Використовується для «Vast 30д», щоб не підсумовувати добові запити з можливим дублем контрактів.
+    """
+    key = (api_key or "").strip()
+    if not key:
+        return 0.0, "vast_api_key_empty"
+    if end < start:
+        start, end = end, start
+    gte, _ = _utc_day_unix_bounds(start)
+    _, lte = _utc_day_unix_bounds(end)
+    filters: Dict[str, Any] = {
+        "day": {"gte": gte, "lte": lte},
+        "type": {"in": list(VAST_BILLING_DAY_TYPE_FILTERS)},
+    }
+    try:
+        c = client or VastAiClient(api_key=key, timeout_sec=timeout_sec)
+        total = sum_vast_billing_range_rows_usd(iter_charge_rows(c, filters))
         return float(total), None
     except Exception as e:
         return 0.0, str(e)
@@ -192,7 +339,8 @@ def sync_vast_billing_daily_cache(
                     if cached is not None:
                         out[dk] = float(cached)
                         continue
-                    out[dk] = 0.0
+                    # Якщо кешу немає, не підставляємо 0.0:
+                    # на рівні admin route тоді спрацює fallback на billed_cost_usd з логів.
                     continue
                 out[dk] = float(val)
                 repo.upsert_day(dk, float(val))
@@ -247,10 +395,14 @@ def sum_billed_usd_last_n_calendar_days(
     billed_by_day: Dict[str, float],
     *,
     n: int,
+    end_date: Optional[date] = None,
 ) -> float:
-    """Сума останніх n календарних днів за ключами YYYY-MM-DD (UTC у billed_by_day)."""
+    """Сума рівно n календарних UTC-днів, що закінчуються end_date (включно)."""
     if not billed_by_day or n <= 0:
         return 0.0
-    keys = sorted(billed_by_day.keys())
-    tail = keys[-min(n, len(keys)) :]
-    return round(sum(float(billed_by_day.get(k) or 0.0) for k in tail), 6)
+    end = end_date or datetime.now(timezone.utc).date()
+    total = 0.0
+    for i in range(n):
+        dk = (end - timedelta(days=i)).strftime("%Y-%m-%d")
+        total += float(billed_by_day.get(dk) or 0.0)
+    return round(total, 6)

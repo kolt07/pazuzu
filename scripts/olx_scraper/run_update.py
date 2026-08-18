@@ -395,12 +395,15 @@ def _process_category_raw_only(
     session: Optional[Any] = None,
     region_name: Optional[str] = None,
     browser_fetcher: Optional[Any] = None,
+    start_page: int = 1,
+    source_load_run_id: Optional[str] = None,
+    on_page_done: Optional[Callable[[int], None]] = None,
 ) -> Tuple[int, List[str]]:
     """
-    Phase 1 (raw pipeline): лише завантаження сирих даних у raw_olx_listings.
-    Фільтрація та зупинка пагінації — як у _process_category: 0 результатів (рекламні), cutoff по даті, ретраї, 404.
-    Сторінки пошуку — завжди через прямі HTTP-запити (session). Деталі оголошень — через browser_fetcher (Playwright).
-    Повертає (total_count, loaded_urls).
+    Phase 1 (raw pipeline): list HTTP → одразу detail+upsert по сторінці (streaming, low-RAM).
+    start_page: продовження пагінації після resume (last_page+1).
+    on_page_done(page): checkpoint після успішної обробки сторінки.
+    Повертає (total_count, loaded_urls) — loaded_urls лише змінені/нові в цьому проході.
     """
     def log(msg: str) -> None:
         if log_fn:
@@ -408,33 +411,40 @@ def _process_category_raw_only(
         else:
             print(msg, flush=True)
 
-    all_listings: List[Dict[str, Any]] = []
-    stop_pages = False
-    page = 1
+    if browser_fetcher is None:
+        raise RuntimeError("Browser detail fetcher is required for OLX detail pages.")
 
-    # ——— Етап 1: сторінки пошуку — та сама логіка що в _process_category ———
+    stop_pages = False
+    page = max(1, int(start_page or 1))
+    total_count = 0
+    loaded_urls: List[str] = []
+    fetch_filters: Dict[str, Any] = {"category_label": category_label}
+    if region_name:
+        fetch_filters["region_filter"] = region_name
+    approximate_region = region_name
+
     while True:
         if stop_pages:
             break
         if max_pages is not None and page > max_pages:
             break
         url = get_list_url(page)
-        if page == 1:
-            log(f"[OLX raw] {category_label}: URL пошуку (перша сторінка): {url}")
+        if page == 1 or page == start_page:
+            log(f"[OLX raw] {category_label}: URL пошуку (сторінка {page}): {url}")
         page_label = f"{page}" if max_pages is None else f"{page}/{max_pages}"
         log(f"[OLX raw] {category_label}: сторінка пошуку {page_label}")
         listings = []
         retry_count = getattr(scraper_config, "RETRY_EMPTY_PAGE_COUNT", 2)
         fetch_failed = False
+        last_was_403 = False
         for attempt in range(max(1, retry_count + 1)):
             response_text = ""
             status_code = 200
             try:
-                # Сторінки пошуку — завжди прямі HTTP-запити (requests)
                 response = fetch_page(
                     url,
                     delay_before=(attempt == 0),
-                    delay_after=True,
+                    delay_after=False,
                     session=session,
                 )
                 response_text = response.text
@@ -443,27 +453,73 @@ def _process_category_raw_only(
                     log(f"[OLX raw] {category_label}: 404 на сторінці {page} — кінець результатів")
                     stop_pages = True
                     break
+                if status_code == 403:
+                    raise RuntimeError("HTTP 403 Forbidden")
                 if status_code >= 500:
                     raise RuntimeError(f"HTTP {status_code}")
             except Exception as e:
                 err_str = str(e)
                 is_404 = "404" in err_str
+                is_403 = "403" in err_str
                 is_server_error = "502" in err_str or "503" in err_str or "504" in err_str
+                last_was_403 = is_403
                 log(f"[OLX raw] Помилка запиту {url}: {e}")
                 if is_404:
                     log(f"[OLX raw] {category_label}: 404 на сторінці {page} — кінець результатів")
                     stop_pages = True
                     break
                 if attempt < retry_count:
-                    delay_sec = scraper_config.get_delay_seconds()
-                    if is_server_error:
-                        delay_sec = max(delay_sec, 10)
+                    if is_403:
+                        delay_sec = scraper_config.get_403_backoff_seconds()
+                        log(f"[OLX raw] HTTP 403 — backoff {delay_sec:.1f} с перед повтором...")
+                    else:
+                        delay_sec = scraper_config.get_delay_seconds()
+                        if is_server_error:
+                            delay_sec = max(delay_sec, 10)
                     time.sleep(delay_sec)
                     continue
-                log(f"[OLX raw] {category_label}: пропускаємо сторінку {page} після {retry_count + 1} спроб")
-                fetch_failed = True
-                page += 1
-                break
+                # Після HTTP-спроб: браузерний fallback на 403 (антибот часто пропускає Playwright)
+                use_browser_list = (
+                    last_was_403
+                    and getattr(scraper_config, "LIST_FALLBACK_BROWSER_ON_403", True)
+                    and browser_fetcher is not None
+                    and hasattr(browser_fetcher, "get_list_page")
+                )
+                if use_browser_list:
+                    log(f"[OLX raw] {category_label}: HTTP 403 після {retry_count + 1} спроб — fallback list через браузер")
+                    try:
+                        br = browser_fetcher.get_list_page(url, delay_before=True, delay_after=False)
+                        status_code = getattr(br, "status_code", 0) or 0
+                        response_text = getattr(br, "text", "") or ""
+                        if status_code == 404:
+                            log(f"[OLX raw] {category_label}: 404 на сторінці {page} — кінець результатів")
+                            stop_pages = True
+                            break
+                        if status_code == 403 or status_code >= 500:
+                            raise RuntimeError(f"Browser list HTTP {status_code}")
+                        last_was_403 = False
+                        # успіх — йдемо парсити response_text нижче (не break з except)
+                    except Exception as be:
+                        log(f"[OLX raw] Browser list fallback не вдався: {be}")
+                        log(
+                            f"[OLX raw] {category_label}: зупинка категорії на сторінці {page} "
+                            f"(антибот 403, не скіпаємо пагінацію)"
+                        )
+                        stop_pages = True
+                        fetch_failed = True
+                        break
+                else:
+                    if last_was_403:
+                        log(
+                            f"[OLX raw] {category_label}: зупинка категорії на сторінці {page} "
+                            f"після {retry_count + 1} спроб (403)"
+                        )
+                        stop_pages = True
+                    else:
+                        log(f"[OLX raw] {category_label}: пропускаємо сторінку {page} після {retry_count + 1} спроб")
+                        page += 1
+                    fetch_failed = True
+                    break
             import re
             html_lower = response_text.lower()
             html_norm = html_lower.replace("\u00a0", " ").replace("\u202f", " ")
@@ -484,8 +540,8 @@ def _process_category_raw_only(
             if listings:
                 break
             if attempt < retry_count:
-                delay_sec = getattr(scraper_config, "DELAY_AFTER_PAGE_LOAD", 3)
-                log(f"[OLX raw] 0 оголошень — повторна спроба через {delay_sec:.0f} с...")
+                delay_sec = scraper_config.get_delay_seconds()
+                log(f"[OLX raw] 0 оголошень — повторна спроба через {delay_sec:.1f} с...")
                 time.sleep(delay_sec)
         min_full = getattr(scraper_config, "MIN_LISTINGS_PER_FULL_PAGE", 15)
         if listings and len(listings) < min_full:
@@ -496,9 +552,8 @@ def _process_category_raw_only(
         if not listings:
             break
 
-        # Топові (платні) оголошення OLX вставляються на сторінку без урахування сортування.
-        # Зупиняємось лише якщо більше половини оголошень на сторінці старші за граничну дату (cutoff).
         count_older_than_cutoff = 0
+        page_items: List[Dict[str, Any]] = []
         for item in listings:
             listing_url = item.get("url")
             if cutoff_utc is not None:
@@ -507,7 +562,7 @@ def _process_category_raw_only(
                     count_older_than_cutoff += 1
                     continue
             if listing_url:
-                all_listings.append(item)
+                page_items.append(item)
 
         if cutoff_utc is not None and count_older_than_cutoff > len(listings) / 2:
             log(f"[OLX raw] {category_label}: більше половини оголошень на сторінці старші за граничну дату ({count_older_than_cutoff}/{len(listings)}) — зупинка")
@@ -522,53 +577,47 @@ def _process_category_raw_only(
             last_date = last_on_page.get("date_text") or last_on_page.get("listed_at_iso") or "—"
             log(f"[OLX raw] {category_label}: дата останнього оголошення на сторінці: {last_date}")
 
+        # Streaming: detail + upsert одразу після list-сторінки (без накопичення all_listings)
+        for idx, item in enumerate(page_items, start=1):
+            listing_url = item.get("url")
+            if not listing_url:
+                continue
+            total_count += 1
+            log(f"[OLX raw] {category_label}: опрацювання стор.{page} {idx}/{len(page_items)}")
+            search_data = search_data_from_listing(item)
+            new_hash = calculate_search_data_hash(search_data)
+            existing_raw = raw_repo.find_by_url(listing_url)
+            if existing_raw and existing_raw.get("search_data_hash") == new_hash:
+                continue
+            try:
+                detail_result = browser_fetcher.get_detail_page(listing_url)
+                detail_html = detail_result.text
+                detail_data = parse_detail_page(detail_html)
+                if detail_data.get("_inactive"):
+                    detail_data.pop("_inactive", None)
+                raw_repo.upsert_raw(
+                    url=listing_url,
+                    search_data=search_data,
+                    detail=detail_data or None,
+                    fetch_filters=fetch_filters,
+                    approximate_region=approximate_region,
+                    source_load_run_id=source_load_run_id,
+                )
+                loaded_urls.append(listing_url)
+            except Exception as e:
+                log(f"[OLX raw] Помилка деталей {listing_url[:50]}...: {e}")
+
+        if on_page_done is not None:
+            try:
+                on_page_done(page)
+            except Exception as e:
+                log(f"[OLX raw] checkpoint page {page}: {e}")
+
         if stop_pages:
             break
         page += 1
 
-    total_count = len(all_listings)
-    log(f"[OLX raw] {category_label}: всього оголошень до опрацювання: {total_count}")
-
-    if total_count == 0:
-        return 0, []
-
-    if browser_fetcher is None:
-        raise RuntimeError("Browser detail fetcher is required for OLX detail pages.")
-
-    # ——— Етап 2: завантаження деталей і запис у raw (без LLM) ———
-    loaded_urls: List[str] = []
-    fetch_filters: Dict[str, Any] = {"category_label": category_label}
-    if region_name:
-        fetch_filters["region_filter"] = region_name
-    approximate_region = region_name
-
-    for idx, item in enumerate(all_listings, start=1):
-        listing_url = item.get("url")
-        if not listing_url:
-            continue
-        log(f"[OLX raw] {category_label}: опрацювання {idx}/{total_count}")
-        search_data = search_data_from_listing(item)
-        new_hash = calculate_search_data_hash(search_data)
-        existing_raw = raw_repo.find_by_url(listing_url)
-        if existing_raw and existing_raw.get("search_data_hash") == new_hash:
-            continue
-        try:
-            detail_result = browser_fetcher.get_detail_page(listing_url)
-            detail_html = detail_result.text
-            detail_data = parse_detail_page(detail_html)
-            if detail_data.get("_inactive"):
-                detail_data.pop("_inactive", None)
-            raw_repo.upsert_raw(
-                url=listing_url,
-                search_data=search_data,
-                detail=detail_data or None,
-                fetch_filters=fetch_filters,
-                approximate_region=approximate_region,
-            )
-            loaded_urls.append(listing_url)
-        except Exception as e:
-            log(f"[OLX raw] Помилка деталей {listing_url[:50]}...: {e}")
-
+    log(f"[OLX raw] {category_label}: всього оголошень (у вікні cutoff): {total_count}, оновлено/завантажено: {len(loaded_urls)}")
     return total_count, loaded_urls
 
 
@@ -820,18 +869,41 @@ def _phase1_worker(
     llm_seen_lock: threading.Lock,
     llm_processed_urls_ref: List[str],
     browser_fetcher: Optional[Any] = None,
+    source_load_run_id: Optional[str] = None,
+    unit_state: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     """
-    Воркер Phase 1: бере завдання з черги (region_name, category_dict), виконує _process_category_raw_only,
-    додає результат до загальних total_listings і all_loaded_urls.
-    Один потік = один воркер = один браузер на потік.
+    Воркер Phase 1: бере завдання з черги (region_name, category_dict), виконує streaming
+    _process_category_raw_only; detail — через спільний BrowserPagePool.
     """
+    from data.repositories.source_load_run_repository import (
+        SourceLoadRunRepository,
+        make_olx_unit_key,
+        UNIT_DONE,
+    )
+
     session = get_session()
+    run_repo = SourceLoadRunRepository() if source_load_run_id else None
 
     def run_job(region_name: str, cat: Dict[str, Any]) -> Tuple[int, List[str]]:
         get_list_url = cat.get("get_list_url")
         if not callable(get_list_url):
             return 0, []
+        label = cat.get("label", "?")
+        unit_key = make_olx_unit_key(region_name, label)
+        start_page = 1
+        if unit_state is not None:
+            st = unit_state.get(unit_key) or {}
+            if st.get("status") == UNIT_DONE:
+                log_fn(f"[OLX raw] skip done work unit: {unit_key}")
+                return 0, []
+            last_page = st.get("last_page")
+            if isinstance(last_page, int) and last_page >= 1:
+                start_page = last_page + 1
+                log_fn(f"[OLX raw] resume {unit_key} з сторінки {start_page}")
+        if run_repo and source_load_run_id:
+            run_repo.mark_unit_running(source_load_run_id, unit_key)
+
         max_pages = (
             max_pages_override
             if max_pages_override is not None
@@ -840,17 +912,36 @@ def _phase1_worker(
                 scraper_config.MAX_SEARCH_PAGES,
             )
         )
-        return _process_category_raw_only(
+
+        def on_page_done(page_num: int) -> None:
+            if run_repo and source_load_run_id:
+                run_repo.set_unit_last_page(source_load_run_id, unit_key, page_num)
+            if unit_state is not None:
+                unit_state[unit_key] = {
+                    **(unit_state.get(unit_key) or {}),
+                    "last_page": page_num,
+                    "status": "running",
+                }
+
+        n_list, urls = _process_category_raw_only(
             get_list_url,
             max_pages,
-            cat.get("label", "?"),
+            label,
             raw_repo,
             log_fn=log_fn,
             cutoff_utc=cutoff_utc,
             session=session,
             region_name=region_name,
             browser_fetcher=browser_fetcher,
+            start_page=start_page,
+            source_load_run_id=source_load_run_id,
+            on_page_done=on_page_done,
         )
+        if run_repo and source_load_run_id:
+            run_repo.mark_unit_done(source_load_run_id, unit_key)
+        if unit_state is not None:
+            unit_state[unit_key] = {**(unit_state.get(unit_key) or {}), "status": UNIT_DONE}
+        return n_list, urls
 
     def _drain_llm_once() -> bool:
         if not llm_process_url_fn or not llm_queue:
@@ -891,23 +982,20 @@ def _phase1_worker(
                 n_list, urls = run_job(region_name, cat)
                 with results_lock:
                     total_listings_ref[0] += n_list
-                    all_loaded_urls_ref.extend(urls)
+                    # Не тримаємо гігантський список у RAM: для Phase 2 — Mongo по run_id.
+                    # all_loaded_urls_ref лише для зворотної сумісності (короткий шлях без run_id).
+                    if not source_load_run_id:
+                        all_loaded_urls_ref.extend(urls)
                 if llm_process_url_fn and llm_queue:
                     allow_region = True
                     if llm_enqueue_region_filter_fn:
                         allow_region = llm_enqueue_region_filter_fn(region_name)
                     if allow_region:
-                        for url in urls:
-                            with llm_seen_lock:
-                                if url in llm_seen_urls:
-                                    continue
-                                llm_seen_urls.add(url)
-                            llm_queue.put(url)
-                while _drain_llm_once():
-                    pass
-            except Exception as e:
-                with results_lock:
-                    log_fn(f"[OLX raw] Помилка {region_name} / {cat.get('label', '?')}: {e}")
+                        with llm_seen_lock:
+                            for u in urls:
+                                if u and u not in llm_seen_urls:
+                                    llm_seen_urls.add(u)
+                                    llm_queue.put(u)
             finally:
                 with source_state_lock:
                     source_inflight_ref[0] = max(0, source_inflight_ref[0] - 1)
@@ -917,6 +1005,7 @@ def _phase1_worker(
         return
 
     from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
+
     with BrowserPageFetcher(headless=True, log_fn=log_fn) as bf:
         browser_fetcher = bf
         _run_loop()
@@ -931,18 +1020,21 @@ def run_olx_update_raw_only(
     max_workers: Optional[int] = None,
     llm_process_url_fn: Optional[Callable[[str], bool]] = None,
     llm_enqueue_region_filter_fn: Optional[Callable[[str], bool]] = None,
+    source_load_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Phase 1 pipeline: завантаження сирих даних OLX лише в raw_olx_listings (без LLM, без olx_listings).
 
-    Пул завдань: кожне завдання = (область, категорія), напр. «Черкаська, Нежитлова нерухомість».
-    Потоки беруть наступне завдання з пулу; коли пул порожній — потік завершується. Після завершення всіх потоків Phase 1 закінчено, далі Phase 2 у run_full_pipeline.
-
-    regions: якщо задано — обробляються лише ці області (назви з olx_region_slugs).
-    listing_types: якщо задано — лише категорії, чий label містить один із рядків (напр. «Нежитлова», «Земля»).
-    max_workers: кількість потоків Phase 1; None = з конфігу (OLX_PHASE1_MAX_THREADS), 0 = не використовувати пул (legacy: по одному потоку на область).
-    Повертає success, total_listings, loaded_urls, llm_processed_urls.
+    Пул завдань: (область, категорія); detail — спільний BrowserPagePool (low-RAM).
+    source_load_run_id: durable resume (skip done units, last_page).
     """
+    from data.repositories.source_load_run_repository import (
+        SourceLoadRunRepository,
+        UNIT_DONE,
+        UNIT_PENDING,
+        make_olx_unit_key,
+    )
+
     if llm_process_url_fn is not None:
         raise ValueError(
             "Inline LLM processing during OLX Phase 1 is disabled. "
@@ -1000,15 +1092,50 @@ def run_olx_update_raw_only(
     num_workers = max_workers if max_workers is not None else getattr(scraper_config, "OLX_PHASE1_MAX_THREADS", 5)
     use_pool = num_workers > 0
 
+    unit_state: Dict[str, Dict[str, Any]] = {}
+    run_repo: Optional[SourceLoadRunRepository] = None
+    if source_load_run_id:
+        run_repo = SourceLoadRunRepository()
+        existing = run_repo.get_run(source_load_run_id)
+        existing_units = {u.get("key"): u for u in (existing or {}).get("work_units") or [] if u.get("key")}
+        built_units: List[Dict[str, Any]] = []
+        for region_name, cats in regions_with_cats:
+            for cat in cats:
+                if not callable(cat.get("get_list_url")):
+                    continue
+                key = make_olx_unit_key(region_name, cat.get("label", "?"))
+                prev = existing_units.get(key) or {}
+                unit = {
+                    "key": key,
+                    "source": "olx",
+                    "region": region_name,
+                    "category": cat.get("label", "?"),
+                    "status": prev.get("status") or UNIT_PENDING,
+                    "last_page": prev.get("last_page"),
+                }
+                built_units.append(unit)
+                unit_state[key] = unit
+        merged = [u for u in (existing or {}).get("work_units") or [] if u.get("source") == "prozorro"]
+        merged.extend(built_units)
+        run_repo.set_work_units(source_load_run_id, merged)
+
     if use_pool:
-        # Пул завдань: одне завдання = (область, категорія), напр. «Черкаська, Нежитлова нерухомість»
         job_list: List[Tuple[str, Dict[str, Any]]] = []
         for region_name, cats in regions_with_cats:
             for cat in cats:
-                if callable(cat.get("get_list_url")):
-                    job_list.append((region_name, cat))
+                if not callable(cat.get("get_list_url")):
+                    continue
+                key = make_olx_unit_key(region_name, cat.get("label", "?"))
+                if unit_state.get(key, {}).get("status") == UNIT_DONE:
+                    continue
+                job_list.append((region_name, cat))
         if not job_list:
-            return {"success": True, "total_listings": 0, "loaded_urls": [], "llm_processed_urls": []}
+            loaded = (
+                raw_repo.list_urls_by_source_load_run_id(source_load_run_id)
+                if source_load_run_id
+                else []
+            )
+            return {"success": True, "total_listings": 0, "loaded_urls": loaded, "llm_processed_urls": []}
         job_queue: "queue.Queue[Tuple[str, Dict[str, Any]]]" = queue.Queue()
         for j in job_list:
             job_queue.put(j)
@@ -1023,84 +1150,20 @@ def run_olx_update_raw_only(
         llm_queue: Optional["queue.Queue[str]"] = queue.Queue() if llm_process_url_fn else None
         llm_seen_urls: Set[str] = set()
         llm_seen_lock = threading.Lock()
-        log("[OLX raw] Phase 1: пул завдань (область + категорія), %s потоків, %s завдань" % (num_workers, len(job_list)))
-        if llm_process_url_fn:
-            log("[OLX raw] Phase 1/2: увімкнено динамічний підхват LLM-черги вільними воркерами.")
-        pool_size_override = int(getattr(scraper_config, "BROWSER_POOL_SIZE", 0) or 0)
-        browser_pool_size = max(1, pool_size_override if pool_size_override > 0 else num_workers)
-        use_shared_pool = browser_pool_size > 0
-
-        if use_shared_pool:
-            try:
-                from scripts.olx_scraper.browser_fetcher import BrowserPagePool
-                with BrowserPagePool(headless=True, pool_size=browser_pool_size, log_fn=log) as browser_fetcher:
-                    # Playwright sync API thread-affine: BrowserPool і його page/context
-                    # мають використовуватися в тому ж потоці, де були створені.
-                    # Для num_workers=1 не запускаємо окремий thread.
-                    if num_workers == 1:
-                        _phase1_worker(
-                            job_queue,
-                            raw_repo,
-                            log,
-                            cutoff_utc,
-                            max_pages_override,
-                            results_lock,
-                            total_listings_ref,
-                            all_loaded_urls,
-                            source_pending_ref,
-                            source_inflight_ref,
-                            source_state_lock,
-                            llm_process_url_fn,
-                            llm_enqueue_region_filter_fn,
-                            llm_queue,
-                            llm_seen_urls,
-                            llm_seen_lock,
-                            llm_processed_urls,
-                            browser_fetcher,
-                        )
-                    else:
-                        workers = [
-                            threading.Thread(
-                                target=_phase1_worker,
-                                args=(
-                                    job_queue,
-                                    raw_repo,
-                                    log,
-                                    cutoff_utc,
-                                    max_pages_override,
-                                    results_lock,
-                                    total_listings_ref,
-                                    all_loaded_urls,
-                                    source_pending_ref,
-                                    source_inflight_ref,
-                                    source_state_lock,
-                                    llm_process_url_fn,
-                                    llm_enqueue_region_filter_fn,
-                                    llm_queue,
-                                    llm_seen_urls,
-                                    llm_seen_lock,
-                                    llm_processed_urls,
-                                    browser_fetcher,
-                                ),
-                                name="OLXPhase1-%d" % (i + 1),
-                            )
-                            for i in range(num_workers)
-                        ]
-                        for t in workers:
-                            t.start()
-                        for t in workers:
-                            t.join()
-            except RuntimeError as e:
-                log(f"[OLX raw] BrowserPool недоступний: {e}")
-                return {"success": False, "total_listings": 0, "loaded_urls": [], "llm_processed_urls": []}
-            except Exception as e:
-                log(f"[OLX raw] Помилка BrowserPool: {e}")
-                return {"success": False, "total_listings": 0, "loaded_urls": [], "llm_processed_urls": []}
-        else:
-            workers = [
-                threading.Thread(
-                    target=_phase1_worker,
-                    args=(
+        browser_pool_size = scraper_config.resolve_browser_pool_size(num_workers)
+        log(
+            "[OLX raw] Phase 1: пул завдань, %s потоків, pool_size=%s, %s завдань"
+            % (num_workers, browser_pool_size, len(job_list))
+        )
+        worker_kwargs = {
+            "source_load_run_id": source_load_run_id,
+            "unit_state": unit_state if source_load_run_id else None,
+        }
+        try:
+            from scripts.olx_scraper.browser_fetcher import BrowserPagePool
+            with BrowserPagePool(headless=True, pool_size=browser_pool_size, log_fn=log) as browser_fetcher:
+                if num_workers == 1:
+                    _phase1_worker(
                         job_queue,
                         raw_repo,
                         log,
@@ -1118,46 +1181,111 @@ def run_olx_update_raw_only(
                         llm_seen_urls,
                         llm_seen_lock,
                         llm_processed_urls,
-                    ),
-                    name="OLXPhase1-%d" % (i + 1),
-                )
-                for i in range(num_workers)
-            ]
-            for t in workers:
-                t.start()
-            for t in workers:
-                t.join()
+                        browser_fetcher,
+                        **worker_kwargs,
+                    )
+                else:
+                    workers = [
+                        threading.Thread(
+                            target=_phase1_worker,
+                            args=(
+                                job_queue,
+                                raw_repo,
+                                log,
+                                cutoff_utc,
+                                max_pages_override,
+                                results_lock,
+                                total_listings_ref,
+                                all_loaded_urls,
+                                source_pending_ref,
+                                source_inflight_ref,
+                                source_state_lock,
+                                llm_process_url_fn,
+                                llm_enqueue_region_filter_fn,
+                                llm_queue,
+                                llm_seen_urls,
+                                llm_seen_lock,
+                                llm_processed_urls,
+                                browser_fetcher,
+                            ),
+                            kwargs=worker_kwargs,
+                            name="OLXPhase1-%d" % (i + 1),
+                        )
+                        for i in range(num_workers)
+                    ]
+                    for t in workers:
+                        t.start()
+                    for t in workers:
+                        t.join()
+        except Exception as e:
+            log(f"[OLX raw] Помилка BrowserPool: {e}")
+            return {"success": False, "total_listings": 0, "loaded_urls": [], "llm_processed_urls": []}
         total_listings = total_listings_ref[0]
     else:
-        # Legacy: по одному завданню на область (послідовно з браузером)
+        # Legacy max_workers=0: sequential, але через BrowserPagePool (не N Chromium / не per-region browser).
         all_loaded_urls = []
         total_listings = 0
         llm_processed_urls = []
-        log("[OLX raw] Phase 1: сторінки пошуку — прямі запити; деталі оголошень — браузер (Playwright). Області обробляються послідовно.")
+        log("[OLX raw] Phase 1: legacy sequential через BrowserPagePool (deprecated path; prefer max_workers>0).")
+        from scripts.olx_scraper.browser_fetcher import BrowserPagePool
+        pool_size = scraper_config.resolve_browser_pool_size(1)
         try:
-            from scripts.olx_scraper.browser_fetcher import BrowserPageFetcher
-            with BrowserPageFetcher(headless=True, log_fn=log) as browser_fetcher:
+            with BrowserPagePool(headless=True, pool_size=pool_size, log_fn=log) as browser_fetcher:
                 for region_name, cats in regions_with_cats:
-                    try:
-                        n_list, urls = _process_region_raw_only(
-                            region_name,
-                            cats,
-                            raw_repo,
-                            log,
-                            cutoff_utc,
-                            max_pages_override,
-                            browser_fetcher=browser_fetcher,
+                    for cat in cats:
+                        if not callable(cat.get("get_list_url")):
+                            continue
+                        key = make_olx_unit_key(region_name, cat.get("label", "?"))
+                        if unit_state.get(key, {}).get("status") == UNIT_DONE:
+                            continue
+                        start_page = 1
+                        st = unit_state.get(key) or {}
+                        if isinstance(st.get("last_page"), int) and st["last_page"] >= 1:
+                            start_page = st["last_page"] + 1
+                        if run_repo and source_load_run_id:
+                            run_repo.mark_unit_running(source_load_run_id, key)
+
+                        def on_page_done(page_num: int, _key=key) -> None:
+                            if run_repo and source_load_run_id:
+                                run_repo.set_unit_last_page(source_load_run_id, _key, page_num)
+
+                        max_pages = (
+                            max_pages_override
+                            if max_pages_override is not None
+                            else min(
+                                int(cat.get("max_pages", scraper_config.MAX_SEARCH_PAGES)),
+                                scraper_config.MAX_SEARCH_PAGES,
+                            )
                         )
-                        total_listings += n_list
-                        all_loaded_urls.extend(urls)
-                    except Exception as e:
-                        log(f"[OLX raw] Помилка області {region_name}: {e}")
-        except RuntimeError as e:
-            log(f"[OLX raw] Браузер недоступний: {e}")
+                        try:
+                            n_list, urls = _process_category_raw_only(
+                                cat["get_list_url"],
+                                max_pages,
+                                cat.get("label", "?"),
+                                raw_repo,
+                                log_fn=log,
+                                cutoff_utc=cutoff_utc,
+                                session=get_session(),
+                                region_name=region_name,
+                                browser_fetcher=browser_fetcher,
+                                start_page=start_page,
+                                source_load_run_id=source_load_run_id,
+                                on_page_done=on_page_done,
+                            )
+                            total_listings += n_list
+                            if not source_load_run_id:
+                                all_loaded_urls.extend(urls)
+                            if run_repo and source_load_run_id:
+                                run_repo.mark_unit_done(source_load_run_id, key)
+                        except Exception as e:
+                            log(f"[OLX raw] Помилка {region_name}/{cat.get('label')}: {e}")
         except Exception as e:
             log(f"[OLX raw] Помилка браузера: {e}")
 
-    loaded_urls = list(dict.fromkeys(all_loaded_urls))
+    if source_load_run_id:
+        loaded_urls = raw_repo.list_urls_by_source_load_run_id(source_load_run_id)
+    else:
+        loaded_urls = list(dict.fromkeys(all_loaded_urls))
     log(f"[OLX raw] Phase 1 готово. Оголошень: {total_listings}, завантажено/оновлено URL: {len(loaded_urls)}")
     return {
         "success": True,
@@ -1560,7 +1688,16 @@ def run_olx_update(
 
     Returns:
         Словник: success, total_listings, total_detail_fetches, by_category.
+
+    Deprecated: для production використовуйте run_olx_update_raw_only + BrowserPagePool
+    (low-RAM). Цей шлях може відкривати окремий Chromium на регіон при паралелі.
     """
+    import warnings
+    warnings.warn(
+        "run_olx_update is deprecated; use run_olx_update_raw_only + BrowserPagePool",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     settings = settings or Settings()
     MongoDBConnection.initialize(settings)
     repo = OlxListingsRepository()

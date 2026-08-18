@@ -13,7 +13,8 @@ class VastBillingDailyRepository(BaseRepository):
     """Зберігає {date YYYY-MM-DD} → billed_usd (сума charges за день: instance+volume+serverless)."""
 
     COLLECTION_NAME = "vast_billing_daily"
-    CHARGES_SCHEMA_VERSION = 2
+    # 5: добові суми беруться напряму з /charges/ day-window (без додаткового prorate).
+    CHARGES_SCHEMA_VERSION = 5
 
     def __init__(self) -> None:
         super().__init__(self.COLLECTION_NAME)

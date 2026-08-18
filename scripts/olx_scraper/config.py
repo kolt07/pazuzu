@@ -33,19 +33,17 @@ LAND_SALE_PATH = "/uk/nedvizhimost/zemlya/prodazha-zemli/"
 OLX_SORT_NEWEST = "search[order]=created_at:desc"
 
 # Додаткові фільтри на OLX (параметри search[...] у URL)
-# Нерухомість: площа від N м², поверх від-до
-FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2 = int(os.getenv("OLX_FILTER_TOTAL_AREA_FROM", "200"))
-FILTER_REAL_ESTATE_FLOOR_FROM = int(os.getenv("OLX_FILTER_FLOOR_FROM", "1"))
-FILTER_REAL_ESTATE_FLOOR_TO = int(os.getenv("OLX_FILTER_FLOOR_TO", "2"))
+# Нерухомість: площа від N м² (фільтр поверху не застосовується)
+FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2 = int(os.getenv("OLX_FILTER_TOTAL_AREA_FROM", "50"))
 # Земля: площа від N соток
 FILTER_LAND_AREA_FROM_SOTOK = float(os.getenv("OLX_FILTER_LAND_AREA_FROM_SOTOK", "15"))
 
-# Затримка перед єдиним запитом (секунди) — імітація людини
-DELAY_BEFORE_REQUEST_MIN = float(os.getenv("OLX_SCRAPER_DELAY_MIN", "2"))
-DELAY_BEFORE_REQUEST_MAX = float(os.getenv("OLX_SCRAPER_DELAY_MAX", "5"))
-# Затримка між запитами сторінки оголошення (деталі) — обережніше, 2–10 с
-DELAY_DETAIL_MIN = float(os.getenv("OLX_SCRAPER_DELAY_DETAIL_MIN", "2"))
-DELAY_DETAIL_MAX = float(os.getenv("OLX_SCRAPER_DELAY_DETAIL_MAX", "10"))
+# Затримка перед list-запитом (секунди) — мінімальний politeness floor
+DELAY_BEFORE_REQUEST_MIN = float(os.getenv("OLX_SCRAPER_DELAY_MIN", "0.5"))
+DELAY_BEFORE_REQUEST_MAX = float(os.getenv("OLX_SCRAPER_DELAY_MAX", "1.5"))
+# Затримка між запитами сторінки оголошення (деталі)
+DELAY_DETAIL_MIN = float(os.getenv("OLX_SCRAPER_DELAY_DETAIL_MIN", "0.5"))
+DELAY_DETAIL_MAX = float(os.getenv("OLX_SCRAPER_DELAY_DETAIL_MAX", "2"))
 
 # Браузер: використовувати встановлений Chrome замість bundled Chromium (краще схожість із звичайним відкриттям).
 BROWSER_USE_CHROME = (os.getenv("OLX_SCRAPER_BROWSER_USE_CHROME", "").strip().lower() in ("1", "true", "yes"))
@@ -72,20 +70,42 @@ MIN_LISTINGS_PER_FULL_PAGE = int(os.getenv("OLX_SCRAPER_MIN_LISTINGS_FULL_PAGE",
 # Максимальна кількість областей, що обробляються паралельно (потоки). По одному потоку на область.
 MAX_PARALLEL_REGIONS = int(os.getenv("OLX_SCRAPER_MAX_PARALLEL_REGIONS", "25"))
 
-# Кількість потоків Phase 1: пул завдань (область + категорія), кожен потік бере наступне завдання з пулу; 0 = використати MAX_PARALLEL_REGIONS замість пулу.
-OLX_PHASE1_MAX_THREADS = int(os.getenv("OLX_SCRAPER_PHASE1_MAX_THREADS", "1" if _IS_DOCKER else "5"))
-# Розмір BrowserPool (кількість reusable сторінок) для Phase 1; 0 = авто (= OLX_PHASE1_MAX_THREADS).
+# Кількість потоків Phase 1: пул завдань (область + категорія); 0 = legacy (по області).
+# Docker: кілька list-потоків при малому BrowserPool (1 Chromium) — low-RAM concurrency.
+OLX_PHASE1_MAX_THREADS = int(os.getenv("OLX_SCRAPER_PHASE1_MAX_THREADS", "3" if _IS_DOCKER else "5"))
+# Розмір BrowserPool (reusable Playwright pages). 0 = дефолт low-RAM: 1 у Docker, 2 на хості (не = числу потоків).
 BROWSER_POOL_SIZE = int(os.getenv("OLX_SCRAPER_BROWSER_POOL_SIZE", "0"))
+BROWSER_POOL_SIZE_DEFAULT = 1 if _IS_DOCKER else 2
+# Жорсткий бюджет одного detail-fetch у BrowserPool (с), включно з ретраями всередині слота.
+# Має бути меншим за BROWSER_POOL_CLIENT_TIMEOUT, інакше слот блокує чергу після клієнтського timeout.
+BROWSER_POOL_FETCH_BUDGET_SEC = float(os.getenv("OLX_SCRAPER_BROWSER_POOL_FETCH_BUDGET_SEC", "160"))
+# Скільки клієнт чекає на відповідь слота (с). Після перевищення — recovery + один retry.
+BROWSER_POOL_CLIENT_TIMEOUT_SEC = float(os.getenv("OLX_SCRAPER_BROWSER_POOL_CLIENT_TIMEOUT_SEC", "200"))
+# Після N поспіль зависань/budget-timeout у слоті — повний restart Chromium у пулі.
+BROWSER_POOL_RESTART_AFTER_HANGS = int(os.getenv("OLX_SCRAPER_BROWSER_POOL_RESTART_AFTER_HANGS", "2"))
 
 # Таймаут одного запиту (секунди)
 REQUEST_TIMEOUT = int(os.getenv("OLX_SCRAPER_TIMEOUT", "25"))
 # Таймаут для сторінки оголошення (деталі), с — браузер (клікер) та requests; OLX іноді повільно віддає
 REQUEST_DETAIL_TIMEOUT = int(os.getenv("OLX_SCRAPER_DETAIL_TIMEOUT", "90"))
 
-# Затримка після отримання сторінки (секунди) — OLX може підвантажувати контент з затримкою
-DELAY_AFTER_PAGE_LOAD = float(os.getenv("OLX_SCRAPER_DELAY_AFTER_LOAD", "3"))
+# Затримка після browser list-завантаження (секунди). Для HTTP (requests) не використовується (0).
+DELAY_AFTER_PAGE_LOAD = float(os.getenv("OLX_SCRAPER_DELAY_AFTER_LOAD", "0"))
+# Короткий jitter після goto detail перед wait_for_selector (с); 0 = без паузи
+DETAIL_POST_GOTO_SETTLE_MAX = float(os.getenv("OLX_SCRAPER_DETAIL_POST_GOTO_SETTLE_MAX", "0.3"))
 # Кількість повторних спроб при 0 оголошень на сторінці
 RETRY_EMPTY_PAGE_COUNT = int(os.getenv("OLX_SCRAPER_RETRY_EMPTY", "2"))
+
+# HTTP 403 (антибот / WAF): довша пауза перед повтором замість короткого politeness delay
+RETRY_403_BACKOFF_MIN = float(os.getenv("OLX_SCRAPER_403_BACKOFF_MIN", "15"))
+RETRY_403_BACKOFF_MAX = float(os.getenv("OLX_SCRAPER_403_BACKOFF_MAX", "45"))
+# Після вичерпання HTTP-спроб на 403 — один list-fetch через BrowserPagePool (якщо є)
+LIST_FALLBACK_BROWSER_ON_403 = (
+    os.getenv("OLX_SCRAPER_LIST_FALLBACK_BROWSER_ON_403", "1").strip().lower()
+    in ("1", "true", "yes")
+)
+# Макс. паралельних HTTP list-запитів між Phase1-потоками (1 = серіалізація — менше 403)
+LIST_HTTP_CONCURRENCY = max(1, int(os.getenv("OLX_SCRAPER_LIST_HTTP_CONCURRENCY", "1")))
 
 # User-Agent — звичайний браузер, не бот
 USER_AGENT = os.getenv(
@@ -162,9 +182,9 @@ def get_olx_land_type_slugs() -> Dict[str, str]:
 
 
 def get_olx_comm_re_object_type_slugs_include() -> List[str]:
-    """Повертає список OLX slug типів об'єкта комерційної нерухомості для фільтра «усі крім бізнес-центрів».
+    """Повертає список OLX slug типів об'єкта комерційної нерухомості для URL-фільтра.
     Завантажує з config/olx_commercial_object_type_slugs.yaml (olx_comm_re_object_type_slugs_include).
-    Якщо файлу немає — повертає порожній список (фільтр за типом об'єкта не застосовується)."""
+    Порожній список — фільтр за типом об'єкта не застосовується (усі типи, включно з бізнес-центрами)."""
     try:
         import yaml
         if _OLX_COMM_OBJECT_TYPE_SLUGS_PATH.exists():
@@ -183,8 +203,31 @@ def get_delay_seconds() -> float:
 
 
 def get_delay_detail_seconds() -> float:
-    """Повертає випадкову затримку перед запитом сторінки оголошення (2–10 с)."""
+    """Повертає випадкову затримку перед запитом сторінки оголошення."""
     return random.uniform(DELAY_DETAIL_MIN, DELAY_DETAIL_MAX)
+
+
+def get_403_backoff_seconds() -> float:
+    """Довга пауза після HTTP 403 (антибот), щоб не спалювати спроби за секунди."""
+    lo = max(1.0, float(RETRY_403_BACKOFF_MIN))
+    hi = max(lo, float(RETRY_403_BACKOFF_MAX))
+    return random.uniform(lo, hi)
+
+
+def get_detail_post_goto_settle_seconds() -> float:
+    """Короткий jitter після navigation detail (readiness — через wait_for_selector)."""
+    max_sec = max(0.0, DETAIL_POST_GOTO_SETTLE_MAX)
+    if max_sec <= 0:
+        return 0.0
+    return random.uniform(0.0, max_sec)
+
+
+def resolve_browser_pool_size(phase1_threads: int) -> int:
+    """Ефективний розмір BrowserPool: явний BROWSER_POOL_SIZE або low-RAM дефолт (не = threads)."""
+    override = int(BROWSER_POOL_SIZE or 0)
+    if override > 0:
+        return max(1, override)
+    return max(1, int(BROWSER_POOL_SIZE_DEFAULT))
 
 
 def get_real_estate_list_url(page: int = 1) -> str:
@@ -204,7 +247,7 @@ def _build_category_url(
 ) -> str:
     """Збирає URL категорії з опціональними фільтрами.
     OLX: path-суфікс /{region_slug}/ для областей; для землі — /{land_type_slug}/{region_slug}/.
-    extra_query_pairs: додаткові параметри пошуку (напр. search[filter_float_total_area:from]=200)."""
+    extra_query_pairs: додаткові параметри пошуку (напр. search[filter_float_total_area:from]=50)."""
     path = base_path.rstrip("/")
     if land_type_slug:
         path = f"{path}/{land_type_slug}"
@@ -234,14 +277,13 @@ def get_commercial_real_estate_list_url(
     sale_only: тільки оголошення про продаж (без оренди).
     sort_newest: сортування «Найновіші спочатку».
     region_slug: OLX slug області для фільтрації (напр. kyivskaya, lvivska).
-    Додаткові фільтри на OLX: площа від FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2 м², поверх 1–2,
-    тип об'єкта — усі крім бізнес-центрів (з olx_commercial_object_type_slugs.yaml).
+    Додаткові фільтри на OLX: площа від FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2 м².
+    Фільтр поверху не застосовується. Тип об'єкта — опційно з olx_commercial_object_type_slugs.yaml
+    (порожній список = усі типи, включно з бізнес-центрами).
     """
     path = COMMERCIAL_REAL_ESTATE_SALE_PATH if sale_only else COMMERCIAL_REAL_ESTATE_PATH
     extra: List[Tuple[str, str]] = [
         ("search[filter_float_total_area:from]", str(FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2)),
-        ("search[filter_float_floor:from]", str(FILTER_REAL_ESTATE_FLOOR_FROM)),
-        ("search[filter_float_floor:to]", str(FILTER_REAL_ESTATE_FLOOR_TO)),
     ]
     for slug in get_olx_comm_re_object_type_slugs_include():
         extra.append(("search[filter_enum_comm_re_object_type]", slug))

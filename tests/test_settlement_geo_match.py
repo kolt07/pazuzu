@@ -54,11 +54,49 @@ def test_geo_settlement_mongo_uses_city_id():
     assert "abc123" in s
 
 
+def test_settlement_regex_does_not_match_oblast_adjective():
+    """«Львів» ≠ «Львівська», «Київ» ≠ «Київська»."""
+    import re
+
+    for city, oblast in (("Львів", "Львівська область"), ("Київ", "Київська область")):
+        pat = settlement_regex(city)["$regex"]
+        assert re.search(pat, city, re.I)
+        assert re.search(pat, f"м. {city}", re.I)
+        assert not re.search(pat, oblast, re.I)
+        assert not re.search(pat, oblast.replace(" область", ""), re.I)
+
+
 def test_settlement_match_includes_location_substring():
     mongo = build_unified_listings_settlement_match("Нововолинськ", region="Волинська область")
     s = json.dumps(mongo, ensure_ascii=False)
     assert "search_data.location" in s
-    assert "detail.address_refs" in s
+    # addresses[] лише як fallback при порожньому root city
+    assert "city" in s
+    assert "$elemMatch" in s
+
+
+def test_settlement_match_prefers_root_not_any_address():
+    """Хибний Київ у addresses[] не повинен матчити, якщо root city = Затока."""
+    mongo = build_unified_listings_settlement_match("Київ")
+    s = json.dumps(mongo, ensure_ascii=False)
+    # прямий match по root city
+    assert '"city"' in s or "'city'" in s or '"city":' in s.replace(" ", "")
+    # addresses elemMatch має бути під умовою відсутності root city
+    assert "city" in s
+    assert s.count("$elemMatch") >= 1
+    # Немає «голої» гілки addresses без root-city-missing
+    # (усі addresses-гілки всередині $and з root missing)
+    assert "$and" in s
+
+
+def test_settlement_location_regex_does_not_match_kyivska_as_kyiv():
+    from utils.settlement_geo_match import settlement_location_field_regex_for_names
+    import re
+
+    pat = settlement_location_field_regex_for_names(["Київ"])["$regex"]
+    assert re.search(pat, "Київ, Київська область", re.I)
+    assert not re.search(pat, "Бровари, Київська область", re.I)
+    assert not re.search(pat, "Київська область", re.I)
 
 
 def test_get_settlement_match_names_without_db():

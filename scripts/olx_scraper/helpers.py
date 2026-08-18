@@ -6,6 +6,14 @@
 import re
 from typing import Optional
 
+from utils.address_geo_enrichment import (
+    build_listing_context,
+    enrich_llm_geo_result,
+    filter_geocode_results_by_location_context,
+    format_address_line_from_llm,
+    resolve_listing_location_context,
+)
+
 
 def _has_region_in_text(text: str) -> bool:
     """Перевіряє, чи текст містить згадку області (для пріоритету над короткими топонімами)."""
@@ -76,28 +84,7 @@ def search_data_from_listing(item: dict) -> dict:
 
 def _address_line_from_llm_address(addr: dict) -> str:
     """Збирає один рядок адреси з об'єкта LLM (region, settlement, street, building тощо)."""
-    parts = []
-    if addr.get("region"):
-        parts.append(addr["region"])
-    if addr.get("district"):
-        parts.append(addr["district"])
-    st = addr.get("settlement_type") or ""
-    settlement = (addr.get("settlement") or "").strip()
-    if settlement:
-        parts.append((st + " " + settlement).strip() if st else settlement)
-    if addr.get("settlement_district"):
-        parts.append(addr["settlement_district"])
-    street_type = addr.get("street_type") or ""
-    street = (addr.get("street") or "").strip()
-    if street:
-        parts.append((street_type + " " + street).strip() if street_type else street)
-    if addr.get("building"):
-        parts.append(addr["building"])
-    if addr.get("building_part"):
-        parts.append(addr["building_part"])
-    if addr.get("room"):
-        parts.append(addr["room"])
-    return ", ".join(p for p in parts if p).strip()
+    return format_address_line_from_llm(addr)
 
 
 def _collect_and_geocode_locations(
@@ -121,6 +108,14 @@ def _collect_and_geocode_locations(
 
     # 1. LLM-адреси — пріоритет, бо містять регіон з тексту оголошення
     llm = detail_data.get("llm") or {}
+    listing_context = build_listing_context(search_data, detail_data)
+    llm = enrich_llm_geo_result(llm, listing_context=listing_context)
+    detail_data["llm"] = llm
+    location_context = resolve_listing_location_context(
+        search_data=search_data,
+        detail_data=detail_data,
+        llm_result=llm,
+    )
     for addr in llm.get("addresses") or []:
         if not isinstance(addr, dict):
             continue
@@ -159,11 +154,20 @@ def _collect_and_geocode_locations(
     for q in query_strings:
         try:
             out = geocoding_service.geocode(query=q, region="ua", caller="olx_scraper")
+            filtered_results = filter_geocode_results_by_location_context(
+                out.get("results") or [],
+                location_context,
+            )
+            if not filtered_results:
+                # Усі кандидати суперечать location_context — не зберігаємо хибний геокод
+                continue
+            out = dict(out)
+            out["results"] = filtered_results
             geocode_hashes.append(out["query_hash"])
             resolved_locations.append({
                 "query_hash": out["query_hash"],
                 "query_text": out["query_text"],
-                "results": out["results"],
+                "results": filtered_results,
             })
         except Exception:
             pass

@@ -131,15 +131,27 @@ class TaskQueueService:
         listing_types: Optional[List[str]] = None,
         olx_phase1_max_threads: Optional[int] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        source_load_run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         if self.get_queue_control_state(self.SOURCE_LOAD_QUEUE) == "disabled":
             raise RuntimeError("Queue source_load is disabled by admin.")
+        from data.repositories.source_load_run_repository import SourceLoadRunRepository
+
+        run_repo = SourceLoadRunRepository()
+        run_id = (source_load_run_id or "").strip() or run_repo.create_run(
+            sources=list(sources or []),
+            days=days,
+            regions=list(regions or []),
+            listing_types=list(listing_types or []),
+            olx_phase1_max_threads=olx_phase1_max_threads,
+        )
         payload = {
             "days": days,
             "sources": list(sources or []),
             "regions": list(regions or []),
             "listing_types": list(listing_types or []),
             "olx_phase1_max_threads": olx_phase1_max_threads,
+            "source_load_run_id": run_id,
         }
         if self._celery is None:
             raise RuntimeError("Task queue is not available because Celery is not installed.")
@@ -148,14 +160,20 @@ class TaskQueueService:
             kwargs=payload,
             queue=self.SOURCE_LOAD_QUEUE,
         )
+        run_repo.patch_run(run_id, {"celery_task_id": async_result.id, "status": "pending"})
+        meta = dict(metadata or {})
+        meta["source_load_run_id"] = run_id
         self._repo.register_task(
             async_result.id,
             "run_source_load_pipeline_task",
             self.SOURCE_LOAD_QUEUE,
             payload=payload,
-            metadata=metadata or {},
+            metadata=meta,
         )
-        return {"task_id": async_result.id, "queue": self.SOURCE_LOAD_QUEUE}
+        return {"task_id": async_result.id, "queue": self.SOURCE_LOAD_QUEUE, "source_load_run_id": run_id}
+
+    def list_llm_batch_tasks(self, batch_id: str) -> List[Dict[str, Any]]:
+        return self._repo.list_by_batch_id(batch_id)
 
     def enqueue_olx_llm(self, listing_url: str, metadata: Optional[Dict[str, Any]] = None) -> str:
         if self.get_queue_control_state(self.LLM_QUEUE) == "disabled":
@@ -265,9 +283,123 @@ class TaskQueueService:
             raise ValueError(f"Unsupported queue: {queue_name}")
         return self._controls.set_control(qn, st, updated_by=updated_by, reason=reason)
 
+    def _purge_rabbit_queue(self, queue_name: str) -> Optional[int]:
+        """Purge повідомлень з RabbitMQ-черги. Повертає кількість видалених або None."""
+        url = (getattr(self.settings, "task_queue_broker_url", None) or "").strip()
+        if not url:
+            return None
+        try:
+            from kombu import Connection
+
+            with Connection(url, connect_timeout=4) as conn:
+                conn.ensure_connection(max_retries=2)
+                ch = conn.channel()
+                try:
+                    purged = ch.queue_purge(queue=queue_name)
+                finally:
+                    try:
+                        ch.close()
+                    except Exception:
+                        pass
+            return int(purged or 0)
+        except Exception as e:
+            logger.warning("Purge RabbitMQ %s: %s", queue_name, e)
+            return None
+
+    def purge_queue(
+        self,
+        queue_name: str,
+        *,
+        revoke_active: bool = True,
+        clear_mongo_active: bool = True,
+        updated_by: Optional[str] = None,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Очищає чергу: purge RabbitMQ, revoke активних Celery-задач, позначає активні
+        записи в background_tasks як revoked.
+        """
+        qn = str(queue_name or "").strip()
+        if qn not in (self.SOURCE_LOAD_QUEUE, self.LLM_QUEUE):
+            raise ValueError(f"Unsupported queue: {queue_name}")
+
+        rabbit_purged = self._purge_rabbit_queue(qn)
+        revoked_celery = 0
+        mongo_revoked = 0
+
+        active_docs: List[Dict[str, Any]] = []
+        if clear_mongo_active or revoke_active:
+            try:
+                active_docs = list(
+                    self._repo.collection.find(
+                        {"queue_name": qn, "state": {"$in": list(self.ACTIVE_STATES)}},
+                        {"task_id": 1},
+                    )
+                )
+            except Exception as e:
+                logger.warning("List active tasks for purge %s: %s", qn, e)
+
+        if revoke_active and self._celery is not None and AsyncResult is not None:
+            for doc in active_docs:
+                tid = str(doc.get("task_id") or "").strip()
+                if not tid:
+                    continue
+                try:
+                    self._celery.control.revoke(tid, terminate=True, signal="SIGTERM")
+                    revoked_celery += 1
+                except Exception as e:
+                    logger.debug("Revoke %s: %s", tid, e)
+
+        if clear_mongo_active and active_docs:
+            try:
+                from datetime import datetime, timezone
+
+                now = datetime.now(timezone.utc)
+                result = self._repo.collection.update_many(
+                    {"queue_name": qn, "state": {"$in": list(self.ACTIVE_STATES)}},
+                    {
+                        "$set": {
+                            "state": "revoked",
+                            "error": reason or "Purged by admin",
+                            "finished_at": now,
+                            "updated_at": now,
+                            "heartbeat_at": now,
+                            "purged_by": updated_by or "",
+                        }
+                    },
+                )
+                mongo_revoked = int(result.modified_count or 0)
+            except Exception as e:
+                logger.warning("Mongo revoke for purge %s: %s", qn, e)
+
+        return {
+            "queue_name": qn,
+            "rabbit_purged": rabbit_purged,
+            "celery_revoked": revoked_celery,
+            "mongo_revoked": mongo_revoked,
+        }
+
+    def purge_all_queues(
+        self,
+        *,
+        updated_by: Optional[str] = None,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Очищає source_load та llm_processing."""
+        results = []
+        for qn in (self.SOURCE_LOAD_QUEUE, self.LLM_QUEUE):
+            results.append(
+                self.purge_queue(
+                    qn,
+                    updated_by=updated_by,
+                    reason=reason or "Purged all queues by admin",
+                )
+            )
+        return {"queues": results}
+
     def get_queues_status_snapshot(self) -> Dict[str, Any]:
         queues = [self.SOURCE_LOAD_QUEUE, self.LLM_QUEUE]
-        out: Dict[str, Any] = {"task_queue_enabled": self.is_enabled(), "queues": []}
+        out: Dict[str, Any] = {"task_queue_enabled": self.is_enabled(), "queues": [], "active_batches": []}
         for queue_name in queues:
             state = self.get_queue_control_state(queue_name)
             counts = self._repo.get_queue_state_counts(queue_name)
@@ -288,6 +420,11 @@ class TaskQueueService:
                     else None,
                 }
             )
+        try:
+            out["active_batches"] = self._repo.list_active_llm_batches(limit=8)
+        except Exception as e:
+            logger.debug("list_active_llm_batches: %s", e)
+            out["active_batches"] = []
         return out
 
     def has_active_source_load_tasks(self, within_sec: int = 20 * 60) -> bool:

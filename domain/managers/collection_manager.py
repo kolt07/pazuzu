@@ -409,7 +409,6 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
             build_unified_listings_region_match,
             build_unified_listings_settlement_match,
         )
-        from utils.ukraine_regions import build_region_search_regex
         root = geo_filter.root
 
         def _settlement_text_match(
@@ -431,12 +430,15 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
                     region_ctx = getattr(elem, "region", None)
                     city_id = getattr(elem, "city_id", None)
                     return _settlement_text_match(
-                        str(elem.value),
+                        str(elem.value or ""),
                         region_ctx,
                         city_id=city_id,
                     )
                 if elem.geo_type == "region":
-                    return build_unified_listings_region_match(str(elem.value))
+                    return build_unified_listings_region_match(
+                        str(elem.value or ""),
+                        region_id=getattr(elem, "region_id", None),
+                    )
                 if elem.geo_type == "city_district":
                     escaped = re.escape(str(elem.value))
                     return {"$or": [
@@ -447,17 +449,17 @@ class UnifiedListingsCollectionManager(BaseCollectionManager):
             if elem.operator in (GeoFilterOperator.NOT_INSIDE, GeoFilterOperator.NE):
                 if elem.geo_type == "settlement":
                     positive = _settlement_text_match(
-                        str(elem.value),
+                        str(elem.value or ""),
                         getattr(elem, "region", None),
                         city_id=getattr(elem, "city_id", None),
                     )
                     return {"$nor": [positive]}
                 if elem.geo_type == "region":
-                    region_pattern = build_region_search_regex(str(elem.value)) or re.escape(str(elem.value))
-                    return {"$and": [
-                        {"$or": [{"region": {"$exists": False}}, {"region": None}, {"region": {"$not": {"$regex": region_pattern, "$options": "i"}}}]},
-                        {"addresses": {"$not": {"$elemMatch": {"region": {"$regex": region_pattern, "$options": "i"}}}}},
-                    ]}
+                    positive = build_unified_listings_region_match(
+                        str(elem.value or ""),
+                        region_id=getattr(elem, "region_id", None),
+                    )
+                    return {"$nor": [positive]} if positive else {}
                 if elem.geo_type == "city_district":
                     escaped = re.escape(str(elem.value))
                     return {"$and": [

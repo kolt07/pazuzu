@@ -611,6 +611,7 @@ def _append_settlement_criteria_items(
     include_settlement_name: bool = True,
     include_population: bool = True,
     include_area: bool = True,
+    include_region_context: bool = True,
 ) -> None:
     """Додає логічні критерії НП (резолвляться в GeoFilter при пошуку)."""
     from domain.models.filter_models import FilterOperator as FO
@@ -621,15 +622,16 @@ def _append_settlement_criteria_items(
         SETTLEMENT_REGION_CONTEXT_FIELD,
     )
 
-    geo_reg = (it.get("geoRegion") or "").strip()
-    if geo_reg:
-        items.append(
-            FilterElement(
-                field=SETTLEMENT_REGION_CONTEXT_FIELD,
-                operator=FO.EQ,
-                value=geo_reg,
+    if include_region_context:
+        geo_reg = (it.get("geoRegion") or "").strip()
+        if geo_reg:
+            items.append(
+                FilterElement(
+                    field=SETTLEMENT_REGION_CONTEXT_FIELD,
+                    operator=FO.EQ,
+                    value=geo_reg,
+                )
             )
-        )
     if include_settlement_name:
         val = it.get("value")
         if val is not None and isinstance(val, str) and val.strip():
@@ -680,12 +682,12 @@ def _geo_node_has_criteria(it: Dict[str, Any], geo_type: str) -> bool:
     if geo_type == "settlement_population":
         return any(
             it.get(k) is not None and it.get(k) != ""
-            for k in ("population_min", "population_max", "geoRegion")
+            for k in ("population_min", "population_max")
         )
     if geo_type == "settlement_area":
         return any(
             it.get(k) is not None and it.get(k) != ""
-            for k in ("area_min", "area_max", "geoRegion")
+            for k in ("area_min", "area_max")
         )
     if geo_type == "settlement":
         return any(
@@ -709,91 +711,145 @@ def _geo_node_has_demographic_criteria(it: Dict[str, Any]) -> bool:
     )
 
 
+def _geo_filter_from_parts(
+    parts: List[Union[GeoFilterElement, GeoFilterGroup]],
+    group_type: FilterGroupType,
+) -> Optional[GeoFilter]:
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return GeoFilter(root=parts[0])
+    return GeoFilter(root=GeoFilterGroup(group_type=group_type, items=parts))
+
+
+def _process_geo_tree_item(
+    it: Dict[str, Any],
+    filter_items: List[Union[FilterElement, FilterGroup]],
+    geo_parts: List[Union[GeoFilterElement, GeoFilterGroup]],
+) -> None:
+    """Додає geo-елемент або критерії НП з вузла дерева."""
+    val = it.get("value")
+    geo_type = str(it.get("geo_type") or "region").strip()
+    has_criteria = _geo_node_has_criteria(it, geo_type)
+    val_empty = val is None or (isinstance(val, str) and not str(val).strip())
+    has_id = bool(
+        (it.get("city_id") or it.get("cityId") or "").strip()
+        or (it.get("region_id") or it.get("regionId") or "").strip()
+    )
+    if val_empty and not has_criteria and not has_id:
+        return
+    op_raw = str(it.get("operator") or "inside").strip().lower()
+    op_enum = _GEO_OP_STR.get(op_raw, GeoFilterOperator.INSIDE)
+    if geo_type not in ("settlement_population", "settlement_area") and (not val_empty or has_id):
+        geo_reg = (it.get("geoRegion") or it.get("region") or "").strip() or None
+        city_id = (it.get("city_id") or it.get("cityId") or "").strip() or None
+        region_id = (it.get("region_id") or it.get("regionId") or "").strip() or None
+        # Region geo: value may be empty if region_id is set
+        if geo_type == "region" and val_empty and region_id:
+            try:
+                from data.repositories.geography_repository import RegionsRepository
+                reg = RegionsRepository().find_by_id(region_id)
+                if reg and reg.get("name"):
+                    val = reg["name"]
+                    val_empty = False
+            except Exception:
+                pass
+        if geo_type == "settlement" and val_empty and city_id:
+            try:
+                from data.repositories.geography_repository import CitiesRepository
+                city = CitiesRepository().find_by_id(city_id)
+                if city and city.get("name"):
+                    val = city["name"]
+                    val_empty = False
+                    if not region_id and city.get("region_id") is not None:
+                        region_id = str(city["region_id"])
+            except Exception:
+                pass
+        display_val = val.strip() if isinstance(val, str) and not val_empty else (val if not val_empty else "")
+        if geo_type == "region" and not display_val and region_id:
+            display_val = ""
+        if not val_empty or region_id or city_id:
+            geo_parts.append(
+                GeoFilterElement(
+                    operator=op_enum,
+                    geo_type=geo_type,
+                    value=display_val,
+                    region=geo_reg if geo_type == "settlement" else None,
+                    region_id=region_id if geo_type in ("region", "settlement") else None,
+                    city_id=city_id if geo_type == "settlement" else None,
+                )
+            )
+    if geo_type == "settlement":
+        if val_empty and not (it.get("city_id") or it.get("cityId")):
+            _append_settlement_criteria_items(
+                filter_items,
+                it,
+                include_settlement_name=True,
+                include_population=False,
+                include_area=False,
+            )
+        elif _geo_node_has_demographic_criteria(it):
+            _append_settlement_criteria_items(
+                filter_items,
+                it,
+                include_settlement_name=False,
+                include_population=True,
+                include_area=True,
+            )
+    elif geo_type == "settlement_population":
+        _append_settlement_criteria_items(
+            filter_items,
+            it,
+            include_settlement_name=False,
+            include_population=True,
+            include_area=False,
+            include_region_context=False,
+        )
+    elif geo_type == "settlement_area":
+        _append_settlement_criteria_items(
+            filter_items,
+            it,
+            include_settlement_name=False,
+            include_population=False,
+            include_area=True,
+            include_region_context=False,
+        )
+
+
 def tree_to_filter_models(root: Dict[str, Any]) -> Tuple[Optional[FilterGroup], Optional[GeoFilter]]:
     """
-    Будує FilterGroup та GeoFilter з дерева (root).
-    root: {"group_type": "and"|"or", "items": [ {"type": "element", "field", "operator", "value"}, {"type": "group", "group_type", "items": [...]}, {"type": "geo", "geo_type", "operator", "value"} ]}
+    Будує FilterGroup та GeoFilter з дерева (root), зберігаючи вкладені групи І/АБО для geo.
+    root: {"group_type": "and"|"or", "items": [ ... ]}
     """
     if not root or not isinstance(root.get("items"), list):
         return None, None
 
-    geo_elems: List[GeoFilterElement] = []
-    try:
-        root_group_type = FilterGroupType((root.get("group_type") or "and").strip().lower())
-    except ValueError:
-        root_group_type = FilterGroupType.AND
-
-    def build_group(node: Dict[str, Any]) -> Optional[FilterGroup]:
+    def build_group(node: Dict[str, Any]) -> Tuple[Optional[FilterGroup], Optional[GeoFilter]]:
         gt = (node.get("group_type") or "and").strip().lower()
         try:
             group_type = FilterGroupType(gt)
         except ValueError:
             group_type = FilterGroupType.AND
-        items: List[Union[FilterElement, FilterGroup]] = []
+        filter_items: List[Union[FilterElement, FilterGroup]] = []
+        geo_parts: List[Union[GeoFilterElement, GeoFilterGroup]] = []
+
         for it in node.get("items") or []:
             if not isinstance(it, dict):
                 continue
             t = (it.get("type") or "").strip().lower()
             if t == "geo":
-                val = it.get("value")
-                geo_type = str(it.get("geo_type") or "region").strip()
-                has_criteria = _geo_node_has_criteria(it, geo_type)
-                val_empty = val is None or (isinstance(val, str) and not str(val).strip())
-                if val_empty and not has_criteria:
-                    continue
-                op_raw = str(it.get("operator") or "inside").strip().lower()
-                op_enum = _GEO_OP_STR.get(op_raw, GeoFilterOperator.INSIDE)
-                if geo_type not in ("settlement_population", "settlement_area") and not val_empty:
-                    geo_reg = (it.get("geoRegion") or "").strip() or None
-                    city_id = (it.get("city_id") or it.get("cityId") or "").strip() or None
-                    geo_elems.append(
-                        GeoFilterElement(
-                            operator=op_enum,
-                            geo_type=geo_type,
-                            value=val.strip() if isinstance(val, str) else val,
-                            region=geo_reg if geo_type == "settlement" else None,
-                            city_id=city_id if geo_type == "settlement" else None,
-                        )
-                    )
-                if geo_type == "settlement":
-                    # Назву/область у FilterGroup лише якщо немає value (фільтр за демографією без НП)
-                    if val_empty:
-                        _append_settlement_criteria_items(
-                            items,
-                            it,
-                            include_settlement_name=True,
-                            include_population=False,
-                            include_area=False,
-                        )
-                    elif _geo_node_has_demographic_criteria(it):
-                        _append_settlement_criteria_items(
-                            items,
-                            it,
-                            include_settlement_name=False,
-                            include_population=True,
-                            include_area=True,
-                        )
-                elif geo_type == "settlement_population":
-                    _append_settlement_criteria_items(
-                        items,
-                        it,
-                        include_settlement_name=False,
-                        include_population=True,
-                        include_area=False,
-                    )
-                elif geo_type == "settlement_area":
-                    _append_settlement_criteria_items(
-                        items,
-                        it,
-                        include_settlement_name=False,
-                        include_population=False,
-                        include_area=True,
-                    )
+                _process_geo_tree_item(it, filter_items, geo_parts)
                 continue
             if t == "group":
-                child = build_group(it)
-                if child and child.items:
-                    items.append(child)
+                child_fg, child_gf = build_group(it)
+                if child_fg and child_fg.items:
+                    filter_items.append(child_fg)
+                if child_gf and child_gf.root:
+                    root_child = child_gf.root
+                    if isinstance(root_child, GeoFilterGroup):
+                        geo_parts.append(root_child)
+                    else:
+                        geo_parts.append(root_child)
                 continue
             if t == "element":
                 field = it.get("field")
@@ -807,25 +863,239 @@ def tree_to_filter_models(root: Dict[str, Any]) -> Tuple[Optional[FilterGroup], 
                 value = it.get("value")
                 if op_enum in (FilterOperator.FILLED, FilterOperator.EMPTY):
                     value = True
-                items.append(FilterElement(field=field, operator=op_enum, value=value))
-        if not items:
-            return None
-        return FilterGroup(group_type=group_type, items=items)
+                filter_items.append(FilterElement(field=field, operator=op_enum, value=value))
 
-    group = build_group(root)
-    geo_filter: Optional[GeoFilter] = None
-    if geo_elems:
-        if len(geo_elems) == 1:
-            geo_filter = GeoFilter(root=geo_elems[0])
-        elif root_group_type == FilterGroupType.OR:
-            geo_filter = GeoFilter(
-                root=GeoFilterGroup(group_type=FilterGroupType.OR, items=geo_elems)
-            )
-        else:
-            geo_filter = GeoFilter(
-                root=GeoFilterGroup(group_type=FilterGroupType.AND, items=geo_elems)
-            )
+        fg = FilterGroup(group_type=group_type, items=filter_items) if filter_items else None
+        gf = _geo_filter_from_parts(geo_parts, group_type)
+        return fg, gf
+
+    group, geo_filter = build_group(root)
     return group, geo_filter
+
+
+def _geo_operator_to_ui(op: GeoFilterOperator) -> str:
+    if op in (GeoFilterOperator.NE, GeoFilterOperator.NOT_INSIDE):
+        return "not_inside"
+    if op == GeoFilterOperator.IN_RADIUS:
+        return "in_radius"
+    return "inside"
+
+
+def _geo_node_to_tree_item(elem: GeoFilterElement) -> Dict[str, Any]:
+    """GeoFilterElement → вузол type=geo для конструктора."""
+    item: Dict[str, Any] = {
+        "type": "geo",
+        "geo_type": elem.geo_type,
+        "operator": _geo_operator_to_ui(elem.operator),
+        "value": "" if elem.value is None else str(elem.value),
+    }
+    region_id = getattr(elem, "region_id", None)
+    if elem.geo_type == "region" and region_id:
+        item["region_id"] = str(region_id)
+    if elem.geo_type == "settlement":
+        region = getattr(elem, "region", None)
+        city_id = getattr(elem, "city_id", None)
+        if region:
+            item["geoRegion"] = str(region)
+        if region_id:
+            item["region_id"] = str(region_id)
+        if city_id:
+            item["city_id"] = str(city_id)
+    return item
+
+
+def _geo_filter_root_to_tree_items(node: Union[GeoFilterElement, GeoFilterGroup]) -> List[Dict[str, Any]]:
+    if isinstance(node, GeoFilterElement):
+        return [_geo_node_to_tree_item(node)]
+    if isinstance(node, GeoFilterGroup):
+        return [
+            {
+                "type": "group",
+                "group_type": node.group_type.value,
+                "items": [
+                    child
+                    for it in node.items
+                    for child in (
+                        _geo_filter_root_to_tree_items(it)
+                        if isinstance(it, (GeoFilterElement, GeoFilterGroup))
+                        else []
+                    )
+                ],
+            }
+        ]
+    return []
+
+
+def _settlement_buffer_to_geo_item(
+    buffer: List[FilterElement],
+) -> Optional[Dict[str, Any]]:
+    """Критерії НП з FilterGroup → один geo-вузол конструктора."""
+    from business.services.settlement_criteria_resolver import (
+        SETTLEMENT_AREA_FIELD,
+        SETTLEMENT_NAME_CONTEXT_FIELD,
+        SETTLEMENT_POPULATION_FIELD,
+        SETTLEMENT_REGION_CONTEXT_FIELD,
+    )
+
+    if not buffer:
+        return None
+
+    pop_min: Optional[int] = None
+    pop_max: Optional[int] = None
+    area_min: Optional[float] = None
+    area_max: Optional[float] = None
+    region_ctx: Optional[str] = None
+    settlement_name: Optional[str] = None
+
+    for elem in buffer:
+        if elem.field == SETTLEMENT_REGION_CONTEXT_FIELD:
+            if isinstance(elem.value, str) and elem.value.strip():
+                region_ctx = elem.value.strip()
+        elif elem.field == SETTLEMENT_NAME_CONTEXT_FIELD:
+            if isinstance(elem.value, str) and elem.value.strip():
+                settlement_name = elem.value.strip()
+        elif elem.field == SETTLEMENT_POPULATION_FIELD:
+            try:
+                iv = int(elem.value)
+            except (TypeError, ValueError):
+                continue
+            if elem.operator == FilterOperator.GTE:
+                pop_min = iv
+            elif elem.operator == FilterOperator.LTE:
+                pop_max = iv
+            elif elem.operator == FilterOperator.GT:
+                pop_min = iv + 1
+            elif elem.operator == FilterOperator.LT:
+                pop_max = iv - 1
+        elif elem.field == SETTLEMENT_AREA_FIELD:
+            try:
+                fv = float(elem.value)
+            except (TypeError, ValueError):
+                continue
+            if elem.operator == FilterOperator.GTE:
+                area_min = fv
+            elif elem.operator == FilterOperator.LTE:
+                area_max = fv
+
+    has_pop = pop_min is not None or pop_max is not None
+    has_area = area_min is not None or area_max is not None
+
+    if has_pop and not settlement_name and not region_ctx:
+        geo_type = "settlement_population"
+    elif has_area and not settlement_name and not region_ctx:
+        geo_type = "settlement_area"
+    else:
+        geo_type = "settlement"
+
+    item: Dict[str, Any] = {
+        "type": "geo",
+        "geo_type": geo_type,
+        "operator": "inside",
+        "value": settlement_name or "",
+    }
+    if region_ctx and geo_type == "settlement":
+        item["geoRegion"] = region_ctx
+    if pop_min is not None:
+        item["population_min"] = pop_min
+    if pop_max is not None:
+        item["population_max"] = pop_max
+    if area_min is not None:
+        item["area_min"] = area_min
+    if area_max is not None:
+        item["area_max"] = area_max
+    return item
+
+
+def _element_to_tree_item(elem: FilterElement) -> Dict[str, Any]:
+    value: Any = elem.value
+    if elem.field == "status" and value is True:
+        value = "активне"
+    elif elem.field == "status" and value is False:
+        value = "неактивне"
+    return {
+        "type": "element",
+        "field": elem.field,
+        "operator": elem.operator.value,
+        "value": value,
+    }
+
+
+def _filter_group_to_tree_items(group: FilterGroup) -> List[Dict[str, Any]]:
+    from business.services.settlement_criteria_resolver import (
+        SETTLEMENT_AREA_FIELD,
+        SETTLEMENT_NAME_CONTEXT_FIELD,
+        SETTLEMENT_POPULATION_FIELD,
+        SETTLEMENT_REGION_CONTEXT_FIELD,
+    )
+
+    settlement_fields = {
+        SETTLEMENT_POPULATION_FIELD,
+        SETTLEMENT_AREA_FIELD,
+        SETTLEMENT_REGION_CONTEXT_FIELD,
+        SETTLEMENT_NAME_CONTEXT_FIELD,
+    }
+    items: List[Dict[str, Any]] = []
+    settlement_buffer: List[FilterElement] = []
+
+    def flush_settlement() -> None:
+        nonlocal settlement_buffer
+        geo_item = _settlement_buffer_to_geo_item(settlement_buffer)
+        if geo_item:
+            items.append(geo_item)
+        settlement_buffer = []
+
+    for node in group.items:
+        if isinstance(node, FilterElement):
+            if node.field in settlement_fields:
+                settlement_buffer.append(node)
+            else:
+                flush_settlement()
+                items.append(_element_to_tree_item(node))
+        elif isinstance(node, FilterGroup):
+            flush_settlement()
+            child_items = _filter_group_to_tree_items(node)
+            if child_items:
+                items.append(
+                    {
+                        "type": "group",
+                        "group_type": node.group_type.value,
+                        "items": child_items,
+                    }
+                )
+    flush_settlement()
+    return items
+
+
+def filter_string_to_tree(
+    filter_string: str,
+    collection: str = "unified_listings",
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Парсить рядок відборів у дерево для UI-конструктора.
+    Повертає (root, error). root: { group_type, items: [{type, ...}] }.
+    """
+    text = (filter_string or "").strip()
+    if not text:
+        return {"group_type": "and", "items": []}, None
+
+    parsed = filter_string_to_models(text, collection=collection)
+    if not parsed.success:
+        return None, parsed.error or "Помилка парсингу рядка фільтрів"
+
+    root_items: List[Dict[str, Any]] = []
+    root_group_type = FilterGroupType.AND
+
+    if parsed.filter_group and parsed.filter_group.items:
+        root_group_type = parsed.filter_group.group_type
+        root_items.extend(_filter_group_to_tree_items(parsed.filter_group))
+
+    if parsed.geo_filter and parsed.geo_filter.root:
+        root_items.extend(_geo_filter_root_to_tree_items(parsed.geo_filter.root))
+
+    if not root_items:
+        return {"group_type": "and", "items": []}, None
+
+    return {"group_type": root_group_type.value, "items": root_items}, None
 
 
 def filter_string_from_tree(root: Dict[str, Any], collection: str = "unified_listings") -> str:

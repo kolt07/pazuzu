@@ -3993,11 +3993,19 @@ class ProZorroService:
     def fetch_and_save_to_raw_only(
         self,
         days: Optional[int] = None,
+        source_load_run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Phase 1 pipeline: отримання аукціонів з API та запис лише в raw_prozorro_auctions (без LLM, без prozorro_auctions).
-        Повертає success, count, loaded_auction_ids.
+        Phase 1 pipeline: отримання аукціонів з API та запис лише в raw_prozorro_auctions.
+        При source_load_run_id — day work units + stamp на raw для Phase 2 resume.
         """
+        from data.repositories.source_load_run_repository import (
+            SourceLoadRunRepository,
+            UNIT_DONE,
+            UNIT_PENDING,
+            make_prozorro_day_unit_key,
+        )
+
         if days is None:
             days = self.settings.default_days_range
         date_from, date_to = get_date_range(days)
@@ -4008,6 +4016,37 @@ class ProZorroService:
         }
         raw_repo = RawProzorroAuctionsRepository()
         raw_repo.ensure_index()
+        run_repo = SourceLoadRunRepository() if source_load_run_id else None
+
+        def _upsert_auctions(auctions_list, day_key: Optional[str] = None) -> List[str]:
+            loaded: List[str] = []
+            ctx = dict(fetch_context)
+            if day_key:
+                ctx["day"] = day_key
+            for auction in auctions_list:
+                try:
+                    if not getattr(auction, "data", None):
+                        continue
+                    auction_data = auction.data
+                    auction_id = extract_auction_id(auction_data)
+                    if not auction_id:
+                        continue
+                    if self._is_rental_auction(auction_data):
+                        continue
+                    approximate_region = self._get_region_from_auction_data(auction_data)
+                    raw_repo.upsert_raw(
+                        auction_id=auction_id,
+                        auction_data=auction_data,
+                        fetch_context=ctx,
+                        approximate_region=approximate_region,
+                        source_load_run_id=source_load_run_id,
+                    )
+                    loaded.append(auction_id)
+                except Exception as e:
+                    logger.warning("ProZorro raw: помилка запису аукціону: %s", e)
+            return loaded
+
+        loaded_auction_ids: List[str] = []
 
         if days == 7:
             now = datetime.now(timezone.utc)
@@ -4015,49 +4054,85 @@ class ProZorroService:
             for i in range(7):
                 day_end = now - timedelta(days=i)
                 day_start = day_end - timedelta(days=1)
-                day_ranges.append((day_start, day_end))
-            all_auctions = []
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
-                futures = [
-                    executor.submit(self.get_real_estate_auctions_by_date_range, ds, de)
-                    for ds, de in day_ranges
-                ]
-                for f in concurrent.futures.as_completed(futures):
-                    try:
-                        all_auctions.extend(f.result())
-                    except Exception as e:
-                        logger.warning("ProZorro raw: помилка дня: %s", e)
-            unique_auctions = {}
-            for a in all_auctions:
-                aid = getattr(a, "id", None) or (extract_auction_id(a.data) if getattr(a, "data", None) else None)
-                if aid and aid not in unique_auctions:
-                    unique_auctions[aid] = a
-            auctions = list(unique_auctions.values())
-        else:
-            auctions = self.get_real_estate_auctions(days)
+                day_key = day_start.date().isoformat()
+                day_ranges.append((day_start, day_end, day_key))
 
-        loaded_auction_ids: List[str] = []
-        for auction in auctions:
-            try:
-                if not getattr(auction, "data", None):
+            existing_units = {}
+            if run_repo and source_load_run_id:
+                existing = run_repo.get_run(source_load_run_id) or {}
+                existing_units = {
+                    u.get("key"): u
+                    for u in (existing.get("work_units") or [])
+                    if u.get("key") and u.get("source") == "prozorro"
+                }
+                olx_units = [u for u in (existing.get("work_units") or []) if u.get("source") == "olx"]
+                pz_units = []
+                for _ds, _de, day_key in day_ranges:
+                    key = make_prozorro_day_unit_key(day_key)
+                    prev = existing_units.get(key) or {}
+                    pz_units.append({
+                        "key": key,
+                        "source": "prozorro",
+                        "day": day_key,
+                        "status": prev.get("status") or UNIT_PENDING,
+                    })
+                run_repo.set_work_units(source_load_run_id, olx_units + pz_units)
+                existing_units = {u["key"]: u for u in pz_units}
+
+            import concurrent.futures
+            # Послідовно по днях для коректного resume; паралель лише для днів що не done
+            pending_ranges = []
+            for ds, de, day_key in day_ranges:
+                key = make_prozorro_day_unit_key(day_key)
+                if existing_units.get(key, {}).get("status") == UNIT_DONE:
                     continue
-                auction_data = auction.data
-                auction_id = extract_auction_id(auction_data)
-                if not auction_id:
-                    continue
-                if self._is_rental_auction(auction_data):
-                    continue
-                approximate_region = self._get_region_from_auction_data(auction_data)
-                raw_repo.upsert_raw(
-                    auction_id=auction_id,
-                    auction_data=auction_data,
-                    fetch_context=fetch_context,
-                    approximate_region=approximate_region,
-                )
-                loaded_auction_ids.append(auction_id)
-            except Exception as e:
-                logger.warning("ProZorro raw: помилка запису аукціону: %s", e)
+                pending_ranges.append((ds, de, day_key, key))
+
+            if pending_ranges:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(7, len(pending_ranges))) as executor:
+                    future_map = {
+                        executor.submit(self.get_real_estate_auctions_by_date_range, ds, de): (day_key, key)
+                        for ds, de, day_key, key in pending_ranges
+                    }
+                    for f in concurrent.futures.as_completed(future_map):
+                        day_key, key = future_map[f]
+                        try:
+                            if run_repo and source_load_run_id:
+                                run_repo.mark_unit_running(source_load_run_id, key)
+                            day_auctions = f.result()
+                            loaded_auction_ids.extend(_upsert_auctions(day_auctions, day_key))
+                            if run_repo and source_load_run_id:
+                                run_repo.mark_unit_done(source_load_run_id, key)
+                        except Exception as e:
+                            logger.warning("ProZorro raw: помилка дня %s: %s", day_key, e)
+        else:
+            day_key = (date_from.date().isoformat() if date_from else "range")
+            key = make_prozorro_day_unit_key(day_key)
+            skip = False
+            if run_repo and source_load_run_id:
+                existing = run_repo.get_run(source_load_run_id) or {}
+                olx_units = [u for u in (existing.get("work_units") or []) if u.get("source") == "olx"]
+                prev = next((u for u in (existing.get("work_units") or []) if u.get("key") == key), {})
+                unit = {
+                    "key": key,
+                    "source": "prozorro",
+                    "day": day_key,
+                    "status": prev.get("status") or UNIT_PENDING,
+                }
+                run_repo.set_work_units(source_load_run_id, olx_units + [unit])
+                if unit["status"] == UNIT_DONE:
+                    skip = True
+                else:
+                    run_repo.mark_unit_running(source_load_run_id, key)
+            if not skip:
+                auctions = self.get_real_estate_auctions(days)
+                loaded_auction_ids.extend(_upsert_auctions(auctions, day_key))
+                if run_repo and source_load_run_id:
+                    run_repo.mark_unit_done(source_load_run_id, key)
+
+        if source_load_run_id:
+            loaded_auction_ids = raw_repo.list_auction_ids_by_source_load_run_id(source_load_run_id)
+
         return {
             "success": True,
             "count": len(loaded_auction_ids),

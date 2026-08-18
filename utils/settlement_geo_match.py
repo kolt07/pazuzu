@@ -77,12 +77,29 @@ def get_settlement_match_names(
 
         if settlement_name:
             region_id = _region_id(region)
+            found = None
             if region_id:
                 found = cities_repo.find_by_name_and_region(settlement_name, region_id)
-                if found:
-                    _add(found.get("name"))
-                    for alias in found.get("search_aliases") or []:
-                        _add(alias)
+            if not found:
+                # Без області: шукаємо за каноном/аліасом (колишні назви → сучасна).
+                key = normalize_settlement_name(settlement_name)
+                key_norm = (key or settlement_name or "").strip()
+                if key_norm:
+                    from utils.settlement_normalizer import normalize_settlement_key
+
+                    nk = normalize_settlement_key(key_norm)
+                    if nk:
+                        found = cities_repo.find_one({
+                            **CitiesRepository._active_city_filter(),
+                            "$or": [
+                                {"name_normalized": nk},
+                                {"search_aliases": nk},
+                            ],
+                        })
+            if found:
+                _add(found.get("name"))
+                for alias in found.get("search_aliases") or []:
+                    _add(alias)
     except Exception:
         pass
 
@@ -93,9 +110,13 @@ def get_settlement_match_names(
 
 
 def settlement_regex(name: str) -> Dict[str, Any]:
-    """MongoDB regex для однієї назви НП (з опційними префіксами типу)."""
+    """MongoDB regex для однієї назви НП (з опційними префіксами типу).
+
+    Після назви не може йти літера — інакше «Львів» матчить «Львівська»,
+    «Київ» — «Київська».
+    """
     escaped = re.escape(str(name))
-    pattern = f"^{SETTLEMENT_PREFIX_REGEX}{escaped}"
+    pattern = f"^{SETTLEMENT_PREFIX_REGEX}{escaped}(?![А-Яа-яЁёЇїІіЄєҐґA-Za-z0-9_])"
     return {"$regex": pattern, "$options": "i"}
 
 
@@ -107,7 +128,7 @@ def settlement_regex_for_names(names: List[str]) -> Dict[str, Any]:
     if len(cleaned) == 1:
         return settlement_regex(cleaned[0])
     alt = "|".join(re.escape(n) for n in cleaned)
-    pattern = f"^{SETTLEMENT_PREFIX_REGEX}(?:{alt})"
+    pattern = f"^{SETTLEMENT_PREFIX_REGEX}(?:{alt})(?![А-Яа-яЁёЇїІіЄєҐґA-Za-z0-9_])"
     return {"$regex": pattern, "$options": "i"}
 
 
@@ -120,6 +141,44 @@ def settlement_substring_regex_for_names(names: List[str]) -> Dict[str, Any]:
         return {"$regex": re.escape(cleaned[0]), "$options": "i"}
     alt = "|".join(re.escape(n) for n in cleaned)
     return {"$regex": alt, "$options": "i"}
+
+
+def settlement_location_field_regex_for_names(names: List[str]) -> Dict[str, Any]:
+    """
+    Для search_data.location формату «НП, область».
+    Якір на початок + межа слова — «Київ» не матчить «Київська область».
+    """
+    cleaned = [str(n).strip() for n in names if n and str(n).strip()]
+    if not cleaned:
+        return {"$regex": "^$", "$options": "i"}
+    alt = "|".join(re.escape(n) for n in cleaned)
+    pattern = (
+        f"^{SETTLEMENT_PREFIX_REGEX}(?:{alt})"
+        f"(?![А-Яа-яЁёЇїІіЄєҐґA-Za-z0-9_])"
+        f"(?:\\s*[,;]|$)"
+    )
+    return {"$regex": pattern, "$options": "i"}
+
+
+def _root_city_missing_clause() -> Dict[str, Any]:
+    """Документи без заповненого root city (legacy fallback на addresses[])."""
+    return {
+        "$or": [
+            {"city": {"$exists": False}},
+            {"city": None},
+            {"city": ""},
+        ]
+    }
+
+
+def _root_region_missing_clause() -> Dict[str, Any]:
+    return {
+        "$or": [
+            {"region": {"$exists": False}},
+            {"region": None},
+            {"region": ""},
+        ]
+    }
 
 
 def region_regex_mongo(region: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -136,7 +195,10 @@ def build_unified_listings_settlement_match(
     city_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    MongoDB-умова для unified_listings: root city/region + addresses + city_id.
+    MongoDB-умова для unified_listings за НП.
+
+    Пріоритет: root city_id / city(+region). Масив addresses[] — лише fallback,
+    коли root city порожній (інакше хибні геокод-варіанти дають false positives).
     """
     if str(settlement_value) == "__NO_MATCH__":
         return {"_id": {"$exists": False}}
@@ -144,13 +206,6 @@ def build_unified_listings_settlement_match(
     or_parts: List[Dict[str, Any]] = []
     cid = str(city_id).strip() if city_id else ""
     region_re = region_regex_mongo(region)
-
-    if cid:
-        or_parts.append({"city_id": cid})
-        addr_by_id: Dict[str, Any] = {"city_id": cid}
-        if region_re:
-            addr_by_id["region"] = region_re
-        or_parts.append({"addresses": {"$elemMatch": addr_by_id}})
 
     names = get_settlement_match_names(
         city_id=city_id,
@@ -160,50 +215,61 @@ def build_unified_listings_settlement_match(
     if not names:
         names = [str(settlement_value)]
     settlement_re = settlement_regex_for_names(names)
-    location_re = settlement_substring_regex_for_names(names)
+    location_re = settlement_location_field_regex_for_names(names)
+
+    # 1) Root identity — при наявності city_id це головний критерій
+    if cid:
+        or_parts.append({"city_id": cid})
 
     if region_re:
         or_parts.append({"$and": [{"city": settlement_re}, {"region": region_re}]})
-        or_parts.append({
-            "addresses": {
-                "$elemMatch": {
-                    "settlement": settlement_re,
-                    "region": region_re,
-                }
-            }
-        })
-        or_parts.append({
-            "$and": [
-                {"region": region_re},
-                {"addresses": {"$elemMatch": {"settlement": settlement_re}}},
-            ]
-        })
-        or_parts.append({
-            "$and": [
-                {"region": region_re},
-                {"search_data.location": location_re},
-            ]
-        })
-        or_parts.append({
-            "$and": [
-                {"search_data.location": location_re},
-                {"search_data.location": region_re},
-            ]
-        })
-        or_parts.append({
-            "detail.address_refs": {
-                "$elemMatch": {
-                    "city.name": settlement_re,
-                    "region.name": region_re,
-                }
-            }
-        })
     else:
         or_parts.append({"city": settlement_re})
-        or_parts.append({"addresses": {"$elemMatch": {"settlement": settlement_re}}})
-        or_parts.append({"search_data.location": location_re})
+
+    # 2) OLX card location — лише якщо немає city_id (інакше достатньо root)
+    if not cid:
+        if region_re:
+            or_parts.append({
+                "$and": [
+                    {"search_data.location": location_re},
+                    {"search_data.location": region_re},
+                ]
+            })
+        else:
+            or_parts.append({"search_data.location": location_re})
+
+    # 3) Structured address_refs — лише якщо root city відсутній
+    if not cid:
+        refs_elem: Dict[str, Any] = {"city.name": settlement_re}
+        if region_re:
+            refs_elem["region.name"] = region_re
         or_parts.append({
-            "detail.address_refs": {"$elemMatch": {"city.name": settlement_re}}
+            "$and": [
+                _root_city_missing_clause(),
+                {"detail.address_refs": {"$elemMatch": refs_elem}},
+            ]
+        })
+
+    # 4) addresses[] — лише fallback без root city
+    if cid:
+        addr_by_id: Dict[str, Any] = {"city_id": cid}
+        if region_re:
+            addr_by_id["region"] = region_re
+        or_parts.append({
+            "$and": [
+                _root_city_missing_clause(),
+                {"addresses": {"$elemMatch": addr_by_id}},
+            ]
+        })
+    else:
+        addr_elem: Dict[str, Any] = {"settlement": settlement_re}
+        if region_re:
+            addr_elem["region"] = region_re
+        or_parts.append({
+            "$and": [
+                _root_city_missing_clause(),
+                {"addresses": {"$elemMatch": addr_elem}},
+            ]
         })
 
     if not or_parts:
@@ -211,17 +277,53 @@ def build_unified_listings_settlement_match(
     return {"$or": or_parts} if len(or_parts) > 1 else or_parts[0]
 
 
-def build_unified_listings_region_match(region: str) -> Dict[str, Any]:
-    """Фільтр лише за областю."""
-    region_re = region_regex_mongo(region)
-    if not region_re:
+def build_unified_listings_region_match(
+    region: str,
+    *,
+    region_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Фільтр лише за областю. Пріоритет: root region_id/region; addresses — fallback."""
+    name = (region or "").strip()
+    rid = str(region_id).strip() if region_id else ""
+
+    if rid:
+        try:
+            from data.repositories.geography_repository import RegionsRepository
+            reg = RegionsRepository().find_by_id(rid)
+            if reg and reg.get("name"):
+                name = str(reg["name"]).strip() or name
+        except Exception:
+            pass
+
+    region_re = region_regex_mongo(name) if name else None
+    if not region_re and not rid:
         return {"_id": {"$exists": False}}
-    return {
-        "$or": [
-            {"region": region_re},
-            {"addresses": {"$elemMatch": {"region": region_re}}},
-        ]
-    }
+
+    or_parts: List[Dict[str, Any]] = []
+    if region_re:
+        or_parts.append({"region": region_re})
+    if rid:
+        or_parts.append({"region_id": rid})
+
+    # addresses[] лише коли root region порожній
+    if region_re:
+        or_parts.append({
+            "$and": [
+                _root_region_missing_clause(),
+                {"addresses": {"$elemMatch": {"region": region_re}}},
+            ]
+        })
+    if rid:
+        or_parts.append({
+            "$and": [
+                _root_region_missing_clause(),
+                {"addresses": {"$elemMatch": {"region_id": rid}}},
+            ]
+        })
+
+    if not or_parts:
+        return {"_id": {"$exists": False}}
+    return {"$or": or_parts} if len(or_parts) > 1 else or_parts[0]
 
 
 def build_unified_listings_city_region_filter(

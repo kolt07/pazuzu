@@ -70,7 +70,8 @@ class GeoFilterElement:
     geo_type: str
     value: Any  # рядок (назва) або dict {"latitude": x, "longitude": y}
     radius_km: Optional[float] = None  # для IN_RADIUS
-    region: Optional[str] = None  # область для однозначного НП (гомоніми)
+    region: Optional[str] = None  # область (display / fallback за назвою)
+    region_id: Optional[str] = None  # _id з regions, якщо відомий
     city_id: Optional[str] = None  # _id з cities, якщо відомий
 
 

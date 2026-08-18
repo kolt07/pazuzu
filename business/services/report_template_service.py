@@ -18,7 +18,8 @@ PARAM_DATE_FILTER = "date_filter"
 PARAM_SORT_FIELD = "sort_field"
 PARAM_SORT_ORDER = "sort_order"
 PARAM_OUTPUT_FORMAT = "output_format"
-PARAM_FILTER_STRING = "filter_string"
+PARAM_FILTER_STRING = "filter_string"  # legacy backup
+PARAM_FILTER = "filter"  # FilterSpec
 
 
 def _default_params() -> Dict[str, Any]:
@@ -26,6 +27,7 @@ def _default_params() -> Dict[str, Any]:
     return {
         PARAM_SOURCE: "",
         PARAM_DATE_FILTER: 7,
+        PARAM_FILTER: {"version": 1, "group_type": "and", "items": []},
         PARAM_FILTER_STRING: None,
         PARAM_SORT_FIELD: "source_updated_at",
         PARAM_SORT_ORDER: "desc",
@@ -150,6 +152,16 @@ class ReportTemplateService:
         if fs:
             snippet = fs[:100] + ("…" if len(fs) > 100 else "")
             parts.append(f"рядок фільтрів: {snippet}")
+        else:
+            filt = params.get(PARAM_FILTER)
+            if isinstance(filt, dict) and (filt.get("items") or []):
+                try:
+                    from domain.services.filter_spec_service import filter_spec_summary
+                    summary = filter_spec_summary(filt)
+                    if summary:
+                        parts.append(summary[:100])
+                except Exception:
+                    parts.append(f"відборів: {len(filt.get('items') or [])}")
 
         return f"Generate a short report template name (max 6-8 words). Report parameters: {', '.join(parts)}. Return only the name, no quotes. The name must be in Ukrainian."
 
@@ -158,13 +170,17 @@ class ReportTemplateService:
         days = params.get(PARAM_DATE_FILTER, 7)
         source = params.get(PARAM_SOURCE) or "всі"
         fs = (params.get(PARAM_FILTER_STRING) or "").strip()
+        filt = params.get(PARAM_FILTER)
+        has_filter = bool(fs) or (
+            isinstance(filt, dict) and bool(filt.get("items"))
+        )
         if days == 1:
             period = "Звіт за добу"
         elif days == 7:
             period = "Звіт за тиждень"
         else:
             period = f"Звіт за {days} днів"
-        if fs:
+        if has_filter:
             return f"{period} (фільтр)"
         return f"{period} ({source})"
 

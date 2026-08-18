@@ -112,6 +112,25 @@ def _set_page_timeouts(page: Any, scraper_config: Any) -> None:
     page.set_default_navigation_timeout(detail_timeout_ms)
 
 
+def _description_selector_combined() -> str:
+    """Один CSS-селектор для будь-якого відомого блоку опису (замість N послідовних wait)."""
+    return ", ".join(_DESCRIPTION_SELECTORS)
+
+
+def _wait_for_description_sync(page: Any, timeout_ms: int = 15000) -> None:
+    try:
+        page.wait_for_selector(_description_selector_combined(), timeout=timeout_ms)
+    except Exception:
+        time.sleep(2)
+
+
+async def _wait_for_description_async(page: Any, timeout_ms: int = 15000) -> None:
+    try:
+        await page.wait_for_selector(_description_selector_combined(), timeout=timeout_ms)
+    except Exception:
+        await asyncio.sleep(2)
+
+
 def _create_browser_context(browser: Any, scraper_config: Any) -> Any:
     context = browser.new_context(
         viewport={"width": 1280, "height": 720},
@@ -272,15 +291,10 @@ class BrowserPageFetcher:
             try:
                 response = self._page.goto(url, wait_until=current_wait, timeout=timeout_ms)
                 status = response.status if response else 0
-                time.sleep(1.5 + random.uniform(0.5, 2.5))
-                for sel in _DESCRIPTION_SELECTORS:
-                    try:
-                        self._page.wait_for_selector(sel, timeout=20000)
-                        break
-                    except Exception:
-                        continue
-                else:
-                    time.sleep(2)
+                settle = scraper_config.get_detail_post_goto_settle_seconds()
+                if settle > 0:
+                    time.sleep(settle)
+                _wait_for_description_sync(self._page, timeout_ms=15000)
                 html = self._page.content()
                 antibot = detect_antibot_page(html)
                 if antibot.get("is_antibot") and antibot.get("hints"):
@@ -288,12 +302,7 @@ class BrowserPageFetcher:
                     time.sleep(8)
                     response = self._page.goto(url, wait_until=current_wait, timeout=timeout_ms)
                     status = response.status if response else 0
-                    for sel in _DESCRIPTION_SELECTORS:
-                        try:
-                            self._page.wait_for_selector(sel, timeout=15000)
-                            break
-                        except Exception:
-                            continue
+                    _wait_for_description_sync(self._page, timeout_ms=12000)
                     html = self._page.content()
                 return PageResult(html, status)
             except Exception as e:
@@ -325,12 +334,14 @@ class BrowserPageFetcher:
 
 class BrowserPagePool:
     """
-    Singleton-подібний оркестратор браузера:
-    - один процес браузера;
+    Оркестратор браузера:
+    - один процес Chromium;
     - внутрішня asyncio-черга запитів;
-    - N worker-сторінок (по одній на logical worker) для одночасного завантаження detail.
+    - N worker-сторінок для паралельного detail/list-fetch.
 
-    Зовнішні потоки викликають sync `get_detail_page(url)` і чекають результат.
+    Зовнішні потоки викликають sync `get_detail_page(url)` / `get_list_page(url)`.
+    Завислий Playwright (goto без відповіді) розблоковується жорстким бюджетом:
+    закриття page → recreate slot/context → за потреби повний restart браузера.
     """
 
     def __init__(
@@ -352,13 +363,18 @@ class BrowserPagePool:
         self._slots: list[dict[str, Any]] = []
         self._playwright: Any = None
         self._browser: Any = None
+        self._restart_lock: Optional[asyncio.Lock] = None
+        self._consecutive_hangs = 0
+        self._recovery_generation = 0
 
     @dataclass
     class _PoolRequest:
         url: str
         done: threading.Event
+        kind: str = "detail"  # "detail" | "list"
         result: Optional["PageResult"] = None
         error: Optional[BaseException] = None
+        abandoned: bool = False
 
     def __enter__(self) -> "BrowserPagePool":
         self._owner_thread = threading.Thread(target=self._run_owner_loop, daemon=True, name="OLXBrowserPoolOwner")
@@ -409,42 +425,59 @@ class BrowserPagePool:
         from scripts.olx_scraper import config as scraper_config
 
         self._request_queue = asyncio.Queue()
+        self._restart_lock = asyncio.Lock()
         self._playwright = await async_playwright().start()
-        launch_options = _build_launch_options(self._headless, scraper_config)
-        self._browser = await self._playwright.chromium.launch(**launch_options)
-
-        for idx in range(self._pool_size):
-            context = await self._browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                user_agent=scraper_config.USER_AGENT,
-                locale="uk-UA",
-                java_script_enabled=True,
-            )
-            await context.set_extra_http_headers({"Accept-Language": "uk,en;q=0.9"})
-            await _add_olx_cookies_to_context_async(context, scraper_config)
-            page = await context.new_page()
-            _set_page_timeouts(page, scraper_config)
-            self._slots.append({"context": context, "page": page, "slot_idx": idx})
+        await self._launch_browser_and_slots(scraper_config)
 
         workers = [asyncio.create_task(self._slot_worker(slot)) for slot in self._slots]
         self._ready_event.set()
         try:
             await asyncio.gather(*workers)
         finally:
-            await self._close_all_slots()
+            await self._close_all_slot_contexts()
             if self._browser:
-                await self._browser.close()
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
             if self._playwright:
-                await self._playwright.stop()
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
 
-    async def _close_all_slots(self) -> None:
+    async def _launch_browser_and_slots(self, scraper_config: Any) -> None:
+        launch_options = _build_launch_options(self._headless, scraper_config)
+        self._browser = await self._playwright.chromium.launch(**launch_options)
+        if not self._slots:
+            for idx in range(self._pool_size):
+                self._slots.append({"context": None, "page": None, "slot_idx": idx})
+        for slot in self._slots:
+            await self._assign_fresh_context(slot, scraper_config)
+
+    async def _assign_fresh_context(self, slot: dict, scraper_config: Any) -> None:
+        context = await self._browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            user_agent=scraper_config.USER_AGENT,
+            locale="uk-UA",
+            java_script_enabled=True,
+        )
+        await context.set_extra_http_headers({"Accept-Language": "uk,en;q=0.9"})
+        await _add_olx_cookies_to_context_async(context, scraper_config)
+        page = await context.new_page()
+        _set_page_timeouts(page, scraper_config)
+        slot["context"] = context
+        slot["page"] = page
+
+    async def _close_all_slot_contexts(self) -> None:
         for slot in self._slots:
             try:
                 if slot.get("context"):
                     await slot["context"].close()
             except Exception:
                 pass
-        self._slots.clear()
+            slot["context"] = None
+            slot["page"] = None
 
     async def _recreate_slot_page(self, slot: dict) -> None:
         from scripts.olx_scraper import config as scraper_config
@@ -464,68 +497,276 @@ class BrowserPagePool:
                 await slot["context"].close()
         except Exception:
             pass
-        context = await self._browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            user_agent=scraper_config.USER_AGENT,
-            locale="uk-UA",
-            java_script_enabled=True,
+        await self._assign_fresh_context(slot, scraper_config)
+
+    async def _force_close_page(self, slot: dict) -> None:
+        """Примусово закриває page, щоб розблокувати завислий page.goto (Playwright CancelledError часто ігнорується)."""
+        try:
+            page = slot.get("page")
+            if page:
+                await page.close()
+        except Exception:
+            pass
+        slot["page"] = None
+
+    async def _restart_browser(self) -> None:
+        """Повний restart Chromium; slot dicts мутуються in-place (workers тримають ті самі refs)."""
+        if self._restart_lock is None:
+            self._restart_lock = asyncio.Lock()
+        async with self._restart_lock:
+            from scripts.olx_scraper import config as scraper_config
+            self._recovery_generation += 1
+            gen = self._recovery_generation
+            self._log_fn(f"[OLX browser] BrowserPool: повний restart Chromium (generation={gen})...")
+            await self._close_all_slot_contexts()
+            try:
+                if self._browser:
+                    await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+            try:
+                await self._launch_browser_and_slots(scraper_config)
+                self._consecutive_hangs = 0
+                self._log_fn(f"[OLX browser] BrowserPool: Chromium перезапущено (generation={gen}).")
+            except Exception as e:
+                self._log_fn(f"[OLX browser] BrowserPool: помилка restart Chromium: {e}")
+                raise
+
+    def _schedule_recovery(self, reason: str) -> None:
+        """З клієнтського потоку: поставити recovery на owner-loop (неблокуюче)."""
+        loop = self._loop
+        if not loop or loop.is_closed() or self._stop_requested:
+            return
+        self._log_fn(f"[OLX browser] BrowserPool: schedule recovery ({reason})")
+
+        async def _recover() -> None:
+            try:
+                await self._restart_browser()
+            except Exception as e:
+                self._log_fn(f"[OLX browser] BrowserPool recovery failed: {e}")
+
+        try:
+            asyncio.run_coroutine_threadsafe(_recover(), loop)
+        except Exception as e:
+            self._log_fn(f"[OLX browser] BrowserPool: не вдалося schedule recovery: {e}")
+
+    async def _recover_after_hang(self, slot: dict) -> None:
+        from scripts.olx_scraper import config as scraper_config
+        self._consecutive_hangs += 1
+        restart_after = max(1, int(getattr(scraper_config, "BROWSER_POOL_RESTART_AFTER_HANGS", 2) or 2))
+        if self._consecutive_hangs >= restart_after:
+            await self._restart_browser()
+            return
+        self._log_fn(
+            f"[OLX browser] BrowserPool: recreate context після hang "
+            f"(slot={slot.get('slot_idx')}, hangs={self._consecutive_hangs}/{restart_after})"
         )
-        await context.set_extra_http_headers({"Accept-Language": "uk,en;q=0.9"})
-        await _add_olx_cookies_to_context_async(context, scraper_config)
-        page = await context.new_page()
-        _set_page_timeouts(page, scraper_config)
-        slot["context"] = context
-        slot["page"] = page
+        try:
+            await self._recreate_slot_context(slot)
+        except Exception as e:
+            self._log_fn(f"[OLX browser] BrowserPool: recreate context failed ({e}), full restart...")
+            await self._restart_browser()
 
     async def _slot_worker(self, slot: dict) -> None:
+        from scripts.olx_scraper import config as scraper_config
+
+        fetch_budget = float(getattr(scraper_config, "BROWSER_POOL_FETCH_BUDGET_SEC", 160) or 160)
+        fetch_budget = max(60.0, fetch_budget)
+
         while True:
             req = await self._request_queue.get()  # type: ignore[arg-type]
             if req is None:
                 return
+            if req.abandoned:
+                req.done.set()
+                continue
+
+            kind = getattr(req, "kind", "detail") or "detail"
+            if kind == "list":
+                fetch_task = asyncio.create_task(self._fetch_list_with_slot(slot, req.url))
+            else:
+                fetch_task = asyncio.create_task(self._fetch_detail_with_slot(slot, req.url))
             try:
-                req.result = await self._fetch_detail_with_slot(slot, req.url)
+                done_set, _ = await asyncio.wait({fetch_task}, timeout=fetch_budget)
+                if fetch_task not in done_set:
+                    self._log_fn(
+                        f"[OLX browser] BrowserPool: fetch budget {fetch_budget:.0f}s вичерпано "
+                        f"(slot={slot.get('slot_idx')}): {req.url[:60]}..."
+                    )
+                    await self._force_close_page(slot)
+                    fetch_task.cancel()
+                    try:
+                        await asyncio.wait_for(fetch_task, timeout=8)
+                    except Exception:
+                        pass
+                    full_restart_done = False
+                    if not fetch_task.done():
+                        self._log_fn("[OLX browser] BrowserPool: fetch-task все ще живий після close — full restart")
+                        try:
+                            await self._restart_browser()
+                            full_restart_done = True
+                        except Exception as e:
+                            self._log_fn(f"[OLX browser] BrowserPool: restart після zombie-task: {e}")
+                        try:
+                            await asyncio.wait_for(fetch_task, timeout=5)
+                        except Exception:
+                            pass
+                    if not req.abandoned:
+                        req.error = RuntimeError(
+                            f"BrowserPool fetch budget exceeded while fetching {kind}: {req.url[:80]}"
+                        )
+                    if not full_restart_done:
+                        await self._recover_after_hang(slot)
+                else:
+                    try:
+                        req.result = fetch_task.result()
+                        self._consecutive_hangs = 0
+                    except BaseException as e:
+                        if not req.abandoned:
+                            req.error = e
+                        if _is_crash_error(e) or "target closed" in str(e).lower():
+                            try:
+                                await self._recreate_slot_context(slot)
+                            except Exception:
+                                await self._restart_browser()
             except BaseException as e:
-                req.error = e
+                if not req.abandoned:
+                    req.error = e
             finally:
                 req.done.set()
 
-    def get_detail_page(self, url: str) -> PageResult:
+    def _enqueue_and_wait(self, url: str, kind: str, *, _retries_left: int = 1) -> PageResult:
         if not self._loop or not self._request_queue:
             raise RuntimeError("BrowserPool is not initialized.")
+        from scripts.olx_scraper import config as scraper_config
+
+        client_timeout = float(getattr(scraper_config, "BROWSER_POOL_CLIENT_TIMEOUT_SEC", 200) or 200)
+        client_timeout = max(90.0, client_timeout)
+
         done = threading.Event()
-        req = BrowserPagePool._PoolRequest(url=url, done=done)
+        req = BrowserPagePool._PoolRequest(url=url, done=done, kind=kind)
         fut = asyncio.run_coroutine_threadsafe(self._request_queue.put(req), self._loop)
         fut.result(timeout=10)
-        if not done.wait(timeout=240):
-            raise RuntimeError(f"BrowserPool timeout while fetching detail: {url[:80]}")
+        if not done.wait(timeout=client_timeout):
+            req.abandoned = True
+            self._schedule_recovery(f"client timeout {client_timeout:.0f}s: {url[:50]}")
+            if _retries_left > 0:
+                self._log_fn(
+                    f"[OLX browser] BrowserPool timeout — recovery + retry ({_retries_left} left): {url[:50]}..."
+                )
+                time.sleep(5)
+                return self._enqueue_and_wait(url, kind, _retries_left=_retries_left - 1)
+            raise RuntimeError(f"BrowserPool timeout while fetching {kind}: {url[:80]}")
         if req.error:
+            err_msg = str(req.error).lower()
+            is_recoverable = (
+                "fetch budget exceeded" in err_msg
+                or "crashed" in err_msg
+                or "target closed" in err_msg
+                or "browser has been closed" in err_msg
+            )
+            if is_recoverable and _retries_left > 0:
+                self._log_fn(
+                    f"[OLX browser] BrowserPool recoverable error — retry ({_retries_left} left): {url[:50]}... ({req.error})"
+                )
+                time.sleep(2)
+                return self._enqueue_and_wait(url, kind, _retries_left=_retries_left - 1)
             raise req.error
         return req.result or PageResult("", 0)
+
+    def get_detail_page(self, url: str, *, _retries_left: int = 1) -> PageResult:
+        return self._enqueue_and_wait(url, "detail", _retries_left=_retries_left)
+
+    def get_list_page(
+        self,
+        url: str,
+        delay_before: bool = True,
+        delay_after: bool = False,
+        *,
+        _retries_left: int = 1,
+    ) -> PageResult:
+        """
+        List-сторінка через той самий BrowserPool (fallback при HTTP 403).
+        delay_before/delay_after — для сумісності з BrowserPageFetcher; пауза перед goto
+        уже є в _fetch_list_with_slot (get_delay_seconds).
+        """
+        _ = delay_before
+        _ = delay_after
+        return self._enqueue_and_wait(url, "list", _retries_left=_retries_left)
+
+    async def _fetch_list_with_slot(self, slot: dict, url: str) -> PageResult:
+        """Швидкий list-fetch (domcontentloaded), без очікування блоку опису detail."""
+        from scripts.olx_scraper import config as scraper_config
+        from scripts.olx_scraper.parser import detect_antibot_page
+
+        await asyncio.sleep(scraper_config.get_delay_seconds())
+        timeout_ms = max(25000, getattr(scraper_config, "REQUEST_TIMEOUT", 25) * 1000)
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            page = slot.get("page")
+            if page is None:
+                await self._recreate_slot_context(slot)
+                page = slot["page"]
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                status = response.status if response else 0
+                delay_after = getattr(scraper_config, "DELAY_AFTER_PAGE_LOAD", 0) or 0
+                if delay_after > 0:
+                    await asyncio.sleep(delay_after)
+                html = await page.content()
+                antibot = detect_antibot_page(html)
+                if antibot.get("is_antibot") and antibot.get("hints"):
+                    self._log_fn(
+                        f"[OLX browser] List: ознаки антиботу: {', '.join(antibot.get('hints', []))}. Повтор через 8 с..."
+                    )
+                    await asyncio.sleep(8)
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    status = response.status if response else 0
+                    html = await page.content()
+                return PageResult(html, status)
+            except Exception as e:
+                last_exc = e
+                self._log_fn(f"[OLX browser] Помилка list {url[:50]}...: {e}")
+                err_str = str(e).lower()
+                if "404" in err_str or "net::err_aborted" in err_str:
+                    return PageResult("", 404)
+                if "502" in err_str or "503" in err_str or "504" in err_str:
+                    return PageResult("", 502)
+                if _is_crash_error(e) and attempt == 0:
+                    self._log_fn("[OLX browser] Краш list-сторінки (pool) — перестворюємо сторінку...")
+                    await self._recreate_slot_page(slot)
+                    await asyncio.sleep(2)
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        return PageResult("", 0)
 
     async def _fetch_detail_with_slot(self, slot: dict, url: str) -> PageResult:
         from scripts.olx_scraper import config as scraper_config
         from scripts.olx_scraper.parser import detect_antibot_page
 
         await asyncio.sleep(scraper_config.get_delay_detail_seconds())
-        timeout_ms = max(60000, getattr(scraper_config, "REQUEST_DETAIL_TIMEOUT", 90) * 1000)
+        # Обмежуємо один goto, щоб 2–3 спроби вміщались у fetch budget.
+        configured_ms = max(30000, getattr(scraper_config, "REQUEST_DETAIL_TIMEOUT", 90) * 1000)
+        timeout_ms = min(60000, configured_ms)
         wait_until = getattr(scraper_config, "BROWSER_DETAIL_WAIT_UNTIL", "load")
         use_fast_wait = False
         last_exc: Optional[Exception] = None
         for attempt in range(3):
             current_wait = "domcontentloaded" if (attempt == 2 or use_fast_wait) else wait_until
-            page = slot["page"]
+            page = slot.get("page")
+            if page is None:
+                await self._recreate_slot_context(slot)
+                page = slot["page"]
             try:
                 response = await page.goto(url, wait_until=current_wait, timeout=timeout_ms)
                 status = response.status if response else 0
-                await asyncio.sleep(1.5 + random.uniform(0.5, 2.5))
-                for sel in _DESCRIPTION_SELECTORS:
-                    try:
-                        await page.wait_for_selector(sel, timeout=20000)
-                        break
-                    except Exception:
-                        continue
-                else:
-                    await asyncio.sleep(2)
+                settle = scraper_config.get_detail_post_goto_settle_seconds()
+                if settle > 0:
+                    await asyncio.sleep(settle)
+                await _wait_for_description_async(page, timeout_ms=12000)
                 html = await page.content()
                 antibot = detect_antibot_page(html)
                 if antibot.get("is_antibot") and antibot.get("hints"):
@@ -533,12 +774,7 @@ class BrowserPagePool:
                     await asyncio.sleep(8)
                     response = await page.goto(url, wait_until=current_wait, timeout=timeout_ms)
                     status = response.status if response else 0
-                    for sel in _DESCRIPTION_SELECTORS:
-                        try:
-                            await page.wait_for_selector(sel, timeout=15000)
-                            break
-                        except Exception:
-                            continue
+                    await _wait_for_description_async(page, timeout_ms=10000)
                     html = await page.content()
                 return PageResult(html, status)
             except Exception as e:

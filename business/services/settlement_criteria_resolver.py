@@ -6,6 +6,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from bson import ObjectId
+from bson.errors import InvalidId
+
 from data.repositories.geography_repository import CitiesRepository, RegionsRepository
 from domain.models.filter_models import (
     FilterElement,
@@ -85,17 +88,29 @@ def _apply_area_op(criteria: SettlementCriteria, op: FilterOperator, value: Any)
         criteria.area_lte = n
 
 
-def extract_settlement_criteria_from_group(
-    group: Optional[FilterGroup],
-) -> tuple[Optional[FilterGroup], List[SettlementCriteria]]:
-    """Витягує settlement_population / settlement_area_sq_km з FilterGroup."""
-    if not group or not group.items:
-        return group, []
+def _criteria_has_values(criteria: SettlementCriteria) -> bool:
+    return any(
+        [
+            criteria.region,
+            criteria.settlement,
+            criteria.population_gte,
+            criteria.population_lte,
+            criteria.population_gt,
+            criteria.population_lt,
+            criteria.area_gte,
+            criteria.area_lte,
+            criteria.area_gt,
+            criteria.area_lt,
+        ]
+    )
 
+
+def _strip_settlement_fields_from_group(
+    group: FilterGroup,
+    current: SettlementCriteria,
+) -> Optional[FilterGroup]:
+    """Рекурсивно прибирає логічні поля НП; накопичує критерії в current."""
     kept: List[Any] = []
-    criteria_list: List[SettlementCriteria] = []
-    current = SettlementCriteria()
-
     for item in group.items:
         if isinstance(item, FilterElement):
             if item.field == SETTLEMENT_REGION_CONTEXT_FIELD:
@@ -112,23 +127,28 @@ def extract_settlement_criteria_from_group(
             if item.field == SETTLEMENT_AREA_FIELD:
                 _apply_area_op(current, item.operator, item.value)
                 continue
-        kept.append(item)
+            kept.append(item)
+        elif isinstance(item, FilterGroup):
+            sub = _strip_settlement_fields_from_group(item, current)
+            if sub is not None and sub.items:
+                kept.append(sub)
+    if not kept:
+        return None
+    return FilterGroup(group_type=group.group_type, items=kept)
 
-    if any(
-        [
-            current.population_gte,
-            current.population_lte,
-            current.population_gt,
-            current.population_lt,
-            current.area_gte,
-            current.area_lte,
-            current.area_gt,
-            current.area_lt,
-        ]
-    ):
+
+def extract_settlement_criteria_from_group(
+    group: Optional[FilterGroup],
+) -> tuple[Optional[FilterGroup], List[SettlementCriteria]]:
+    """Витягує settlement_population / settlement_area_sq_km з FilterGroup (включно з вкладеними групами)."""
+    if not group or not group.items:
+        return group, []
+
+    current = SettlementCriteria()
+    new_group = _strip_settlement_fields_from_group(group, current)
+    criteria_list: List[SettlementCriteria] = []
+    if _criteria_has_values(current):
         criteria_list.append(current)
-
-    new_group = FilterGroup(group_type=group.group_type, items=kept) if kept else None
     return new_group, criteria_list
 
 
@@ -168,24 +188,33 @@ def extract_settlement_criteria_from_geo_tree(geo_items: List[Dict[str, Any]]) -
 
 
 def extract_region_from_geo_filter(geo_filter: Optional[GeoFilter]) -> Optional[str]:
-    if not geo_filter or not geo_filter.root:
-        return None
+    regions = extract_regions_from_geo_filter(geo_filter)
+    return regions[0] if regions else None
 
-    def walk(node) -> Optional[str]:
+
+def extract_regions_from_geo_filter(geo_filter: Optional[GeoFilter]) -> List[str]:
+    """Усі області з geo (включно з OR-групи)."""
+    if not geo_filter or not geo_filter.root:
+        return []
+
+    found: List[str] = []
+
+    def walk(node) -> None:
         if isinstance(node, GeoFilterElement):
             if node.geo_type == "region" and node.value:
-                return str(node.value)
-            if node.geo_type == "settlement" and getattr(node, "region", None):
-                return str(node.region)
-            return None
-        if isinstance(node, GeoFilterGroup):
+                val = str(node.value).strip()
+                if val and val not in found:
+                    found.append(val)
+            elif node.geo_type == "settlement" and getattr(node, "region", None):
+                val = str(node.region).strip()
+                if val and val not in found:
+                    found.append(val)
+        elif isinstance(node, GeoFilterGroup):
             for it in node.items:
-                r = walk(it)
-                if r:
-                    return r
-        return None
+                walk(it)
 
-    return walk(geo_filter.root)
+    walk(geo_filter.root)
+    return found
 
 
 class SettlementCriteriaResolver:
@@ -199,6 +228,118 @@ class SettlementCriteriaResolver:
         lookup = normalize_region_for_repository_lookup(region_name) or region_name
         reg = self.regions_repo.find_by_name(lookup)
         return str(reg["_id"]) if reg else None
+
+    def _find_city_for_geo_element(self, elem: GeoFilterElement) -> Optional[Dict[str, Any]]:
+        """Документ НП з каталогу для явного geo-вузла (city_id або назва+область)."""
+        city_id = (getattr(elem, "city_id", None) or "").strip() if getattr(elem, "city_id", None) else None
+        if city_id:
+            try:
+                doc = self.cities_repo.find_by_id(city_id)
+                if doc:
+                    return doc
+            except Exception:
+                pass
+            try:
+                doc = self.cities_repo.find_by_id(ObjectId(city_id))
+                if doc:
+                    return doc
+            except (InvalidId, Exception):
+                pass
+        name = (elem.value or "").strip() if isinstance(elem.value, str) else ""
+        if not name:
+            return None
+        region_id = self._region_id(getattr(elem, "region", None))
+        if region_id:
+            return self.cities_repo.find_by_name_and_region(name, region_id)
+        return self.cities_repo.find_one({"name_normalized": self.cities_repo._normalize_name(name)})
+
+    @staticmethod
+    def _city_satisfies_criteria(city: Optional[Dict[str, Any]], criteria: SettlementCriteria) -> bool:
+        """
+        Перевіряє демографічні критерії для конкретного НП.
+        Якщо population/area у каталозі відсутні — не відсікаємо (дані ще не заповнені).
+        """
+        if not city:
+            return False
+        if criteria.settlement:
+            key = (city.get("name") or "").strip().casefold()
+            want = criteria.settlement.strip().casefold()
+            if key != want:
+                return False
+        pop = city.get("population")
+        if pop is not None:
+            try:
+                pv = int(pop)
+            except (TypeError, ValueError):
+                pv = None
+            if pv is not None:
+                if criteria.population_gte is not None and pv < criteria.population_gte:
+                    return False
+                if criteria.population_lte is not None and pv > criteria.population_lte:
+                    return False
+                if criteria.population_gt is not None and pv <= criteria.population_gt:
+                    return False
+                if criteria.population_lt is not None and pv >= criteria.population_lt:
+                    return False
+        area = city.get("area_sq_km")
+        if area is not None:
+            try:
+                av = float(area)
+            except (TypeError, ValueError):
+                av = None
+            if av is not None:
+                if criteria.area_gte is not None and av < criteria.area_gte:
+                    return False
+                if criteria.area_lte is not None and av > criteria.area_lte:
+                    return False
+                if criteria.area_gt is not None and av <= criteria.area_gt:
+                    return False
+                if criteria.area_lt is not None and av >= criteria.area_lt:
+                    return False
+        return True
+
+    @staticmethod
+    def _geo_root_is_region_only(geo_filter: GeoFilter) -> bool:
+        root = geo_filter.root
+        return isinstance(root, GeoFilterElement) and root.geo_type == "region"
+
+    def _iter_settlement_geo_elements(self, node: Any) -> List[GeoFilterElement]:
+        out: List[GeoFilterElement] = []
+        if isinstance(node, GeoFilterElement):
+            if node.geo_type == "settlement" and node.value and str(node.value) != "__NO_MATCH__":
+                out.append(node)
+        elif isinstance(node, GeoFilterGroup):
+            for it in node.items:
+                out.extend(self._iter_settlement_geo_elements(it))
+        return out
+
+    def _base_geo_satisfies_criteria_list(
+        self,
+        base_geo: GeoFilter,
+        criteria_list: List[SettlementCriteria],
+    ) -> bool:
+        """Явний geo('НП' …) + критерії населення: перевірка по каталогу, не розгортання по області."""
+        settlements = self._iter_settlement_geo_elements(base_geo.root)
+        if not settlements or not criteria_list:
+            return False
+        for elem in settlements:
+            city = self._find_city_for_geo_element(elem)
+            for raw in criteria_list:
+                crit = SettlementCriteria(
+                    region=raw.region or getattr(elem, "region", None),
+                    settlement=raw.settlement,
+                    population_gte=raw.population_gte,
+                    population_lte=raw.population_lte,
+                    population_gt=raw.population_gt,
+                    population_lt=raw.population_lt,
+                    area_gte=raw.area_gte,
+                    area_lte=raw.area_lte,
+                    area_gt=raw.area_gt,
+                    area_lt=raw.area_lt,
+                )
+                if not self._city_satisfies_criteria(city, crit):
+                    return False
+        return True
 
     def resolve_city_names(self, criteria: SettlementCriteria) -> List[str]:
         region_id = self._region_id(criteria.region)
@@ -253,13 +394,21 @@ class SettlementCriteriaResolver:
                 )
 
         if not elems:
-            return GeoFilter(
-                root=GeoFilterElement(
-                    operator=GeoFilterOperator.INSIDE,
-                    geo_type="settlement",
-                    value="__NO_MATCH__",
-                )
+            if base_geo and self._base_geo_satisfies_criteria_list(base_geo, criteria_list):
+                return base_geo
+            no_match = GeoFilterElement(
+                operator=GeoFilterOperator.INSIDE,
+                geo_type="settlement",
+                value="__NO_MATCH__",
             )
+            if base_geo and self._geo_root_is_region_only(base_geo):
+                return GeoFilter(
+                    root=GeoFilterGroup(
+                        group_type=FilterGroupType.AND,
+                        items=[base_geo.root, no_match],  # type: ignore[list-item]
+                    )
+                )
+            return GeoFilter(root=no_match)
         pop_geo = (
             GeoFilter(root=elems[0])
             if len(elems) == 1
@@ -325,10 +474,29 @@ def strip_and_apply_settlement_criteria(
     if not criteria_list:
         return new_group, geo_filter
 
-    region_from_geo = extract_region_from_geo_filter(geo_filter)
-    for c in criteria_list:
-        if not c.region and region_from_geo:
-            c.region = region_from_geo
+    regions_from_geo = extract_regions_from_geo_filter(geo_filter)
+    if regions_from_geo:
+        expanded: List[SettlementCriteria] = []
+        for c in criteria_list:
+            if c.region:
+                expanded.append(c)
+                continue
+            for region_name in regions_from_geo:
+                expanded.append(
+                    SettlementCriteria(
+                        region=region_name,
+                        settlement=c.settlement,
+                        population_gte=c.population_gte,
+                        population_lte=c.population_lte,
+                        population_gt=c.population_gt,
+                        population_lt=c.population_lt,
+                        area_gte=c.area_gte,
+                        area_lte=c.area_lte,
+                        area_gt=c.area_gt,
+                        area_lt=c.area_lt,
+                    )
+                )
+        criteria_list = expanded
 
     resolver = SettlementCriteriaResolver()
     merged_geo = resolver.criteria_to_geo_filter(criteria_list, base_geo=geo_filter)

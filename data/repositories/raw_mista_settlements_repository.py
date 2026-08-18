@@ -66,6 +66,11 @@ class RawMistaSettlementsRepository(BaseRepository):
             raise ValueError("mista_url required")
         now = datetime.now(timezone.utc)
         mista_id = self._safe_mista_id_for_write(row.get("mista_id"), url)
+        existing = self.find_one({"mista_url": url})
+        # Не відкочуємо вже розпарсені деталі до list_only при повторному обході списку.
+        scrape_status = "list_only"
+        if existing and existing.get("scrape_status") == "parsed" and existing.get("parsed"):
+            scrape_status = "parsed"
         fields: Dict[str, Any] = {
             "mista_url": url,
             "name": row.get("name"),
@@ -75,12 +80,11 @@ class RawMistaSettlementsRepository(BaseRepository):
             "population": row.get("population"),
             "area_sq_km": row.get("area_sq_km"),
             "list_page": row.get("list_page"),
-            "scrape_status": "list_only",
+            "scrape_status": scrape_status,
             "updated_at": now,
         }
         if mista_id is not None:
             fields["mista_id"] = mista_id
-        existing = self.find_one({"mista_url": url})
         if existing:
             update_op: Dict[str, Any] = {"$set": {**fields, "created_at": existing.get("created_at", now)}}
             if mista_id is None:
@@ -93,12 +97,29 @@ class RawMistaSettlementsRepository(BaseRepository):
     def upsert_parsed(self, mista_url: str, parsed: Dict[str, Any]) -> None:
         self._ensure_indexes()
         now = datetime.now(timezone.utc)
+        existing = self.find_one({"mista_url": mista_url})
+        from utils.settlement_normalizer import resolve_mista_canonical_and_aliases
+
+        canonical, aliases = resolve_mista_canonical_and_aliases(
+            list_name=(existing or {}).get("name"),
+            detail_name=parsed.get("name"),
+            mista_url=mista_url,
+            former_names=parsed.get("former_names") or [],
+        )
+        if aliases:
+            parsed = dict(parsed)
+            parsed["search_aliases"] = sorted(
+                set(parsed.get("search_aliases") or []) | set(aliases)
+            )
+            if canonical:
+                parsed["name"] = canonical
+
         mista_id = self._safe_mista_id_for_write(parsed.get("mista_id"), mista_url)
         update_fields: Dict[str, Any] = {
             "parsed": parsed,
             "scrape_status": "parsed",
-            "name": parsed.get("name"),
-            "region_name": parsed.get("region_name"),
+            "name": canonical or parsed.get("name") or (existing or {}).get("name"),
+            "region_name": parsed.get("region_name") or (existing or {}).get("region_name"),
             "updated_at": now,
         }
         if mista_id is not None:
@@ -119,6 +140,20 @@ class RawMistaSettlementsRepository(BaseRepository):
 
     def find_parsed(self, limit: int = 0) -> List[Dict[str, Any]]:
         filt = {"scrape_status": "parsed", "parsed": {"$exists": True}}
+        cursor = self.collection.find(filt)
+        if limit > 0:
+            cursor = cursor.limit(limit)
+        return list(cursor)
+
+    def find_for_import(self, limit: int = 0) -> List[Dict[str, Any]]:
+        """Документи для імпорту в cities: детальний parse або рядок списку з population/area."""
+        filt = {
+            "$or": [
+                {"scrape_status": "parsed", "parsed": {"$exists": True}},
+                {"population": {"$exists": True, "$ne": None}},
+                {"area_sq_km": {"$exists": True, "$ne": None}},
+            ]
+        }
         cursor = self.collection.find(filt)
         if limit > 0:
             cursor = cursor.limit(limit)

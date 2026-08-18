@@ -42,7 +42,8 @@ class MapBbox(BaseModel):
 
 
 class MapQueryRequest(BaseModel):
-    filter_string: str = ""
+    filter: Optional[Dict[str, Any]] = None
+    filter_string: str = ""  # legacy
     mode: Literal["filter", "viewport"] = "viewport"
     bbox: Optional[MapBbox] = None
     zoom: int = Field(default=8, ge=1, le=21)
@@ -192,7 +193,8 @@ def map_query(request: Request, body: MapQueryRequest):
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
 
-    from domain.services.unified_search_service import find_by_filter_string
+    from domain.services.unified_search_service import find_by_filter_spec, find_by_filter_string
+    from domain.services.filter_spec_service import normalize_filter_spec
 
     mode = (body.mode or "viewport").strip().lower()
     is_filter_mode = mode == "filter"
@@ -213,12 +215,20 @@ def map_query(request: Request, body: MapQueryRequest):
 
     sort = [{"field": body.sort_field, "order": -1 if body.sort_order == "desc" else 1}]
 
-    data, total_matched, err = find_by_filter_string(
-        filter_string=body.filter_string or "",
-        sort=sort,
-        limit=limit,
-        skip=0,
-    )
+    if body.filter is not None:
+        data, total_matched, err = find_by_filter_spec(
+            filter_spec=normalize_filter_spec(body.filter),
+            sort=sort,
+            limit=limit,
+            skip=0,
+        )
+    else:
+        data, total_matched, err = find_by_filter_string(
+            filter_string=body.filter_string or "",
+            sort=sort,
+            limit=limit,
+            skip=0,
+        )
     if err is not None:
         raise HTTPException(status_code=400, detail=err)
 

@@ -13,6 +13,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from telegram_mini_app.auth import validate_telegram_init_data
+from telegram_mini_app.user_activity import record_report_generate
 from business.services.report_template_service import ReportTemplateService
 from domain.gateways.listing_gateway import ListingGateway
 
@@ -21,6 +22,7 @@ router = APIRouter(prefix="/api/report-templates", tags=["report-templates"])
 # Імпортуємо unified_search для єдиного механізму фільтрів (пошук + звіти)
 from domain.services.unified_search_service import (
     find,
+    find_by_filter_spec,
     find_by_filter_string,
     build_query_from_flat_params,
 )
@@ -183,7 +185,7 @@ def _params_to_search_filters(params: Dict[str, Any]) -> tuple:
     """
     Перетворює params шаблону на аргументи для unified_search.
     Повертає (docs, total, sort_field, sort_order).
-    Якщо в params є filter_string — використовується find_by_filter_string, інакше build_query_from_flat_params + find.
+    Пріоритет: params.filter (FilterSpec) → filter_string (legacy) → flat params.
     """
     sort_field = params.get("sort_field", "source_updated_at")
     sort_order = params.get("sort_order", "desc")
@@ -192,18 +194,35 @@ def _params_to_search_filters(params: Dict[str, Any]) -> tuple:
     if sort_field == "source_updated_at":
         sort_spec.append({"field": "system_updated_at", "order": sort_direction})
 
+    src = params.get("source")
+    if isinstance(src, str):
+        src = src.strip() or None
+    elif not src:
+        src = None
+    days = params.get("date_filter")
+    try:
+        date_days = int(days) if days is not None else None
+    except (TypeError, ValueError):
+        date_days = None
+
+    filter_spec = params.get("filter")
+    if isinstance(filter_spec, dict) and (
+        filter_spec.get("items") is not None or filter_spec.get("version")
+    ):
+        docs, total, err = find_by_filter_spec(
+            filter_spec,
+            sort=sort_spec,
+            limit=10000,
+            skip=0,
+            date_filter_days=date_days,
+            source=src,
+        )
+        if err:
+            raise ValueError(err)
+        return (docs or []), (total or 0), sort_field, sort_order
+
     filter_string = (params.get("filter_string") or "").strip()
     if filter_string:
-        src = params.get("source")
-        if isinstance(src, str):
-            src = src.strip() or None
-        elif not src:
-            src = None
-        days = params.get("date_filter")
-        try:
-            date_days = int(days) if days is not None else None
-        except (TypeError, ValueError):
-            date_days = None
         docs, total, err = find_by_filter_string(
             filter_string,
             sort=sort_spec,
@@ -316,6 +335,15 @@ def generate_report_from_template(
         ok = send_file_via_telegram(user_id, content_bytes, filename, bot_token)
         if not ok:
             raise HTTPException(status_code=500, detail="Не вдалося надіслати файл через бота")
+        record_report_generate(
+            request,
+            user_id,
+            template_id=template_id,
+            template_name=template.get("name", ""),
+            rows_count=len(docs),
+            via_bot=True,
+            output_format=output_format,
+        )
         return {"success": True, "message": "Файл надіслано в чат бота", "rows_count": len(docs)}
 
     file_b64 = base64.b64encode(content_bytes).decode("utf-8")
@@ -328,6 +356,15 @@ def generate_report_from_template(
         "filename": filename,
     }
 
+    record_report_generate(
+        request,
+        user_id,
+        template_id=template_id,
+        template_name=template.get("name", ""),
+        rows_count=len(docs),
+        via_bot=False,
+        output_format=output_format,
+    )
     return {
         "success": True,
         "format": "xlsx",

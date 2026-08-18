@@ -1,3 +1,177 @@
+## 2026-08-11 — OLX list 403: backoff + browser fallback
+
+- **Запит**: логи Phase1 — масові `403 Forbidden` на list URL (Вінницька, комерція/земля), сторінки скіпались після 3 коротких спроб.
+- **Причина**: паралельні HTTP list-запити з короткою паузою (0.5–1.5 с) ловлять антибот; retry не розрізняв 403 від інших помилок.
+- **Дії**: `LIST_HTTP_CONCURRENCY=1` (семафор у `fetcher`); backoff 15–45 с на 403; після вичерпання спроб — `BrowserPagePool.get_list_page`; при стійкому 403 — зупинка категорії без скіпу пагінації. README + глосарій.
+
+## 2026-08-10 — Геофільтр: Дніпропетровськ у каталозі vs Дніпро в оголошеннях
+
+- **Запит**: у геофільтрах є «Дніпропетровськ», немає «Дніпро»; фільтр нічого не знаходить.
+- **Причина (Docker DB)**: `cities` імпортовано зі slug/detail mista (стара назва), а `unified_listings.addresses.settlement` ≈ «Дніпро» (~435). Те саме для Кіровоград/Кропивницький, Дніпродзержинськ/Кам'янське тощо. Детальний parse затирав list-name.
+- **Дії**: пріоритет назви зі списку mista + aliases з URL; `upsert_list_row` не відкочує `parsed`; міграція `065_sync_mista_list_canonical_names.py`; геопошук підхоплює aliases без області.
+
+## 2026-08-04 — Фікс [object Object] у списку областей (розширені відбори)
+
+- **Запит**: у розширених фільтрах дропдаун «Область» показує `[object Object]` замість назв.
+- **Причина**: `/api/search/unified/filters/regions` повертає `{id, name}`, а geo-combobox/`addRegionSelect` підставляли об'єкт як рядок.
+- **Дії**: `app.js` — нормалізація опцій у `applyOptions` і `addRegionSelect`; при виборі області зберігається `regionId`; у legacy `loadFilterOptions` області теж зводяться до імен.
+
+## 2026-08-02 — Аудит/ремонт фільтра НП для всіх великих міст
+
+- **Запит**: гарантувати потрапляння оголошень у фільтр НП не лише для Києва.
+- **Аудит (Docker DB)**: великі провали card↔filter у містах зі склейкою «Місто, район»: Одеса (~597), Харків (~328), Львів/Дніпро/Запоріжжя/Миколаїв (~118–143), Київ (~614). Села/малі міста — майже без gap. Майже всі miss: glued + порожній root city + **немає resolved_locations**, але LLM settlement є.
+- **Зроблено**: mongo-кандидати на будь-яку склейку; fallback адрес з LLM/картки в `sync_olx`; collect також unified з empty root city; `--resync-only` для масового ремонту.
+
+## 2026-08-02 — Інгест/гео Києва: дві Mongo + масовий resync
+
+- **Запит**: зайнятися причиною малої кількості оголошень по Києву.
+- **Корінь**: на хості `localhost:27017` слухає **локальний mongod** (і Docker), тому CLI-аудит дивився в «порожню» БД (~73 Київ), а `pazuzu-app`/workers — у Docker volume (~1750 OLX Київ, ~188 у фільтрі).
+- **На Docker-БД**: у 1585/1750 київських OLX root `city=None` (склейка локації) — після light `--resync-only` (без ОНМ/Qdrant): **1750/1750**, фільтр Київ **~1785**.
+- **Дії**: `sync_olx_listing(..., side_effects=False)` для швидкого geo-resync; enqueue `source_load` regions=`Київ`, days=7 (task `aad13642…`).
+- **Рекомендація**: не тримати другий mongod на 27017; хост-скрипти через `docker exec` або окремий порт.
+
+## 2026-08-02 — Аудит обсягу: чому по Києву мало оголошень
+
+- **Запит**: після ремонту гео все одно ~76–85 по Києву; на OLX сотні/день — знайти причину.
+- **Висновок**: головна причина — **не геофільтр**, а **зупинка інгесту**. У `olx_listings` жоден новий документ з `created_at` після **2026-04-16** (~3.5 міс.). У БД лише **~73** з `location` ^«Київ» (зріз березень–квітень).
+- **Воронка**: OLX Київ продаж комерції ~**3 300**; оренда ~**9 000** (ми не беремо); з нашими фільтрами (sale, ≥50 м²) OLX показує **>1 000**; у нас **~73** raw → **~85** unified після geo-fix.
+- **Фільтри скрейпа** (вторинно звужують): sale-only, area≥50, land≥15, max 25 стор.; регіон `Київ`/`kiev` у конфігу є.
+- **Гео** після `--resync-only` (76/76) уже не головний bottleneck.
+
+## 2026-08-02 — Патч: склеєний «Київ, район» ламає геофільтр
+
+- **Запит**: патч для виправлення вже існуючих оголошень, що не потрапляють у фільтр по місту Київ.
+- **Причина**: `detail.location.city` = «Київ, Голосіївський»; контекст брал це як settlement → відкидав правильний геокод; вибір результату надавав перевагу «Київська область».
+- **Зроблено**:
+  - `build_listing_context` / `normalize_olx_detail_location` — розклейка city+district (`split_city_and_district`), region спецміста «м. Київ».
+  - `_settlements_compatible` / `_regions_compatible` — Київ ≠ Київська; склеєний settlement сумісний з «Київ».
+  - `_pick_geocode_result` — пріоритет вулиці/міста над APPROXIMATE областю.
+  - `sanitize_llm_address_districts` — region Київська→місто Київ для settlement=Київ.
+  - Geo reprocess: кандидати зі склейкою; `--resync-only` (без Google API) нормалізує картку + sync unified.
+- **Запуск ремонту**: `py scripts/reprocess_olx_geo_context.py --resync-only` (спочатку `--dry-run`).
+
+## 2026-08-02 — Аудит: оголошення Києва не потрапляють у геофільтр
+
+- **Запит**: оголошення з картки «Київ, Голосіївський» (і багато інших) не входить у вибірку по місту Київ — знайти етап поломки.
+- **Висновок аудиту**: Mongo-фільтр по НП (`build_unified_listings_settlement_match`) працює коректно на root `city`/`city_id`. Ламається **раніше** — на збагаченні/геокоді OLX → `unified_listings`.
+- **Цифри (active)**: ~73 OLX з `search_data.location` ^«Київ»; у unified ~34 hit / ~35 miss фільтра Київ. Root `city=Київ` лише ~51.
+- **Головний баг**: `detail.location.city` = «Київ, {район}» (склейка НП+район міста, ~182 docs з комою в city). `build_listing_context` бере це як `settlement` → `_settlements_compatible("Київ, Печерський", "Київ")=False` → **відкидається правильний** Google-результат (вулиця в Києві), лишається APPROXIMATE «Київська область» без city → root `city=None` → фільтр miss.
+- **Супутнє**: (1) Святошинський → Києво-Святошинський район (~10); (2) дубль `cities` «Київ» під регіонами «Київ» і «Київська» (address_refs переважно wrong id); (3) LLM часто пише region=`Київська область` для м. Київ; (4) повторний sync поточною логікою зламав би ~27/34 уже коректних Київ-хітів.
+- **Дії**: лише аудит даних/коду, фікс не впроваджувався.
+
+## 2026-08-01 — Прискорення і resume завантаження з джерел
+
+- **Запит**: скоротити зайві паузи при fetch; low-RAM багатопотоковість; resume Phase 1/2 після перезапуску застосунку.
+- **Дії**:
+  - Паузи: list 0.5–1.5 с, detail 0.5–2 с; HTTP без `DELAY_AFTER_PAGE_LOAD`; post-goto settle ≤0.3 с (selector wait лишається).
+  - Streaming detail після кожної search-сторінки; `PHASE1_MAX_THREADS` і `BROWSER_POOL_SIZE` розв’язані (Docker: 3 threads / pool 1); SourceReload — один browser на батч; legacy `run_olx_update` deprecated.
+  - Колекція `source_load_runs` + stamp `source_load_run_id` на raw; work units (region+category / day) з `last_page`; Phase 2 з Mongo + reconcile LLM batch без дублікатів; міграція 064.
+
+## 2026-07-28 — BrowserPool: auto-recovery замість каскадних timeout
+
+- **Запит**: постійні `BrowserPool timeout while fetching detail` під час OLX raw scrape; після рестарту застосунку знову працює.
+- **Причина**: завислий/довгий Playwright `goto` тримав слот довше за клієнтський wait (240 с); наступні запити стояли в черзі й теж падали по timeout — пул «вмирав» до рестарту процесу.
+- **Зроблено**: жорсткий fetch-budget + force-close page, recreate context / повний restart Chromium, клієнтський timeout з одним retry; швидший wait опису (один combined selector); конфіг `OLX_SCRAPER_BROWSER_POOL_*`.
+
+## 2026-07-23 — OLX скрейп: ширші фільтри комерції
+
+- **Запит**: прибрати фільтр бізнес-центрів і поверху; площа комерції від 50 м² (було 200, поверх 1–2, без BC).
+- **Зроблено**: `FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2=50`; з URL прибрано `filter_float_floor`; `olx_comm_re_object_type_slugs_include: []` — усі типи об'єкта.
+
+## 2026-07-10 — Контраст чіпів локації у dark theme
+
+- **Запит**: світлий текст на світлому чіпі — НП майже нечитабельні.
+- **Зроблено**: чіпи областей/НП — суцільний `--tg-theme-button-color` + `--tg-theme-button-text-color` (як активна валюта), без залежності від theme text-color.
+
+## 2026-07-10 — Вибрані області/НП помітніші у панелі фільтрів
+
+- **Запит**: у вікні налаштування фільтрів важко бачити вибрані населені пункти й області.
+- **Зроблено**: сильніше виділення чіпів локації, checked-рядків областей і `is-selected` у списку НП (акцентний фон/бордер, жирніший текст; dark-theme варіанти).
+
+## 2026-07-10 — Львів/Київ regex не повинен матчити область
+
+- **Запит**: Малехів/Сокільники (Львівська обл.) і Сокирна (Черкаська) у видачі при пошуку по місту; у картці явно інша область.
+- **Причина**: `settlement_regex("Львів")` без межі слова матчив `Львівська`; аналогічно Київ→Київська; плутанина область vs НП у UI.
+- **Зроблено**: negative lookahead у settlement/location regex; при `city_id` не використовуємо location-fallback; підказки в фасетах «область ≠ місто».
+
+## 2026-07-10 — False positives геопошуку: root geo + відсів суперечливих геокодів
+
+- **Запит**: оголошення (готель у Затоці тощо) потрапляють у пошук по Києву/Львову через хибні елементи в `addresses[]`.
+- **Зроблено**: (1) `build_unified_listings_settlement_match` / region — пріоритет root `city_id`/`city`/`region`; `addresses[]` лише якщо root порожній; якір для `search_data.location` щоб «Київ» ≠ «Київська». (2) `address_contradicts_location_context` + фільтр у `_collect_and_geocode_locations` та `UnifiedListingsService._extract_addresses_from_olx`.
+
+## 2026-07-10 — UX фасетів: мульти-НП + валюта ціни
+
+- **Запит**: НП зникав після вибору; немає множинного вибору міст; зникли ціни в USD; зробити як на OLX, але краще.
+- **Зроблено**: draft-стан панелі (`keepDraft`), чіпи обраних НП/областей без скидання; toggle грн/$; `price_usd` у FilterSpec; autocomplete з `region_id(s)`; стилі currency/chips; тест multi-settlement + USD.
+
+## 2026-07-10 — Стилі панелі фасетних фільтрів
+
+- **Запит**: панель «Фільтри» майже нечитабельна (світлий текст на білому); у «Географії» сміття замість областей.
+- **Зроблено**: контрастні стилі на `--tg-theme-*`; канонічний список областей у `/unified/filters/regions`.
+
+- **Запит**: класичні marketplace-відбори замість рядка DSL; пошук/мапа/звіти на ідентифікаторах полів і геосутностей; міграція шаблонів без втрати відборів.
+- **Зроблено**: `FilterSpec` (`domain/services/filter_spec_service.py`), `find_by_filter_spec`, `region_id` у geo, ID-first geo→Mongo; API search/map/reports на `filter`; UI фасети + чіпи + розширене дерево (`listing_filters.js`); міграція `063_report_templates_filter_spec.py`; тести `test_filter_spec_service.py`.
+
+## 2026-07-10 — Скрипт масової переобробки геоконтексту OLX
+
+- **Запит**: масово переобробити оголошення з невірною геолокацією (street-only адреси).
+- **Зроблено**: `GeoContextReprocessService`, `scripts/reprocess_olx_geo_context.py`; детекція кандидатів у `address_geo_enrichment`; режими geocode-only (default) та `--force-llm`.
+
+## 2026-07-10 — Геоконтекст адрес: location_context + підстановка НП при геокодуванні
+
+- **Запит**: багато оголошень геолоковані невірно, бо при витягуванні адреси (напр. «вул. Садова») не враховується населений пункт з картки/тексту; Google повертає випадковий НП.
+- **Зроблено**: у промпти `parsing`/`olx_parsing` додано `location_context` (область/НП/громада) та `geo_present` на адресу; модуль `utils/address_geo_enrichment.py` підставляє НП/область у street-only адреси з контексту оголошення; інтеграція в `OlxLLMExtractorService`, `LLMService`, `_collect_and_geocode_locations`; тести `test_address_geo_enrichment.py`.
+
+## 2026-06-04 — Журнал активності: групування по користувачу
+
+- **Запит**: групувати події по користувачу, показувати псевдонім.
+- **Зроблено**: агрегація MongoDB по `user_id`, API повертає `users[]` з `nickname`/`role`; UI — згортані групи з подіями всередині.
+
+## 2026-06-04 — Журнал активності користувачів у Mini App
+
+- **Запит**: окреме логування авторизацій, пошуків, відкриття оголошень, формування звітів; перегляд в адмініструванні.
+- **Зроблено**: колекція `user_activity_log`, `UserActivityLogRepository` / `UserActivityLogService`, інтеграція в `/api/me`, `/api/search/query`, експорт, деталі оголошень, `/api/report-templates/.../generate`; адмін-вкладка «Активність»; міграція `062_user_activity_log_collection.py`.
+
+## 2026-06-04 — Фільтр населення + область: 0 через порожній cities.population
+
+- **Запит**: `"Населення НП, осіб" >= 10000 AND geo('Область' INSIDE 'Одеська область')` → 0.
+- **Причина**: population була в raw_mista (список), але не потрапляла в cities; резолвер підміняв geo на `__NO_MATCH__`.
+- **Виправлено**: `_effective_parsed` при імпорті; `find_for_import`; `backfill_city_population_from_mista.py`; при відсутніх НП за критерієм — AND(область, __NO_MATCH__) замість лише NO_MATCH. Після reimport у Docker: **313** оголошень для цього фільтра.
+
+## 2026-06-04 — Конструктор: десеріалізація рядка фільтрів у дерево
+
+- **Запит**: при «Створити/Змінити фільтри» відкривати конструктор з поточного рядка, а не порожній дефолт.
+- **Зроблено**: `filter_string_to_tree`, `POST /api/search/filter-string-to-tree`, `loadFilterTreeFromTextarea` у `app.js`; підпис кнопки «Змінити фільтри», якщо textarea не порожня.
+
+## 2026-06-04 — Конструктор: вкладені групи І/АБО в рядку фільтрів
+
+- **Запит**: дерево «АБО (Одеська, Волинська) І населення ≥10000» перетворювалось на AND між geo; лише земля/OLX.
+- **Причина**: `tree_to_filter_models` збирав усі geo в плоский список з логікою кореневої AND-групи; дефолтне дерево додавало `Джерело = olx`.
+- **Виправлено**: рекурсивна збірка geo по групах; `extract_regions_from_geo_filter` для критеріїв населення в кількох областях; дефолт конструктора — лише «Активність = активне»; тест `test_tree_and_with_or_regions_and_population`.
+
+## 2026-06-04 — Конструктор: «Населення НП» без прив’язки до області
+
+- **Запит**: фільтр за населенням має бути виключно по числу населення, без згадок області в рядку/UI.
+- **Зроблено**: прибрано вибір області для geo-типів `settlement_population` / `settlement_area` у `app.js`; `include_region_context=False` при формуванні рядка; тест `test_tree_settlement_population_geo_node`.
+
+## 2026-06-04 — Пошук/звіти: 0 результатів при geo(Одеса) + населення НП ≥ 8000
+
+- **Запит**: шаблон з рядком відборів (Одеса, населення ≥ 8000, OLX+ProZorro) повертає 0 оголошень.
+- **Причини**: (1) `settlement_population` / `settlement_region_context` лишались у вкладених FilterGroup і йшли в Mongo як неіснуючі поля; (2) при порожньому каталозі НП за population резолвер підміняв geo на `__NO_MATCH__`, ігноруючи явний `geo('Одеса' …)`; (3) у рядку одночасно `"Джерело" = olx` AND `"Джерело" = prozorro`.
+- **Виправлено**: рекурсивне витягування критеріїв НП; fallback перевірки population для явного geo-вузла; `find_matching_criteria` — `region_id_mongo_filter`; повідомлення про суперечливі умови по «Джерело»; тести в `test_settlement_criteria_resolver.py`.
+
+## 2026-06-01 — Admin: коректна сума «Vast 30д (UTC)»
+
+- **Запит**: Некоректно рахувалась сума Vast 30д (UTC) (~$26.86).
+- **Причина**: підсумовувались 30 добових запитів до `/charges/`; багатоденні контракти могли входити в кілька днів із повною сумою `amount`.
+- **Виправлено**: `fetch_calendar_range_charges_usd` — один запит на 30 UTC-днів з дедуплікацією; добові суми — пропорція по `items`/`start`/`end`; `sum_billed_usd_last_n_calendar_days` — явне вікно від `end_date`; кеш `charges_schema_version` → 3.
+
+## 2026-05-27 — Vast 30д (UTC): пропорційна сума за вікно, не повний контракт
+
+- Запит: «Vast 30д (UTC): $26.8630» рахується некоректно.
+- Причина: для підсумку 30 днів один range-запит до `/charges/` брав повну `amount` контракту, навіть якщо більша частина періоду була поза вікном; добові суми вже були з prorate по `items/start/end`.
+- Виправлено: `sum_vast_billing_range_rows_usd` — пропорція на `[win_gte, win_lte]`; у `usage-stats` спочатку range за 30 UTC-днів, потім sync кешу для графіка; `CHARGES_SCHEMA_VERSION=4` для перерахунку застарілого денного кешу.
+
 ## 2026-05-27 — Звіти: редагування користувацьких шаблонів, назва вводиться вручну
 
 - Запит: дати редагувати користувацький шаблон запиту; поле «Назва шаблону» має бути доступним для вводу тексту.
@@ -3434,6 +3608,40 @@
 - У `telegram_mini_app/routes/search.py` ендпоінти `/filters/regions` для `olx/prozorro/unified` переведено на стабільний канонічний список; прибрано динамічне підмішування "брудних" назв з даних.
 - У фільтрах пошуку (`_build_unified_filters`, `_build_olx_filters`, `_build_prozorro_filters`) додано єдину нормалізацію області для lookup і fallback-пошуку, щоб один вибір області покривав варіанти написання.
 - У `domain/managers/collection_manager.py` оновлено перетворення `geo(region ...)` у Mongo-умови: замість жорсткого `^значення` використано канонічний regex для еквівалентних форм топоніма.
+
+## 2026-07-10 — Адреси з кешу LLM (без повторного виклику моделі)
+- Запит: замість повільного повторного розпізнавання брати адреси з `llm_cache` / `detail.llm` і переобробляти всі адреси.
+- Додано `AddressCacheReprocessService`: OLX — `detail.llm` або кеш за текстом опису → enrich/sanitize → geocode → `address_refs` → unified; ProZorro — кеш за `description_hash` + items → `address_refs` / `llm_addresses` → unified.
+- CLI `scripts/batch/address_cache_reprocess.py`; admin job_type `address_cache_reprocess`; у UI — опція «Адреси з кешу LLM» + «Усі дати».
+- `enrich_llm_geo_result` і `GeographyService.resolve_address` застосовують санітизацію районів; `district` → oblast_rayon, `settlement_district` → geo_circle(city_district).
+- Очищено чергу `llm_processing` (повільний recognition batch), щоб не витрачати GPU на зайві LLM-виклики.
+
+## 2026-07-10 — Прогрес LLM-батчів у UI + Святошинський ≠ Києво-Святошинський
+- Процес розпізнавання йшов (воркер ~2/11781), але UI не показував батч (запуск був поза admin task_id). У вкладці «Черги» додано блок **Активні LLM-батчі** з прогресом + автооновлення кожні 5 с.
+- Виправлено плутанину: «Києво-Святошинський» (скасований район області) vs «Святошинський» (район м. Київ) — `district_normalizer`, санітизація перед геокодом, правила в `prompts.yaml`, глосарій.
+
+## 2026-07-10 — Очищення черг + кнопка в адмінці + розпізнавання Київ/Київська/Львівська
+- Очищено RabbitMQ (`source_load`, `llm_processing`), revoked активні `background_tasks`, деактивовано `scheduled_events`.
+- Додано `TaskQueueService.purge_queue` / `purge_all_queues`, API `POST /api/admin/task-queues/purge` та action `purge` у control; у UI — «Очистити чергу» на картці та «Очистити всі черги».
+- Запущено повторне розпізнавання (LLM+гео) для областей `Київ`, `Київська`, `Львівська` через чергу `llm_processing`.
+
+## 2026-07-10 — Групова обробка: виправлення poll прогресу черги
+- Проблема: `wait_for_all` з 6000+ task_id щоразу тягнув усі документи з Mongo — UI зависав на 0/N; поки воркер обробляє старі задачі, batch лічильник лишався 0.
+- `_wait_llm_batch` переведено на легкий poll по `metadata.llm_batch_id` + snapshot RabbitMQ кожні 2 с; UI показує підказку про очікування в черзі.
+
+## 2026-07-10 — Групова обробка: розпізнавання через Celery-чергу
+- Причина повільності: batch обробляв OLX послідовно в `pazuzu-app` (1 потік), тоді як звичайне оновлення ставить задачі в `llm_processing` (3+ паралельних потоків у `pazuzu-llm-worker`).
+- `RecognitionReprocessService` тепер при `task_queue_enabled` enqueue-ить OLX/ProZorro LLM у RabbitMQ і чекає батч з прогресом, як `run_full_pipeline`.
+
+## 2026-07-10 — Групова обробка: інкрементальний прогрес розпізнавання OLX
+- Проблема: UI показував 0/11861 — `_process_llm_pending` обробляв увесь батч без проміжних `progress_fn`.
+- Виправлено `RecognitionReprocessService`: цикл по URL з `_process_single_llm_pending_url` та оновленням прогресу (кожен / 5 / 25 елементів залежно від розміру батчу).
+
+## 2026-07-10 — Групова обробка даних (перезавантаження з джерел, повторне розпізнавання)
+- Запит: механізми групової обробки з параметрами та запуском через адмін-інтерфейс; два скрипти — перезавантаження з джерел (фільтри: час, область, джерело, «вантажити нові») та повторне розпізнавання з raw (фільтри: актуальність, джерело, область, час).
+- Додано `business/services/batch_processing/`: `BatchJobFilters`, `SourceReloadService` (відбір з unified → fetch OLX/ProZorro → оновлення raw/main → LLM при зміні; опційно `run_full_pipeline` для нових), `RecognitionReprocessService` (відбір з raw → LLM + geocode + unified + ProZorro LLM).
+- CLI: `scripts/batch/source_reload.py`, `scripts/batch/recognition_reprocess.py` з `--dry-run`, фільтрами та `--load-new` / `--force`.
+- Admin API: `GET/POST /api/admin/batch-jobs/options|start`, `GET /api/admin/batch-jobs/status`; UI-блок «Групова обробка даних» у вкладці «Дані та пайплайни».
 
 ## 2026-05-13 — Flx звіт: додатки (карти, CSV)
 - Запит: окрім тексту звіту формувати додатки — теплові/просторові карти кадастрових ділянок, переліки ділянок і оголошень, контакти тощо як частина HTML-звіту.

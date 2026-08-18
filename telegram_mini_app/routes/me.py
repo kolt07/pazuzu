@@ -5,6 +5,7 @@ API: поточний користувач (профіль, авторизаці
 
 from fastapi import APIRouter, Request, HTTPException, Depends
 from telegram_mini_app.auth import validate_telegram_init_data
+from telegram_mini_app.user_activity import record_auth_check
 
 router = APIRouter(prefix="/api/me", tags=["me"])
 
@@ -34,6 +35,7 @@ def me(request: Request):
     Повертає профіль поточного користувача та чи він авторизований/адмін.
     """
     user_id, user_obj, user_service = _get_validated_user(request)
+    record_auth_check(request, user_id, user_service)
     authorized = user_service.is_user_authorized(user_id)
     is_admin = user_service.is_admin(user_id)
     nickname = user_service.get_user_nickname(user_id)

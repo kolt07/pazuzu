@@ -169,6 +169,102 @@ class BackgroundTaskRepository(BaseRepository):
             query["state"] = {"$in": list(states)}
         return int(self.collection.count_documents(query))
 
+    def list_by_batch_id(self, batch_id: str) -> List[Dict[str, Any]]:
+        """Усі background_tasks з metadata.llm_batch_id (для resume Phase 2 без дублікатів)."""
+        self._ensure_indexes()
+        bid = str(batch_id or "").strip()
+        if not bid:
+            return []
+        docs = list(self.collection.find({"metadata.llm_batch_id": bid}))
+        for doc in docs:
+            if "_id" in doc and hasattr(doc["_id"], "binary"):
+                doc["_id"] = str(doc["_id"])
+        return docs
+
+    def list_active_llm_batches(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Активні LLM-батчі (є задачі не в terminal state) з агрегованим прогресом.
+        """
+        self._ensure_indexes()
+        pipeline = [
+            {
+                "$match": {
+                    "queue_name": "llm_processing",
+                    "metadata.llm_batch_id": {"$exists": True, "$nin": [None, ""]},
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$metadata.llm_batch_id",
+                    "source": {"$first": "$metadata.llm_batch_source"},
+                    "trigger": {"$first": "$metadata.trigger"},
+                    "total_hint": {"$max": "$metadata.llm_batch_total"},
+                    "regions": {"$first": "$metadata.regions"},
+                    "created_at": {"$min": "$created_at"},
+                    "updated_at": {"$max": "$updated_at"},
+                    "success": {
+                        "$sum": {"$cond": [{"$eq": ["$state", "success"]}, 1, 0]}
+                    },
+                    "failed": {
+                        "$sum": {
+                            "$cond": [
+                                {"$in": ["$state", ["failed", "revoked"]]},
+                                1,
+                                0,
+                            ]
+                        }
+                    },
+                    "active": {
+                        "$sum": {
+                            "$cond": [
+                                {
+                                    "$in": [
+                                        "$state",
+                                        ["queued", "received", "started", "running", "retry"],
+                                    ]
+                                },
+                                1,
+                                0,
+                            ]
+                        }
+                    },
+                    "total": {"$sum": 1},
+                }
+            },
+            {"$match": {"active": {"$gt": 0}}},
+            {"$sort": {"updated_at": -1}},
+            {"$limit": max(1, int(limit))},
+        ]
+        out: List[Dict[str, Any]] = []
+        for row in self.collection.aggregate(pipeline):
+            total = int(row.get("total") or 0)
+            hint = row.get("total_hint")
+            if hint is not None:
+                try:
+                    total = max(total, int(hint))
+                except (TypeError, ValueError):
+                    pass
+            success = int(row.get("success") or 0)
+            failed = int(row.get("failed") or 0)
+            active = int(row.get("active") or 0)
+            processed = success + failed
+            out.append(
+                {
+                    "batch_id": row.get("_id"),
+                    "source": row.get("source") or "unknown",
+                    "trigger": row.get("trigger") or "",
+                    "regions": row.get("regions"),
+                    "total": total,
+                    "processed": processed,
+                    "success": success,
+                    "failed": failed,
+                    "in_progress": active,
+                    "created_at": row.get("created_at"),
+                    "updated_at": row.get("updated_at"),
+                }
+            )
+        return out
+
     def _set_state(self, task_id: str, state: str, **extra: Any) -> None:
         self._ensure_indexes()
         now = datetime.now(timezone.utc)

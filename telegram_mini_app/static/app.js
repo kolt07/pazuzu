@@ -1583,6 +1583,7 @@
       name: t.name || "",
       source: params.source || "",
       date_filter: params.date_filter != null ? params.date_filter : 7,
+      filter: params.filter || null,
       filter_string: params.filter_string != null ? String(params.filter_string) : "",
       sort_field: params.sort_field || "source_updated_at",
       sort_order: params.sort_order || "desc",
@@ -1624,13 +1625,31 @@
     if (!modal) return;
     setConstructorNameFieldEditable();
     updateReportConstructorUi();
-    var cfs = document.getElementById("constructor-filter-string");
     if (prefill) {
       document.getElementById("constructor-source").value = prefill.source || "";
       document.getElementById("constructor-date-filter").value = String(
         prefill.date_filter != null ? prefill.date_filter : 7
       );
-      if (cfs) cfs.value = prefill.filter_string != null ? String(prefill.filter_string) : "";
+      if (window.ListingFilters) {
+        if (prefill.filter) {
+          ListingFilters.setFilterSpec("report", prefill.filter);
+          ListingFilters.syncFacetsFromServer("report", function (url, opts) {
+            opts = opts || {};
+            opts.headers = Object.assign({}, opts.headers || {}, apiHeaders());
+            return fetch(url, opts);
+          });
+        } else if (prefill.filter_string) {
+          fetch("/api/search/filter-string-to-tree", {
+            method: "POST",
+            headers: Object.assign({ "Content-Type": "application/json" }, apiHeaders()),
+            body: JSON.stringify({ filter_string: prefill.filter_string })
+          }).then(function (r) { return r.json(); }).then(function (data) {
+            if (data.root) ListingFilters.applyTreeRoot("report", data.root);
+          }).catch(function () {});
+        } else {
+          ListingFilters.clearFilters("report");
+        }
+      }
       var sortF = document.getElementById("constructor-sort-field");
       var sortO = document.getElementById("constructor-sort-order");
       if (sortF) sortF.value = prefill.sort_field || "source_updated_at";
@@ -1642,7 +1661,7 @@
     } else {
       document.getElementById("constructor-source").value = "";
       document.getElementById("constructor-date-filter").value = "7";
-      if (cfs) cfs.value = "";
+      if (window.ListingFilters) ListingFilters.clearFilters("report");
       var sortF2 = document.getElementById("constructor-sort-field");
       var sortO2 = document.getElementById("constructor-sort-order");
       if (sortF2) sortF2.value = "source_updated_at";
@@ -1668,16 +1687,14 @@
   }
 
   function getConstructorParams() {
-    var fsEl = document.getElementById("constructor-filter-string");
-    var fs = fsEl ? fsEl.value.trim() : "";
     var params = {
       source: document.getElementById("constructor-source").value,
       date_filter: parseInt(document.getElementById("constructor-date-filter").value, 10) || 7,
       sort_field: document.getElementById("constructor-sort-field").value,
       sort_order: document.getElementById("constructor-sort-order").value,
-      output_format: document.getElementById("constructor-output-format").value
+      output_format: document.getElementById("constructor-output-format").value,
+      filter: (window.ListingFilters && ListingFilters.getFilterSpec("report")) || { version: 1, group_type: "and", items: [] }
     };
-    if (fs) params.filter_string = fs;
     return params;
   }
 
@@ -1714,15 +1731,20 @@
     });
     var cancelBtn = document.getElementById("constructor-cancel");
     if (cancelBtn) cancelBtn.addEventListener("click", closeReportConstructor);
+    var consOpenFacets = document.getElementById("constructor-open-facets");
+    if (consOpenFacets) {
+      consOpenFacets.addEventListener("click", function () {
+        if (window.ListingFilters) ListingFilters.openPanel("report");
+      });
+    }
     var consBuild = document.getElementById("constructor-build-filters");
     if (consBuild) {
-      consBuild.addEventListener("click", function () { openFilterBuilderModal("constructor-filter-string"); });
+      consBuild.addEventListener("click", function () { openFilterBuilderModal("report"); });
     }
-    var consClearFs = document.getElementById("constructor-clear-filter-string");
+    var consClearFs = document.getElementById("constructor-clear-filters");
     if (consClearFs) {
       consClearFs.addEventListener("click", function () {
-        var el = document.getElementById("constructor-filter-string");
-        if (el) el.value = "";
+        if (window.ListingFilters) ListingFilters.clearFilters("report");
       });
     }
     var genNameBtn = document.getElementById("constructor-generate-name");
@@ -2061,6 +2083,7 @@
       if (btnFullOlx) btnFullOlx.addEventListener("click", function () { startAdminDataUpdate({ mode: "full_olx" }); });
       if (btnFullProzorro) btnFullProzorro.addEventListener("click", function () { startAdminDataUpdate({ mode: "full_prozorro" }); });
       initAdminTargetedUpdate();
+      initAdminBatchJobs();
       var cadastral10 = document.getElementById("admin-cadastral-start-10");
       var cadastral50 = document.getElementById("admin-cadastral-start-50");
       var cadastralUnlimited = document.getElementById("admin-cadastral-start-unlimited");
@@ -2104,6 +2127,7 @@
       initAdminQueueControls();
       initAdminScheduler();
       initAdminFeedback();
+      initAdminUserActivity();
     }
   }
 
@@ -2229,6 +2253,9 @@
       if (tabName === "overview") {
         loadAdminUsageStats();
       }
+      if (tabName === "activity") {
+        loadAdminUserActivity(false);
+      }
       if (tabName === "queues") {
         loadAdminQueueStatus();
       }
@@ -2275,11 +2302,140 @@
     onTabActivated(initialTab);
   }
 
+  var adminActivitySkip = 0;
+  var adminActivityLimit = 20;
+
+  function initAdminUserActivity() {
+    var refreshBtn = document.getElementById("admin-activity-refresh");
+    var loadMoreBtn = document.getElementById("admin-activity-load-more");
+    var categoryEl = document.getElementById("admin-activity-category");
+    var daysEl = document.getElementById("admin-activity-days");
+    var userIdEl = document.getElementById("admin-activity-user-id");
+    function resetAndLoad() {
+      adminActivitySkip = 0;
+      loadAdminUserActivity(false);
+    }
+    if (refreshBtn && !refreshBtn.dataset.bound) {
+      refreshBtn.addEventListener("click", resetAndLoad);
+      refreshBtn.dataset.bound = "1";
+    }
+    if (categoryEl && !categoryEl.dataset.bound) {
+      categoryEl.addEventListener("change", resetAndLoad);
+      categoryEl.dataset.bound = "1";
+    }
+    if (daysEl && !daysEl.dataset.bound) {
+      daysEl.addEventListener("change", resetAndLoad);
+      daysEl.dataset.bound = "1";
+    }
+    if (userIdEl && !userIdEl.dataset.bound) {
+      userIdEl.addEventListener("change", resetAndLoad);
+      userIdEl.dataset.bound = "1";
+    }
+    if (loadMoreBtn && !loadMoreBtn.dataset.bound) {
+      loadMoreBtn.addEventListener("click", function () {
+        loadAdminUserActivity(true);
+      });
+      loadMoreBtn.dataset.bound = "1";
+    }
+  }
+
+  function loadAdminUserActivity(append) {
+    var container = document.getElementById("admin-activity-list");
+    var summaryEl = document.getElementById("admin-activity-summary");
+    var loadMoreBtn = document.getElementById("admin-activity-load-more");
+    if (!container) return;
+    if (!append) {
+      container.innerHTML = "<p class=\"admin-hint\">Завантаження...</p>";
+      adminActivitySkip = 0;
+    }
+    var category = (document.getElementById("admin-activity-category") || {}).value || "";
+    var days = parseInt((document.getElementById("admin-activity-days") || {}).value || "7", 10) || 7;
+    var userIdRaw = (document.getElementById("admin-activity-user-id") || {}).value || "";
+    var params = "days=" + days + "&limit=" + adminActivityLimit + "&skip=" + adminActivitySkip;
+    if (category) params += "&category=" + encodeURIComponent(category);
+    if (userIdRaw) params += "&user_id=" + encodeURIComponent(userIdRaw);
+    fetch("/api/admin/user-activity?" + params, { headers: apiHeaders() })
+      .then(function (r) {
+        if (!r.ok) throw new Error("Помилка завантаження");
+        return r.json();
+      })
+      .then(function (data) {
+        var users = data.users || [];
+        var totalUsers = data.total_users != null ? data.total_users : users.length;
+        var totalEvents = data.total_events != null ? data.total_events : 0;
+        if (summaryEl) {
+          summaryEl.textContent = "Користувачів: " + totalUsers + ", подій: " + totalEvents +
+            " (показано користувачів " + (append ? adminActivitySkip + users.length : users.length) + ")";
+        }
+        if (!append) container.innerHTML = "";
+        if (!append && users.length === 0) {
+          container.innerHTML = "<p class=\"admin-hint\">Немає записів за обраний період.</p>";
+          if (loadMoreBtn) loadMoreBtn.classList.add("hidden");
+          return;
+        }
+        users.forEach(function (userGroup) {
+          var wrap = document.createElement("div");
+          wrap.className = "admin-feedback-item admin-activity-user-group";
+          var nick = userGroup.nickname ? escapeHtml(userGroup.nickname) : "без псевдоніма";
+          var rolePart = userGroup.role === "admin" ? " · адмін" : "";
+          var blockedPart = userGroup.is_blocked ? " · заблокований" : "";
+          var lastTs = userGroup.last_activity ? new Date(userGroup.last_activity).toLocaleString("uk-UA") : "";
+          var evCount = userGroup.events_count != null ? userGroup.events_count : (userGroup.events || []).length;
+          var header = document.createElement("div");
+          header.className = "admin-feedback-item-header";
+          header.innerHTML = "<strong>" + nick + "</strong> <span class=\"admin-feedback-meta\">(ID " + (userGroup.user_id || "") + rolePart + blockedPart + ")</span><br>" +
+            "<span class=\"admin-feedback-meta\">" + evCount + " подій · остання " + escapeHtml(lastTs) + "</span>";
+          header.onclick = function () {
+            var body = wrap.querySelector(".admin-activity-user-events");
+            if (body) body.classList.toggle("hidden");
+          };
+          wrap.appendChild(header);
+          var body = document.createElement("div");
+          body.className = "admin-activity-user-events hidden";
+          (userGroup.events || []).forEach(function (entry) {
+            var ev = document.createElement("div");
+            ev.className = "admin-activity-event";
+            var ts = entry.timestamp ? new Date(entry.timestamp).toLocaleString("uk-UA") : "";
+            var cat = entry.category_label || entry.category || "";
+            var act = entry.action_label || entry.action || "";
+            var meta = entry.metadata || {};
+            var metaStr = Object.keys(meta).length ? JSON.stringify(meta, null, 2) : "";
+            ev.innerHTML = "<div class=\"admin-activity-event-head\"><strong>" + escapeHtml(entry.message || act) + "</strong><br>" +
+              "<span class=\"admin-feedback-meta\">" + escapeHtml(ts) + " · " + escapeHtml(cat) + " / " + escapeHtml(act) + "</span></div>" +
+              (metaStr ? "<pre class=\"admin-activity-event-meta\">" + escapeHtml(metaStr) + "</pre>" : "") +
+              (entry.error ? "<p class=\"admin-hint\">Помилка: " + escapeHtml(entry.error) + "</p>" : "");
+            body.appendChild(ev);
+          });
+          wrap.appendChild(body);
+          container.appendChild(wrap);
+        });
+        adminActivitySkip += users.length;
+        if (loadMoreBtn) {
+          if (adminActivitySkip < totalUsers && users.length > 0) {
+            loadMoreBtn.classList.remove("hidden");
+          } else {
+            loadMoreBtn.classList.add("hidden");
+          }
+        }
+      })
+      .catch(function (err) {
+        if (!append) {
+          container.innerHTML = "<p class=\"admin-hint\" style=\"color:var(--tg-theme-destructive-text-color)\">" + escapeHtml(err.message || "Помилка") + "</p>";
+        }
+      });
+  }
+
   function initAdminQueueControls() {
     var refreshBtn = document.getElementById("admin-queue-refresh");
     if (refreshBtn) {
       refreshBtn.addEventListener("click", function () {
         loadAdminQueueStatus();
+      });
+    }
+    var purgeAllBtn = document.getElementById("admin-queue-purge-all");
+    if (purgeAllBtn) {
+      purgeAllBtn.addEventListener("click", function () {
+        purgeAdminQueues(null);
       });
     }
     var cards = document.getElementById("admin-queue-cards");
@@ -2291,9 +2447,23 @@
         var queueName = btn.getAttribute("data-queue");
         var action = btn.getAttribute("data-action");
         if (!queueName || !action) return;
+        if (action === "purge") {
+          purgeAdminQueues(queueName);
+          return;
+        }
         controlAdminQueue(queueName, action);
       });
       cards.dataset.bound = "1";
+    }
+    if (!window._adminQueueAutoRefresh) {
+      window._adminQueueAutoRefresh = setInterval(function () {
+        var queuesTab = document.querySelector('.admin-subtab[data-tab="queues"]');
+        var screen = document.getElementById("screen-admin");
+        if (!screen || screen.classList.contains("hidden")) return;
+        if (queuesTab && queuesTab.getAttribute("aria-selected") === "true") {
+          loadAdminQueueStatus();
+        }
+      }, 5000);
     }
   }
 
@@ -2330,7 +2500,7 @@
       cardsEl.innerHTML = "<p class=\"admin-hint\">Немає даних про черги.</p>";
       return;
     }
-    cardsEl.innerHTML = queues.map(function (q) {
+    var html = queues.map(function (q) {
       var name = q.queue_name || "unknown";
       var state = q.control_state || "running";
       var counts = q.counts || {};
@@ -2361,10 +2531,41 @@
             "<button type=\"button\" class=\"btn btn-small\" data-queue=\"" + escapeHtml(name) + "\" data-action=\"resume\">Resume</button>" +
             "<button type=\"button\" class=\"btn btn-small\" data-queue=\"" + escapeHtml(name) + "\" data-action=\"pause\">Pause</button>" +
             "<button type=\"button\" class=\"btn btn-danger btn-small\" data-queue=\"" + escapeHtml(name) + "\" data-action=\"disable\">Disable</button>" +
+            "<button type=\"button\" class=\"btn btn-danger btn-small\" data-queue=\"" + escapeHtml(name) + "\" data-action=\"purge\">Очистити чергу</button>" +
           "</div>" +
         "</div>"
       );
     }).join("");
+
+    var batches = (data && data.active_batches) || [];
+    if (batches.length) {
+      html += "<div class=\"admin-block\" style=\"margin-top:1rem;\"><h4>Активні LLM-батчі</h4>";
+      html += batches.map(function (b) {
+        var total = Number(b.total || 0);
+        var processed = Number(b.processed || 0);
+        var success = Number(b.success || 0);
+        var failed = Number(b.failed || 0);
+        var inProg = Number(b.in_progress || 0);
+        var pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+        var regions = Array.isArray(b.regions) ? b.regions.join(", ") : "";
+        var title = (b.source || "?") + " · " + String(b.batch_id || "").slice(0, 28);
+        if (regions) title += " · " + regions;
+        return (
+          "<div class=\"admin-queue-card\" style=\"margin-bottom:0.5rem;\">" +
+            "<div><strong>" + escapeHtml(title) + "</strong></div>" +
+            "<div class=\"admin-data-update-progress-bar\" style=\"margin:0.35rem 0;\"><div class=\"admin-data-update-progress-fill\" style=\"width:" + pct + "%\"></div></div>" +
+            "<div class=\"admin-hint\">" +
+              escapeHtml(processed + "/" + total + " (успішно: " + success + ", помилок: " + failed + ", в черзі/роботі: " + inProg + ")") +
+            "</div>" +
+          "</div>"
+        );
+      }).join("");
+      html += "</div>";
+    } else {
+      html += "<p class=\"admin-hint\" style=\"margin-top:0.75rem;\">Немає активних LLM-батчів з прогресом.</p>";
+    }
+
+    cardsEl.innerHTML = html;
   }
 
   function controlAdminQueue(queueName, action) {
@@ -2385,6 +2586,48 @@
       })
       .catch(function (err) {
         if (statusEl) statusEl.textContent = "Помилка: " + (err.message || "Не вдалося оновити стан черги");
+      });
+  }
+
+  function purgeAdminQueues(queueName) {
+    var statusEl = document.getElementById("admin-queue-controls-status");
+    var label = queueName ? ("чергу " + queueName) : "усі черги та заплановані задачі";
+    if (!window.confirm("Очистити " + label + "? Активні задачі буде скасовано.")) {
+      return;
+    }
+    if (statusEl) statusEl.textContent = "Очищення " + label + "...";
+    var body = {
+      queue_name: queueName || null,
+      clear_scheduled: !queueName,
+      reason: "Purged from admin UI"
+    };
+    fetch("/api/admin/task-queues/purge", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify(body)
+    })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (b) { throw new Error(b.detail || "Помилка"); });
+        return r.json();
+      })
+      .then(function (data) {
+        var parts = [];
+        var queues = (data.purge && data.purge.queues) || [];
+        queues.forEach(function (q) {
+          parts.push(
+            (q.queue_name || "?") +
+            ": Rabbit=" + String(q.rabbit_purged == null ? "н/д" : q.rabbit_purged) +
+            ", Mongo revoked=" + String(q.mongo_revoked || 0)
+          );
+        });
+        if (data.scheduled_deactivated != null) {
+          parts.push("запланованих вимкнено: " + data.scheduled_deactivated);
+        }
+        if (statusEl) statusEl.textContent = "Очищено. " + parts.join("; ");
+        loadAdminQueueStatus();
+      })
+      .catch(function (err) {
+        if (statusEl) statusEl.textContent = "Помилка очищення: " + (err.message || "невідома");
       });
   }
 
@@ -3479,6 +3722,144 @@
     }
   }
 
+  var adminBatchOptionsLoaded = false;
+
+  function loadAdminBatchJobOptions(cb) {
+    var regionsEl = document.getElementById("admin-batch-regions");
+    fetch("/api/admin/batch-jobs/options", { headers: apiHeaders() })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (regionsEl && data.regions && data.regions.length) {
+          regionsEl.innerHTML = data.regions.map(function (regionName) {
+            return "<label class=\"admin-targeted-checkbox\"><input type=\"checkbox\" name=\"admin-batch-region\" value=\"" + (regionName.replace(/"/g, "&quot;")) + "\"> " + (regionName.replace(/</g, "&lt;")) + "</label>";
+          }).join("");
+        } else if (regionsEl) {
+          regionsEl.innerHTML = "<span class=\"admin-hint\">Немає областей.</span>";
+        }
+        adminBatchOptionsLoaded = true;
+        if (typeof cb === "function") cb();
+      })
+      .catch(function () {
+        if (regionsEl) regionsEl.innerHTML = "<span class=\"admin-hint\">Не вдалося завантажити опції.</span>";
+      });
+  }
+
+  function initAdminBatchJobs() {
+    var jobTypeEl = document.getElementById("admin-batch-job-type");
+    var loadNewGroup = document.getElementById("admin-batch-load-new-group");
+    function syncBatchJobTypeUi() {
+      var jobType = jobTypeEl && jobTypeEl.value ? jobTypeEl.value : "source_reload";
+      if (loadNewGroup) {
+        loadNewGroup.style.display = jobType === "source_reload" ? "" : "none";
+      }
+    }
+    if (jobTypeEl) {
+      jobTypeEl.addEventListener("change", syncBatchJobTypeUi);
+      syncBatchJobTypeUi();
+    }
+    loadAdminBatchJobOptions();
+    var startBtn = document.getElementById("admin-batch-start");
+    if (startBtn) {
+      startBtn.addEventListener("click", startAdminBatchJob);
+    }
+  }
+
+  function startAdminBatchJob() {
+    var statusEl = document.getElementById("admin-batch-job-status");
+    if (!statusEl) return;
+    var jobTypeEl = document.getElementById("admin-batch-job-type");
+    var sourceEl = document.getElementById("admin-batch-source");
+    var daysEl = document.getElementById("admin-batch-days");
+    var statusFilterEl = document.getElementById("admin-batch-status");
+    var limitEl = document.getElementById("admin-batch-limit");
+    var loadNewEl = document.getElementById("admin-batch-load-new");
+    var forceEl = document.getElementById("admin-batch-force");
+    var regionChecks = document.querySelectorAll("input[name=admin-batch-region]:checked");
+    var regions = [];
+    var i;
+    for (i = 0; i < regionChecks.length; i++) {
+      if (regionChecks[i].value) regions.push(regionChecks[i].value);
+    }
+    var daysVal = 7;
+    if (daysEl && daysEl.value !== "" && daysEl.value != null) {
+      daysVal = parseInt(daysEl.value, 10);
+      if (isNaN(daysVal) || daysVal < 0) daysVal = 7;
+    }
+    var body = {
+      job_type: jobTypeEl && jobTypeEl.value ? jobTypeEl.value : "source_reload",
+      source: sourceEl && sourceEl.value ? sourceEl.value : "both",
+      days: daysVal,
+      status: statusFilterEl && statusFilterEl.value ? statusFilterEl.value : null,
+      regions: regions.length ? regions : null,
+      load_new: !!(loadNewEl && loadNewEl.checked),
+      force: !!(forceEl && forceEl.checked)
+    };
+    if (limitEl && limitEl.value) {
+      var limitVal = parseInt(limitEl.value, 10);
+      if (!isNaN(limitVal) && limitVal > 0) body.limit = limitVal;
+    }
+    statusEl.classList.remove("hidden");
+    statusEl.className = "admin-data-update-status running";
+    statusEl.textContent = "Запуск групової задачі...";
+    fetch("/api/admin/batch-jobs/start", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify(body)
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (x) {
+        if (!x.ok) {
+          statusEl.className = "admin-data-update-status error";
+          statusEl.textContent = (x.data && x.data.detail) || "Помилка запуску";
+          return;
+        }
+        var taskId = x.data.task_id;
+        function poll() {
+          fetch("/api/admin/batch-jobs/status?task_id=" + encodeURIComponent(taskId), { headers: apiHeaders() })
+            .then(function (res) { return res.json(); })
+            .then(function (st) {
+              var progress = st.progress || {};
+              var total = progress.total > 0 ? progress.total : 0;
+              var current = typeof progress.current === "number" ? progress.current : 0;
+              var msg = st.message || st.status;
+              if (progress.batch_progress && progress.batch_progress.in_progress > 0 && current === 0) {
+                msg = msg + " (задачі ще в черзі RabbitMQ — воркер обробляє попередні)";
+              }
+              if (total > 0) {
+                var pct = Math.min(100, Math.round((current / total) * 100));
+                statusEl.innerHTML = "<div class=\"admin-data-update-progress-bar\"><div class=\"admin-data-update-progress-fill\" style=\"width:" + pct + "%\"></div></div><div class=\"admin-data-update-progress-meta\">" + (typeof escapeHtml === "function" ? escapeHtml(msg || (current + " / " + total)) : (msg || (current + " / " + total))) + "</div>";
+              } else {
+                statusEl.textContent = msg;
+              }
+              if (st.status === "done") {
+                statusEl.className = "admin-data-update-status done";
+                if (st.result) {
+                  statusEl.textContent = msg + " | " + JSON.stringify(st.result);
+                } else {
+                  statusEl.textContent = msg || "Готово.";
+                }
+                return;
+              }
+              if (st.status === "error") {
+                statusEl.className = "admin-data-update-status error";
+                statusEl.textContent = st.message || "Помилка";
+                return;
+              }
+              setTimeout(poll, 2000);
+            })
+            .catch(function (err) {
+              statusEl.className = "admin-data-update-status error";
+              statusEl.textContent = "Помилка: " + (err.message || "невідома");
+            });
+        }
+        poll();
+      })
+      .catch(function (err) {
+        statusEl.className = "admin-data-update-status error";
+        statusEl.textContent = "Помилка: " + (err.message || "невідома");
+      });
+  }
+
   function startAdminDataUpdate(opts) {
     var statusEl = document.getElementById("admin-data-update-status");
     if (!statusEl) return;
@@ -3667,7 +4048,10 @@
         .then(function (data) {
           filterLoadingState.regions = false;
           if (data && data.regions && Array.isArray(data.regions)) {
-            filterOptions.regions = data.regions;
+            filterOptions.regions = data.regions.map(function (r) {
+              if (typeof r === "string") return String(r).trim();
+              return String((r && (r.name || r.label)) || "").trim();
+            }).filter(Boolean);
             console.log("Loaded regions:", filterOptions.regions.length);
           } else {
             filterOptions.regions = [];
@@ -3851,14 +4235,13 @@
     if (countEl) countEl.classList.add("hidden");
     
     var endpoint = "/api/search/query";
-    var filterStringEl = document.getElementById("filter-string");
-    var filterString = (filterStringEl && filterStringEl.value) ? filterStringEl.value.trim() : "";
+    var filterSpec = (window.ListingFilters && ListingFilters.getFilterSpec("search")) || { version: 1, group_type: "and", items: [] };
 
     fetch(endpoint, {
       method: "POST",
       headers: Object.assign({ "Content-Type": "application/json" }, apiHeaders()),
       body: JSON.stringify({
-        filter_string: filterString || "",
+        filter: filterSpec,
         sort_field: searchState.sortField,
         sort_order: searchState.sortOrder,
         limit: searchState.pageSize,
@@ -4188,20 +4571,25 @@
   var MAP_DEFAULT_ZOOM = 6;
 
   function updateMapFilterSummary() {
-    var el = document.getElementById("map-filter-summary-text");
-    var ta = document.getElementById("map-filter-string");
-    if (!el) return;
-    var text = (ta && ta.value) ? ta.value.trim() : "";
-    el.textContent = text ? (text.length > 80 ? text.slice(0, 80) + "…" : text) : "Рядок відборів не задано";
+    if (window.ListingFilters) ListingFilters.updateSummary("map");
   }
 
   function syncMapFilterFromSearch() {
-    var searchTa = document.getElementById("filter-string");
-    var mapTa = document.getElementById("map-filter-string");
-    if (searchTa && mapTa && !mapTa.value.trim() && searchTa.value.trim()) {
-      mapTa.value = searchTa.value;
+    if (window.ListingFilters) {
+      var searchSpec = ListingFilters.getFilterSpec("search");
+      var mapSpec = ListingFilters.getFilterSpec("map");
+      if ((!(mapSpec.items || []).length) && (searchSpec.items || []).length) {
+        ListingFilters.setFilterSpec("map", searchSpec);
+        ListingFilters.syncFacetsFromServer("map", function (url, opts) {
+          opts = opts || {};
+          opts.headers = Object.assign({}, opts.headers || {}, apiHeaders());
+          return fetch(url, opts);
+        });
+      } else {
+        ListingFilters.updateSummary("map");
+        ListingFilters.renderChips("map");
+      }
     }
-    updateMapFilterSummary();
   }
 
   function loadScriptOnce(src, flagKey) {
@@ -4452,8 +4840,12 @@
   }
 
   function getMapFilterString() {
-    var filterTa = document.getElementById("map-filter-string");
-    return (filterTa && filterTa.value) ? filterTa.value.trim() : "";
+    /* legacy name: returns summary text for UI */
+    if (window.ListingFilters) return ListingFilters.filterSpecSummary(ListingFilters.getFilterSpec("map")) || "";
+    return "";
+  }
+  function getMapFilterSpec() {
+    return (window.ListingFilters && ListingFilters.getFilterSpec("map")) || { version: 1, group_type: "and", items: [] };
   }
 
   function abortMapFetch() {
@@ -4531,8 +4923,8 @@
   /** Зміна фільтрів: усі маркери за фільтром + центрування карти. */
   function loadMapForFilter() {
     if (!mapState.mapInstance) return;
-    var filterString = getMapFilterString();
-    mapState.appliedFilterString = filterString;
+    var filterSpec = getMapFilterSpec();
+    mapState.appliedFilterString = JSON.stringify(filterSpec);
     mapState.loadMode = "filter";
     mapState.clusterFilterListingIds = null;
     mapState.lastViewportKey = null;
@@ -4544,7 +4936,7 @@
 
     mapFetchQuery({
       mode: "filter",
-      filter_string: filterString,
+      filter: filterSpec,
       zoom: getMapZoom(),
       sort_field: mapState.sortField,
       sort_order: mapState.sortOrder,
@@ -4584,7 +4976,7 @@
 
     mapFetchQuery({
       mode: "viewport",
-      filter_string: getMapFilterString(),
+      filter: getMapFilterSpec(),
       bbox: bbox,
       zoom: zoom,
       sort_field: mapState.sortField,
@@ -4696,7 +5088,7 @@
     initMapScreen();
     if (mapState.mapInstance) {
       google.maps.event.trigger(mapState.mapInstance, "resize");
-      var fs = getMapFilterString();
+      var fs = JSON.stringify(getMapFilterSpec());
       if (fs !== mapState.appliedFilterString) {
         loadMapForFilter();
       }
@@ -4706,7 +5098,7 @@
   function bindMapEvents() {
     var runBtn = document.getElementById("map-run-search");
     var buildBtn = document.getElementById("map-build-filters");
-    var filterTa = document.getElementById("map-filter-string");
+    var openFacetsBtn = document.getElementById("map-open-facets");
     if (runBtn) {
       runBtn.addEventListener("click", function () {
         mapState.clusterFilterListingIds = null;
@@ -4715,10 +5107,12 @@
       });
     }
     if (buildBtn) {
-      buildBtn.addEventListener("click", function () { openFilterBuilderModal("map-filter-string"); });
+      buildBtn.addEventListener("click", function () { openFilterBuilderModal("map"); });
     }
-    if (filterTa) {
-      filterTa.addEventListener("input", updateMapFilterSummary);
+    if (openFacetsBtn) {
+      openFacetsBtn.addEventListener("click", function () {
+        if (window.ListingFilters) ListingFilters.openPanel("map");
+      });
     }
   }
 
@@ -6176,7 +6570,7 @@
   var filterBuilderConfig = null;
   var filterTreeRoot = null;
   /** ID textarea, куди вставляється рядок після «Вставити» в конструкторі фільтрів (пошук або шаблон звіту). */
-  var filterBuilderOutputTextareaId = "filter-string";
+  var filterBuilderSurface = "search";
 
   function createFilterTreeRoot() {
     return { type: "group", groupType: "and", items: [] };
@@ -6187,8 +6581,7 @@
       type: "group",
       groupType: "and",
       items: [
-        { type: "element", field: "status", operator: "eq", value: "активне" },
-        { type: "element", field: "source", operator: "eq", value: "olx" }
+        { type: "element", field: "status", operator: "eq", value: "активне" }
       ]
     };
   }
@@ -6402,11 +6795,12 @@
               item.value = preservedRegion;
               item.settlementLabel = "";
               item.cityId = "";
-            } else if (
-              nextType === "settlement"
-              || nextType === "settlement_population"
-              || nextType === "settlement_area"
-            ) {
+            } else if (nextType === "settlement_population" || nextType === "settlement_area") {
+              item.geoRegion = "";
+              item.value = "";
+              item.settlementLabel = "";
+              item.cityId = "";
+            } else if (nextType === "settlement") {
               item.geoRegion = preservedRegion;
               item.value = "";
               item.settlementLabel = "";
@@ -6521,7 +6915,27 @@
                 });
                 return;
               }
-              allOptions = isCities ? [] : (raw || []);
+              // regions / districts: API may return strings or {id, name} objects
+              allOptions = [];
+              (raw || []).forEach(function (item) {
+                if (item == null) return;
+                if (typeof item === "string") {
+                  var s = item.trim();
+                  if (!s) return;
+                  optionByLabel[s] = { name: s, label: s };
+                  allOptions.push(s);
+                  return;
+                }
+                if (typeof item === "object") {
+                  var lab = String(item.name || item.label || "").trim();
+                  if (!lab) return;
+                  var meta = Object.assign({}, item);
+                  meta.name = lab;
+                  meta.label = lab;
+                  optionByLabel[lab] = meta;
+                  allOptions.push(lab);
+                }
+              });
             }
             function loadOptions(cb) {
               remotePending = false;
@@ -6686,8 +7100,8 @@
                 el.addEventListener("click", function () {
                   var meta = optionByLabel[opt] || settlementOptionCache[opt];
                   var picked = meta && meta.name ? meta.name : (comboOpt.stripSettlementValue ? stripSettlementPopulationLabel(opt) : opt);
-                  if (comboOpt.onPickMeta && meta) comboOpt.onPickMeta(meta);
                   onSelect(picked);
+                  if (comboOpt.onPickMeta && meta) comboOpt.onPickMeta(meta);
                   input.value = (meta && (meta.picker_label || meta.label)) ? (meta.picker_label || meta.label) : opt;
                   closeDropdown();
                 });
@@ -6768,10 +7182,13 @@
               .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
               .then(function (data) {
                 (data.regions || []).forEach(function (r) {
-                  if (selectedRegion && r === selectedRegion) return;
+                  var name = typeof r === "string" ? String(r).trim() : String((r && (r.name || r.label)) || "").trim();
+                  if (!name) return;
+                  if (selectedRegion && name === selectedRegion) return;
                   var o = document.createElement("option");
-                  o.value = r;
-                  o.textContent = r;
+                  o.value = name;
+                  o.textContent = name;
+                  if (r && typeof r === "object" && r.id) o.setAttribute("data-region-id", String(r.id));
                   sel.appendChild(o);
                 });
                 sel.value = selectedRegion || "";
@@ -6827,6 +7244,14 @@
               function (v) {
                 item.value = v;
                 item.geoRegion = v;
+                item.regionId = "";
+              },
+              {
+                onPickMeta: function (meta) {
+                  item.value = meta.name || item.value;
+                  item.geoRegion = meta.name || item.geoRegion;
+                  item.regionId = meta.id ? String(meta.id) : "";
+                }
               }
             ));
           } else if (geoType === "settlement") {
@@ -6856,11 +7281,9 @@
             settlementValueCell.appendChild(settlementCombo);
             row.appendChild(settlementValueCell);
           } else if (geoType === "settlement_population") {
-            row.appendChild(addRegionSelect(item.geoRegion, function (v) { item.geoRegion = v; }));
             addNumField("Насел. від, осіб", "population_min");
             addNumField("Насел. до, осіб", "population_max");
           } else if (geoType === "settlement_area") {
-            row.appendChild(addRegionSelect(item.geoRegion, function (v) { item.geoRegion = v; }));
             addNumField("Площа км² від", "area_min");
             addNumField("Площа км² до", "area_max");
           } else {
@@ -6904,38 +7327,106 @@
     renderGroup(container, root, 0);
   }
 
-  function openFilterBuilderModal(targetTextareaId) {
-    filterBuilderOutputTextareaId = targetTextareaId || "filter-string";
+  function apiTreeItemToUi(it) {
+    if (!it || typeof it !== "object") return null;
+    var t = (it.type || "").toLowerCase();
+    if (t === "group") {
+      return {
+        type: "group",
+        groupType: it.group_type || it.groupType || "and",
+        items: (it.items || []).map(apiTreeItemToUi).filter(Boolean)
+      };
+    }
+    if (t === "geo") {
+      var geo = {
+        type: "geo",
+        geoType: it.geo_type || it.geoType || "region",
+        operator: it.operator || "inside",
+        value: it.value != null ? String(it.value) : ""
+      };
+      if (it.geoRegion) geo.geoRegion = String(it.geoRegion);
+      if (it.geoCity) geo.geoCity = String(it.geoCity);
+      if (it.city_id) geo.cityId = String(it.city_id);
+      if (it.cityId) geo.cityId = String(it.cityId);
+      if (it.region_id) geo.regionId = String(it.region_id);
+      if (it.regionId) geo.regionId = String(it.regionId);
+      ["population_min", "population_max", "area_min", "area_max"].forEach(function (k) {
+        if (it[k] !== undefined && it[k] !== null && it[k] !== "") geo[k] = it[k];
+      });
+      return geo;
+    }
+    if (t === "element") {
+      return {
+        type: "element",
+        field: it.field || "",
+        operator: it.operator || "eq",
+        value: it.value
+      };
+    }
+    return null;
+  }
+
+  function apiRootToUiTree(apiRoot) {
+    if (!apiRoot || typeof apiRoot !== "object") return createDefaultFilterTree();
+    return {
+      type: "group",
+      groupType: apiRoot.group_type || apiRoot.groupType || "and",
+      items: (apiRoot.items || []).map(apiTreeItemToUi).filter(Boolean)
+    };
+  }
+
+  function surfaceFromBuilderTarget(target) {
+    if (target === "map" || target === "map-filter-string") return "map";
+    if (target === "report" || target === "constructor-filter-string") return "report";
+    return "search";
+  }
+
+  function loadFilterTreeFromSurface(surface, onReady) {
+    var spec = (window.ListingFilters && ListingFilters.getFilterSpec(surface)) || { version: 1, group_type: "and", items: [] };
+    if (!(spec.items || []).length) {
+      filterTreeRoot = createDefaultFilterTree();
+      if (onReady) onReady();
+      return;
+    }
+    filterTreeRoot = apiRootToUiTree({
+      group_type: spec.group_type || "and",
+      items: spec.items || []
+    });
+    if (!filterTreeRoot.items || !filterTreeRoot.items.length) {
+      filterTreeRoot = createDefaultFilterTree();
+    }
+    if (onReady) onReady();
+  }
+
+  function openFilterBuilderModal(targetOrSurface) {
+    filterBuilderSurface = surfaceFromBuilderTarget(targetOrSurface || "search");
     var modal = document.getElementById("filter-builder-modal");
     var treeEl = document.getElementById("filter-builder-tree");
     if (!modal || !treeEl) return;
-    treeEl.innerHTML = "";
-    if (!filterTreeRoot || !filterTreeRoot.items || filterTreeRoot.items.length === 0) {
-      filterTreeRoot = createDefaultFilterTree();
-    }
-    fetch("/api/search/filter-fields", { headers: apiHeaders() })
-      .then(function (r) {
-        if (!r.ok) throw new Error("Не вдалося завантажити поля");
-        return r.json();
-      })
-      .then(function (config) {
-        filterBuilderConfig = config;
-        var fields = config.fields || {};
-        renderFilterTree(treeEl, filterTreeRoot, fields);
-        modal.classList.remove("hidden");
-      })
-      .catch(function (err) { alert(err.message || "Помилка"); });
+    treeEl.innerHTML = "<div class='filter-tree-loading'>Завантаження…</div>";
+    loadFilterTreeFromSurface(filterBuilderSurface, function () {
+      fetch("/api/search/filter-fields", { headers: apiHeaders() })
+        .then(function (r) {
+          if (!r.ok) throw new Error("Не вдалося завантажити поля");
+          return r.json();
+        })
+        .then(function (config) {
+          filterBuilderConfig = config;
+          treeEl.innerHTML = "";
+          renderFilterTree(treeEl, filterTreeRoot, config.fields || {});
+          modal.classList.remove("hidden");
+        })
+        .catch(function (err) { alert(err.message || "Помилка"); });
+    });
   }
 
   function updateSearchSummaries() {
-    var summaryEl = document.getElementById("search-filter-summary-text");
     var sortSummaryEl = document.getElementById("search-sort-summary-text");
-    var filterStringEl = document.getElementById("filter-string");
     var sortFieldSelect = document.getElementById("search-sort-field");
     var sortOrderSelect = document.getElementById("search-sort-order");
-    if (summaryEl && filterStringEl) {
-      var s = (filterStringEl.value || "").trim();
-      summaryEl.textContent = s ? (s.length > 60 ? s.slice(0, 57) + "…" : s) : "Рядок відборів не задано";
+    if (window.ListingFilters) {
+      ListingFilters.updateSummary("search");
+      ListingFilters.renderChips("search");
     }
     if (sortSummaryEl && sortFieldSelect && sortOrderSelect) {
       var fieldLabels = { source_updated_at: "За датою", price: "За ціною", title: "За назвою" };
@@ -7013,20 +7504,17 @@
       });
     }
 
-    // Очищення фільтрів
-    var clearFilterStringBtn = document.getElementById("search-clear-filter-string");
-    if (clearFilterStringBtn) {
-      clearFilterStringBtn.addEventListener("click", function () {
-        var filterStringEl = document.getElementById("filter-string");
-        if (filterStringEl) filterStringEl.value = "";
+    var clearFiltersBtn = document.getElementById("search-clear-filters");
+    if (clearFiltersBtn) {
+      clearFiltersBtn.addEventListener("click", function () {
+        if (window.ListingFilters) ListingFilters.clearFilters("search");
         var filterStringErr = document.getElementById("filter-string-error");
         if (filterStringErr) { filterStringErr.textContent = ""; filterStringErr.classList.add("hidden"); }
         searchState.currentPage = 0;
         performSearch();
       });
     }
-    
-    // Пошук за рядком фільтрів
+
     var searchByFilterStringBtn = document.getElementById("search-by-filter-string");
     var filterStringErrorEl = document.getElementById("filter-string-error");
     if (searchByFilterStringBtn) {
@@ -7038,10 +7526,15 @@
       });
     }
 
-    // Створити фільтри — відкрити модалку конструктора
+    ["search-open-facets", "search-open-facets-settings"].forEach(function (id) {
+      var btn = document.getElementById(id);
+      if (btn) btn.addEventListener("click", function () {
+        if (window.ListingFilters) ListingFilters.openPanel("search");
+      });
+    });
     var searchBuildFiltersBtn = document.getElementById("search-build-filters");
     if (searchBuildFiltersBtn) {
-      searchBuildFiltersBtn.addEventListener("click", function () { openFilterBuilderModal("filter-string"); });
+      searchBuildFiltersBtn.addEventListener("click", function () { openFilterBuilderModal("search"); });
     }
     var filterBuilderModal = document.getElementById("filter-builder-modal");
     var filterBuilderInsert = document.getElementById("filter-builder-insert");
@@ -7066,6 +7559,8 @@
             if (node.geoRegion) geoApi.geoRegion = String(node.geoRegion).trim();
             if (node.geoCity) geoApi.geoCity = String(node.geoCity).trim();
             if (node.cityId) geoApi.city_id = String(node.cityId).trim();
+            if (node.regionId) geoApi.region_id = String(node.regionId).trim();
+            if (node.region_id) geoApi.region_id = String(node.region_id).trim();
             ["population_min", "population_max", "area_min", "area_max"].forEach(function (k) {
               if (node[k] !== undefined && node[k] !== "" && node[k] !== null) {
                 geoApi[k] = node[k];
@@ -7089,7 +7584,7 @@
           group_type: filterTreeRoot.groupType || "and",
           items: (filterTreeRoot.items || []).map(nodeToApi).filter(Boolean)
         } : { group_type: "and", items: [] };
-        fetch("/api/search/filter-string-from-structure", {
+        fetch("/api/search/filter-from-tree", {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, apiHeaders()),
           body: JSON.stringify({ root: rootApi })
@@ -7099,18 +7594,31 @@
             return r.json();
           })
           .then(function (data) {
-            var taId = filterBuilderOutputTextareaId || "filter-string";
-            var ta = document.getElementById(taId);
-            if (ta) ta.value = (data.filter_string != null ? data.filter_string : "");
+            var surface = filterBuilderSurface || "search";
+            if (window.ListingFilters && data.filter) {
+              ListingFilters.applyTreeRoot(surface, {
+                group_type: data.filter.group_type || rootApi.group_type,
+                items: data.filter.items || rootApi.items
+              });
+              ListingFilters.syncFacetsFromServer(surface, function (url, opts) {
+                opts = opts || {};
+                opts.headers = Object.assign({}, opts.headers || {}, apiHeaders());
+                return fetch(url, opts);
+              });
+            }
             if (filterBuilderModal) filterBuilderModal.classList.add("hidden");
-            if (taId === "map-filter-string") {
+            if (surface === "map") {
               updateMapFilterSummary();
               if (currentScreen === "screen-map" && mapState.mapReady) {
                 loadMapForFilter();
               }
+            } else if (surface === "search") {
+              updateSearchSummaries();
+              searchState.currentPage = 0;
+              performSearch();
             }
           })
-          .catch(function (err) { alert(err.message || "Помилка формування рядка"); });
+          .catch(function (err) { alert(err.message || "Помилка збереження відборів"); });
       });
     }
     if (filterBuilderCancel && filterBuilderModal) {
@@ -7168,11 +7676,10 @@
   }
 
   function buildSearchExportBody() {
-    var filterStringEl = document.getElementById("filter-string");
     var sortFieldSelect = document.getElementById("search-sort-field");
     var sortOrderSelect = document.getElementById("search-sort-order");
     return {
-      filter_string: filterStringEl ? filterStringEl.value.trim() || null : null,
+      filter: (window.ListingFilters && ListingFilters.getFilterSpec("search")) || { version: 1, group_type: "and", items: [] },
       sort_field: sortFieldSelect ? sortFieldSelect.value : "source_updated_at",
       sort_order: sortOrderSelect ? sortOrderSelect.value : "desc"
     };
@@ -7181,7 +7688,7 @@
   function openReportConstructorFromSearch() {
     var body = buildSearchExportBody();
     var prefill = {
-      filter_string: body.filter_string,
+      filter: body.filter,
       sort_field: body.sort_field,
       sort_order: body.sort_order
     };
@@ -7222,6 +7729,42 @@
       }
       renderNav(me);
       bindEvents(me);
+      if (window.ListingFilters) {
+        ListingFilters._apiFetch = function (url, opts) {
+          opts = opts || {};
+          opts.headers = Object.assign({}, opts.headers || {}, apiHeaders());
+          return fetch(url, opts);
+        };
+        ListingFilters.onApply("search", function () {
+          searchState.currentPage = 0;
+          updateSearchSummaries();
+          performSearch();
+        });
+        ListingFilters.onApply("map", function () {
+          updateMapFilterSummary();
+          if (currentScreen === "screen-map" && mapState.mapReady) loadMapForFilter();
+        });
+        ListingFilters.onApply("report", function () {
+          ListingFilters.updateSummary("report");
+          ListingFilters.renderChips("report");
+        });
+        var facetClose = document.getElementById("facet-filters-close");
+        var facetApply = document.getElementById("facet-filters-apply");
+        var facetReset = document.getElementById("facet-filters-reset");
+        var facetAdvanced = document.getElementById("facet-filters-advanced");
+        if (facetClose) facetClose.addEventListener("click", function () { ListingFilters.closePanel(); });
+        if (facetApply) facetApply.addEventListener("click", function () { ListingFilters.applyPanel(); });
+        if (facetReset) facetReset.addEventListener("click", function () {
+          var surface = ListingFilters.getActiveSurface();
+          ListingFilters.clearFilters(surface);
+          ListingFilters.openPanel(surface);
+        });
+        if (facetAdvanced) facetAdvanced.addEventListener("click", function () {
+          var surface = ListingFilters.getActiveSurface();
+          ListingFilters.closePanel();
+          openFilterBuilderModal(surface);
+        });
+      }
       bindSearchEvents();
       initSearch();
       showSearch();

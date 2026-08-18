@@ -17,6 +17,34 @@ from config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+
+def _attach_geo_fields_from_raw(raw: Dict[str, Any], normalized: Dict[str, Any]) -> Dict[str, Any]:
+    """Зберігає location_context та geo_present з сирої відповіді LLM."""
+    raw_ctx = raw.get("location_context")
+    if isinstance(raw_ctx, dict):
+        normalized["location_context"] = raw_ctx
+
+    raw_addrs = raw.get("addresses") or []
+    norm_addrs = normalized.get("addresses") or []
+    if isinstance(raw_addrs, list) and isinstance(norm_addrs, list):
+        merged: List[Dict[str, Any]] = []
+        for index, addr in enumerate(norm_addrs):
+            if not isinstance(addr, dict):
+                continue
+            item = dict(addr)
+            if index < len(raw_addrs) and isinstance(raw_addrs[index], dict):
+                raw_addr = raw_addrs[index]
+                geo = raw_addr.get("geo_present")
+                if isinstance(geo, dict):
+                    item["geo_present"] = geo
+                for key in ("hromada",):
+                    if raw_addr.get(key) and not item.get(key):
+                        item[key] = raw_addr[key]
+            merged.append(item)
+        normalized["addresses"] = merged
+    return normalized
+
+
 def _get_vllm_orchestrator():
     from business.services.vllm_runtime_orchestrator import get_shared_vllm_runtime_orchestrator
 
@@ -124,7 +152,8 @@ class BaseLLMProvider(ABC):
             "- building_area_sqm: building/premises area in square meters (number; not land).\n"
             "- land_area_sqm: land plot area in square meters (number; not buildings).\n"
             "- addresses: array of address objects (region, district, settlement_type, settlement, settlement_district, "
-            "street_type, street, building, building_part, room) with Ukrainian text.\n"
+            "street_type, street, building, building_part, room, geo_present) with Ukrainian text.\n"
+            "- location_context: primary listing location (region, district, settlement_type, settlement, hromada).\n"
             "- floor: floor number if present.\n"
             "- property_type: one of \"Земля під будівництво\", \"Землі с/г призначення\", \"Нерухомість\", \"інше\".\n"
             "- utilities: short Ukrainian string with communications (e.g. \"електрика, вода, газ\") or \"відсутні\".\n"
@@ -383,7 +412,7 @@ class GeminiLLMProvider(BaseLLMProvider):
                 land_area_sqm = float(land_area_ha) * 10000.0
             except (TypeError, ValueError):
                 land_area_sqm = ''
-        return {
+        return _attach_geo_fields_from_raw(result, {
             'cadastral_number': result.get('cadastral_number', ''),
             'building_area_sqm': building_area_sqm if building_area_sqm else '',
             'land_area_ha': land_area_ha if land_area_ha else '',
@@ -394,7 +423,7 @@ class GeminiLLMProvider(BaseLLMProvider):
             'utilities': result.get('utilities', ''),
             'tags': tags,
             'arrests_info': result.get('arrests_info', '')
-        }
+        })
     
     def _empty_result(self) -> Dict[str, Any]:
         """Повертає порожній результат."""
@@ -404,6 +433,13 @@ class GeminiLLMProvider(BaseLLMProvider):
             'land_area_ha': '',
             'land_area_sqm': '',
             'addresses': [],  # Порожній масив адрес
+            'location_context': {
+                'region': '',
+                'district': '',
+                'settlement_type': '',
+                'settlement': '',
+                'hromada': '',
+            },
             'floor': '',
             'property_type': '',
             'utilities': '',
@@ -608,7 +644,7 @@ class OpenAILLMProvider(BaseLLMProvider):
                 land_area_sqm = float(land_area_ha) * 10000.0
             except (TypeError, ValueError):
                 land_area_sqm = ''
-        return {
+        return _attach_geo_fields_from_raw(result, {
             'cadastral_number': result.get('cadastral_number', ''),
             'building_area_sqm': building_area_sqm if building_area_sqm else '',
             'land_area_ha': land_area_ha if land_area_ha else '',
@@ -619,7 +655,7 @@ class OpenAILLMProvider(BaseLLMProvider):
             'utilities': result.get('utilities', ''),
             'tags': tags,
             'arrests_info': result.get('arrests_info', '')
-        }
+        })
     
     def _empty_result(self) -> Dict[str, Any]:
         """Повертає порожній результат."""
@@ -629,6 +665,13 @@ class OpenAILLMProvider(BaseLLMProvider):
             'land_area_ha': '',
             'land_area_sqm': '',
             'addresses': [],  # Порожній масив адрес
+            'location_context': {
+                'region': '',
+                'district': '',
+                'settlement_type': '',
+                'settlement': '',
+                'hromada': '',
+            },
             'floor': '',
             'property_type': '',
             'utilities': '',
@@ -758,7 +801,7 @@ class AnthropicLLMProvider(BaseLLMProvider):
                 land_area_sqm = float(land_area_ha) * 10000.0
             except (TypeError, ValueError):
                 land_area_sqm = ''
-        return {
+        return _attach_geo_fields_from_raw(result, {
             'cadastral_number': result.get('cadastral_number', ''),
             'building_area_sqm': building_area_sqm if building_area_sqm else '',
             'land_area_ha': land_area_ha if land_area_ha else '',
@@ -769,7 +812,7 @@ class AnthropicLLMProvider(BaseLLMProvider):
             'utilities': result.get('utilities', ''),
             'tags': tags,
             'arrests_info': result.get('arrests_info', '')
-        }
+        })
     
     def _empty_result(self) -> Dict[str, Any]:
         """Повертає порожній результат."""
@@ -779,6 +822,13 @@ class AnthropicLLMProvider(BaseLLMProvider):
             'land_area_ha': '',
             'land_area_sqm': '',
             'addresses': [],  # Порожній масив адрес
+            'location_context': {
+                'region': '',
+                'district': '',
+                'settlement_type': '',
+                'settlement': '',
+                'hromada': '',
+            },
             'floor': '',
             'property_type': '',
             'utilities': '',
@@ -947,7 +997,7 @@ class OllamaLLMProvider(BaseLLMProvider):
                 land_area_sqm = float(land_area_ha) * 10000.0
             except (TypeError, ValueError):
                 land_area_sqm = ""
-        return {
+        return _attach_geo_fields_from_raw(result, {
             "cadastral_number": result.get("cadastral_number", ""),
             "building_area_sqm": building_area_sqm if building_area_sqm else "",
             "land_area_ha": land_area_ha if land_area_ha else "",
@@ -958,7 +1008,7 @@ class OllamaLLMProvider(BaseLLMProvider):
             "utilities": result.get("utilities", ""),
             "tags": tags,
             "arrests_info": result.get("arrests_info", ""),
-        }
+        })
 
     def _empty_result(self) -> Dict[str, Any]:
         """Повертає порожній результат."""
@@ -968,6 +1018,13 @@ class OllamaLLMProvider(BaseLLMProvider):
             "land_area_ha": "",
             "land_area_sqm": "",
             "addresses": [],
+            "location_context": {
+                "region": "",
+                "district": "",
+                "settlement_type": "",
+                "settlement": "",
+                "hromada": "",
+            },
             "floor": "",
             "property_type": "",
             "utilities": "",
@@ -1286,7 +1343,7 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
                 land_area_sqm = float(land_area_ha) * 10000.0
             except (TypeError, ValueError):
                 land_area_sqm = ""
-        return {
+        return _attach_geo_fields_from_raw(result, {
             "cadastral_number": result.get("cadastral_number", ""),
             "building_area_sqm": building_area_sqm if building_area_sqm else "",
             "land_area_ha": land_area_ha if land_area_ha else "",
@@ -1297,7 +1354,7 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
             "utilities": result.get("utilities", ""),
             "tags": tags,
             "arrests_info": result.get("arrests_info", ""),
-        }
+        })
 
     def _empty_result(self) -> Dict[str, Any]:
         return {
@@ -1306,6 +1363,13 @@ class VllmRemoteLLMProvider(BaseLLMProvider):
             "land_area_ha": "",
             "land_area_sqm": "",
             "addresses": [],
+            "location_context": {
+                "region": "",
+                "district": "",
+                "settlement_type": "",
+                "settlement": "",
+                "hromada": "",
+            },
             "floor": "",
             "property_type": "",
             "utilities": "",
@@ -1491,6 +1555,10 @@ class LLMService:
         log_svc = self._get_logging()
 
         result = self.provider.parse_auction_description(description)
+
+        if isinstance(result, dict):
+            from utils.address_geo_enrichment import enrich_llm_geo_result
+            result = enrich_llm_geo_result(result)
 
         if log_svc:
             try:

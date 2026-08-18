@@ -19,6 +19,7 @@ from config.settings import Settings
 from business.services.user_service import UserService
 from business.services.prozorro_service import ProZorroService
 from business.services.logging_service import LoggingService
+from business.services.user_activity_log_service import UserActivityLogService
 
 from telegram_mini_app.routes import me, llm, admin, files, search, map, feedback, report_templates, analytics, investigation, mini_app_chats
 
@@ -87,6 +88,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.user_service = UserService(settings.telegram_users_config_path)
     app.state.prozorro_service = ProZorroService(settings)
     app.state.logging_service = LoggingService()
+    app.state.user_activity_service = UserActivityLogService()
     app.state.multi_agent_service = None  # леніва ініціалізація в routes/llm.py
     app.state.investigation_service = None  # леніва ініціалізація в routes/investigation.py
 

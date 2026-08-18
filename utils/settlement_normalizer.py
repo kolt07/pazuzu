@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # Префікси типу НП на початку або після коми/слеша
 _SETTLEMENT_TYPE_PREFIX = re.compile(
@@ -225,6 +225,62 @@ def settlement_name_from_mista_url(url: Optional[str]) -> Optional[str]:
         return normalize_settlement_name(slug) or slug or None
     except Exception:
         return None
+
+
+def merge_settlement_alias_keys(*raw_names: Optional[str]) -> List[str]:
+    """Унікальні нормалізовані ключі назв для search_aliases."""
+    seen: set[str] = set()
+    out: List[str] = []
+    for raw in raw_names:
+        if raw is None:
+            continue
+        if isinstance(raw, dict):
+            raw = raw.get("name")
+        key = normalize_settlement_key(str(raw) if raw is not None else "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def resolve_mista_canonical_and_aliases(
+    *,
+    list_name: Optional[str] = None,
+    detail_name: Optional[str] = None,
+    mista_url: Optional[str] = None,
+    former_names: Optional[Iterable[Any]] = None,
+) -> Tuple[Optional[str], List[str]]:
+    """
+    Канонічна назва НП з mista.ua та аліаси для пошуку.
+
+    Список пошуку mista показує сучасні назви (Дніпро, Кам'янське), тоді як
+    URL/поле «Місто» на детальній сторінці часто лишаються зі старими (Дніпропетровськ).
+    Пріоритет канону: list → detail → URL-slug. Усі інші варіанти — search_aliases.
+    """
+    url_name = settlement_name_from_mista_url(mista_url)
+    candidates = [
+        normalize_settlement_name(list_name) or (str(list_name).strip() if list_name else None),
+        normalize_settlement_name(detail_name) or (str(detail_name).strip() if detail_name else None),
+        url_name,
+    ]
+    canonical: Optional[str] = next((c for c in candidates if c), None)
+
+    former_raw: List[Optional[str]] = []
+    for item in former_names or []:
+        if isinstance(item, dict):
+            former_raw.append(item.get("name"))
+        else:
+            former_raw.append(str(item) if item is not None else None)
+
+    aliases = merge_settlement_alias_keys(
+        canonical,
+        list_name,
+        detail_name,
+        url_name,
+        *former_raw,
+    )
+    return canonical, aliases
 
 
 def settlement_prefix_regex_pattern(normalized_key: str) -> str:

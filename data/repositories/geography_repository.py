@@ -332,15 +332,27 @@ class CitiesRepository(BaseRepository):
         query: str,
         *,
         limit: int = 25,
+        region_id: Optional[str] = None,
+        region_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Пошук НП за префіксом назви або search_aliases (усі області)."""
+        """Пошук НП за префіксом назви або search_aliases (опційно — у межах областей)."""
         self._ensure_indexes()
         key = normalize_settlement_key(query)
         if not key or len(key) < 2:
             return []
 
         or_clauses = settlement_search_or_clauses(key)
-        filt = self._active_city_filter({"$or": or_clauses} if or_clauses else {})
+        extra: Dict[str, Any] = {"$or": or_clauses} if or_clauses else {}
+        ids: List[str] = []
+        if region_ids:
+            ids = [str(x).strip() for x in region_ids if x and str(x).strip()]
+        elif region_id and str(region_id).strip():
+            ids = [str(region_id).strip()]
+        if len(ids) == 1:
+            extra["region_id"] = ids[0]
+        elif len(ids) > 1:
+            extra["region_id"] = {"$in": ids}
+        filt = self._active_city_filter(extra)
         docs = self.find_many(
             filter=filt,
             sort=[("population", -1), ("name", 1)],
@@ -379,7 +391,7 @@ class CitiesRepository(BaseRepository):
         self._ensure_indexes()
         filt: Dict[str, Any] = dict(self._active_city_filter())
         if region_id:
-            filt["region_id"] = region_id
+            filt = {"$and": [filt, region_id_mongo_filter(region_id)]}
         if settlement_name:
             key = self._normalize_name(settlement_name)
             if key:

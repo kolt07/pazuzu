@@ -235,22 +235,12 @@ def run_full_pipeline(
     use_brokered_llm: bool = False,
     llm_wait_heartbeat_fn: Optional[Callable[[], None]] = None,
     run_phase3: bool = True,
+    source_load_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Запускає повний pipeline: Phase 1 (raw) → Phase 2 (promote + LLM для обраних) → Phase 3 (аналітика + гео).
+    Запускає повний pipeline: Phase 1 (raw) → Phase 2 (promote + LLM) → Phase 3.
 
-    Args:
-        settings: налаштування (за замовчуванням новий Settings).
-        sources: список джерел ("olx", "prozorro") або None = обидва.
-        days: період у днях для ProZorro та OLX cutoff.
-        log_fn: опціональна функція логування.
-        regions: точкове оновлення — лише ці області (для OLX — обмеження Phase 1; для ProZorro — фільтр Phase 2 по approximate_region).
-        listing_types: точкове оновлення OLX — лише категорії, чий label містить один із рядків (напр. «Нежитлова», «Земля»).
-        olx_phase1_max_threads: кількість потоків Phase 1 OLX (пул завдань область+категорія); None = з конфігу; 0 = legacy (по області).
-        run_phase3: якщо False — пропускає перерахунок аналітик/гео-індексу (Phase 3).
-
-    Returns:
-        Словник з результатами по фазах та джерелах.
+    source_load_run_id: durable resume після перезапуску (work units + Phase 2 reconcile).
     """
     from scripts.olx_scraper.run_update import (
         run_olx_update_raw_only,
@@ -261,7 +251,14 @@ def run_full_pipeline(
     from business.services.olx_llm_extractor_service import OlxLLMExtractorService
     from business.services.geocoding_service import GeocodingService
     from business.services.currency_rate_service import CurrencyRateService
-    from utils.price_metrics import compute_price_metrics
+    from data.repositories.source_load_run_repository import (
+        SourceLoadRunRepository,
+        STATUS_RUNNING,
+        STATUS_PHASE1_DONE,
+        STATUS_PHASE2_WAITING,
+        STATUS_DONE,
+        STATUS_FAILED,
+    )
 
     global _SOURCE_LOAD_ACTIVE_COUNT
     with _SOURCE_LOAD_LOCK:
@@ -280,18 +277,49 @@ def run_full_pipeline(
             else:
                 logger.info("%s", msg)
 
+        run_repo = SourceLoadRunRepository()
+        run_id = (source_load_run_id or "").strip()
+        if not run_id:
+            run_id = run_repo.create_run(
+                sources=list(sources),
+                days=days,
+                regions=list(regions or []),
+                listing_types=list(listing_types or []),
+                olx_phase1_max_threads=olx_phase1_max_threads,
+            )
+            log(f"[Source load] Створено source_load_run_id={run_id}")
+        else:
+            existing = run_repo.get_run(run_id)
+            if not existing:
+                run_repo.create_run(
+                    run_id=run_id,
+                    sources=list(sources),
+                    days=days,
+                    regions=list(regions or []),
+                    listing_types=list(listing_types or []),
+                    olx_phase1_max_threads=olx_phase1_max_threads,
+                )
+            log(f"[Source load] Resume/continue source_load_run_id={run_id}")
+
+        run_doc = run_repo.get_run(run_id) or {}
+        run_status = str(run_doc.get("status") or "")
+        phase2_state = dict(run_doc.get("phase2") or {})
+
         result: Dict[str, Any] = {
             "phase1": {},
             "phase2": {"olx_llm_processed": 0, "prozorro_llm_processed": 0},
             "phase3": {},
             "core_completed": False,
+            "source_load_run_id": run_id,
         }
 
-        # Попередня нормалізація фільтрів: пишемо у лог невпізнані значення одразу на рівні
-        # pipeline, щоб у task heartbeat було видно, що саме викликач передав некоректно.
-        # Якщо ВСІ передані значення фільтра невпізнані — повертаємо явну помилку замість
-        # тихого «load all», бо тихе зняття фільтра небезпечне (раптом завантажуємо все
-        # коли користувач замовляв точкове оновлення однієї області).
+        if run_status == STATUS_DONE:
+            log(f"[Source load] Run {run_id} уже status=done — пропускаємо повторне виконання.")
+            result["core_completed"] = True
+            result["skipped_reason"] = "already_done"
+            result["phase3"]["skipped"] = True
+            return result
+
         if regions or listing_types:
             try:
                 from scripts.olx_scraper.run_update import (
@@ -311,13 +339,13 @@ def run_full_pipeline(
                     log(f"[Source load] Фільтр listing_types: невпізнано {unknown_types}.")
                 if regions and not norm_regions:
                     err_msg = (
-                        "[Source load] Усі передані regions невпізнані — припиняємо запуск, "
-                        "щоб не завантажити випадково всі дані. "
+                        "[Source load] Усі передані regions невпізнані — припиняємо запуск. "
                         f"Прийшло: {list(regions)!r}; канонічні: {_avail_regions[:5]}…"
                     )
                     log(err_msg)
                     result["error"] = err_msg
                     result["skipped_reason"] = "all_regions_invalid"
+                    run_repo.patch_run(run_id, {"status": STATUS_FAILED, "message": err_msg})
                     return result
                 if listing_types and not norm_types:
                     err_msg = (
@@ -327,11 +355,8 @@ def run_full_pipeline(
                     log(err_msg)
                     result["error"] = err_msg
                     result["skipped_reason"] = "all_listing_types_invalid"
+                    run_repo.patch_run(run_id, {"status": STATUS_FAILED, "message": err_msg})
                     return result
-                # Підмінюємо вхідні значення на нормалізовані канонічні (часткові випадки):
-                # downstream-функції теж нормалізують, але переписуємо тут, щоб у логах фільтри
-                # відображались однаково на всіх рівнях, а ProZorro-частина одразу отримала правильні
-                # назви для матчингу з normalize_region_name().
                 if regions and norm_regions and set(norm_regions) != set(regions):
                     log(f"[Source load] regions нормалізовано до канонічних: {norm_regions}")
                     regions = norm_regions
@@ -341,12 +366,15 @@ def run_full_pipeline(
             except Exception as _e:
                 logger.warning("Filter normalization skipped: %s", _e)
 
-        # ---------- Phase 1: завантаження сирих даних ----------
-        log("[Source load] Phase 1: завантаження сирих даних з джерел (без LLM).")
+        skip_phase1 = run_status in (STATUS_PHASE1_DONE, STATUS_PHASE2_WAITING, STATUS_DONE)
+        if skip_phase1:
+            log(f"[Source load] Phase 1 пропущено (status={run_status}), recovery з Mongo.")
+        else:
+            run_repo.patch_run(run_id, {"status": STATUS_RUNNING, "message": "phase1"})
+            log("[Source load] Phase 1: завантаження сирих даних з джерел (без LLM).")
+
         olx_loaded_urls: List[str] = []
         prozorro_loaded_ids: List[str] = []
-        # LLM має стартувати тільки після повного завершення Phase 1 (raw),
-        # тому не робимо inline LLM під час завантаження сирих даних.
         olx_dynamic_llm_processed_urls: Set[str] = set()
 
         raw_olx = RawOlxListingsRepository()
@@ -369,36 +397,73 @@ def run_full_pipeline(
             except Exception:
                 usd_rate_olx = None
 
-        if "olx" in sources:
-            r = run_olx_update_raw_only(
-                settings=st,
-                log_fn=log_fn,
-                days=days,
-                regions=regions,
-                listing_types=listing_types,
-                max_workers=olx_phase1_max_threads,
-            )
-            result["phase1"]["olx"] = r
-            olx_loaded_urls = r.get("loaded_urls") or []
-            # Для сумісності зі старими результатами, якщо поле існує у відповіді.
-            olx_dynamic_llm_processed_urls.update(r.get("llm_processed_urls") or [])
+        if not skip_phase1:
+            if "olx" in sources:
+                r = run_olx_update_raw_only(
+                    settings=st,
+                    log_fn=log_fn,
+                    days=days,
+                    regions=regions,
+                    listing_types=listing_types,
+                    max_workers=olx_phase1_max_threads,
+                    source_load_run_id=run_id,
+                )
+                result["phase1"]["olx"] = r
+                olx_loaded_urls = r.get("loaded_urls") or []
+                olx_dynamic_llm_processed_urls.update(r.get("llm_processed_urls") or [])
 
-        if "prozorro" in sources:
-            prozorro = ProZorroService(st)
-            r = prozorro.fetch_and_save_to_raw_only(days=days)
-            result["phase1"]["prozorro"] = r
-            prozorro_loaded_ids = list(r.get("loaded_auction_ids") or [])
-            if regions and prozorro_loaded_ids:
-                raw_prozorro = RawProzorroAuctionsRepository()
-                docs = raw_prozorro.get_by_auction_ids(prozorro_loaded_ids)
-                region_set = {normalize_region_name(r.strip()) or r.strip() for r in regions if r and r.strip()}
-                prozorro_loaded_ids = [
-                    d["auction_id"] for d in docs
-                    if d.get("auction_id") and normalize_region_name(d.get("approximate_region") or "") in region_set
-                ]
-                log(f"[Source load] ProZorro: після фільтра по областях залишено {len(prozorro_loaded_ids)} аукціонів.")
+            if "prozorro" in sources:
+                prozorro = ProZorroService(st)
+                r = prozorro.fetch_and_save_to_raw_only(days=days, source_load_run_id=run_id)
+                result["phase1"]["prozorro"] = r
+                prozorro_loaded_ids = list(r.get("loaded_auction_ids") or [])
+                if regions and prozorro_loaded_ids:
+                    docs = raw_prozorro.get_by_auction_ids(prozorro_loaded_ids)
+                    region_set = {
+                        normalize_region_name(r.strip()) or r.strip()
+                        for r in regions
+                        if r and r.strip()
+                    }
+                    prozorro_loaded_ids = [
+                        d["auction_id"]
+                        for d in docs
+                        if d.get("auction_id")
+                        and normalize_region_name(d.get("approximate_region") or "") in region_set
+                    ]
+                    log(
+                        f"[Source load] ProZorro: після фільтра по областях залишено "
+                        f"{len(prozorro_loaded_ids)} аукціонів."
+                    )
+            run_repo.patch_run(run_id, {"status": STATUS_PHASE1_DONE, "message": "phase1_done"})
+        else:
+            if "olx" in sources:
+                olx_loaded_urls = raw_olx.list_urls_by_source_load_run_id(run_id)
+                result["phase1"]["olx"] = {
+                    "success": True,
+                    "loaded_urls": olx_loaded_urls,
+                    "resumed": True,
+                }
+            if "prozorro" in sources:
+                prozorro_loaded_ids = raw_prozorro.list_auction_ids_by_source_load_run_id(run_id)
+                if regions and prozorro_loaded_ids:
+                    docs = raw_prozorro.get_by_auction_ids(prozorro_loaded_ids)
+                    region_set = {
+                        normalize_region_name(r.strip()) or r.strip()
+                        for r in regions
+                        if r and r.strip()
+                    }
+                    prozorro_loaded_ids = [
+                        d["auction_id"]
+                        for d in docs
+                        if d.get("auction_id")
+                        and normalize_region_name(d.get("approximate_region") or "") in region_set
+                    ]
+                result["phase1"]["prozorro"] = {
+                    "success": True,
+                    "loaded_auction_ids": prozorro_loaded_ids,
+                    "resumed": True,
+                }
 
-        # ---------- Phase 2: підняття raw → main, LLM для обраних, sync unified ----------
         log("[Source load] Phase 2: підняття з raw у основні колекції та LLM для обраних.")
         task_queue = None
         brokered_llm_task_ids: List[str] = []
@@ -407,14 +472,50 @@ def run_full_pipeline(
             task_queue = TaskQueueService(st)
             use_brokered_llm = task_queue.is_enabled()
         llm_batch_progress_state = {"processed": -1}
+
+        if run_id and "olx" in sources:
+            stamped = raw_olx.list_urls_by_source_load_run_id(run_id)
+            if stamped:
+                olx_loaded_urls = stamped
+        if run_id and "prozorro" in sources:
+            stamped_ids = raw_prozorro.list_auction_ids_by_source_load_run_id(run_id)
+            if stamped_ids:
+                prozorro_loaded_ids = stamped_ids
+                if regions:
+                    docs = raw_prozorro.get_by_auction_ids(prozorro_loaded_ids)
+                    region_set = {
+                        normalize_region_name(r.strip()) or r.strip()
+                        for r in regions
+                        if r and r.strip()
+                    }
+                    prozorro_loaded_ids = [
+                        d["auction_id"]
+                        for d in docs
+                        if d.get("auction_id")
+                        and normalize_region_name(d.get("approximate_region") or "") in region_set
+                    ]
+
         if "olx" in sources and olx_loaded_urls:
             urls_for_llm = set(_select_olx_urls_for_llm(raw_olx, olx_loaded_urls))
             if urls_for_llm:
-                pending_list = [u for u in olx_loaded_urls if u in urls_for_llm and u not in olx_dynamic_llm_processed_urls]
-                log(f"[Source load] Phase 2 OLX: LLM-обробка для {len(pending_list)} оголошень (дані в olx_listings та unified тільки після LLM).")
+                pending_list = [
+                    u
+                    for u in olx_loaded_urls
+                    if u in urls_for_llm and u not in olx_dynamic_llm_processed_urls
+                ]
+                log(f"[Source load] Phase 2 OLX: LLM-обробка для {len(pending_list)} оголошень.")
                 if use_brokered_llm and task_queue:
-                    olx_llm_batch_id = f"phase2-olx-{uuid.uuid4().hex[:12]}"
-                    for listing_url in pending_list:
+                    olx_llm_batch_id = (
+                        phase2_state.get("olx_llm_batch_id")
+                        or f"phase2-olx-{uuid.uuid4().hex[:12]}"
+                    )
+                    already = {
+                        (d.get("payload") or {}).get("listing_url")
+                        for d in task_queue.list_llm_batch_tasks(olx_llm_batch_id)
+                    }
+                    already.discard(None)
+                    to_enqueue = [u for u in pending_list if u not in already]
+                    for listing_url in to_enqueue:
                         brokered_llm_task_ids.append(
                             task_queue.enqueue_olx_llm(
                                 listing_url,
@@ -424,11 +525,29 @@ def run_full_pipeline(
                                     "llm_batch_id": olx_llm_batch_id,
                                     "llm_batch_total": len(pending_list),
                                     "llm_batch_source": "olx",
+                                    "source_load_run_id": run_id,
                                 },
                             )
                         )
-                    n = 0
-                    log(f"[Source load] Phase 2 OLX: поставлено в RabbitMQ {len(pending_list)} LLM-задач.")
+                    for d in task_queue.list_llm_batch_tasks(olx_llm_batch_id):
+                        tid = d.get("task_id")
+                        if tid and tid not in brokered_llm_task_ids:
+                            brokered_llm_task_ids.append(tid)
+                    run_repo.patch_phase2(
+                        run_id,
+                        {
+                            "olx_llm_batch_id": olx_llm_batch_id,
+                            "olx_pending": len(pending_list),
+                        },
+                    )
+                    phase2_state["olx_llm_batch_id"] = olx_llm_batch_id
+                    log(
+                        f"[Source load] Phase 2 OLX: batch={olx_llm_batch_id}, "
+                        f"нових задач {len(to_enqueue)}, всього в batch {len(brokered_llm_task_ids)}."
+                    )
+                    result["phase2"]["olx_llm_processed"] = len(pending_list) + len(
+                        olx_dynamic_llm_processed_urls
+                    )
                 else:
                     n = _process_llm_pending(
                         pending_list,
@@ -440,22 +559,26 @@ def run_full_pipeline(
                         usd_rate_olx,
                         log_fn,
                     )
-                total_olx_processed = (len(pending_list) if use_brokered_llm else n) + len(olx_dynamic_llm_processed_urls)
-                result["phase2"]["olx_llm_processed"] = total_olx_processed
-                if use_brokered_llm:
-                    log(f"[Source load] Phase 2 OLX: LLM-задачі поставлено. Очікується {total_olx_processed}/{len([u for u in olx_loaded_urls if u in urls_for_llm])}.")
-                else:
-                    log(f"[Source load] Phase 2 OLX: LLM завершено. Оброблено {total_olx_processed}/{len([u for u in olx_loaded_urls if u in urls_for_llm])} оголошень (записано в olx_listings та unified).")
+                    result["phase2"]["olx_llm_processed"] = n + len(olx_dynamic_llm_processed_urls)
+                    log(
+                        f"[Source load] Phase 2 OLX: LLM завершено. "
+                        f"Оброблено {result['phase2']['olx_llm_processed']}."
+                    )
             else:
                 log(
-                    f"[Source load] Phase 2 OLX: LLM пропущено (завантажено URL: {len(olx_loaded_urls)}, "
-                    "обрано для LLM: 0 — перевірте llm_processing_regions.yaml та approximate_region у raw)."
+                    f"[Source load] Phase 2 OLX: LLM пропущено "
+                    f"(завантажено URL: {len(olx_loaded_urls)}, обрано для LLM: 0)."
                 )
             log("[Source load] Phase 2 OLX завершено.")
 
         if "prozorro" in sources and prozorro_loaded_ids:
-            _promote_raw_prozorro_to_main(raw_prozorro, main_prozorro, prozorro_loaded_ids, log_fn=log_fn)
-            log(f"[Source load] Phase 2 ProZorro: синхронізація в unified_listings ({len(prozorro_loaded_ids)} аукціонів)...")
+            _promote_raw_prozorro_to_main(
+                raw_prozorro, main_prozorro, prozorro_loaded_ids, log_fn=log_fn
+            )
+            log(
+                f"[Source load] Phase 2 ProZorro: синхронізація в unified_listings "
+                f"({len(prozorro_loaded_ids)} аукціонів)..."
+            )
             unified_prozorro = UnifiedListingsService(st)
             for i, aid in enumerate(prozorro_loaded_ids, start=1):
                 try:
@@ -463,15 +586,31 @@ def run_full_pipeline(
                 except Exception as e:
                     logger.debug("Unified sync ProZorro %s: %s", aid, e)
                 if i % 100 == 0 or i == len(prozorro_loaded_ids):
-                    log(f"[Source load] Phase 2 ProZorro: unified — {i}/{len(prozorro_loaded_ids)}.")
-            log(f"[Source load] Phase 2 ProZorro: unified готово.")
+                    log(
+                        f"[Source load] Phase 2 ProZorro: unified — "
+                        f"{i}/{len(prozorro_loaded_ids)}."
+                    )
+            log("[Source load] Phase 2 ProZorro: unified готово.")
             ids_for_llm = _select_prozorro_ids_for_llm(raw_prozorro, prozorro_loaded_ids)
             if ids_for_llm:
-                log(f"[Source load] Phase 2 ProZorro: LLM-обробка для {len(ids_for_llm)} аукціонів...")
+                log(
+                    f"[Source load] Phase 2 ProZorro: LLM-обробка для "
+                    f"{len(ids_for_llm)} аукціонів..."
+                )
                 if use_brokered_llm and task_queue:
-                    prozorro_llm_batch_id = f"phase2-prozorro-{uuid.uuid4().hex[:12]}"
-                    for auction_id in ids_for_llm:
-                        brokered_llm_task_ids.append(
+                    prozorro_llm_batch_id = (
+                        phase2_state.get("prozorro_llm_batch_id")
+                        or f"phase2-prozorro-{uuid.uuid4().hex[:12]}"
+                    )
+                    already = {
+                        (d.get("payload") or {}).get("auction_id")
+                        for d in task_queue.list_llm_batch_tasks(prozorro_llm_batch_id)
+                    }
+                    already.discard(None)
+                    to_enqueue = [a for a in ids_for_llm if a not in already]
+                    pz_task_ids: List[str] = []
+                    for auction_id in to_enqueue:
+                        pz_task_ids.append(
                             task_queue.enqueue_prozorro_llm(
                                 auction_id,
                                 metadata={
@@ -480,11 +619,27 @@ def run_full_pipeline(
                                     "llm_batch_id": prozorro_llm_batch_id,
                                     "llm_batch_total": len(ids_for_llm),
                                     "llm_batch_source": "prozorro",
+                                    "source_load_run_id": run_id,
                                 },
                             )
                         )
+                    for d in task_queue.list_llm_batch_tasks(prozorro_llm_batch_id):
+                        tid = d.get("task_id")
+                        if tid and tid not in pz_task_ids and tid not in brokered_llm_task_ids:
+                            pz_task_ids.append(tid)
+                    brokered_llm_task_ids.extend(pz_task_ids)
+                    run_repo.patch_phase2(
+                        run_id,
+                        {
+                            "prozorro_llm_batch_id": prozorro_llm_batch_id,
+                            "prozorro_pending": len(ids_for_llm),
+                        },
+                    )
                     result["phase2"]["prozorro_llm_processed"] = len(ids_for_llm)
-                    log(f"[Source load] Phase 2 ProZorro: поставлено в RabbitMQ {len(ids_for_llm)} LLM-задач.")
+                    log(
+                        f"[Source load] Phase 2 ProZorro: batch={prozorro_llm_batch_id}, "
+                        f"нових задач {len(to_enqueue)}."
+                    )
                 else:
                     prozorro_svc = ProZorroService(st)
                     if prozorro_svc.llm_service:
@@ -497,22 +652,33 @@ def run_full_pipeline(
                                     result["phase2"]["prozorro_llm_processed"] += 1
                             except Exception as e:
                                 logger.warning("ProZorro LLM для %s: %s", auction_id, e)
-                        log(f"[Source load] Phase 2 ProZorro: LLM завершено. Оброблено {result['phase2']['prozorro_llm_processed']}/{len(ids_for_llm)}.")
+                        log(
+                            f"[Source load] Phase 2 ProZorro: LLM завершено. "
+                            f"Оброблено {result['phase2']['prozorro_llm_processed']}/{len(ids_for_llm)}."
+                        )
                     else:
-                        log("[Source load] Phase 2 ProZorro: LLM недоступний (сервіс не ініціалізовано).")
+                        log("[Source load] Phase 2 ProZorro: LLM недоступний.")
             else:
-                log("[Source load] Phase 2 ProZorro: LLM пропущено (0 кандидатів за регіонами).")
+                log("[Source load] Phase 2 ProZorro: LLM пропущено (0 кандидатів).")
             log("[Source load] Phase 2 ProZorro завершено.")
 
         if use_brokered_llm and task_queue and brokered_llm_task_ids:
-            log(f"[Source load] Phase 2: очікування завершення {len(brokered_llm_task_ids)} LLM-задач із RabbitMQ...")
+            from business.services.task_queue_service import TaskQueueService
+
+            run_repo.patch_run(run_id, {"status": STATUS_PHASE2_WAITING, "message": "waiting_llm"})
+            brokered_llm_task_ids = list(dict.fromkeys(brokered_llm_task_ids))
+            log(
+                f"[Source load] Phase 2: очікування завершення "
+                f"{len(brokered_llm_task_ids)} LLM-задач із RabbitMQ..."
+            )
 
             def _llm_wait_progress(docs: List[Dict[str, Any]], task_ids: List[str]) -> None:
                 by_id = {doc.get("task_id"): doc for doc in docs}
                 processed = sum(
                     1
                     for tid in task_ids
-                    if str((by_id.get(tid) or {}).get("state") or "").lower() in TaskQueueService.TERMINAL_STATES
+                    if str((by_id.get(tid) or {}).get("state") or "").lower()
+                    in TaskQueueService.TERMINAL_STATES
                 )
                 total = len(task_ids)
                 if processed != llm_batch_progress_state["processed"]:
@@ -529,21 +695,27 @@ def run_full_pipeline(
             prozorro_success = 0
             for doc in task_docs:
                 if str(doc.get("state") or "").lower() != "success":
-                    logger.warning("LLM background task failed: %s", doc.get("error") or doc.get("task_id"))
+                    logger.warning(
+                        "LLM background task failed: %s",
+                        doc.get("error") or doc.get("task_id"),
+                    )
                     continue
                 payload = doc.get("payload") or {}
                 if doc.get("task_name") == "process_olx_llm_task" and payload.get("listing_url"):
                     olx_success += 1
-                elif doc.get("task_name") == "process_prozorro_llm_task" and payload.get("auction_id"):
+                elif (
+                    doc.get("task_name") == "process_prozorro_llm_task"
+                    and payload.get("auction_id")
+                ):
                     prozorro_success += 1
             result["phase2"]["olx_llm_processed"] = olx_success + len(olx_dynamic_llm_processed_urls)
             result["phase2"]["prozorro_llm_processed"] = prozorro_success
             log(
                 f"[Source load] Phase 2: LLM background tasks завершено. "
-                f"OLX={result['phase2']['olx_llm_processed']}, ProZorro={result['phase2']['prozorro_llm_processed']}."
+                f"OLX={result['phase2']['olx_llm_processed']}, "
+                f"ProZorro={result['phase2']['prozorro_llm_processed']}."
             )
 
-        # Зберігаємо дату оновлення ProZorro для get_auctions_from_db_by_period / generate_excel_from_db
         if "prozorro" in sources and days is not None:
             try:
                 from datetime import datetime, timezone
@@ -557,6 +729,7 @@ def run_full_pipeline(
                 logger.debug("Збереження дати оновлення ProZorro: %s", e)
 
         result["core_completed"] = True
+        run_repo.patch_run(run_id, {"status": STATUS_DONE, "message": "done"})
         log("[Source load] Core pipeline завершено: raw + promote/main + LLM виконано успішно.")
         if run_phase3:
             _run_phase3_post_processing(sources, result, log_fn=log_fn)

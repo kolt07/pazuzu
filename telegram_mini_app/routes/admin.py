@@ -33,6 +33,9 @@ _olx_clicker_tasks: dict = {}
 # Задачі скрапера mista.ua (населені пункти)
 _mista_scraper_tasks: dict = {}
 
+# Групові задачі обробки даних (перезавантаження з джерел, повторне розпізнавання)
+_batch_job_tasks: dict = {}
+
 
 def _get_admin_user(request: Request):
     init_data = request.headers.get("X-Telegram-Init-Data")
@@ -76,9 +79,30 @@ class CreateSchedulerEventRequest(BaseModel):
     sources: str = "all"
 
 
+class BatchJobStartRequest(BaseModel):
+    """Параметри групової задачі обробки даних."""
+    job_type: str  # source_reload | recognition_reprocess | address_cache_reprocess
+    source: str = "both"
+    regions: Optional[List[str]] = None
+    status: Optional[str] = None
+    days: Optional[int] = 7
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    load_new: bool = False
+    limit: Optional[int] = None
+    force: bool = False
+
+
 class TaskQueueControlRequest(BaseModel):
     queue_name: str
-    action: str  # pause | resume | disable | enable
+    action: str  # pause | resume | disable | enable | purge
+    reason: str = ""
+
+
+class TaskQueuePurgeRequest(BaseModel):
+    """Очищення черги (або всіх) + опційно запланованих подій."""
+    queue_name: Optional[str] = None  # source_load | llm_processing | None = обидві
+    clear_scheduled: bool = True
     reason: str = ""
 
 
@@ -417,6 +441,165 @@ def start_data_update(
     return out
 
 
+@router.get("/batch-jobs/options")
+def batch_jobs_options(request: Request):
+    """Опції для групових задач: типи задач, області, джерела."""
+    _get_admin_user(request)
+    try:
+        from business.services.source_data_load_service import get_targeted_update_options
+        opts = get_targeted_update_options()
+        return {
+            "job_types": [
+                {
+                    "id": "source_reload",
+                    "label": "Перезавантаження з джерел",
+                    "description": "Оновити наявні оголошення з OLX/ProZorro; опційно завантажити нові",
+                },
+                {
+                    "id": "recognition_reprocess",
+                    "label": "Повторне розпізнавання",
+                    "description": "Прогін raw-даних через LLM, геокодування та unified",
+                },
+                {
+                    "id": "address_cache_reprocess",
+                    "label": "Адреси з кешу LLM",
+                    "description": "Без виклику моделі: взяти addresses з llm_cache/detail.llm, санітизація, геокод, address_refs, unified",
+                },
+            ],
+            "regions": opts.get("regions") or [],
+            "sources": [
+                {"id": "both", "label": "OLX + ProZorro"},
+                {"id": "olx", "label": "OLX"},
+                {"id": "prozorro", "label": "ProZorro"},
+            ],
+            "statuses": [
+                {"id": "", "label": "Усі"},
+                {"id": "активне", "label": "Активні"},
+                {"id": "неактивне", "label": "Неактивні"},
+            ],
+            "days_options": [0, 1, 7, 30],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _build_batch_job_filters(body: BatchJobStartRequest):
+    from datetime import datetime, timezone
+    from business.services.batch_processing.filters import BatchJobFilters
+
+    def _parse_dt(s: Optional[str]):
+        if not s:
+            return None
+        val = s.strip()
+        if val.endswith("Z"):
+            val = val.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(val)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    return BatchJobFilters(
+        source=body.source or "both",
+        regions=body.regions,
+        status=body.status or None,
+        days=body.days,
+        date_from=_parse_dt(body.date_from),
+        date_to=_parse_dt(body.date_to),
+        load_new=body.load_new,
+        limit=body.limit,
+        force=body.force,
+    )
+
+
+@router.post("/batch-jobs/start")
+def start_batch_job(request: Request, body: BatchJobStartRequest):
+    """
+    Запускає групову задачу обробки даних.
+    job_type: source_reload | recognition_reprocess | address_cache_reprocess
+    """
+    _get_admin_user(request)
+    job_type = (body.job_type or "").strip().lower()
+    if job_type not in ("source_reload", "recognition_reprocess", "address_cache_reprocess"):
+        raise HTTPException(
+            status_code=400,
+            detail="job_type must be source_reload, recognition_reprocess or address_cache_reprocess",
+        )
+
+    settings = request.app.state.settings
+    task_id = str(uuid.uuid4())
+    filters = _build_batch_job_filters(body)
+
+    _batch_job_tasks[task_id] = {
+        "status": "running",
+        "job_type": job_type,
+        "message": "Запуск...",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "progress": None,
+        "result": None,
+    }
+
+    def progress_fn(data: dict):
+        if task_id in _batch_job_tasks:
+            _batch_job_tasks[task_id]["progress"] = data
+            _batch_job_tasks[task_id]["message"] = data.get("message") or _batch_job_tasks[task_id].get("message")
+
+    def run_job():
+        try:
+            if job_type == "source_reload":
+                from business.services.batch_processing.source_reload_service import SourceReloadService
+                svc = SourceReloadService(settings)
+                preview = svc.collect_listings(filters)
+                _batch_job_tasks[task_id]["message"] = f"Перезавантаження: {len(preview)} оголошень..."
+                result = svc.run(filters, progress_fn=progress_fn)
+            elif job_type == "address_cache_reprocess":
+                from business.services.batch_processing.address_cache_reprocess_service import (
+                    AddressCacheReprocessService,
+                )
+                svc = AddressCacheReprocessService(settings)
+                targets = svc.collect_targets(filters)
+                _batch_job_tasks[task_id]["message"] = (
+                    f"Адреси з кешу LLM: {len(targets)} оголошень (без виклику моделі)..."
+                )
+                result = svc.run(filters, progress_fn=progress_fn)
+            else:
+                from business.services.batch_processing.recognition_reprocess_service import RecognitionReprocessService
+                svc = RecognitionReprocessService(settings)
+                olx_n = len(svc.collect_olx_urls(filters)) if "olx" in filters.resolved_sources() else 0
+                pz_n = len(svc.collect_prozorro_ids(filters)) if "prozorro" in filters.resolved_sources() else 0
+                _batch_job_tasks[task_id]["message"] = f"Розпізнавання: OLX {olx_n}, ProZorro {pz_n}..."
+                result = svc.run(filters, progress_fn=progress_fn)
+
+            _batch_job_tasks[task_id]["status"] = "done"
+            _batch_job_tasks[task_id]["result"] = result
+            _batch_job_tasks[task_id]["message"] = (
+                _batch_job_tasks[task_id].get("progress") or {}
+            ).get("message") or "Завершено"
+        except Exception as e:
+            _batch_job_tasks[task_id]["status"] = "error"
+            _batch_job_tasks[task_id]["message"] = f"Помилка: {e!s}"
+
+    threading.Thread(target=run_job, daemon=True, name=f"BatchJob-{job_type}").start()
+    return {"task_id": task_id, "status": "started", "job_type": job_type}
+
+
+@router.get("/batch-jobs/status")
+def batch_job_status(request: Request, task_id: str):
+    """Статус групової задачі обробки даних."""
+    _get_admin_user(request)
+    if task_id not in _batch_job_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    t = _batch_job_tasks[task_id]
+    return {
+        "task_id": task_id,
+        "status": t.get("status"),
+        "job_type": t.get("job_type"),
+        "message": t.get("message"),
+        "started_at": t.get("started_at"),
+        "progress": t.get("progress"),
+        "result": t.get("result"),
+    }
+
+
 @router.post("/reformat-listing")
 def reformat_listing(
     request: Request,
@@ -499,9 +682,22 @@ def get_task_queues_status(request: Request):
 
 @router.post("/task-queues/control")
 def control_task_queue(request: Request, body: TaskQueueControlRequest):
-    """Керування чергою: pause/resume/disable/enable."""
+    """Керування чергою: pause/resume/disable/enable/purge."""
     admin_id, _, _, _ = _get_admin_user(request)
     action = str(body.action or "").strip().lower()
+    tq = TaskQueueService(request.app.state.settings)
+
+    if action == "purge":
+        try:
+            result = tq.purge_queue(
+                body.queue_name,
+                updated_by=str(admin_id),
+                reason=body.reason or "Purged by admin",
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"success": True, "purge": result}
+
     if action in ("resume", "enable"):
         target_state = "running"
     elif action == "pause":
@@ -509,9 +705,11 @@ def control_task_queue(request: Request, body: TaskQueueControlRequest):
     elif action == "disable":
         target_state = "disabled"
     else:
-        raise HTTPException(status_code=400, detail="Unsupported action. Use pause/resume/disable/enable.")
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported action. Use pause/resume/disable/enable/purge.",
+        )
 
-    tq = TaskQueueService(request.app.state.settings)
     try:
         control = tq.set_queue_control_state(
             queue_name=body.queue_name,
@@ -523,6 +721,54 @@ def control_task_queue(request: Request, body: TaskQueueControlRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"success": True, "control": control}
+
+
+@router.post("/task-queues/purge")
+def purge_task_queues(request: Request, body: TaskQueuePurgeRequest):
+    """
+    Очищає черги RabbitMQ + активні background_tasks.
+    queue_name порожній — обидві черги. clear_scheduled=True — деактивує scheduled_events.
+    """
+    admin_id, _, _, _ = _get_admin_user(request)
+    tq = TaskQueueService(request.app.state.settings)
+    reason = body.reason or "Purged by admin"
+    qn = (body.queue_name or "").strip() or None
+
+    try:
+        if qn:
+            purge_result = {"queues": [tq.purge_queue(qn, updated_by=str(admin_id), reason=reason)]}
+        else:
+            purge_result = tq.purge_all_queues(updated_by=str(admin_id), reason=reason)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    scheduled_deactivated = 0
+    if body.clear_scheduled:
+        try:
+            from data.repositories.scheduled_events_repository import ScheduledEventsRepository
+            from datetime import datetime, timezone
+
+            repo = ScheduledEventsRepository()
+            result = repo.collection.update_many(
+                {"is_active": True},
+                {
+                    "$set": {
+                        "is_active": False,
+                        "updated_at": datetime.now(timezone.utc),
+                        "deactivated_reason": reason,
+                        "deactivated_by": str(admin_id),
+                    }
+                },
+            )
+            scheduled_deactivated = int(result.modified_count or 0)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Queues purged, but scheduled clear failed: {e}")
+
+    return {
+        "success": True,
+        "purge": purge_result,
+        "scheduled_deactivated": scheduled_deactivated,
+    }
 
 
 # ---------- Області для LLM-обробки (OLX + ProZorro) ----------
@@ -1699,6 +1945,7 @@ def get_usage_stats(
     from config.llm_pricing import estimate_gemini_cost_usd
     from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
     from business.services.vast_billing_service import (
+        fetch_calendar_range_charges_usd,
         sum_billed_usd_last_n_calendar_days,
         sync_vast_billing_daily_cache,
     )
@@ -1748,24 +1995,39 @@ def get_usage_stats(
         gpu_last_month = logs_repo.sum_gpu_runtime_last_month()
         gpu_by_day: List[Dict[str, Any]] = []
         gpu_by_date = {d.get("date"): d for d in gpu_by_day_raw}
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
+
+        today_utc = datetime.now(timezone.utc).date()
 
         vast_cfg = VastRuntimeSettingsService().get_settings()
         vast_key = str(vast_cfg.get("vast_api_key") or "").strip()
         vast_by_day: Dict[str, float] = {}
         vast_err: Optional[str] = None
         vast_days = max(int(days), 30)
+        range_start = today_utc - timedelta(days=29)
+        range_total: Optional[float] = None
+        range_err: Optional[str] = None
         if vast_key:
-            vast_by_day, vast_err = sync_vast_billing_daily_cache(
+            # Спочатку один запит за 30 UTC-днів (узгоджено з Vast), потім кеш для графіка.
+            range_total, range_err = fetch_calendar_range_charges_usd(
+                vast_key,
+                range_start,
+                today_utc,
+                timeout_sec=120,
+            )
+            if range_err:
+                vast_err = range_err
+            vast_by_day, sync_err = sync_vast_billing_daily_cache(
                 vast_key,
                 days=vast_days,
                 sleep_between_sec=0.05,
                 timeout_sec=120,
             )
+            if sync_err:
+                vast_err = vast_err or sync_err
 
-        today = datetime.utcnow().date()
         for i in range(days - 1, -1, -1):
-            day = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+            day = (today_utc - timedelta(days=i)).strftime("%Y-%m-%d")
             row = gpu_by_date.get(day) or {}
             sec = float(row.get("active_seconds") or 0.0)
             log_billed = float(row.get("billed_cost_usd") or 0.0)
@@ -1787,15 +2049,30 @@ def get_usage_stats(
         gpu_total_billed = float(gpu_total.get("billed_cost_usd") or 0.0)
         gpu_month_from_logs = float(gpu_last_month.get("billed_cost_usd") or 0.0)
         billed_last_month = gpu_month_from_logs
+        if vast_key:
+            if range_err is None and range_total is not None:
+                billed_last_month = float(range_total)
+            elif vast_by_day:
+                # Якщо частина днів відсутня у vast_by_day (API transient), добираємо з teardown-логів.
+                blended_last_month = 0.0
+                for j in range(30):
+                    dk = (today_utc - timedelta(days=j)).strftime("%Y-%m-%d")
+                    if dk in vast_by_day:
+                        blended_last_month += float(vast_by_day.get(dk) or 0.0)
+                    else:
+                        day_row = gpu_by_date.get(dk) or {}
+                        blended_last_month += float(day_row.get("billed_cost_usd") or 0.0)
+                billed_last_month = round(blended_last_month, 6)
         if vast_key and vast_by_day:
-            billed_last_month = float(
-                sum_billed_usd_last_n_calendar_days(vast_by_day, n=30)
-            )
-            # Одна погоджена з графіком сума Vast за вікно `days` (дні з кеша/API, не дубль з логів)
+            # Узгоджено з графіком: беремо Vast де є, і fallback на billed_cost_usd логів де дня немає.
             sum_chart_vast = 0.0
             for j in range(days - 1, -1, -1):
-                dk = (today - timedelta(days=j)).strftime("%Y-%m-%d")
-                sum_chart_vast += float(vast_by_day.get(dk) or 0.0)
+                dk = (today_utc - timedelta(days=j)).strftime("%Y-%m-%d")
+                if dk in vast_by_day:
+                    sum_chart_vast += float(vast_by_day.get(dk) or 0.0)
+                else:
+                    day_row = gpu_by_date.get(dk) or {}
+                    sum_chart_vast += float(day_row.get("billed_cost_usd") or 0.0)
             gpu_total_billed = round(sum_chart_vast, 6)
 
         return {
@@ -1832,6 +2109,11 @@ def get_usage_stats(
                 "estimated_cost_usd_last_month": round(float(billed_last_month), 6),
                 "sessions_last_month": int(gpu_last_month.get("sessions") or 0),
                 "vast_daily_charges_error": vast_err,
+                "vast_billing_30d_source": (
+                    "range_api"
+                    if vast_key and range_err is None and range_total is not None
+                    else ("daily_cache" if vast_key and vast_by_day else "logs")
+                ),
             },
         }
     except Exception as e:
@@ -1849,6 +2131,44 @@ def get_usage_stats(
             },
             "error": str(e),
         }
+
+
+@router.get("/user-activity")
+def get_user_activity_log(
+    request: Request,
+    category: Optional[str] = Query(None, description="auth | search | listing | report"),
+    action: Optional[str] = Query(None),
+    user_id: Optional[int] = Query(None, ge=1),
+    days: int = Query(7, ge=1, le=90),
+    limit: int = Query(100, ge=1, le=500),
+    skip: int = Query(0, ge=0),
+):
+    """Журнал активності користувачів Mini App, згрупований по користувачу."""
+    _get_admin_user(request)
+    svc = getattr(request.app.state, "user_activity_service", None)
+    if not svc:
+        from business.services.user_activity_log_service import UserActivityLogService
+        svc = UserActivityLogService()
+    user_service = getattr(request.app.state, "user_service", None)
+    profiles: Dict[int, Dict[str, Any]] = {}
+    if user_service:
+        for u in user_service.repository.get_all_users():
+            uid = u.get("user_id")
+            if uid is not None:
+                profiles[int(uid)] = {
+                    "nickname": u.get("nickname"),
+                    "role": u.get("role"),
+                    "is_blocked": u.get("is_blocked", False),
+                }
+    return svc.list_for_admin(
+        category=category,
+        action=action,
+        user_id=user_id,
+        days=days,
+        limit=limit,
+        skip=skip,
+        user_profiles=profiles,
+    )
 
 
 @router.get("/feedback/dislikes")

@@ -10,8 +10,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from domain.models.filter_models import FilterGroup, FindQuery, GeoFilter
 from domain.models.filter_models import FilterElement, FilterGroupType, FilterOperator
-from domain.services.filter_string_service import (
-    filter_string_to_models,
+from domain.services.filter_spec_service import (
+    enrich_filter_spec_geo_ids,
+    filter_spec_to_models,
+    normalize_filter_spec,
 )
 from utils.source_field_mapper import SourceFieldMapper
 
@@ -66,33 +68,38 @@ def find(
     return data, total
 
 
-def find_by_filter_string(
-    filter_string: str,
-    sort: Optional[List[Dict[str, Any]]] = None,
-    limit: int = 50,
-    skip: int = 0,
+def _contradictory_source_eq_message(filter_group: Optional[FilterGroup]) -> Optional[str]:
+    """Повідомлення, якщо в рядку одночасно source=olx AND source=prozorro (неможливо)."""
+    if not filter_group:
+        return None
+    values: List[str] = []
+
+    def walk(group: FilterGroup) -> None:
+        for item in group.items:
+            if isinstance(item, FilterElement):
+                if item.field == "source" and item.operator == FilterOperator.EQ:
+                    v = item.value
+                    if v is not None and str(v).strip():
+                        values.append(str(v).strip().lower())
+            elif isinstance(item, FilterGroup):
+                walk(item)
+
+    walk(filter_group)
+    unique = set(values)
+    if len(unique) > 1:
+        return (
+            "Суперечливі умови по полю «Джерело» в рядку відборів "
+            f"({', '.join(sorted(unique))}): одне оголошення не може бути в двох джерелах одночасно. "
+            "Приберіть «Джерело» з рядка і оберіть OLX + ProZorro у полі «Джерело даних» шаблону."
+        )
+    return None
+
+
+def _merge_date_and_source(
+    filter_group: Optional[FilterGroup],
     date_filter_days: Optional[int] = None,
     source: Optional[str] = None,
-) -> Tuple[Optional[List[Dict[str, Any]]], Optional[int], Optional[str]]:
-    """
-    Парсить рядок фільтрів, виконує пошук. При помилці парсингу повертає (None, None, error).
-    Опційно додає до умов AND: період за датою оновлення у джерелі (date_filter_days)
-    та обмеження полем source (як у шаблонах звітів разом із рядком фільтрів).
-
-    Returns:
-        (list of documents or None, total or None, error message or None)
-    """
-    parse_result = filter_string_to_models(filter_string, collection=COLLECTION)
-    if not parse_result.success:
-        return None, None, parse_result.error
-
-    from business.services.settlement_criteria_resolver import strip_and_apply_settlement_criteria
-
-    filter_group_parsed, geo_filter_parsed = strip_and_apply_settlement_criteria(
-        parse_result.filter_group,
-        parse_result.geo_filter,
-    )
-
+) -> Optional[FilterGroup]:
     from datetime import datetime, timedelta, timezone
 
     phys = lambda f: SourceFieldMapper.get_field_path(f, COLLECTION)
@@ -106,24 +113,85 @@ def find_by_filter_string(
     if src:
         extra_elems.append(FilterElement(field=phys("source"), operator=FilterOperator.EQ, value=src))
 
-    final_filter_group: Optional[FilterGroup]
     if not extra_elems:
-        final_filter_group = filter_group_parsed
-    else:
-        merged: List[Union[FilterElement, FilterGroup]] = []
-        if filter_group_parsed is not None:
-            merged.append(filter_group_parsed)
-        merged.extend(extra_elems)
-        final_filter_group = FilterGroup(group_type=FilterGroupType.AND, items=merged)
+        return filter_group
+    merged: List[Union[FilterElement, FilterGroup]] = []
+    if filter_group is not None:
+        merged.append(filter_group)
+    merged.extend(extra_elems)
+    return FilterGroup(group_type=FilterGroupType.AND, items=merged)
 
+
+def find_by_filter_spec(
+    filter_spec: Optional[Dict[str, Any]] = None,
+    sort: Optional[List[Dict[str, Any]]] = None,
+    limit: int = 50,
+    skip: int = 0,
+    date_filter_days: Optional[int] = None,
+    source: Optional[str] = None,
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[int], Optional[str]]:
+    """
+    Пошук за канонічним FilterSpec (JSON з ключами полів та geo id).
+    Returns: (documents, total, error).
+    """
+    spec = normalize_filter_spec(filter_spec)
+    if spec.get("items"):
+        spec = enrich_filter_spec_geo_ids(spec)
+
+    group, geo, err = filter_spec_to_models(spec)
+    if err:
+        return None, None, err
+
+    src_err = _contradictory_source_eq_message(group)
+    if src_err:
+        return None, None, src_err
+
+    final_group = _merge_date_and_source(group, date_filter_days, source)
     data, total = find(
-        filter_group=final_filter_group,
-        geo_filter=geo_filter_parsed,
+        filter_group=final_group,
+        geo_filter=geo,
         sort=sort,
         limit=limit,
         skip=skip,
     )
     return data, total, None
+
+
+def find_by_filter_string(
+    filter_string: str,
+    sort: Optional[List[Dict[str, Any]]] = None,
+    limit: int = 50,
+    skip: int = 0,
+    date_filter_days: Optional[int] = None,
+    source: Optional[str] = None,
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[int], Optional[str]]:
+    """
+    Legacy: парсить рядок фільтрів і виконує пошук.
+    Для нових шляхів використовуйте find_by_filter_spec.
+    """
+    from domain.services.filter_spec_service import filter_string_to_filter_spec
+
+    text = (filter_string or "").strip()
+    if not text:
+        return find_by_filter_spec(
+            None,
+            sort=sort,
+            limit=limit,
+            skip=skip,
+            date_filter_days=date_filter_days,
+            source=source,
+        )
+    spec, err = filter_string_to_filter_spec(text, collection=COLLECTION)
+    if err:
+        return None, None, err
+    return find_by_filter_spec(
+        spec,
+        sort=sort,
+        limit=limit,
+        skip=skip,
+        date_filter_days=date_filter_days,
+        source=source,
+    )
 
 
 def build_query_from_flat_params(

@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Завантаження сторінок OLX з обмеженнями для зменшення ризику блокування:
-- один запит за раз (без конкурентних запитів);
+- обмежена паралельність list-HTTP між Phase1-потоками;
 - затримка перед запитом;
 - реалістичні заголовки (User-Agent, Accept-Language, Referer).
 """
 
+import threading
 import time
 import sys
 from pathlib import Path
@@ -19,6 +20,19 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from scripts.olx_scraper import config as scraper_config
+
+# Глобальний ліміт паралельних HTTP list-запитів (не detail).
+_list_http_sema: Optional[threading.Semaphore] = None
+_list_http_sema_lock = threading.Lock()
+
+
+def _get_list_http_semaphore() -> threading.Semaphore:
+    global _list_http_sema
+    with _list_http_sema_lock:
+        if _list_http_sema is None:
+            n = max(1, int(getattr(scraper_config, "LIST_HTTP_CONCURRENCY", 1) or 1))
+            _list_http_sema = threading.Semaphore(n)
+        return _list_http_sema
 
 
 def get_session() -> requests.Session:
@@ -61,6 +75,7 @@ def fetch_page(
     Опційно — затримка після отримання (OLX може підвантажувати контент з затримкою).
     session: якщо передано — використовується для повторного використання з'єднання (keep-alive).
     is_detail: True для сторінки оголошення — використовується більший таймаут (REQUEST_DETAIL_TIMEOUT).
+    List-запити (is_detail=False) проходять через глобальний semaphore LIST_HTTP_CONCURRENCY.
     """
     if delay_before:
         sec = scraper_config.get_delay_seconds()
@@ -69,22 +84,27 @@ def fetch_page(
 
     sess = session if session is not None else get_session()
     timeout = getattr(scraper_config, "REQUEST_DETAIL_TIMEOUT", scraper_config.REQUEST_TIMEOUT) if is_detail else scraper_config.REQUEST_TIMEOUT
-    # Referer на головну сторінку категорії при першому запиті не обов'язковий
-    response = sess.get(
-        url,
-        timeout=timeout,
-        allow_redirects=True,
-    )
+
+    def _do_get() -> requests.Response:
+        return sess.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+
+    if is_detail:
+        response = _do_get()
+    else:
+        sema = _get_list_http_semaphore()
+        with sema:
+            response = _do_get()
     response.raise_for_status()
     # Кодування з заголовків або контенту
     if response.encoding == "ISO-8859-1" or not response.apparent_encoding:
         response.encoding = response.apparent_encoding or "utf-8"
 
-    # Затримка після отримання — OLX може показувати 0 оголошень і підвантажувати їх згодом
-    if delay_after and hasattr(scraper_config, "DELAY_AFTER_PAGE_LOAD"):
-        sec = scraper_config.DELAY_AFTER_PAGE_LOAD
-        if sec > 0:
-            print(f"[OLX scraper] Затримка {sec:.1f} с після завантаження сторінки...", flush=True)
-            time.sleep(sec)
+    # HTTP (requests) уже має повний HTML — післязавантажувальна пауза не потрібна.
+    # delay_after залишено в сигнатурі для сумісності; для browser list див. BrowserPageFetcher.
+    _ = delay_after
 
     return response

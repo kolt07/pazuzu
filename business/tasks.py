@@ -157,6 +157,7 @@ def run_source_load_pipeline_task(
     regions: Optional[list] = None,
     listing_types: Optional[list] = None,
     olx_phase1_max_threads: Optional[int] = None,
+    source_load_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     settings = _init_runtime()
     queue = _queue_service(settings)
@@ -174,7 +175,10 @@ def run_source_load_pipeline_task(
         return {"success": False, "skipped": True, "reason": msg}
     if task_id:
         queue.mark_task_started(task_id)
-        queue.heartbeat(task_id, patch={"phase": "source_load_started"})
+        queue.heartbeat(
+            task_id,
+            patch={"phase": "source_load_started", "source_load_run_id": source_load_run_id},
+        )
     try:
         log_fn = _heartbeat_logger(queue, task_id)
         result = run_full_pipeline(
@@ -192,11 +196,13 @@ def run_source_load_pipeline_task(
                 {"phase": "waiting_llm_tasks"},
             ),
             run_phase3=False,
+            source_load_run_id=source_load_run_id,
         )
         logger.info(
-            "[source_load] Core pipeline completed (task_id=%s): raw + promote/main + LLM done. "
+            "[source_load] Core pipeline completed (task_id=%s run_id=%s): raw + promote/main + LLM done. "
             "Task marked SUCCESS. Phase 3 analytics is decoupled from this completion.",
             task_id or "—",
+            source_load_run_id or "—",
         )
         if task_id:
             _safe_queue_heartbeat(
@@ -212,6 +218,18 @@ def run_source_load_pipeline_task(
         return result
     except Exception as e:
         logger.exception("Source-load task failed: %s", e)
+        if source_load_run_id:
+            try:
+                from data.repositories.source_load_run_repository import (
+                    SourceLoadRunRepository,
+                    STATUS_FAILED,
+                )
+                SourceLoadRunRepository().patch_run(
+                    source_load_run_id,
+                    {"status": STATUS_FAILED, "message": str(e)[:2000]},
+                )
+            except Exception:
+                pass
         if task_id:
             queue.mark_task_failed(task_id, str(e))
         _wake_up_flx_sessions_waiting_on(task_id)

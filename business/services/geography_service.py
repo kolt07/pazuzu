@@ -33,12 +33,19 @@ class GeographyService:
         Args:
             address_data: Словник з полями:
                 - region: назва області
-                - oblast_raion / oblast_rayon / raion: район області (не плутати з районом міста)
+                - oblast_raion / oblast_rayon / raion / district: район області (не плутати з районом міста)
                 - settlement/city: НП
+                - settlement_district: район міста → geo_circle(kind=city_district)
                 - geo_circle: назва умовної групи (рядок) або
                   {name, kind?, parent_city_id?, parent_rayon_id?} — сільрада, округ Києва тощо
                 - street_type, street, building, building_part
         """
+        from utils.district_normalizer import sanitize_llm_address_districts
+
+        address_data = sanitize_llm_address_districts(
+            dict(address_data) if isinstance(address_data, dict) else {}
+        )
+
         result = {
             "region_id": None,
             "oblast_rayon_id": None,
@@ -63,6 +70,7 @@ class GeographyService:
             or address_data.get("oblast_rayon")
             or address_data.get("raion")
             or address_data.get("rayon_oblast")
+            or address_data.get("district")
         )
         if raion_name and result["region_id"]:
             try:
@@ -106,8 +114,17 @@ class GeographyService:
                     }
 
         gc_raw = address_data.get("geo_circle")
+        if not gc_raw:
+            settlement_district = address_data.get("settlement_district")
+            if isinstance(settlement_district, str) and settlement_district.strip():
+                gc_raw = {
+                    "name": settlement_district.strip(),
+                    "kind": "city_district",
+                }
         if gc_raw:
             try:
+                address_data = dict(address_data)
+                address_data["geo_circle"] = gc_raw
                 circle_doc = self._resolve_geo_circle(address_data, result)
                 if circle_doc:
                     result["geo_circle_id"] = str(circle_doc["_id"])
@@ -223,11 +240,18 @@ class GeographyService:
         query: str,
         *,
         limit: int = 25,
+        region_id: Optional[str] = None,
+        region_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Пошук НП у довіднику cities з назвою області (для autocomplete)."""
         from utils.settlement_normalizer import build_settlement_picker_options
 
-        cities = self.cities_repo.search_by_name_prefix(query, limit=limit)
+        cities = self.cities_repo.search_by_name_prefix(
+            query,
+            limit=limit,
+            region_id=region_id,
+            region_ids=region_ids,
+        )
         if not cities:
             return []
 

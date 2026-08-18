@@ -44,9 +44,11 @@ class RawOlxListingsRepository(BaseRepository):
         detail: Optional[Dict[str, Any]] = None,
         fetch_filters: Optional[Dict[str, Any]] = None,
         approximate_region: Optional[str] = None,
+        source_load_run_id: Optional[str] = None,
     ) -> bool:
         """
         Створює або оновлює сирий запис. Повертає True якщо запис додано/оновлено.
+        source_load_run_id: stamp для resume Phase 2 (кандидати LLM цього run).
         """
         if not url or not url.strip():
             return False
@@ -78,6 +80,8 @@ class RawOlxListingsRepository(BaseRepository):
             set_fields["fetch_filters"] = fetch_filters
         if approximate_region is not None:
             set_fields["approximate_region"] = approximate_region
+        if source_load_run_id:
+            set_fields["source_load_run_id"] = str(source_load_run_id).strip()
 
         result = self.collection.update_one(
             {"url": url},
@@ -85,6 +89,22 @@ class RawOlxListingsRepository(BaseRepository):
             upsert=True,
         )
         return result.upserted_id is not None or result.modified_count > 0
+
+    def list_urls_by_source_load_run_id(self, run_id: str) -> List[str]:
+        """URL, оновлені під час конкретного source_load run (для Phase 2 resume)."""
+        rid = str(run_id or "").strip()
+        if not rid:
+            return []
+        cursor = self.collection.find(
+            {"source_load_run_id": rid},
+            {"url": 1},
+        )
+        out: List[str] = []
+        for d in cursor:
+            u = (d or {}).get("url")
+            if u:
+                out.append(str(u))
+        return out
 
     def get_by_urls(self, urls: List[str]) -> List[Dict[str, Any]]:
         """Повертає сирі записи за списком URL."""
@@ -105,6 +125,7 @@ class RawOlxListingsRepository(BaseRepository):
         self.collection.create_index("url", unique=True)
         self.collection.create_index("loaded_at")
         self.collection.create_index("approximate_region")
+        self.collection.create_index("source_load_run_id")
 
     def count_by_source(self, source: str) -> int:
         """Повертає кількість записів із fetch_filters.source == source (напр. 'clicker')."""

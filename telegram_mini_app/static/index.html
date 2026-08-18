@@ -11,7 +11,7 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=20260710-geo4">
 </head>
 <body>
   <div id="root">
@@ -54,6 +54,7 @@
         <h2>Адміністрування</h2>
         <nav class="admin-subtabs" role="tablist" aria-label="Розділи адміністрування">
           <button type="button" class="admin-subtab active" data-tab="overview" role="tab" aria-selected="true">Огляд</button>
+          <button type="button" class="admin-subtab" data-tab="activity" role="tab" aria-selected="false">Активність</button>
           <button type="button" class="admin-subtab" data-tab="queues" role="tab" aria-selected="false">Черги задач</button>
           <button type="button" class="admin-subtab" data-tab="data" role="tab" aria-selected="false">Дані та пайплайни</button>
           <button type="button" class="admin-subtab" data-tab="users" role="tab" aria-selected="false">Користувачі</button>
@@ -78,6 +79,33 @@
               <canvas id="admin-chart-gpu-runtime"></canvas>
             </div>
           </div>
+        </div>
+        <div class="admin-block hidden" data-admin-tab="activity">
+          <h3>Активність користувачів</h3>
+          <p class="admin-hint">Журнал авторизацій, пошуків, відкриття оголошень та формування звітів у Mini App.</p>
+          <div class="filter-group admin-activity-filters">
+            <label for="admin-activity-category">Категорія:</label>
+            <select id="admin-activity-category" class="filter-input">
+              <option value="">Усі</option>
+              <option value="auth">Авторизація</option>
+              <option value="search">Пошук</option>
+              <option value="listing">Оголошення</option>
+              <option value="report">Звіт</option>
+            </select>
+            <label for="admin-activity-days">Період (днів):</label>
+            <select id="admin-activity-days" class="filter-input">
+              <option value="1">1</option>
+              <option value="7" selected>7</option>
+              <option value="14">14</option>
+              <option value="30">30</option>
+            </select>
+            <label for="admin-activity-user-id">User ID:</label>
+            <input type="number" id="admin-activity-user-id" placeholder="усі" class="filter-input" style="width:8rem;" />
+            <button type="button" id="admin-activity-refresh" class="btn btn-small">Оновити</button>
+          </div>
+          <p id="admin-activity-summary" class="admin-hint"></p>
+          <div id="admin-activity-list"></div>
+          <button type="button" id="admin-activity-load-more" class="btn btn-small hidden" style="margin-top:0.5rem;">Завантажити ще</button>
         </div>
         <div class="admin-block" data-admin-tab="config">
           <h3>Vast.ai / vLLM (parsing pipeline)</h3>
@@ -157,6 +185,7 @@
           </div>
           <div class="admin-data-update-actions" style="margin-top: 0.75rem;">
             <button type="button" id="admin-queue-refresh" class="btn btn-small">Оновити стан черг</button>
+            <button type="button" id="admin-queue-purge-all" class="btn btn-danger btn-small">Очистити всі черги</button>
           </div>
         </div>
         <div class="admin-block" data-admin-tab="users">
@@ -224,6 +253,59 @@
             </div>
           </div>
           <div id="admin-data-update-status" class="admin-data-update-status hidden"></div>
+        </div>
+        <div class="admin-block" data-admin-tab="data">
+          <h3>Групова обробка даних</h3>
+          <p class="admin-hint">Перезавантаження з джерел, повторне розпізнавання raw або переобробка адрес з кешу LLM (без виклику моделі).</p>
+          <div class="filter-group">
+            <label for="admin-batch-job-type">Тип задачі:</label>
+            <select id="admin-batch-job-type" class="filter-select">
+              <option value="source_reload">Перезавантаження з джерел</option>
+              <option value="recognition_reprocess">Повторне розпізнавання</option>
+              <option value="address_cache_reprocess">Адреси з кешу LLM</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label for="admin-batch-source">Джерело:</label>
+            <select id="admin-batch-source" class="filter-select">
+              <option value="both">OLX + ProZorro</option>
+              <option value="olx">Тільки OLX</option>
+              <option value="prozorro">Тільки ProZorro</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label for="admin-batch-days">Період (дні):</label>
+            <select id="admin-batch-days" class="filter-select">
+              <option value="0">Усі дати</option>
+              <option value="1">1 день</option>
+              <option value="7" selected>7 днів</option>
+              <option value="30">30 днів</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label for="admin-batch-status">Актуальність:</label>
+            <select id="admin-batch-status" class="filter-select">
+              <option value="">Усі</option>
+              <option value="активне">Активні</option>
+              <option value="неактивне">Неактивні</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label>Області (опційно):</label>
+            <div id="admin-batch-regions" class="admin-targeted-checkbox-group"></div>
+          </div>
+          <div class="filter-group">
+            <label for="admin-batch-limit">Ліміт (опційно):</label>
+            <input type="number" id="admin-batch-limit" min="1" max="10000" placeholder="без обмеження" class="filter-input" style="width: 8rem;" />
+          </div>
+          <div class="filter-group" id="admin-batch-load-new-group">
+            <label><input type="checkbox" id="admin-batch-load-new" /> Вантажити нові з джерел після оновлення наявних</label>
+          </div>
+          <div class="filter-group">
+            <label><input type="checkbox" id="admin-batch-force" /> Примусово (навіть без змін у джерелі)</label>
+          </div>
+          <button type="button" id="admin-batch-start" class="btn btn-primary">Запустити групову задачу</button>
+          <div id="admin-batch-job-status" class="admin-data-update-status hidden"></div>
         </div>
         <div class="admin-block" data-admin-tab="data">
           <h3>Стан скрапера OLX</h3>
@@ -435,15 +517,16 @@
                 <option value="7" selected>За тиждень</option>
                 <option value="30">За 30 днів</option>
               </select>
-              <p class="search-filter-hint" style="margin-top: 0.35rem;">Період та джерело додаються до умов пошуку разом із рядком відборів (AND).</p>
+              <p class="search-filter-hint" style="margin-top: 0.35rem;">Період та джерело додаються до умов пошуку разом із відборами (AND).</p>
             </div>
-            <div class="filter-group filter-string-group">
-              <label for="constructor-filter-string">Рядок відборів</label>
-              <p class="search-filter-hint">Той самий формат, що й на сторінці пошуку: можна вставити текст або зібрати умови кнопкою «Створити фільтри».</p>
-              <textarea id="constructor-filter-string" class="filter-textarea filter-string-input" rows="8" placeholder='Наприклад: "Джерело" = olx AND "Активність" = True'></textarea>
+            <div class="filter-group">
+              <label>Відбори оголошень</label>
+              <div id="constructor-filter-chips" class="filter-chips hidden"></div>
+              <p id="constructor-filter-summary-text" class="search-filter-summary-text">Відбори не задано</p>
               <div class="filter-string-actions">
-                <button type="button" id="constructor-build-filters" class="btn btn-secondary">Створити фільтри</button>
-                <button type="button" id="constructor-clear-filter-string" class="btn btn-ghost">Очистити рядок</button>
+                <button type="button" id="constructor-open-facets" class="btn btn-primary">Фільтри</button>
+                <button type="button" id="constructor-build-filters" class="btn btn-secondary">Розширені</button>
+                <button type="button" id="constructor-clear-filters" class="btn btn-ghost">Очистити</button>
               </div>
             </div>
             <div class="filter-group">
@@ -488,14 +571,16 @@
         <p class="intro intro-search">Зведений пошук оголошень з OLX та ProZorro</p>
         <nav class="search-subtabs" role="tablist" aria-label="Підвкладки пошуку">
           <button type="button" id="search-subtab-results" class="search-subtab active" role="tab" aria-selected="true" aria-controls="search-tab-results" data-tab="results">Результати</button>
-          <button type="button" id="search-subtab-settings" class="search-subtab" role="tab" aria-selected="false" aria-controls="search-tab-settings" data-tab="settings">Фільтри та сортування</button>
+          <button type="button" id="search-subtab-settings" class="search-subtab" role="tab" aria-selected="false" aria-controls="search-tab-settings" data-tab="settings">Сортування</button>
         </nav>
         <div id="search-tab-results" class="search-tab-pane active" role="tabpanel" aria-labelledby="search-subtab-results">
           <div class="search-results-toolbar">
             <div class="search-filter-summary">
-              <span id="search-filter-summary-text" class="search-filter-summary-text">Рядок відборів не задано</span>
+              <div id="search-filter-chips" class="filter-chips hidden"></div>
+              <span id="search-filter-summary-text" class="search-filter-summary-text">Відбори не задано</span>
               <button type="button" id="search-run-from-results" class="btn btn-primary">Шукати</button>
-              <button type="button" id="search-open-settings-tab" class="btn btn-ghost">Налаштування фільтрів</button>
+              <button type="button" id="search-open-facets" class="btn btn-ghost">Фільтри</button>
+              <button type="button" id="search-open-settings-tab" class="btn btn-ghost">Сортування</button>
             </div>
             <div class="search-sort-summary">
               <span id="search-sort-summary-text" class="search-sort-summary-text">За датою, новіші</span>
@@ -514,18 +599,14 @@
           </div>
         </div>
         <div id="search-tab-settings" class="search-tab-pane" role="tabpanel" aria-labelledby="search-subtab-settings">
-          <div id="search-filters" class="search-filters search-filter-string-block">
-            <p class="search-filter-hint">Вставте рядок відборів або зберіть умови кнопкою «Створити фільтри».</p>
-            <div class="filter-group filter-string-group">
-              <label for="filter-string" class="filter-string-label">Рядок відборів</label>
-              <textarea id="filter-string" class="filter-textarea filter-string-input" rows="10" placeholder='Наприклад: "Джерело" = olx AND "Активність" = True AND geo(\'Область\' INSIDE \'Київська\')'></textarea>
-              <div class="filter-string-actions">
-                <button type="button" id="search-by-filter-string" class="btn btn-primary">Шукати</button>
-                <button type="button" id="search-build-filters" class="btn btn-secondary">Створити фільтри</button>
-                <button type="button" id="search-clear-filter-string" class="btn btn-ghost">Очистити</button>
-              </div>
-              <span id="filter-string-error" class="filter-string-error hidden" role="alert"></span>
+          <div id="search-filters" class="search-filters">
+            <div class="filter-string-actions" style="margin-bottom: 0.75rem;">
+              <button type="button" id="search-open-facets-settings" class="btn btn-primary">Фільтри</button>
+              <button type="button" id="search-build-filters" class="btn btn-secondary">Розширені</button>
+              <button type="button" id="search-clear-filters" class="btn btn-ghost">Очистити відбори</button>
+              <button type="button" id="search-by-filter-string" class="btn btn-primary">Шукати</button>
             </div>
+            <span id="filter-string-error" class="filter-string-error hidden" role="alert"></span>
           </div>
           <div class="search-controls-row search-settings-controls">
             <div class="search-sort-header">
@@ -553,15 +634,13 @@
           <div class="map-panel">
             <div class="search-results-toolbar map-toolbar">
               <div class="search-filter-summary">
-                <span id="map-filter-summary-text" class="search-filter-summary-text">Рядок відборів не задано</span>
+                <div id="map-filter-chips" class="filter-chips hidden"></div>
+                <span id="map-filter-summary-text" class="search-filter-summary-text">Відбори не задано</span>
                 <button type="button" id="map-run-search" class="btn btn-primary">Шукати</button>
-                <button type="button" id="map-build-filters" class="btn btn-secondary">Створити фільтри</button>
+                <button type="button" id="map-open-facets" class="btn btn-ghost">Фільтри</button>
+                <button type="button" id="map-build-filters" class="btn btn-secondary">Розширені</button>
               </div>
-              <div class="filter-group filter-string-group map-filter-string-group">
-                <label for="map-filter-string" class="filter-string-label">Рядок відборів</label>
-                <textarea id="map-filter-string" class="filter-textarea filter-string-input" rows="4" placeholder='Наприклад: "Джерело" = olx AND geo(\'Область\' INSIDE \'Київська\')'></textarea>
-                <span id="map-filter-string-error" class="filter-string-error hidden" role="alert"></span>
-              </div>
+              <span id="map-filter-string-error" class="filter-string-error hidden" role="alert"></span>
             </div>
             <div id="map-results" class="map-results">
               <div id="map-loading" class="hidden">Завантаження...</div>
@@ -571,13 +650,27 @@
           </div>
         </div>
       </div>
+      <div id="facet-filters-panel" class="facet-filters-panel hidden" role="dialog" aria-modal="true" aria-labelledby="facet-filters-title">
+        <div class="facet-filters-sheet">
+          <div class="facet-filters-header">
+            <h3 id="facet-filters-title">Фільтри</h3>
+            <button type="button" id="facet-filters-close" class="btn btn-ghost btn-small" aria-label="Закрити">×</button>
+          </div>
+          <div id="facet-filters-body" class="facet-filters-body"></div>
+          <div class="facet-filters-footer">
+            <button type="button" id="facet-filters-reset" class="btn btn-ghost">Скинути</button>
+            <button type="button" id="facet-filters-advanced" class="btn btn-secondary">Розширені</button>
+            <button type="button" id="facet-filters-apply" class="btn btn-primary">Застосувати</button>
+          </div>
+        </div>
+      </div>
       <div id="filter-builder-modal" class="modal-overlay hidden">
         <div class="modal-content modal-filter-builder">
-          <h3>Фільтри</h3>
+          <h3>Розширені відбори</h3>
           <p class="modal-hint">Дерево умов: рядки — елементи або гео, гілки — групи І/АБО.</p>
           <div id="filter-builder-tree" class="filter-tree"></div>
           <div class="modal-actions">
-            <button type="button" id="filter-builder-insert" class="btn btn-primary">Вставити рядок</button>
+            <button type="button" id="filter-builder-insert" class="btn btn-primary">Застосувати</button>
             <button type="button" id="filter-builder-cancel" class="btn btn-secondary">Скасувати</button>
           </div>
         </div>
@@ -590,6 +683,7 @@
     </div>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
-  <script src="/static/app.js?v=20260526-settlement-geo-match"></script>
+  <script src="/static/listing_filters.js?v=20260710-geo4"></script>
+  <script src="/static/app.js?v=20260710-geo4"></script>
 </body>
 </html>

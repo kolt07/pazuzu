@@ -25,6 +25,7 @@ EXPECTED_COLLECTIONS = frozenset({
     "olx_listings",
     "raw_olx_listings",
     "raw_prozorro_auctions",
+    "source_load_runs",
     "unified_listings",
     "llm_cache",
     # Аналітика та знання
@@ -50,6 +51,7 @@ EXPECTED_COLLECTIONS = frozenset({
     # Користувачі, сесії, логи
     "users",
     "logs",
+    "user_activity_log",
     "llm_exchange_logs",
     "llm_feedback",
     "chat_sessions",
@@ -119,6 +121,26 @@ def main() -> int:
     else:
         print("Зайвих колекцій не виявлено.")
         print()
+
+    # М'яка перевірка: шаблони звітів мають params.filter (FilterSpec)
+    if "report_templates" in existing:
+        try:
+            col = db["report_templates"]
+            total = col.count_documents({})
+            with_filter = col.count_documents({"params.filter": {"$exists": True}})
+            legacy_only = col.count_documents({
+                "params.filter_string": {"$exists": True, "$nin": [None, ""]},
+                "params.filter": {"$exists": False},
+            })
+            print("report_templates: всього=%s з params.filter=%s лише legacy filter_string=%s" % (
+                total, with_filter, legacy_only
+            ))
+            if legacy_only:
+                print("  Підказка: запустіть py scripts/migrations/063_report_templates_filter_spec.py")
+            print()
+        except Exception as e:
+            print("Не вдалося перевірити params.filter у report_templates:", e)
+            print()
 
     return 0 if not missing else 1
 

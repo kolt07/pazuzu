@@ -123,7 +123,7 @@ def run_olx_clicker_scraper(
             )
             log(f"[OLX clicker] Відкриваю {start_url}")
             page.goto(start_url, wait_until="domcontentloaded")
-            time.sleep(2 + random.uniform(1, 3))  # імітація перегляду
+            time.sleep(scraper_config.get_delay_seconds())
 
             for page_num in range(1, max_pages + 1):
                 if page_num > 1:
@@ -132,7 +132,7 @@ def run_olx_clicker_scraper(
                     )
                     log(f"[OLX clicker] Сторінка {page_num}: {next_url}")
                     page.goto(next_url, wait_until="domcontentloaded")
-                    time.sleep(1.5 + random.uniform(0.5, 2))
+                    time.sleep(scraper_config.get_delay_seconds())
 
                 html = page.content()
                 antibot = detect_antibot_page(html)
@@ -167,11 +167,13 @@ def run_olx_clicker_scraper(
                     if existing and (existing.get("search_data_hash") == new_hash):
                         continue
 
-                    time.sleep(random.uniform(2, 6))  # затримка між відкриттям оголошень
+                    time.sleep(scraper_config.get_delay_detail_seconds())
                     try:
                         wait_until = getattr(scraper_config, "BROWSER_DETAIL_WAIT_UNTIL", "load")
                         page.goto(url, wait_until=wait_until)
-                        time.sleep(1.5 + random.uniform(0.5, 2.5))
+                        settle = scraper_config.get_detail_post_goto_settle_seconds()
+                        if settle > 0:
+                            time.sleep(settle)
                         for sel in (
                             '[data-cy="ad_description"]',
                             '[data-cy="ad_description_content"]',
@@ -184,7 +186,7 @@ def run_olx_clicker_scraper(
                             except Exception:
                                 continue
                         else:
-                            time.sleep(2)
+                            time.sleep(min(2.0, scraper_config.get_delay_seconds()))
                         detail_html = page.content()
                         detail_data = parse_detail_page(detail_html)
                         if detail_data.get("_inactive"):

@@ -21,6 +21,7 @@ from typing import Dict, Any
 from config.settings import Settings
 from business.services.llm_service import LLMService
 from business.services.llm_cache_service import LLMCacheService
+from utils.address_geo_enrichment import build_listing_context, enrich_llm_geo_result
 from utils.hash_utils import calculate_object_version_hash, calculate_description_hash
 from utils.land_area_utils import (
     coerce_land_area_sqm,
@@ -201,6 +202,7 @@ class OlxLLMExtractorService:
         self,
         search_data: Dict[str, Any],
         detail: Dict[str, Any],
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         """
         Застосовує LLM до оголошення OLX, повертає структуровані дані.
@@ -214,9 +216,10 @@ class OlxLLMExtractorService:
             return {}
 
         # Кеш: якщо такий самий текст ми вже парсили — повертаємо з кешу
-        cached = self.cache_service.get_cached_result(description_text)
-        if cached is not None:
-            return cached
+        if not force_refresh:
+            cached = self.cache_service.get_cached_result(description_text)
+            if cached is not None:
+                return cached
 
         # Виклик LLM: використовуємо наявний parse_auction_description (нерухомість)
         try:
@@ -224,6 +227,10 @@ class OlxLLMExtractorService:
         except Exception as e:
             print(f"[OlxLLMExtractor] Помилка при виклику LLM: {e}")
             return {}
+
+        if isinstance(result, dict):
+            listing_context = build_listing_context(search_data, detail)
+            result = enrich_llm_geo_result(result, listing_context=listing_context)
 
         # Захист від типового зсуву масштабу площі землі (x10) при значеннях у "сотках".
         # Напр.: "38 соток" -> має бути 3800 м², а не 380 або 38000.

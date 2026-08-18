@@ -160,55 +160,97 @@ class UnifiedListingsService:
             return m.group(1).strip() or None
         return None
 
+    @staticmethod
+    def _geocode_result_specificity(result: Dict[str, Any]) -> int:
+        """Вищий score = точніша адреса (вулиця/місто важливіші за APPROXIMATE область)."""
+        struct = result.get("address_structured") or {}
+        if not isinstance(struct, dict):
+            struct = {}
+        score = 0
+        if struct.get("street_number"):
+            score += 8
+        if struct.get("street"):
+            score += 4
+        if struct.get("city"):
+            score += 2
+        if struct.get("sublocality"):
+            score += 1
+        types = result.get("types") or []
+        if "administrative_area_level_1" in types and not struct.get("city"):
+            score -= 10
+        location_type = (result.get("location_type") or "").upper()
+        if location_type == "ROOFTOP":
+            score += 3
+        elif location_type == "APPROXIMATE":
+            score -= 2
+        return score
+
+    def _pick_geocode_result(
+        self,
+        results: List[Dict[str, Any]],
+        query_text: str,
+    ) -> Dict[str, Any]:
+        """
+        Обирає найкращий геокод-результат.
+        Спочатку за точністю (місто/вулиця > область), серед рівних — збіг області з query.
+        """
+        if len(results) == 1:
+            return results[0]
+
+        ranked = sorted(
+            results,
+            key=self._geocode_result_specificity,
+            reverse=True,
+        )
+        best_score = self._geocode_result_specificity(ranked[0])
+        top = [r for r in ranked if self._geocode_result_specificity(r) == best_score]
+        if len(top) == 1:
+            return top[0]
+
+        query_region = self._extract_region_from_query(query_text)
+        if query_region:
+            qr_lower = query_region.lower()
+            for r in top:
+                region = ((r.get("address_structured") or {}).get("region") or "")
+                if region and qr_lower in region.lower():
+                    return r
+        return top[0]
+
     def _normalize_address_from_geocode(
-        self, geocode_result: Dict[str, Any]
+        self,
+        geocode_result: Dict[str, Any],
+        location_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Нормалізує адресу з результату геокодування в уніфікований формат.
-        Якщо query_text містить область і є кілька результатів — обираємо той, чий регіон збігається.
-        
-        Args:
-            geocode_result: Результат з geocoding_service.geocode()
-            
-        Returns:
-            Словник з нормалізованою адресою або None
+        Серед кількох результатів обираємо найточніший (не «Київська область» замість вулиці в Києві).
+        Результати, що суперечать location_context, відкидаються.
         """
+        from utils.address_geo_enrichment import (
+            address_contradicts_location_context,
+            filter_geocode_results_by_location_context,
+        )
+
         results = geocode_result.get("results", [])
         if not results:
             return None
-        
+
+        results = filter_geocode_results_by_location_context(results, location_context)
+        if not results:
+            return None
+
         query_text = (geocode_result.get("query_text") or "").strip()
-        query_region = self._extract_region_from_query(query_text)
-        
-        # Якщо в запиті є область — шукаємо результат, що їй відповідає
-        if query_region and len(results) > 1:
-            qr_lower = query_region.lower()
-            for r in results:
-                addr_struct = r.get("address_structured", {})
-                region = addr_struct.get("region") or ""
-                if region and qr_lower in region.lower():
-                    result = r
-                    break
-            else:
-                result = results[0]
-        else:
-            result = results[0]
-        address_structured = result.get("address_structured", {})
-        
-        # Визначаємо повноту адреси
-        # Повна адреса має street та street_number
+        result = self._pick_geocode_result(results, query_text)
+        address_structured = result.get("address_structured", {}) or {}
+
         is_complete = bool(
             address_structured.get("street") and address_structured.get("street_number")
         )
-        
-        # Перевіряємо, чи координати не є просто центром населеного пункту
-        # Якщо location_type == "APPROXIMATE" - це приблизна локація
+
         location_type = result.get("location_type", "")
         if location_type == "APPROXIMATE" and not is_complete:
             is_complete = False
-        
-        # district = район області (administrative_area_level_2)
-        # city_district = район міста (sublocality) — для великих міст при наявності вулиці
+
         address = {
             "region": address_structured.get("region"),
             "settlement": address_structured.get("city") or address_structured.get("sublocality"),
@@ -216,7 +258,7 @@ class UnifiedListingsService:
             "city_district": address_structured.get("sublocality"),
             "street": address_structured.get("street"),
             "building": address_structured.get("street_number"),
-            "apartment": None,  # Не витягується з геокодування
+            "apartment": None,
             "coordinates": {
                 "latitude": result.get("latitude"),
                 "longitude": result.get("longitude"),
@@ -224,7 +266,10 @@ class UnifiedListingsService:
             "is_complete": is_complete,
             "formatted_address": result.get("formatted_address", ""),
         }
-        
+
+        if address_contradicts_location_context(address, location_context):
+            return None
+
         return address
 
     def _extract_addresses_from_olx(self, olx_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -232,11 +277,23 @@ class UnifiedListingsService:
         Витягує та нормалізує адреси з документа OLX.
         Пріоритет: адреси з resolved_locations (порядок — LLM спочатку, потім raw, city, location).
         При кількох результатах геокодування обираємо той, чий регіон збігається з query_text.
+        Адреси, що суперечать location_context картки/LLM, не зберігаються.
         """
+        from utils.address_geo_enrichment import (
+            build_address_from_llm_or_context,
+            filter_addresses_by_location_context,
+            resolve_listing_location_context,
+        )
+
         addresses = []
         
         # Перевіряємо resolved_locations (порядок уже виставлений в helpers: LLM → raw → city → location)
-        detail = olx_doc.get("detail", {})
+        detail = olx_doc.get("detail", {}) or {}
+        search_data = olx_doc.get("search_data", {}) or {}
+        location_context = resolve_listing_location_context(
+            search_data=search_data,
+            detail_data=detail,
+        )
         resolved_locations = detail.get("resolved_locations", [])
         
         for loc in resolved_locations:
@@ -247,26 +304,39 @@ class UnifiedListingsService:
                     "results": results,
                     "query_text": query_text,
                 }
-                addr = self._normalize_address_from_geocode(geocode_result)
+                addr = self._normalize_address_from_geocode(
+                    geocode_result,
+                    location_context=location_context,
+                )
                 if addr:
                     addresses.append(addr)
-        
-        # Якщо немає resolved_locations, пробуємо геокодувати з location
+
+        # Без Google: LLM / картка НП (склейка «Місто, район» часто без resolved)
         if not addresses:
-            search_data = olx_doc.get("search_data", {})
+            addresses = build_address_from_llm_or_context(
+                search_data=search_data,
+                detail_data=detail,
+                location_context=location_context,
+            )
+        
+        # Якщо немає resolved_locations і fallback — пробуємо геокодувати з location
+        if not addresses:
             location = search_data.get("location")
             if location:
                 try:
                     geocode_result = self.geocoding_service.geocode(
                         query=location, region="ua", caller="unified_listings_olx"
                     )
-                    addr = self._normalize_address_from_geocode(geocode_result)
+                    addr = self._normalize_address_from_geocode(
+                        geocode_result,
+                        location_context=location_context,
+                    )
                     if addr:
                         addresses.append(addr)
                 except Exception as e:
                     logger.warning(f"Помилка геокодування OLX location {location}: {e}")
-        
-        return addresses
+
+        return filter_addresses_by_location_context(addresses, location_context)
 
     def _extract_addresses_from_prozorro(
         self, prozorro_doc: Dict[str, Any]
@@ -769,14 +839,21 @@ class UnifiedListingsService:
         
         return area_info
 
-    def sync_olx_listing(self, olx_url: str, usd_rate_override: Optional[float] = None) -> bool:
+    def sync_olx_listing(
+        self,
+        olx_url: str,
+        usd_rate_override: Optional[float] = None,
+        *,
+        side_effects: bool = True,
+    ) -> bool:
         """
         Синхронізує одне оголошення OLX в зведену таблицю.
-        
+
         Args:
             olx_url: URL оголошення OLX
             usd_rate_override: опційний курс USD для конвертації (напр. з reformat)
-            
+            side_effects: якщо False — без ОНМ і vector index (швидкий geo-resync)
+
         Returns:
             True якщо успішно
         """
@@ -801,7 +878,7 @@ class UnifiedListingsService:
             unified_stored = ok or bool(
                 self.unified_repo.find_by_source_id("olx", unified_doc.get("source_id") or olx_url)
             )
-            if unified_stored:
+            if unified_stored and side_effects:
                 try:
                     from business.services.real_estate_objects_service import RealEstateObjectsService
                     reo_service = RealEstateObjectsService()

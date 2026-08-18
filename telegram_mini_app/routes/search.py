@@ -13,6 +13,11 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from telegram_mini_app.auth import validate_telegram_init_data
+from telegram_mini_app.user_activity import (
+    record_listing_view,
+    record_search_export,
+    record_search_query,
+)
 from data.repositories.unified_listings_repository import UnifiedListingsRepository
 from data.repositories.olx_listings_repository import OlxListingsRepository, _olx_url_variants
 from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepository
@@ -1029,8 +1034,9 @@ def search_unified(
 
 
 class SearchByFilterRequest(BaseModel):
-    """Тіло запиту пошуку за рядком фільтрів або деревом."""
-    filter_string: Optional[str] = None
+    """Тіло запиту пошуку за FilterSpec (канонічний) або legacy filter_string."""
+    filter: Optional[Dict[str, Any]] = None
+    filter_string: Optional[str] = None  # legacy
     sort_field: str = "source_updated_at"
     sort_order: str = "desc"
     limit: int = 50
@@ -1043,21 +1049,46 @@ def search_by_filter(
     body: SearchByFilterRequest,
 ):
     """
-    Пошук за рядком фільтрів (формат: "Активність" = True AND "Дата в джерелі" >= '...' AND geo('Область' INSIDE 'Київська')).
-    Якщо filter_string порожній або відсутній — повертаються усі активні оголошення з урахуванням limit/skip.
+    Пошук за FilterSpec (структурований JSON з ключами полів та geo id).
+    Legacy: filter_string DSL підтримується для сумісності.
+    Порожній filter — усі активні оголошення з урахуванням limit/skip.
     """
     user_id, user_service = _get_validated_user(request)
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
 
-    from domain.services.unified_search_service import find_by_filter_string
+    from domain.services.unified_search_service import find_by_filter_spec, find_by_filter_string
+    from domain.services.filter_spec_service import normalize_filter_spec
 
-    data, total, err = find_by_filter_string(
-        filter_string=body.filter_string or "",
-        sort=[{"field": body.sort_field, "order": -1 if body.sort_order == "desc" else 1}],
-        limit=min(body.limit, 200),
-        skip=max(0, body.skip),
-    )
+    sort = [{"field": body.sort_field, "order": -1 if body.sort_order == "desc" else 1}]
+    limit = min(body.limit, 200)
+    skip = max(0, body.skip)
+
+    if body.filter is not None:
+        data, total, err = find_by_filter_spec(
+            filter_spec=normalize_filter_spec(body.filter),
+            sort=sort,
+            limit=limit,
+            skip=skip,
+        )
+        active_filter = body.filter
+    elif body.filter_string and str(body.filter_string).strip():
+        data, total, err = find_by_filter_string(
+            filter_string=body.filter_string,
+            sort=sort,
+            limit=limit,
+            skip=skip,
+        )
+        active_filter = None
+    else:
+        data, total, err = find_by_filter_spec(
+            filter_spec=None,
+            sort=sort,
+            limit=limit,
+            skip=skip,
+        )
+        active_filter = None
+
     if err is not None:
         raise HTTPException(status_code=400, detail=err)
 
@@ -1083,35 +1114,53 @@ def search_by_filter(
         "limit": body.limit,
         "skip": body.skip,
     }
-    hint = _geo_search_hint_when_empty(body.filter_string or "", total or 0)
+    hint = _geo_search_hint_when_empty(body.filter_string or "", total or 0, filter_spec=active_filter)
     if hint:
         payload["geo_search_hint"] = hint
+    record_search_query(
+        request,
+        user_id,
+        total=total or 0,
+        filter_string=body.filter_string,
+        limit=body.limit,
+        skip=body.skip,
+    )
     return _sanitize_json_floats(payload)
 
 
-def _geo_search_hint_when_empty(filter_string: str, total: int) -> Optional[str]:
+def _geo_search_hint_when_empty(
+    filter_string: str,
+    total: int,
+    filter_spec: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Підказка, якщо геофільтр по НП коректний, але оголошень у БД немає."""
-    if total > 0 or not (filter_string or "").strip():
+    if total > 0:
         return None
-    from domain.services.filter_string_service import filter_string_to_models
+    from domain.services.filter_spec_service import filter_spec_to_models, filter_string_to_filter_spec
     from domain.models.filter_models import GeoFilterElement, GeoFilterGroup
     from data.database.connection import MongoDBConnection
     from utils.settlement_geo_match import build_unified_listings_settlement_match
 
-    parsed = filter_string_to_models(filter_string)
-    if not parsed.success or not parsed.geo_filter:
+    geo_filter = None
+    if filter_spec:
+        _g, geo_filter, _err = filter_spec_to_models(filter_spec)
+    elif (filter_string or "").strip():
+        spec, err = filter_string_to_filter_spec(filter_string)
+        if err or not spec:
+            return None
+        _g, geo_filter, _err = filter_spec_to_models(spec)
+    if not geo_filter:
         return None
 
     def _walk(node):
         if isinstance(node, GeoFilterElement):
-            if node.geo_type == "settlement" and node.value:
+            if node.geo_type == "settlement" and (node.value or getattr(node, "city_id", None)):
                 yield node
         elif isinstance(node, GeoFilterGroup):
             for it in node.items:
                 yield from _walk(it)
 
-    root = parsed.geo_filter.root
-    elems = list(_walk(root))
+    elems = list(_walk(geo_filter.root))
     if not elems:
         return None
 
@@ -1124,7 +1173,7 @@ def _geo_search_hint_when_empty(filter_string: str, total: int) -> Optional[str]
         region = getattr(el, "region", None)
         city_id = getattr(el, "city_id", None)
         mongo = build_unified_listings_settlement_match(
-            str(el.value),
+            str(el.value or ""),
             region=region,
             city_id=city_id,
         )
@@ -1134,8 +1183,8 @@ def _geo_search_hint_when_empty(filter_string: str, total: int) -> Optional[str]
             from utils.ukraine_regions import normalize_region_for_repository_lookup
 
             gs = GeographyService()
-            in_catalog = False
-            if region:
+            in_catalog = bool(city_id and gs.cities_repo.find_by_id(str(city_id)))
+            if not in_catalog and region and el.value:
                 reg = gs.regions_repo.find_by_name(
                     normalize_region_for_repository_lookup(region) or region
                 )
@@ -1145,8 +1194,9 @@ def _geo_search_hint_when_empty(filter_string: str, total: int) -> Optional[str]
                     )
                     in_catalog = bool(found)
             if in_catalog:
+                label = el.value or city_id or "НП"
                 return (
-                    f"Населений пункт «{el.value}» є в довіднику"
+                    f"Населений пункт «{label}» є в довіднику"
                     + (f" ({region})" if region else "")
                     + ", але в зведеній таблиці немає жодного оголошення з цією адресою."
                 )
@@ -1155,7 +1205,7 @@ def _geo_search_hint_when_empty(filter_string: str, total: int) -> Optional[str]
 
 @router.get("/filter-fields")
 def get_filter_fields(request: Request):
-    """Повертає конфіг полів та гео для конструктора фільтрів (рядок пошуку)."""
+    """Повертає конфіг полів та гео для конструктора фільтрів."""
     user_id, user_service = _get_validated_user(request)
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
@@ -1163,11 +1213,84 @@ def get_filter_fields(request: Request):
     return get_builder_config("unified_listings")
 
 
+class FacetsToFilterRequest(BaseModel):
+    facets: Dict[str, Any]
+
+
+class FilterToFacetsRequest(BaseModel):
+    filter: Dict[str, Any]
+
+
+@router.post("/facets-to-filter")
+def facets_to_filter_endpoint(request: Request, body: FacetsToFilterRequest):
+    """Фасетний стан UI → FilterSpec."""
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+    from domain.services.filter_spec_service import facets_to_filter_spec, enrich_filter_spec_geo_ids
+    spec = enrich_filter_spec_geo_ids(facets_to_filter_spec(body.facets or {}))
+    return {"filter": spec}
+
+
+@router.post("/filter-to-facets")
+def filter_to_facets_endpoint(request: Request, body: FilterToFacetsRequest):
+    """FilterSpec → фасетний стан (або is_simple=false для Advanced)."""
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+    from domain.services.filter_spec_service import filter_spec_to_facet_state, filter_spec_summary
+    facets, is_simple = filter_spec_to_facet_state(body.filter)
+    return {
+        "facets": facets,
+        "is_simple": is_simple,
+        "summary": filter_spec_summary(body.filter),
+    }
+
+
+class FilterTreeRequest(BaseModel):
+    """Дерево Advanced → FilterSpec (без DSL)."""
+    root: Dict[str, Any]
+
+
+@router.post("/filter-from-tree")
+def filter_from_tree_endpoint(request: Request, body: FilterTreeRequest):
+    """Конструктор дерева → канонічний FilterSpec."""
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+    from domain.services.filter_spec_service import enrich_filter_spec_geo_ids, normalize_filter_spec
+    root = body.root or {}
+    spec = normalize_filter_spec({
+        "version": 1,
+        "group_type": root.get("group_type") or "and",
+        "items": root.get("items") or [],
+    })
+    return {"filter": enrich_filter_spec_geo_ids(spec)}
+
 class FilterStructureRequest(BaseModel):
     """Тіло запиту для перетворення структури фільтрів на рядок. Або root (дерево), або filters+geo (плоский список)."""
     root: Optional[Dict[str, Any]] = None  # дерево: { group_type: "and"|"or", items: [ {type, ...} ] }
     filters: Optional[List[Dict[str, Any]]] = None
     geo: Optional[List[Dict[str, Any]]] = None
+
+
+class FilterStringToTreeRequest(BaseModel):
+    """Тіло запиту: рядок відборів → дерево конструктора."""
+    filter_string: str = ""
+
+
+@router.post("/filter-string-to-tree")
+def filter_string_to_tree_endpoint(request: Request, body: FilterStringToTreeRequest):
+    """Парсить рядок відборів у дерево (group_type + items) для редагування в конструкторі."""
+    user_id, user_service = _get_validated_user(request)
+    if not user_service.is_user_authorized(user_id):
+        raise HTTPException(status_code=403, detail="User not authorized")
+    from domain.services.filter_string_service import filter_string_to_tree
+
+    root, err = filter_string_to_tree(body.filter_string or "", collection="unified_listings")
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    return {"root": root}
 
 
 @router.post("/filter-string-from-structure")
@@ -1193,6 +1316,7 @@ def filter_string_from_structure_endpoint(request: Request, body: FilterStructur
 
 class ExportSearchRequest(BaseModel):
     """Параметри експорту результатів пошуку."""
+    filter: Optional[Dict[str, Any]] = None
     filter_string: Optional[str] = None
     source: Optional[str] = None
     region: Optional[str] = None
@@ -1237,7 +1361,22 @@ def export_search_results(request: Request, body: ExportSearchRequest):
     if actual_sort == "source_updated_at":
         sort_list.append(("system_updated_at", sort_direction))
 
-    if body.filter_string and body.filter_string.strip():
+    if body.filter is not None:
+        from domain.services.unified_search_service import find_by_filter_spec
+        from domain.services.filter_spec_service import normalize_filter_spec
+        sort_spec = [{"field": actual_sort, "order": -1 if body.sort_order == "desc" else 1}]
+        if actual_sort == "source_updated_at":
+            sort_spec.append({"field": "system_updated_at", "order": -1 if body.sort_order == "desc" else 1})
+        data, _total, err = find_by_filter_spec(
+            filter_spec=normalize_filter_spec(body.filter),
+            sort=sort_spec,
+            limit=10000,
+            skip=0,
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        docs = [_normalize_unified_doc(d) for d in (data or [])]
+    elif body.filter_string and body.filter_string.strip():
         from domain.services.unified_search_service import find_by_filter_string
         sort_spec = [{"field": actual_sort, "order": -1 if body.sort_order == "desc" else 1}]
         if actual_sort == "source_updated_at":
@@ -1310,6 +1449,14 @@ def export_search_results(request: Request, body: ExportSearchRequest):
     excel_bytes = generate_excel_in_memory(rows, columns, headers)
     content = excel_bytes.getvalue()
 
+    record_search_export(
+        request,
+        user_id,
+        rows_count=len(rows),
+        via_bot=False,
+        filter_string=body.filter_string,
+    )
+
     from urllib.parse import quote
     filename = "Зведена_таблиця.xlsx"
     encoded = quote(filename, safe="")
@@ -1337,7 +1484,22 @@ def send_export_via_bot(request: Request, body: ExportSearchRequest):
     if actual_sort == "source_updated_at":
         sort_list.append(("system_updated_at", sort_direction))
 
-    if body.filter_string and body.filter_string.strip():
+    if body.filter is not None:
+        from domain.services.unified_search_service import find_by_filter_spec
+        from domain.services.filter_spec_service import normalize_filter_spec
+        sort_spec = [{"field": actual_sort, "order": -1 if body.sort_order == "desc" else 1}]
+        if actual_sort == "source_updated_at":
+            sort_spec.append({"field": "system_updated_at", "order": -1 if body.sort_order == "desc" else 1})
+        data, _total, err = find_by_filter_spec(
+            filter_spec=normalize_filter_spec(body.filter),
+            sort=sort_spec,
+            limit=10000,
+            skip=0,
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        docs = [_normalize_unified_doc(d) for d in (data or [])]
+    elif body.filter_string and body.filter_string.strip():
         from domain.services.unified_search_service import find_by_filter_string
         sort_spec = [{"field": actual_sort, "order": -1 if body.sort_order == "desc" else 1}]
         if actual_sort == "source_updated_at":
@@ -1417,18 +1579,51 @@ def send_export_via_bot(request: Request, body: ExportSearchRequest):
     ok = send_file_via_telegram(user_id, content, filename, bot_token)
     if not ok:
         raise HTTPException(status_code=500, detail="Не вдалося надіслати файл через бота")
+    record_search_export(
+        request,
+        user_id,
+        rows_count=len(rows),
+        via_bot=True,
+        filter_string=body.filter_string,
+    )
     return {"success": True, "message": "Файл надіслано в чат бота"}
 
 
 @router.get("/unified/filters/regions")
 def get_unified_regions(request: Request):
-    """Отримує список унікальних областей з зведеної таблиці (через GeographyService)."""
+    """Канонічний список областей з id (без сміття з довідника)."""
     user_id, user_service = _get_validated_user(request)
     if not user_service.is_user_authorized(user_id):
         raise HTTPException(status_code=403, detail="User not authorized")
 
-    return {"regions": get_ua_region_options()}
+    canonical = get_ua_region_options()
+    by_name: Dict[str, str] = {}
+    try:
+        from business.services.geography_service import GeographyService
+        from utils.ukraine_regions import normalize_region_for_repository_lookup
 
+        for r in GeographyService().get_all_regions():
+            name = (r.get("name") or "").strip()
+            if not name or r.get("_id") is None:
+                continue
+            by_name[name] = str(r["_id"])
+            lookup = normalize_region_for_repository_lookup(name) or name
+            if lookup and lookup not in by_name:
+                by_name[lookup] = str(r["_id"])
+    except Exception:
+        pass
+
+    regions = []
+    for name in canonical:
+        rid = by_name.get(name)
+        if not rid:
+            try:
+                from utils.ukraine_regions import normalize_region_for_repository_lookup
+                rid = by_name.get(normalize_region_for_repository_lookup(name) or "")
+            except Exception:
+                rid = None
+        regions.append({"id": rid, "name": name})
+    return {"regions": regions}
 
 # Міста зі спеціальним статусом (не входять до складу областей)
 _CITIES_WITH_SPECIAL_STATUS = ["Київ", "Севастополь"]
@@ -1545,6 +1740,10 @@ def search_unified_settlements(
     request: Request,
     q: Optional[str] = Query(None, description="Префікс назви НП (мін. 2 символи)"),
     limit: Optional[int] = Query(25, ge=1, le=50),
+    region_id: Optional[str] = Query(None, description="Обмежити пошук однією областю"),
+    region_ids: Optional[str] = Query(
+        None, description="Кілька region_id через кому (якщо обрано кілька областей)"
+    ),
 ):
     """Autocomplete НП по довіднику cities (усі області, з дизамбігуацією)."""
     user_id, user_service = _get_validated_user(request)
@@ -1555,6 +1754,12 @@ def search_unified_settlements(
     if len(query) < 2:
         return _sanitize_json_floats({"options": [], "count": 0})
 
+    ids: List[str] = []
+    if region_ids and str(region_ids).strip():
+        ids = [p.strip() for p in str(region_ids).split(",") if p.strip()]
+    elif region_id and str(region_id).strip():
+        ids = [str(region_id).strip()]
+
     try:
         from business.services.geography_service import GeographyService
 
@@ -1562,6 +1767,7 @@ def search_unified_settlements(
         options = geography_service.search_settlements_catalog(
             query,
             limit=int(limit or 25),
+            region_ids=ids or None,
         )
         catalog_size = geography_service.cities_repo.collection.count_documents(
             geography_service.cities_repo._active_city_filter()
@@ -1665,6 +1871,7 @@ def get_unified_detail(
     except Exception:
         pass
     item["_detail_type"] = "unified"
+    record_listing_view(request, user_id, source=source.lower(), source_id=source_id)
     return item
 
 
@@ -1943,6 +2150,7 @@ def get_olx_item(request: Request, item_id: str):
             if unified_doc and unified_doc.get("price_notes"):
                 doc["price_notes"] = unified_doc["price_notes"]
                 break
+    record_listing_view(request, user_id, source="olx", source_id=item_id)
     return doc
 
 
@@ -1984,6 +2192,7 @@ def get_prozorro_item(request: Request, item_id: str):
     unified_doc = unified_repo.find_by_source_id("prozorro", doc.get("auction_id") or item_id)
     if unified_doc and unified_doc.get("price_notes"):
         doc["price_notes"] = unified_doc["price_notes"]
+    record_listing_view(request, user_id, source="prozorro", source_id=item_id)
     return doc
 
 

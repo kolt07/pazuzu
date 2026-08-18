@@ -40,6 +40,7 @@ class RawProzorroAuctionsRepository(BaseRepository):
         auction_data: Dict[str, Any],
         fetch_context: Optional[Dict[str, Any]] = None,
         approximate_region: Optional[str] = None,
+        source_load_run_id: Optional[str] = None,
     ) -> bool:
         """
         Створює або оновлює сирий запис. Повертає True якщо запис додано/оновлено.
@@ -58,6 +59,8 @@ class RawProzorroAuctionsRepository(BaseRepository):
             set_fields["fetch_context"] = fetch_context
         if approximate_region is not None:
             set_fields["approximate_region"] = approximate_region
+        if source_load_run_id:
+            set_fields["source_load_run_id"] = str(source_load_run_id).strip()
 
         result = self.collection.update_one(
             {"auction_id": auction_id},
@@ -65,6 +68,18 @@ class RawProzorroAuctionsRepository(BaseRepository):
             upsert=True,
         )
         return result.upserted_id is not None or result.modified_count > 0
+
+    def list_auction_ids_by_source_load_run_id(self, run_id: str) -> List[str]:
+        rid = str(run_id or "").strip()
+        if not rid:
+            return []
+        cursor = self.collection.find({"source_load_run_id": rid}, {"auction_id": 1})
+        out: List[str] = []
+        for d in cursor:
+            aid = (d or {}).get("auction_id")
+            if aid:
+                out.append(str(aid))
+        return out
 
     def get_by_auction_ids(self, auction_ids: List[str]) -> List[Dict[str, Any]]:
         """Повертає сирі записи за списком auction_id."""
@@ -81,3 +96,4 @@ class RawProzorroAuctionsRepository(BaseRepository):
         self.collection.create_index("auction_id", unique=True)
         self.collection.create_index("loaded_at")
         self.collection.create_index("approximate_region")
+        self.collection.create_index("source_load_run_id")
