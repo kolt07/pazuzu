@@ -24,6 +24,7 @@ _FACET_ELEMENT_FIELDS = frozenset({
     "status",
     "source",
     "property_type",
+    "deal_type",
     "price_uah",
     "price_usd",
     "building_area_sqm",
@@ -50,7 +51,7 @@ _RANGE_FIELDS = frozenset({
     "price_per_ha_usd",
 })
 
-_MULTI_EQ_FIELDS = frozenset({"status", "source", "property_type"})
+_MULTI_EQ_FIELDS = frozenset({"status", "source", "property_type", "deal_type"})
 
 
 def empty_filter_spec() -> Dict[str, Any]:
@@ -304,6 +305,7 @@ def empty_facet_state() -> Dict[str, Any]:
         "status": [],
         "source": [],
         "property_type": [],
+        "deal_type": [],
         "price_currency": "uah",
         "price_uah": {"min": None, "max": None},
         "price_usd": {"min": None, "max": None},
@@ -354,6 +356,7 @@ def facets_to_filter_spec(facets: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     _add_multi("status", f.get("status"))
     _add_multi("source", f.get("source"))
     _add_multi("property_type", f.get("property_type"))
+    _add_multi("deal_type", f.get("deal_type"))
 
     currency = str(f.get("price_currency") or "uah").strip().lower()
     price_field = "price_usd" if currency == "usd" else "price_uah"
@@ -743,6 +746,9 @@ def filter_spec_summary(spec: Optional[Dict[str, Any]]) -> str:
         parts.append(str(p))
     for st in facets.get("status") or []:
         parts.append(str(st))
+    _deal_labels = {"sale": "Продаж", "rent": "Оренда"}
+    for dt in facets.get("deal_type") or []:
+        parts.append(_deal_labels.get(str(dt), str(dt)))
     currency = str(facets.get("price_currency") or "uah").lower()
     price = facets.get("price_usd") if currency == "usd" else facets.get("price_uah")
     price = price or {}

@@ -1084,6 +1084,12 @@ collections:
         description: "Тип оголошення: 'Земельна ділянка', 'Комерційна нерухомість', 'Земельна ділянка з нерухомістю', 'інше'"
         enum: ["Земельна ділянка", "Комерційна нерухомість", "Земельна ділянка з нерухомістю", "інше"]
         indexed: true
+      deal_type:
+        type: "string"
+        required: false
+        description: "Тип угоди: продаж (sale) або оренда (rent). Для оренди price_uah — ставка як у джерелі (зазвичай грн/міс.)."
+        enum: ["sale", "rent"]
+        indexed: true
       title:
         type: "string"
         required: false
@@ -1231,6 +1237,10 @@ collections:
         type: "string"
         description: "Тип оголошення"
         usage: "Фільтр за типом нерухомості"
+      deal_type:
+        type: "string"
+        description: "Тип угоди: sale (продаж) або rent (оренда)"
+        usage: "Фільтр продажу/оренди; за замовчуванням sale"
       building_area_sqm:
         type: "number"
         description: "Площа нерухомості (м²)"

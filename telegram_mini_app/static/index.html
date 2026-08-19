@@ -624,6 +624,45 @@
           </div>
         </div>
       </div>
+      <div id="screen-market-research" class="hidden">
+        <p class="intro intro-research">Точковий пошук у OLX і ProZorro за фільтрами, стандартний pipeline і статистична довідка (без LLM-аналітики).</p>
+        <div class="search-results-toolbar">
+          <div class="search-filter-summary">
+            <div id="research-filter-chips" class="filter-chips hidden"></div>
+            <span id="research-filter-summary-text" class="search-filter-summary-text">Відбори не задано</span>
+            <button type="button" id="research-open-facets" class="btn btn-ghost">Фільтри</button>
+            <button type="button" id="research-build-filters" class="btn btn-secondary">Розширені</button>
+            <button type="button" id="research-clear-filters" class="btn btn-ghost">Очистити</button>
+          </div>
+        </div>
+        <div class="research-extra-filters">
+          <fieldset class="research-deal-types">
+            <legend>Тип угоди</legend>
+            <label><input type="checkbox" id="research-deal-sale" checked> Продаж</label>
+            <label><input type="checkbox" id="research-deal-rent"> Оренда</label>
+          </fieldset>
+          <label class="research-depth">
+            Глибина пошуку
+            <select id="research-depth" class="filter-select">
+              <option value="">без обмежень</option>
+              <option value="7">7 днів</option>
+              <option value="30">30 днів</option>
+              <option value="90">90 днів</option>
+              <option value="365">365 днів</option>
+            </select>
+          </label>
+          <button type="button" id="research-start" class="btn btn-primary">Запустити дослідження</button>
+          <button type="button" id="research-cancel" class="btn btn-ghost hidden">Скасувати</button>
+        </div>
+        <div id="research-status" class="research-status hidden" role="status"></div>
+        <div id="research-history" class="research-history"></div>
+        <div id="research-report" class="research-report hidden"></div>
+        <div id="research-results" class="search-results">
+          <div id="research-results-count" class="search-results-count hidden"></div>
+          <div id="research-items" class="search-items"></div>
+          <div id="research-pagination" class="search-pagination"></div>
+        </div>
+      </div>
       <div id="screen-map" class="hidden">
         <p class="intro intro-map">Оголошення на карті за поточними фільтрами та видимою областю</p>
         <div class="map-layout">

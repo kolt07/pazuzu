@@ -48,6 +48,7 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
         result_expires=3600,
         task_routes={
             "business.tasks.run_source_load_pipeline_task": {"queue": "source_load"},
+            "business.tasks.run_market_research_task": {"queue": "source_load"},
             "business.tasks.cadastral_national_cluster_build_task": {"queue": "source_load"},
             "business.tasks.backfill_real_estate_objects_task": {"queue": "source_load"},
             "business.tasks.process_olx_llm_task": {"queue": "llm_processing"},

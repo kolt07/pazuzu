@@ -1,0 +1,34 @@
+# Префікси / procedure_type для ProZorro.Sale Search API.
+# sellingMethod виглядає як landRental-english; procedure_type — родина без типу аукціону.
+# Джерело: документація Search (POST /api/search/procedures), поля sellingMethod, procedure_type.
+
+rent_procedure_types:
+  - legitimatePropertyLease
+  - landRental
+  - commercialPropertyLease
+  - propertyLease
+  - basicLease
+
+sale_procedure_types:
+  - smallPrivatization
+  - largePrivatization
+  - bankRuptcy
+  - bankruptcy
+  - simpleSell
+  - commercialSell
+  - landSell
+  - basicSell
+  - alienation
+  - nonperformingLoans
+  - governmentFactoring
+  - armaProperty
+  - timber
+  - subsoil
+  - railwayCargo
+  - dgf
+
+rent_selling_method_substrings:
+  - lease
+  - rental
+  - оренд
+  - аренд

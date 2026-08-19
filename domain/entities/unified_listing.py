@@ -49,6 +49,11 @@ class UnifiedListing(BaseEntity):
         return self.get_property("property_type") or ""
 
     @property
+    def deal_type(self) -> str:
+        """Тип угоди: sale (продаж) або rent (оренда)."""
+        return self.get_property("deal_type") or "sale"
+
+    @property
     def title(self) -> str:
         """Заголовок оголошення."""
         return self.get_property("title") or ""

@@ -1,3 +1,8 @@
+## 2026-08-19 — Дослідження ринку
+
+- **Запит**: окрема вкладка Mini App для точкового пошуку в джерелах за фільтрами користувача і статистичної довідки (не Flx).
+- **Дії**: `deal_type` (sale/rent) на `unified_listings` + дефолт sale у пошуку; `SourceFilterMapper` / OLX rent URL + extra query; ProZorro POST `/api/search/procedures`; `MarketResearchService` у черзі `source_load`; вкладка «Дослідження ринку»; аналітика без LLM.
+
 ## 2026-08-11 — OLX list 403: backoff + browser fallback
 
 - **Запит**: логи Phase1 — масові `403 Forbidden` на list URL (Вінницька, комерція/земля), сторінки скіпались після 3 коротких спроб.

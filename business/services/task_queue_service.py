@@ -172,6 +172,30 @@ class TaskQueueService:
         )
         return {"task_id": async_result.id, "queue": self.SOURCE_LOAD_QUEUE, "source_load_run_id": run_id}
 
+    def enqueue_market_research(
+        self,
+        research_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if self.get_queue_control_state(self.SOURCE_LOAD_QUEUE) == "disabled":
+            raise RuntimeError("Queue source_load is disabled by admin.")
+        payload = {"research_id": str(research_id)}
+        if self._celery is None:
+            raise RuntimeError("Task queue is not available because Celery is not installed.")
+        async_result = self._celery.send_task(
+            "business.tasks.run_market_research_task",
+            kwargs=payload,
+            queue=self.SOURCE_LOAD_QUEUE,
+        )
+        self._repo.register_task(
+            async_result.id,
+            "run_market_research_task",
+            self.SOURCE_LOAD_QUEUE,
+            payload=payload,
+            metadata=dict(metadata or {}),
+        )
+        return {"task_id": async_result.id, "queue": self.SOURCE_LOAD_QUEUE, "queued": True}
+
     def list_llm_batch_tasks(self, batch_id: str) -> List[Dict[str, Any]]:
         return self._repo.list_by_batch_id(batch_id)
 

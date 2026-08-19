@@ -21,6 +21,7 @@ COLLECTION = "unified_listings"
 DEFAULT_SORT_FIELD = "source_updated_at"
 DEFAULT_SORT_ORDER = -1
 DEFAULT_STATUS_ACTIVE = "активне"
+DEFAULT_DEAL_TYPE_SALE = "sale"
 
 
 def find(
@@ -31,6 +32,7 @@ def find(
     skip: int = 0,
     fields: Optional[List[str]] = None,
     default_status_active: bool = True,
+    default_deal_type_sale: bool = True,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     Виконує пошук по unified_listings за деревом фільтрів та геофільтром.
@@ -51,6 +53,8 @@ def find(
 
     if default_status_active:
         filter_group = _with_default_status(filter_group, COLLECTION)
+    if default_deal_type_sale:
+        filter_group = _with_default_deal_type(filter_group, COLLECTION)
     query = FindQuery(
         filters=filter_group,
         geo_filters=geo_filter,
@@ -129,6 +133,8 @@ def find_by_filter_spec(
     skip: int = 0,
     date_filter_days: Optional[int] = None,
     source: Optional[str] = None,
+    default_status_active: bool = True,
+    default_deal_type_sale: bool = True,
 ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[int], Optional[str]]:
     """
     Пошук за канонічним FilterSpec (JSON з ключами полів та geo id).
@@ -153,6 +159,8 @@ def find_by_filter_spec(
         sort=sort,
         limit=limit,
         skip=skip,
+        default_status_active=default_status_active,
+        default_deal_type_sale=default_deal_type_sale,
     )
     return data, total, None
 
@@ -164,6 +172,8 @@ def find_by_filter_string(
     skip: int = 0,
     date_filter_days: Optional[int] = None,
     source: Optional[str] = None,
+    default_status_active: bool = True,
+    default_deal_type_sale: bool = True,
 ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[int], Optional[str]]:
     """
     Legacy: парсить рядок фільтрів і виконує пошук.
@@ -180,6 +190,8 @@ def find_by_filter_string(
             skip=skip,
             date_filter_days=date_filter_days,
             source=source,
+            default_status_active=default_status_active,
+            default_deal_type_sale=default_deal_type_sale,
         )
     spec, err = filter_string_to_filter_spec(text, collection=COLLECTION)
     if err:
@@ -191,6 +203,8 @@ def find_by_filter_string(
         skip=skip,
         date_filter_days=date_filter_days,
         source=source,
+        default_status_active=default_status_active,
+        default_deal_type_sale=default_deal_type_sale,
     )
 
 
@@ -330,6 +344,33 @@ def _with_default_status(
     if not filter_group or not filter_group.items:
         return FilterGroup(group_type=FilterGroupType.AND, items=[status_elem])
     return FilterGroup(group_type=FilterGroupType.AND, items=[status_elem, filter_group])
+
+
+def _with_default_deal_type(
+    filter_group: Optional[FilterGroup],
+    collection: str,
+) -> Optional[FilterGroup]:
+    """Додає deal_type=sale, якщо у фільтрі ще немає deal_type (щоб оренда не змішувалась із продажем)."""
+    from domain.models.filter_models import FilterElement, FilterGroupType, FilterOperator
+
+    phys = SourceFieldMapper.get_field_path("deal_type", collection)
+
+    def has_deal_type(gr: Optional[FilterGroup]) -> bool:
+        if not gr:
+            return False
+        for item in gr.items:
+            if isinstance(item, FilterElement) and item.field in ("deal_type", phys):
+                return True
+            if isinstance(item, FilterGroup) and has_deal_type(item):
+                return True
+        return False
+
+    if has_deal_type(filter_group):
+        return filter_group
+    deal_elem = FilterElement(field=phys, operator=FilterOperator.EQ, value=DEFAULT_DEAL_TYPE_SALE)
+    if not filter_group or not filter_group.items:
+        return FilterGroup(group_type=FilterGroupType.AND, items=[deal_elem])
+    return FilterGroup(group_type=FilterGroupType.AND, items=[deal_elem, filter_group])
 
 
 def get_search_fields_config(collection: str = "unified_listings") -> Dict[str, Any]:

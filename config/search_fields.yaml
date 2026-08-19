@@ -22,6 +22,10 @@ collections:
         label_uk: "Тип оголошення"
         value_type: "string"
         allowed_operators: [eq, ne, in, nin]
+      deal_type:
+        label_uk: "Тип угоди"
+        value_type: "string"
+        allowed_operators: [eq, ne, in, nin]
       title:
         label_uk: "Заголовок"
         value_type: "string"

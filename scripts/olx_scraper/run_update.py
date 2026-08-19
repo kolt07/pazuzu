@@ -398,6 +398,7 @@ def _process_category_raw_only(
     start_page: int = 1,
     source_load_run_id: Optional[str] = None,
     on_page_done: Optional[Callable[[int], None]] = None,
+    deal_type: Optional[str] = None,
 ) -> Tuple[int, List[str]]:
     """
     Phase 1 (raw pipeline): list HTTP → одразу detail+upsert по сторінці (streaming, low-RAM).
@@ -421,6 +422,12 @@ def _process_category_raw_only(
     fetch_filters: Dict[str, Any] = {"category_label": category_label}
     if region_name:
         fetch_filters["region_filter"] = region_name
+    if deal_type:
+        fetch_filters["deal_type"] = deal_type
+    elif "(оренда)" in (category_label or ""):
+        fetch_filters["deal_type"] = "rent"
+    else:
+        fetch_filters["deal_type"] = "sale"
     approximate_region = region_name
 
     while True:
@@ -653,6 +660,7 @@ def _process_region_raw_only(
             session=session,
             region_name=region_name,
             browser_fetcher=browser_fetcher,
+            deal_type=cat.get("deal_type"),
         )
         total_count += n_listings
         loaded_urls.extend(urls)
@@ -936,6 +944,7 @@ def _phase1_worker(
             start_page=start_page,
             source_load_run_id=source_load_run_id,
             on_page_done=on_page_done,
+            deal_type=cat.get("deal_type"),
         )
         if run_repo and source_load_run_id:
             run_repo.mark_unit_done(source_load_run_id, unit_key)
@@ -1021,6 +1030,12 @@ def run_olx_update_raw_only(
     llm_process_url_fn: Optional[Callable[[str], bool]] = None,
     llm_enqueue_region_filter_fn: Optional[Callable[[str], bool]] = None,
     source_load_run_id: Optional[str] = None,
+    deal_types: Optional[List[str]] = None,
+    extra_query_pairs: Optional[List[Tuple[str, str]]] = None,
+    building_area_min: Optional[float] = None,
+    building_area_max: Optional[float] = None,
+    land_area_sotky_min: Optional[float] = None,
+    land_area_sotky_max: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Phase 1 pipeline: завантаження сирих даних OLX лише в raw_olx_listings (без LLM, без olx_listings).
@@ -1067,7 +1082,14 @@ def run_olx_update_raw_only(
             else:
                 print(msg, flush=True)
 
-    regions_with_cats = _build_regions_with_categories()
+    regions_with_cats = _build_regions_with_categories(
+        deal_types=deal_types,
+        extra_query_pairs=extra_query_pairs,
+        building_area_min=building_area_min,
+        building_area_max=building_area_max,
+        land_area_sotky_min=land_area_sotky_min,
+        land_area_sotky_max=land_area_sotky_max,
+    )
     regions_with_cats = _filter_regions_with_categories(
         regions_with_cats,
         regions_filter=regions,
@@ -1271,6 +1293,7 @@ def run_olx_update_raw_only(
                                 start_page=start_page,
                                 source_load_run_id=source_load_run_id,
                                 on_page_done=on_page_done,
+                                deal_type=cat.get("deal_type"),
                             )
                             total_listings += n_list
                             if not source_load_run_id:
@@ -1587,17 +1610,67 @@ def _process_llm_pending(
 
 # Базові категорії: нежитлова нерухомість + земля по типах (без с/г).
 # Земля: окрема категорія на тип з olx_land_type_slugs — фільтрація на рівні URL OLX.
-def _get_base_categories() -> List[Dict[str, Any]]:
-    """Повертає базові категорії: комерційна + земля по типах (без с/г)."""
-    cats: List[Dict[str, Any]] = [
-        {"label": "Нежитлова нерухомість", "get_list_url": scraper_config.get_commercial_real_estate_list_url},
-    ]
+def _get_base_categories(
+    deal_types: Optional[List[str]] = None,
+    extra_query_pairs: Optional[List[Tuple[str, str]]] = None,
+    building_area_min: Optional[float] = None,
+    building_area_max: Optional[float] = None,
+    land_area_sotky_min: Optional[float] = None,
+    land_area_sotky_max: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Повертає базові категорії: комерційна + земля по типах (без с/г).
+
+    deal_types: sale та/або rent. За замовчуванням лише продаж.
+    extra_query_pairs: додаткові search[...] параметри OLX (ціна, query).
+    """
+    from utils.deal_type import DEAL_RENT, DEAL_SALE, normalize_deal_types
+
+    types = normalize_deal_types(deal_types)
+    extra = list(extra_query_pairs or [])
+    cats: List[Dict[str, Any]] = []
+
+    def _comm_fn(dt: str):
+        return lambda p, fn=scraper_config.get_commercial_real_estate_list_url, deal=dt, extra_q=extra, **kw: fn(
+            p,
+            deal_type=deal,
+            extra_query_pairs=extra_q,
+            area_from_m2=building_area_min,
+            area_to_m2=building_area_max,
+            **{k: v for k, v in kw.items() if k in ("region_slug", "sort_newest", "sale_only")},
+        )
+
+    def _land_fn(dt: str, land_slug: Optional[str]):
+        return lambda p, fn=scraper_config.get_land_list_url, deal=dt, lt=land_slug, extra_q=extra, **kw: fn(
+            p,
+            land_type_slug=lt,
+            deal_type=deal,
+            extra_query_pairs=extra_q,
+            land_area_from_sotok=land_area_sotky_min,
+            land_area_to_sotok=land_area_sotky_max,
+            **{k: v for k, v in kw.items() if k in ("region_slug", "sort_newest")},
+        )
+
     land_slugs = scraper_config.get_olx_land_type_slugs()
-    for label, slug in land_slugs.items():
-        get_fn = lambda p, fn=scraper_config.get_land_list_url, lt=slug, **kw: fn(p, land_type_slug=lt, **kw)
-        cats.append({"label": f"Земля — {label}", "get_list_url": get_fn})
-    if not land_slugs:
-        cats.append({"label": "Земельні ділянки", "get_list_url": scraper_config.get_land_list_url})
+    for dt in types:
+        suffix = " (оренда)" if dt == DEAL_RENT else ""
+        cats.append({
+            "label": f"Нежитлова нерухомість{suffix}",
+            "deal_type": dt,
+            "get_list_url": _comm_fn(dt),
+        })
+        if land_slugs:
+            for label, slug in land_slugs.items():
+                cats.append({
+                    "label": f"Земля — {label}{suffix}",
+                    "deal_type": dt,
+                    "get_list_url": _land_fn(dt, slug),
+                })
+        else:
+            cats.append({
+                "label": f"Земельні ділянки{suffix}",
+                "deal_type": dt,
+                "get_list_url": _land_fn(dt, None),
+            })
     return cats
 
 
@@ -1637,28 +1710,40 @@ def _build_region_categories() -> List[Dict[str, Any]]:
     return categories
 
 
-def _build_regions_with_categories() -> List[Tuple[str, List[Dict[str, Any]]]]:
+def _build_regions_with_categories(
+    deal_types: Optional[List[str]] = None,
+    extra_query_pairs: Optional[List[Tuple[str, str]]] = None,
+    building_area_min: Optional[float] = None,
+    building_area_max: Optional[float] = None,
+    land_area_sotky_min: Optional[float] = None,
+    land_area_sotky_max: Optional[float] = None,
+) -> List[Tuple[str, List[Dict[str, Any]]]]:
     """
-    Групує категорії по областях. Кожна область має 2 категорії: нежитлова + земля.
+    Групує категорії по областях. Кожна область має категорії: нежитлова + земля (± оренда).
     Повертає [(region_name, [cat1, cat2]), ...] для паралельної обробки.
     """
     slugs = scraper_config.get_olx_region_slugs()
+    base_cats = _get_base_categories(
+        deal_types=deal_types,
+        extra_query_pairs=extra_query_pairs,
+        building_area_min=building_area_min,
+        building_area_max=building_area_max,
+        land_area_sotky_min=land_area_sotky_min,
+        land_area_sotky_max=land_area_sotky_max,
+    )
     if not slugs:
-        # Fallback: один «регіон» з двома категоріями без фільтра
-        return [
-            ("Україна", [
-                {"label": "Нежитлова нерухомість", "get_list_url": scraper_config.get_commercial_real_estate_list_url, "max_pages": scraper_config.MAX_SEARCH_PAGES},
-                {"label": "Земельні ділянки", "get_list_url": scraper_config.get_land_list_url, "max_pages": scraper_config.MAX_SEARCH_PAGES},
-            ]),
-        ]
+        return [("Україна", [
+            {**c, "max_pages": scraper_config.MAX_SEARCH_PAGES} for c in base_cats
+        ])]
     result = []
     for region_name, region_slug in slugs.items():
         cats = []
-        for base in _get_base_categories():
+        for base in base_cats:
             get_fn = base["get_list_url"]
             get_list_url = lambda p, fn=get_fn, rs=region_slug: fn(p, region_slug=rs)
             cats.append({
                 "label": f"{base['label']} — {region_name}",
+                "deal_type": base.get("deal_type") or "sale",
                 "get_list_url": get_list_url,
                 "max_pages": scraper_config.MAX_SEARCH_PAGES,
             })

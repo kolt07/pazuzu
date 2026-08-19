@@ -42,6 +42,7 @@ class UnifiedListingsRepository(BaseRepository):
             self.collection.create_index("source")
             self.collection.create_index("status")
             self.collection.create_index("property_type")
+            self.collection.create_index("deal_type")
             self.collection.create_index("source_updated_at")
             self.collection.create_index("system_updated_at")
             # Root geo для геопошуку
@@ -190,6 +191,23 @@ class UnifiedListingsRepository(BaseRepository):
         
         self._ensure_indexes()
         docs = list(self.collection.find(criteria))
+        return [_normalize_doc(d) for d in docs]
+
+    def find_by_source_keys(self, keys: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """Документи за списком {source, source_id}."""
+        if not keys:
+            return []
+        olx_ids = [k.get("source_id") for k in keys if (k or {}).get("source") == "olx" and k.get("source_id")]
+        pz_ids = [k.get("source_id") for k in keys if (k or {}).get("source") == "prozorro" and k.get("source_id")]
+        ors = []
+        if olx_ids:
+            ors.append({"source": "olx", "source_id": {"$in": list(dict.fromkeys(olx_ids))}})
+        if pz_ids:
+            ors.append({"source": "prozorro", "source_id": {"$in": list(dict.fromkeys(pz_ids))}})
+        if not ors:
+            return []
+        self._ensure_indexes()
+        docs = list(self.collection.find({"$or": ors} if len(ors) > 1 else ors[0]))
         return [_normalize_doc(d) for d in docs]
 
     def find_listings(

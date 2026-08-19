@@ -16,6 +16,7 @@ from business.services.geocoding_service import GeocodingService
 from business.services.currency_rate_service import CurrencyRateService
 from utils.price_metrics import compute_price_metrics
 from utils.address_parser import parse_prozorro_item_address
+from utils.deal_type import deal_type_from_olx_url, deal_type_from_prozorro_data
 
 logger = logging.getLogger(__name__)
 
@@ -1010,6 +1011,7 @@ class UnifiedListingsService:
             "land_area_sqm": area_info["land_area_sqm"],
             "floor": floor,
             "tags": tags,
+            "deal_type": deal_type_from_olx_url(url),
             "price_uah": price_info["price_uah"],
             "price_usd": price_info["price_usd"],
             "price_per_m2_uah": price_metrics.get("price_per_m2_uah"),
@@ -1121,6 +1123,7 @@ class UnifiedListingsService:
             "land_area_sqm": area_info["land_area_sqm"],
             "floor": floor,
             "tags": tags,
+            "deal_type": deal_type_from_prozorro_data(auction_data),
             "price_uah": price_info["price_uah"],
             "price_usd": price_info["price_usd"],
             "price_per_m2_uah": price_metrics.get("price_per_m2_uah"),

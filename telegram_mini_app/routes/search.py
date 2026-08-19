@@ -492,6 +492,7 @@ def _normalize_unified_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "addresses": doc.get("addresses", []),
         "status": doc.get("status", ""),
         "property_type": doc.get("property_type", ""),
+        "deal_type": doc.get("deal_type") or "sale",
         "building_area_sqm": doc.get("building_area_sqm"),
         "land_area_sqm": doc.get("land_area_sqm"),
         "land_area_sotky": (doc.get("land_area_sqm") / 100.0) if doc.get("land_area_sqm") else None,

@@ -49,6 +49,7 @@ class SourceFieldMapper:
             "district": "city_district",  # Аліас: район міста (Солом'янський, Шевченківський)
             "source": "source",
             "property_type": "property_type",
+            "deal_type": "deal_type",
             # price завжди означає price_uah (ціна в грн), якщо не вказано інакше
             "price": "price_uah",
             "date": "source_updated_at",

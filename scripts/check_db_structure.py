@@ -27,6 +27,7 @@ EXPECTED_COLLECTIONS = frozenset({
     "raw_prozorro_auctions",
     "source_load_runs",
     "unified_listings",
+    "market_research_runs",
     "llm_cache",
     # Аналітика та знання
     "collection_knowledge",

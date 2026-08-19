@@ -24,10 +24,14 @@ COMMERCIAL_REAL_ESTATE_PATH = "/uk/nedvizhimost/kommercheskaya-nedvizhimost/"
 # Тільки продаж комерційної нерухомості (без оренди)
 # Алгоритм: сторінка нерухомості → фільтр «продаж нежитлової» → сортування від найновіших
 COMMERCIAL_REAL_ESTATE_SALE_PATH = "/uk/nedvizhimost/kommercheskaya-nedvizhimost/prodazha-kommercheskoy-nedvizhimosti/"
+# Оренда комерційної нерухомості (перевірено: https://www.olx.ua/uk/nedvizhimost/kommercheskaya-nedvizhimost/arenda-kommercheskoy-nedvizhimosti/)
+COMMERCIAL_REAL_ESTATE_RENT_PATH = "/uk/nedvizhimost/kommercheskaya-nedvizhimost/arenda-kommercheskoy-nedvizhimosti/"
 # Земельні ділянки (включно з ділянками під забудову)
 LAND_PATH = "/uk/nedvizhimost/zemlya/"
 # Продаж землі (підкатегорія з фільтром за типом: житлова, оздоровча, рекреаційна тощо)
 LAND_SALE_PATH = "/uk/nedvizhimost/zemlya/prodazha-zemli/"
+# Оренда землі (перевірено: https://www.olx.ua/uk/nedvizhimost/zemlya/arenda-zemli/)
+LAND_RENT_PATH = "/uk/nedvizhimost/zemlya/arenda-zemli/"
 
 # Сортування: найновіші спочатку (параметр у URL)
 OLX_SORT_NEWEST = "search[order]=created_at:desc"
@@ -271,22 +275,36 @@ def get_commercial_real_estate_list_url(
     sale_only: bool = True,
     sort_newest: bool = True,
     region_slug: Optional[str] = None,
+    extra_query_pairs: Optional[List[Tuple[str, str]]] = None,
+    deal_type: Optional[str] = None,
+    area_from_m2: Optional[float] = None,
+    area_to_m2: Optional[float] = None,
 ) -> str:
     """
     Повертає URL сторінки списку нежитлової (комерційної) нерухомості.
     sale_only: тільки оголошення про продаж (без оренди).
+    deal_type: sale | rent (має пріоритет над sale_only).
     sort_newest: сортування «Найновіші спочатку».
     region_slug: OLX slug області для фільтрації (напр. kyivskaya, lvivska).
-    Додаткові фільтри на OLX: площа від FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2 м².
-    Фільтр поверху не застосовується. Тип об'єкта — опційно з olx_commercial_object_type_slugs.yaml
-    (порожній список = усі типи, включно з бізнес-центрами).
+    Додаткові фільтри на OLX: площа від FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2 м²
+    (або area_from_m2/area_to_m2 якщо задано).
     """
-    path = COMMERCIAL_REAL_ESTATE_SALE_PATH if sale_only else COMMERCIAL_REAL_ESTATE_PATH
+    dt = (deal_type or "").strip().lower()
+    if dt == "rent":
+        path = COMMERCIAL_REAL_ESTATE_RENT_PATH
+    elif dt == "sale" or sale_only:
+        path = COMMERCIAL_REAL_ESTATE_SALE_PATH
+    else:
+        path = COMMERCIAL_REAL_ESTATE_PATH
+    area_from = area_from_m2 if area_from_m2 is not None else FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2
     extra: List[Tuple[str, str]] = [
-        ("search[filter_float_total_area:from]", str(FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2)),
+        ("search[filter_float_total_area:from]", str(int(area_from))),
     ]
+    if area_to_m2 is not None:
+        extra.append(("search[filter_float_total_area:to]", str(int(area_to_m2))))
     for slug in get_olx_comm_re_object_type_slugs_include():
         extra.append(("search[filter_enum_comm_re_object_type]", slug))
+    extra.extend(extra_query_pairs or [])
     return _build_category_url(path, page, sort_newest, region_slug, extra_query_pairs=extra)
 
 
@@ -295,13 +313,28 @@ def get_land_list_url(
     sort_newest: bool = True,
     region_slug: Optional[str] = None,
     land_type_slug: Optional[str] = None,
+    extra_query_pairs: Optional[List[Tuple[str, str]]] = None,
+    deal_type: Optional[str] = None,
+    land_area_from_sotok: Optional[float] = None,
+    land_area_to_sotok: Optional[float] = None,
 ) -> str:
     """Повертає URL сторінки списку земельних ділянок.
     land_type_slug: фільтр за типом землі (з olx_land_type_slugs) — виключає с/г при використанні.
-    Без land_type_slug — загальна сторінка /zemlya/ (legacy).
+    deal_type: sale | rent.
+    Без land_type_slug і sale — загальна сторінка /zemlya/ (legacy).
     Додатковий фільтр на OLX: площа від FILTER_LAND_AREA_FROM_SOTOK соток."""
-    base = LAND_SALE_PATH if land_type_slug else LAND_PATH
+    dt = (deal_type or "").strip().lower()
+    if dt == "rent":
+        base = LAND_RENT_PATH
+    elif land_type_slug or dt == "sale":
+        base = LAND_SALE_PATH
+    else:
+        base = LAND_PATH
+    area_from = land_area_from_sotok if land_area_from_sotok is not None else FILTER_LAND_AREA_FROM_SOTOK
     extra = [
-        ("search[filter_float_land_area:from]", str(int(FILTER_LAND_AREA_FROM_SOTOK))),
+        ("search[filter_float_land_area:from]", str(int(area_from))),
     ]
+    if land_area_to_sotok is not None:
+        extra.append(("search[filter_float_land_area:to]", str(int(land_area_to_sotok))))
+    extra.extend(extra_query_pairs or [])
     return _build_category_url(base, page, sort_newest, region_slug, land_type_slug, extra_query_pairs=extra)

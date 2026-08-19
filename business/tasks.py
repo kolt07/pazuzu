@@ -236,6 +236,41 @@ def run_source_load_pipeline_task(
         raise
 
 
+@celery_app.task(bind=True, name="business.tasks.run_market_research_task")
+def run_market_research_task(self, research_id: str) -> Dict[str, Any]:
+    settings = _init_runtime()
+    queue = _queue_service(settings)
+    task_id = _current_task_id()
+    control_state = queue.get_queue_control_state(TaskQueueService.SOURCE_LOAD_QUEUE)
+    if control_state == "paused":
+        if task_id:
+            queue.heartbeat(task_id, patch={"phase": "paused_by_admin", "queue_control_state": "paused"})
+        raise self.retry(countdown=20, max_retries=None)
+    if control_state == "disabled":
+        msg = "Queue source_load is disabled by admin."
+        if task_id:
+            queue.mark_task_failed(task_id, msg)
+        return {"success": False, "skipped": True, "reason": msg}
+    if task_id:
+        queue.mark_task_started(task_id)
+        queue.heartbeat(task_id, patch={"phase": "market_research_started", "research_id": research_id})
+    try:
+        from business.services.market_research_service import MarketResearchService
+
+        result = MarketResearchService(settings).run(research_id)
+        if task_id:
+            if result.get("ok"):
+                queue.mark_task_success(task_id, result=result)
+            else:
+                queue.mark_task_failed(task_id, str(result.get("error") or "market_research_failed"))
+        return result
+    except Exception as e:
+        logger.exception("Market research task failed: %s", e)
+        if task_id:
+            queue.mark_task_failed(task_id, str(e))
+        raise
+
+
 @celery_app.task(bind=True, name="business.tasks.process_olx_llm_task")
 def process_olx_llm_task(self, listing_url: str) -> Dict[str, Any]:
     settings = _init_runtime()

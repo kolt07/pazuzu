@@ -21,13 +21,13 @@ from business.services.prozorro_service import ProZorroService
 from business.services.logging_service import LoggingService
 from business.services.user_activity_log_service import UserActivityLogService
 
-from telegram_mini_app.routes import me, llm, admin, files, search, map, feedback, report_templates, analytics, investigation, mini_app_chats
+from telegram_mini_app.routes import me, llm, admin, files, search, map, feedback, report_templates, analytics, investigation, mini_app_chats, market_research
 
 
 def _get_static_file_version(static_dir: Path) -> str:
     """Обчислює версію статичних файлів на основі модифікації app.js та styles.css."""
     version_parts = []
-    for filename in ["app.js", "styles.css", "index.html"]:
+    for filename in ["app.js", "styles.css", "index.html", "listing_filters.js"]:
         file_path = static_dir / filename
         if file_path.exists():
             mtime = file_path.stat().st_mtime
@@ -91,6 +91,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.user_activity_service = UserActivityLogService()
     app.state.multi_agent_service = None  # леніва ініціалізація в routes/llm.py
     app.state.investigation_service = None  # леніва ініціалізація в routes/investigation.py
+    app.state.market_research_service = None
 
     app.include_router(me.router)
     app.include_router(llm.router)
@@ -103,6 +104,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(analytics.router)
     app.include_router(investigation.router)
     app.include_router(mini_app_chats.router)
+    app.include_router(market_research.router)
 
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():
@@ -123,6 +125,10 @@ def create_app(settings: Settings) -> FastAPI:
                 html_content = html_content.replace(
                     'src="/static/app.js"',
                     f'src="/static/app.js?v={static_version}"'
+                )
+                html_content = html_content.replace(
+                    'src="/static/listing_filters.js"',
+                    f'src="/static/listing_filters.js?v={static_version}"'
                 )
                 maps_key = (getattr(settings, "google_maps_api_key", None) or "").strip()
                 maps_bootstrap = (

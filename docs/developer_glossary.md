@@ -110,7 +110,13 @@
 
 - **рядок фільтрів (filter string)**: текстовий вигляд дерева фільтрів для редагування користувачем. Формат: `"Активність" = True AND "Дата в джерелі" >= '01.01.2026' AND (geo('Область' INSIDE 'Київська'))`. Серіалізація та парсинг: `domain/services/filter_string_service.py` (filter_group_to_string, filter_string_to_models). Поля виводяться лейблами з `config/search_fields.yaml`.
 
-- **UnifiedSearchService**: доменний сервіс централізованого пошуку по unified_listings. Будує FindQuery з дерева фільтрів (FilterGroup + GeoFilter) або з рядка фільтрів, виконує пошук через CollectionManager, повертає список документів та total. Використовується на сторінці пошуку (POST /api/search/query) та при формуванні звітів. Джерело: `domain/services/unified_search_service.py`.
+- **UnifiedSearchService**: доменний сервіс централізованого пошуку по unified_listings. Будує FindQuery з дерева фільтрів (FilterGroup + GeoFilter) або з рядка фільтрів, виконує пошук через CollectionManager, повертає список документів та total. Використовується на сторінці пошуку (POST /api/search/query) та при формуванні звітів. За замовчуванням додає `deal_type=sale`, якщо фільтр не задає тип угоди. Джерело: `domain/services/unified_search_service.py`.
+
+- **deal_type**: тип угоди в `unified_listings`: `sale` (продаж) або `rent` (оренда). Для оренди `price_uah` — ставка як у джерелі (зазвичай грн/міс.). Пошук за замовчуванням показує лише продаж, щоб орендні ціни не змішувались із продажними. Джерело: `utils/deal_type.py`.
+
+- **дослідження ринку (market research)**: окрема вкладка Mini App. Користувач задає FilterSpec (як у пошуку) плюс чекбокси продаж/оренда та глибину пошуку; система точково шукає в OLX (URL-фільтри) і ProZorro.Sale Search API, проганяє знайдене через стандартний Phase 2 pipeline у `unified_listings` і будує статистичну довідку без LLM (квартилі, IQR, розрізи, порівняння з `price_analytics`). Черга Celery `source_load`. Колекція `market_research_runs` (TTL 30 днів). Сервіси: `MarketResearchService`, `MarketResearchAnalyticsService`, `SourceFilterMapper`. API: `/api/market-research`.
+
+- **глибина пошуку (дослідження ринку)**: обмеження за датою на стороні джерела: без обмежень (дефолт) або 7 / 30 / 90 / 365 днів. На OLX — cutoff як у скрапері; на ProZorro — `datePublished` gte. Без області/НП і без обмеження глибини потрібне підтвердження широкого пошуку.
 
 - **root geo (unified_listings)**: базові географічні поля в корені документа: **region** (область), **oblast_raion** (район області), **city** (місто/населений пункт), **city_district** (район міста). Заповнюються з масиву addresses за логікою: якщо всі адреси збігаються — спільне значення; при суперечках — більшість; при наявності точної адреси (is_complete) — її пріоритет. city_district зʼявляється при геокодуванні повної адреси (з вулицею) у великих містах — з sublocality Google Maps. Джерело: UnifiedListingsService._compute_root_geo_from_addresses.
 

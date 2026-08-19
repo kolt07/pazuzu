@@ -910,7 +910,7 @@
 
   function show(id) {
     currentScreen = id || "screen-home";
-    ["screen-loading", "screen-error", "screen-home", "screen-admin", "screen-files", "screen-search", "screen-map", "screen-detail"].forEach(function (sid) {
+    ["screen-loading", "screen-error", "screen-home", "screen-admin", "screen-files", "screen-search", "screen-market-research", "screen-map", "screen-detail"].forEach(function (sid) {
       var el = document.getElementById(sid);
       if (el) {
         if (sid === id) {
@@ -921,7 +921,7 @@
       }
     });
     // Модалка фільтрів для пошуку та мапи — на інших екранах закриваємо
-    if (id !== "screen-search" && id !== "screen-map") {
+    if (id !== "screen-search" && id !== "screen-map" && id !== "screen-market-research") {
       var filterModal = document.getElementById("filter-builder-modal");
       if (filterModal) filterModal.classList.add("hidden");
     }
@@ -963,6 +963,17 @@
         showSearch(); 
       });
       nav.appendChild(aSearch);
+
+      var aResearch = document.createElement("a");
+      aResearch.href = "#";
+      aResearch.textContent = "Дослідження ринку";
+      aResearch.classList.add("secondary");
+      aResearch.setAttribute("data-screen", "screen-market-research");
+      aResearch.addEventListener("click", function (e) {
+        e.preventDefault();
+        showMarketResearch();
+      });
+      nav.appendChild(aResearch);
 
       if (MAP_TAB_UI_ENABLED) {
         var aMap = document.createElement("a");
@@ -3982,6 +3993,387 @@
     cities: false
   };
   
+  var researchState = {
+    currentId: null,
+    pollTimer: null,
+    page: 0,
+    pageSize: 20,
+    total: 0
+  };
+
+  function researchDealTypes() {
+    var types = [];
+    var sale = document.getElementById("research-deal-sale");
+    var rent = document.getElementById("research-deal-rent");
+    if (sale && sale.checked) types.push("sale");
+    if (rent && rent.checked) types.push("rent");
+    return types;
+  }
+
+  function researchDepthDays() {
+    var sel = document.getElementById("research-depth");
+    var v = sel ? String(sel.value || "").trim() : "";
+    if (!v) return null;
+    var n = parseInt(v, 10);
+    return isNaN(n) ? null : n;
+  }
+
+  function setResearchStatus(text, visible) {
+    var el = document.getElementById("research-status");
+    if (!el) return;
+    if (!visible) {
+      el.classList.add("hidden");
+      el.textContent = "";
+      return;
+    }
+    el.classList.remove("hidden");
+    el.textContent = text || "";
+  }
+
+  function stopResearchPoll() {
+    if (researchState.pollTimer) {
+      clearInterval(researchState.pollTimer);
+      researchState.pollTimer = null;
+    }
+  }
+
+  function isResearchActiveStatus(st) {
+    return st === "queued" || st === "searching_sources" || st === "processing" || st === "analyzing";
+  }
+
+  function formatResearchCounts(counts) {
+    counts = counts || {};
+    var parts = [];
+    if (counts.found != null) parts.push("знайдено " + counts.found);
+    if (counts.new != null) parts.push("нових " + counts.new);
+    if (counts.processed != null) parts.push("оброблено " + counts.processed);
+    if (counts.matched != null) parts.push("у вибірці " + counts.matched);
+    return parts.join(" · ");
+  }
+
+  function renderStatsTable(rows, columns) {
+    if (!rows || !rows.length) return "<p class='research-empty'>Немає даних</p>";
+    var thead = "<tr>" + columns.map(function (c) { return "<th>" + escapeHtml(c.label) + "</th>"; }).join("") + "</tr>";
+    var body = rows.map(function (row) {
+      return "<tr>" + columns.map(function (c) {
+        var v = row[c.key];
+        if (v == null || v === "") v = "—";
+        return "<td>" + escapeHtml(String(v)) + "</td>";
+      }).join("") + "</tr>";
+    }).join("");
+    return "<div class='research-table-wrap'><table class='research-table'><thead>" + thead + "</thead><tbody>" + body + "</tbody></table></div>";
+  }
+
+  function counterToRows(obj) {
+    return Object.keys(obj || {}).map(function (k) {
+      return { name: k || "—", n: obj[k] };
+    });
+  }
+
+  function renderPriceBlock(block) {
+    var deal = block.deal_type === "rent" ? "Оренда" : "Продаж";
+    var kindLabels = { land: "Земля", real_estate: "Нерухомість", mixed: "Земля з нерухомістю", other: "Інше" };
+    var html = "<h4>" + escapeHtml(deal) + " (n=" + (block.n || 0) + ")</h4>";
+    var byKind = block.by_kind || {};
+    Object.keys(byKind).forEach(function (kind) {
+      html += "<h5>" + escapeHtml(kindLabels[kind] || kind) + "</h5>";
+      var metrics = byKind[kind] || {};
+      ["price_uah", "price_per_m2_uah", "price_per_sotka_uah"].forEach(function (metric) {
+        var st = metrics[metric];
+        if (!st || !st.n) return;
+        var title = metric === "price_uah" ? "Ціна, грн" : metric === "price_per_m2_uah" ? "грн/м²" : "грн/сотку";
+        var cols = [
+          { key: "metric", label: "Метрика" },
+          { key: "n", label: "n" },
+          { key: "min", label: "min" },
+          { key: "p25", label: "p25" },
+          { key: "median", label: "медіана" },
+          { key: "p75", label: "p75" },
+          { key: "max", label: "max" },
+          { key: "mean", label: "mean" },
+          { key: "std", label: "std" },
+          { key: "iqr_outliers", label: "IQR-викиди" }
+        ];
+        html += renderStatsTable([Object.assign({ metric: title }, st)], cols);
+      });
+    });
+    return html;
+  }
+
+  function renderResearchReport(report) {
+    var el = document.getElementById("research-report");
+    if (!el) return;
+    if (!report) {
+      el.classList.add("hidden");
+      el.innerHTML = "";
+      return;
+    }
+    var p = report.passport || {};
+    var depth = p.depth_days == null ? "без обмежень" : (p.depth_days + " дн.");
+    var deals = (p.deal_types || []).map(function (d) { return d === "rent" ? "оренда" : "продаж"; }).join(", ");
+    var html = "";
+    html += "<section class='research-section'><h3>Паспорт запиту</h3>";
+    html += "<p>" + escapeHtml(p.filter_summary || "Відбори не задано") + "</p>";
+    html += "<p>Угода: " + escapeHtml(deals || "продаж") + ". Глибина: " + escapeHtml(depth) + ".</p>";
+    html += "<p>n=" + (p.n || 0);
+    if (p.date_from || p.date_to) html += ", дати у вибірці: " + escapeHtml((p.date_from || "—") + " — " + (p.date_to || "—"));
+    var srcParts = [];
+    var sources = p.sources || {};
+    Object.keys(sources).forEach(function (k) { srcParts.push(k + ": " + sources[k]); });
+    html += ". Джерела: " + escapeHtml(srcParts.join(", ") || "—") + ".</p></section>";
+
+    var comp = report.composition || {};
+    html += "<section class='research-section'><h3>Склад</h3>";
+    html += "<h5>Тип</h5>" + renderStatsTable(counterToRows(comp.property_type), [{ key: "name", label: "Тип" }, { key: "n", label: "n" }]);
+    html += "<h5>Регіон</h5>" + renderStatsTable(counterToRows(comp.region), [{ key: "name", label: "Регіон" }, { key: "n", label: "n" }]);
+    html += "<h5>Топ-10 міст</h5>" + renderStatsTable(counterToRows(comp.city_top10), [{ key: "name", label: "Місто" }, { key: "n", label: "n" }]);
+    html += "<h5>Статус</h5>" + renderStatsTable(counterToRows(comp.status), [{ key: "name", label: "Статус" }, { key: "n", label: "n" }]);
+    html += "</section>";
+
+    html += "<section class='research-section'><h3>Розподіл цін</h3>";
+    (report.price_distribution || []).forEach(function (b) { html += renderPriceBlock(b); });
+    if (!(report.price_distribution || []).length) html += "<p class='research-empty'>Немає цін у вибірці</p>";
+    html += "</section>";
+
+    var slices = report.slices || {};
+    html += "<section class='research-section'><h3>Розрізи</h3>";
+    html += "<h5>Медіана ціни за регіоном</h5>" + renderStatsTable(slices.region_median_price_uah || [], [
+      { key: "name", label: "Регіон" }, { key: "n", label: "n" }, { key: "median", label: "медіана" }, { key: "min", label: "min" }, { key: "max", label: "max" }
+    ]);
+    html += "<h5>Кошики площі</h5>" + renderStatsTable(slices.area_buckets || [], [
+      { key: "bucket", label: "Кошик" }, { key: "n", label: "n" }, { key: "median", label: "медіана" }
+    ]);
+    html += "<h5>Теги</h5>" + renderStatsTable(slices.tags_top || [], [
+      { key: "tag", label: "Тег" }, { key: "n", label: "n" }, { key: "median", label: "медіана" }
+    ]);
+    html += "</section>";
+
+    html += "<section class='research-section'><h3>Порівняння з індикатором ринку</h3>";
+    html += renderStatsTable(report.market_comparison || [], [
+      { key: "city", label: "Місто" }, { key: "region", label: "Область" }, { key: "scope", label: "Рівень" },
+      { key: "sample_n", label: "n вибірки" }, { key: "sample_median", label: "медіана вибірки" },
+      { key: "market_median", label: "індикатор" }, { key: "delta_pct", label: "дельта %" }
+    ]);
+    html += "</section>";
+
+    html += "<section class='research-section'><h3>Обмеження</h3><ul>";
+    (report.limitations || []).forEach(function (l) { html += "<li>" + escapeHtml(l) + "</li>"; });
+    html += "</ul></section>";
+    el.innerHTML = html;
+    el.classList.remove("hidden");
+  }
+
+  function renderResearchHistory(items) {
+    var el = document.getElementById("research-history");
+    if (!el) return;
+    if (!items || !items.length) {
+      el.innerHTML = "<p class='research-history-empty'>Немає попередніх досліджень</p>";
+      return;
+    }
+    el.innerHTML = "<h3 class='research-history-title'>Історія</h3>" + items.map(function (it) {
+      var st = it.status || "";
+      var when = (it.created_at || "").slice(0, 16).replace("T", " ");
+      return '<button type="button" class="research-history-item" data-id="' + escapeHtml(it.research_id || "") + '">' +
+        '<span class="research-history-status">' + escapeHtml(st) + "</span> " +
+        escapeHtml(it.filter_summary || "") +
+        " · " + escapeHtml(when) + "</button>";
+    }).join("");
+    el.querySelectorAll(".research-history-item").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var id = btn.getAttribute("data-id");
+        if (id) loadResearch(id, 0);
+      });
+    });
+  }
+
+  function renderResearchTable(items, total, skip) {
+    var countEl = document.getElementById("research-results-count");
+    var itemsEl = document.getElementById("research-items");
+    var pagEl = document.getElementById("research-pagination");
+    if (countEl) {
+      countEl.classList.remove("hidden");
+      countEl.textContent = "У таблиці " + (total || 0) + " " + pluralizeListings(total || 0);
+    }
+    renderListingCards(items || [], itemsEl);
+    if (!pagEl) return;
+    pagEl.innerHTML = "";
+    if ((total || 0) <= researchState.pageSize) return;
+    var totalPages = Math.ceil(total / researchState.pageSize);
+    var page = Math.floor((skip || 0) / researchState.pageSize);
+    var wrap = document.createElement("div");
+    wrap.className = "pagination";
+    if (page > 0) {
+      var prev = document.createElement("button");
+      prev.className = "btn btn-secondary";
+      prev.textContent = "← Попередня";
+      prev.addEventListener("click", function () { loadResearch(researchState.currentId, page - 1); });
+      wrap.appendChild(prev);
+    }
+    var info = document.createElement("span");
+    info.textContent = "Сторінка " + (page + 1) + " з " + totalPages;
+    wrap.appendChild(info);
+    if (page < totalPages - 1) {
+      var next = document.createElement("button");
+      next.className = "btn btn-secondary";
+      next.textContent = "Наступна →";
+      next.addEventListener("click", function () { loadResearch(researchState.currentId, page + 1); });
+      wrap.appendChild(next);
+    }
+    pagEl.appendChild(wrap);
+  }
+
+  function applyResearchPayload(data) {
+    var cancelBtn = document.getElementById("research-cancel");
+    var active = isResearchActiveStatus(data.status);
+    if (cancelBtn) cancelBtn.classList.toggle("hidden", !active);
+    var counts = formatResearchCounts(data.counts);
+    setResearchStatus((data.message || data.status || "") + (counts ? " (" + counts + ")" : ""), true);
+    if (data.status === "done") {
+      renderResearchReport(data.report);
+      renderResearchTable(data.items || [], data.total || 0, data.skip || 0);
+    } else if (data.status === "error") {
+      renderResearchReport(null);
+      setResearchStatus("Помилка: " + (data.error || data.message || "невідома"), true);
+    } else if (data.status === "cancelled") {
+      renderResearchReport(null);
+    }
+  }
+
+  function loadResearch(id, page) {
+    if (!id) return;
+    researchState.currentId = id;
+    researchState.page = page || 0;
+    var skip = researchState.page * researchState.pageSize;
+    fetch("/api/market-research/" + encodeURIComponent(id) + "?skip=" + skip + "&limit=" + researchState.pageSize, {
+      headers: apiHeaders()
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+      .then(function (res) {
+        if (!res.ok) throw new Error((res.data && (res.data.detail || res.data.message)) || "Помилка завантаження");
+        applyResearchPayload(res.data);
+        if (isResearchActiveStatus(res.data.status)) {
+          if (!researchState.pollTimer) startResearchPoll(id);
+        } else {
+          stopResearchPoll();
+          loadResearchHistory();
+        }
+      })
+      .catch(function (err) {
+        setResearchStatus(err.message || "Помилка", true);
+      });
+  }
+
+  function startResearchPoll(id) {
+    stopResearchPoll();
+    researchState.pollTimer = setInterval(function () {
+      if (currentScreen !== "screen-market-research") return;
+      loadResearch(id, researchState.page);
+    }, 3000);
+  }
+
+  function loadResearchHistory() {
+    fetch("/api/market-research", { headers: apiHeaders() })
+      .then(function (r) { return r.json(); })
+      .then(function (data) { renderResearchHistory(data.items || []); })
+      .catch(function () { renderResearchHistory([]); });
+  }
+
+  function detailFromResponse(data) {
+    if (!data) return {};
+    if (data.detail && typeof data.detail === "object") return data.detail;
+    if (typeof data.detail === "string") return { message: data.detail };
+    return data;
+  }
+
+  function startMarketResearch(confirmBroad) {
+    var dealTypes = researchDealTypes();
+    if (!dealTypes.length) {
+      alert("Оберіть продаж і/або оренду.");
+      return;
+    }
+    var body = {
+      filter: (window.ListingFilters && ListingFilters.getFilterSpec("research")) || { version: 1, group_type: "and", items: [] },
+      deal_types: dealTypes,
+      depth_days: researchDepthDays(),
+      confirm_broad: !!confirmBroad
+    };
+    setResearchStatus("Запуск…", true);
+    fetch("/api/market-research", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify(body)
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, status: r.status, data: d }; }); })
+      .then(function (res) {
+        var detail = detailFromResponse(res.data);
+        if (!res.ok) {
+          if (detail.error === "confirm_broad_required") {
+            if (window.confirm(detail.message || "Підтвердити широкий пошук по всій Україні?")) {
+              startMarketResearch(true);
+            }
+            return;
+          }
+          if (detail.error === "active_run_exists") {
+            alert(detail.message || "Уже виконується інше дослідження.");
+            if (detail.research_id) loadResearch(detail.research_id, 0);
+            return;
+          }
+          throw new Error(detail.message || res.data.detail || "Не вдалося запустити");
+        }
+        researchState.currentId = res.data.research_id;
+        renderResearchReport(null);
+        loadResearchHistory();
+        loadResearch(res.data.research_id, 0);
+      })
+      .catch(function (err) {
+        setResearchStatus(err.message || "Помилка запуску", true);
+      });
+  }
+
+  function cancelMarketResearch() {
+    if (!researchState.currentId) return;
+    fetch("/api/market-research/" + encodeURIComponent(researchState.currentId) + "/cancel", {
+      method: "POST",
+      headers: apiHeaders()
+    })
+      .then(function (r) { return r.json(); })
+      .then(function () { loadResearch(researchState.currentId, researchState.page); })
+      .catch(function (err) { setResearchStatus(err.message || "Не вдалося скасувати", true); });
+  }
+
+  function showMarketResearch() {
+    show("screen-market-research");
+    if (window.ListingFilters) {
+      ListingFilters.updateSummary("research");
+      ListingFilters.renderChips("research");
+    }
+    loadResearchHistory();
+    if (researchState.currentId) loadResearch(researchState.currentId, researchState.page);
+  }
+
+  function bindMarketResearchEvents() {
+    var openFacets = document.getElementById("research-open-facets");
+    if (openFacets) {
+      openFacets.addEventListener("click", function () {
+        if (window.ListingFilters) ListingFilters.openPanel("research");
+      });
+    }
+    var buildBtn = document.getElementById("research-build-filters");
+    if (buildBtn) {
+      buildBtn.addEventListener("click", function () { openFilterBuilderModal("research"); });
+    }
+    var clearBtn = document.getElementById("research-clear-filters");
+    if (clearBtn) {
+      clearBtn.addEventListener("click", function () {
+        if (window.ListingFilters) ListingFilters.clearFilters("research");
+      });
+    }
+    var startBtn = document.getElementById("research-start");
+    if (startBtn) startBtn.addEventListener("click", function () { startMarketResearch(false); });
+    var cancelBtn = document.getElementById("research-cancel");
+    if (cancelBtn) cancelBtn.addEventListener("click", cancelMarketResearch);
+  }
+
   // Ініціалізація пошуку (викликається при завантаженні сторінки)
   function initSearch() {
     console.log("Initializing search functionality");
@@ -7378,6 +7770,7 @@
   function surfaceFromBuilderTarget(target) {
     if (target === "map" || target === "map-filter-string") return "map";
     if (target === "report" || target === "constructor-filter-string") return "report";
+    if (target === "research") return "research";
     return "search";
   }
 
@@ -7748,6 +8141,12 @@
           ListingFilters.updateSummary("report");
           ListingFilters.renderChips("report");
         });
+        ListingFilters.onApply("research", function () {
+          if (window.ListingFilters) {
+            ListingFilters.updateSummary("research");
+            ListingFilters.renderChips("research");
+          }
+        });
         var facetClose = document.getElementById("facet-filters-close");
         var facetApply = document.getElementById("facet-filters-apply");
         var facetReset = document.getElementById("facet-filters-reset");
@@ -7766,6 +8165,7 @@
         });
       }
       bindSearchEvents();
+      bindMarketResearchEvents();
       initSearch();
       showSearch();
       renderChatMessages();

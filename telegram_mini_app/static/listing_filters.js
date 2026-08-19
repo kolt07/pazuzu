@@ -7,6 +7,7 @@
       status: [],
       source: [],
       property_type: [],
+      deal_type: [],
       price_currency: "uah",
       price_uah: { min: null, max: null },
       price_usd: { min: null, max: null },
@@ -69,6 +70,7 @@
     addMulti("status", f.status);
     addMulti("source", f.source);
     addMulti("property_type", f.property_type);
+    addMulti("deal_type", f.deal_type);
 
     var currency = (f.price_currency || "uah").toLowerCase() === "usd" ? "usd" : "uah";
     var priceField = currency === "usd" ? "price_usd" : "price_uah";
@@ -179,6 +181,7 @@
           if (it.field === "source") parts.push(String(it.value).toUpperCase());
           else if (it.field === "property_type") parts.push(String(it.value));
           else if (it.field === "status") parts.push(String(it.value));
+          else if (it.field === "deal_type") parts.push(it.value === "rent" ? "Оренда" : it.value === "sale" ? "Продаж" : String(it.value));
           else if (it.field === "price_uah" || it.field === "price_usd") {
             var unit = it.field === "price_usd" ? "$" : "грн";
             if (it.operator === "gte") parts.push("ціна ≥ " + it.value + " " + unit);
@@ -214,6 +217,10 @@
     });
     (facets.status || []).forEach(function (s, i) {
       chips.push({ key: "st:" + i, label: String(s), remove: { facet: "status", index: i } });
+    });
+    (facets.deal_type || []).forEach(function (s, i) {
+      var lab = s === "rent" ? "Оренда" : s === "sale" ? "Продаж" : String(s);
+      chips.push({ key: "dt:" + i, label: lab, remove: { facet: "deal_type", index: i } });
     });
     var price = facets.price_uah || {};
     var priceUsd = facets.price_usd || {};
@@ -309,7 +316,7 @@
   ];
 
   /**
-   * Стан відборів для однієї поверхні (search | map | report).
+   * Стан відборів для однієї поверхні (search | map | report | research).
    */
   function createSurfaceState(initialSpec) {
     return {
@@ -323,7 +330,8 @@
   var surfaces = {
     search: createSurfaceState(),
     map: createSurfaceState(),
-    report: createSurfaceState()
+    report: createSurfaceState(),
+    research: createSurfaceState()
   };
 
   var regionOptions = [];
@@ -415,7 +423,9 @@
         ? "map-filter-summary-text"
         : surface === "report"
           ? "constructor-filter-summary-text"
-          : "search-filter-summary-text";
+          : surface === "research"
+            ? "research-filter-summary-text"
+            : "search-filter-summary-text";
     var el = document.getElementById(elId);
     if (el) {
       el.textContent = text || "Відбори не задано";
@@ -428,7 +438,9 @@
         ? "map-filter-chips"
         : surface === "report"
           ? "constructor-filter-chips"
-          : "search-filter-chips";
+          : surface === "research"
+            ? "research-filter-chips"
+            : "search-filter-chips";
     var el = document.getElementById(containerId);
     if (!el) return;
     var st = getState(surface);
@@ -541,7 +553,17 @@
               { v: "неактивне", l: "Неактивне" }
             ],
             f.status
-          )
+          ) +
+          (surface === "research"
+            ? ""
+            : checkboxGroup(
+                "deal_type",
+                [
+                  { v: "sale", l: "Продаж" },
+                  { v: "rent", l: "Оренда" }
+                ],
+                f.deal_type
+              ))
       ) +
       section(
         "Текст у оголошенні",
