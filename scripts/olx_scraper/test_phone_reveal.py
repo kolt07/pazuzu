@@ -32,7 +32,7 @@ def main() -> None:
     print("[test] Завантаження сторінки через requests...", flush=True)
 
     try:
-        response = fetch_page(url, delay_before=False)
+        response = fetch_page(url, delay_before=False, is_detail=True)
         detail = parse_detail_page(response.text)
         phones = (detail.get("contact") or {}).get("phones") or []
         print(f"[test] HTML: {len(response.text)} символів", flush=True)

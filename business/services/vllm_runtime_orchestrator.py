@@ -1073,9 +1073,9 @@ class VllmRuntimeOrchestrator:
         self._start_instance_observability(public_endpoint, instance_payload, cfg)
         if self._use_ollama_runtime(cfg):
             endpoint = self._wait_for_ollama_control_readiness(public_endpoint, int(cfg.get("boot_timeout_sec") or 600), cfg)
-            endpoint = self._ensure_ollama_model_ready(endpoint, public_endpoint, int(cfg.get("ready_timeout_sec") or 300), cfg)
+            endpoint = self._ensure_ollama_model_ready(endpoint, public_endpoint, int(cfg.get("ready_timeout_sec") or 390), cfg)
         else:
-            endpoint = self._wait_for_runtime_readiness(public_endpoint, int(cfg.get("ready_timeout_sec") or 300), cfg)
+            endpoint = self._wait_for_runtime_readiness(public_endpoint, int(cfg.get("ready_timeout_sec") or 390), cfg)
         self._endpoint = endpoint
         self._instance_paused = False
         self._coord_update_state(
@@ -2144,7 +2144,7 @@ class VllmRuntimeOrchestrator:
 
     def _coord_lease_seconds(self, cfg: Dict[str, Any]) -> int:
         endpoint_timeout = int(cfg.get("endpoint_timeout_sec") or 600)
-        ready_timeout = int(cfg.get("ready_timeout_sec") or 300)
+        ready_timeout = int(cfg.get("ready_timeout_sec") or 390)
         boot_timeout = int(cfg.get("boot_timeout_sec") or 600)
         return max(90, min(1800, max(endpoint_timeout, ready_timeout, boot_timeout) + 120))
 
@@ -2229,7 +2229,7 @@ class VllmRuntimeOrchestrator:
         deadline = time.time() + max(
             30,
             int(cfg.get("endpoint_timeout_sec") or 600),
-            int(cfg.get("ready_timeout_sec") or 300),
+            int(cfg.get("ready_timeout_sec") or 390),
             int(cfg.get("boot_timeout_sec") or 600),
         )
         while time.time() < deadline:

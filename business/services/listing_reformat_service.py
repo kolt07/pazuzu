@@ -14,6 +14,7 @@ from business.services.olx_llm_extractor_service import OlxLLMExtractorService
 from business.services.geocoding_service import GeocodingService
 from business.services.unified_listings_service import UnifiedListingsService
 from utils.price_metrics import compute_price_metrics
+from business.services.listing_price import listing_price_to_uah
 
 logger = logging.getLogger(__name__)
 
@@ -198,11 +199,9 @@ class ListingReformatService:
             currency = (search_data.get("currency") or "UAH").strip().upper() or "UAH"
             if currency not in ("UAH", "USD", "EUR"):
                 currency = "UAH"
-            total_price_uah = price_value
-            if price_value is not None and currency == "USD" and usd_rate:
-                total_price_uah = price_value * usd_rate
-            elif price_value is not None and currency == "EUR" and usd_rate:
-                total_price_uah = price_value * usd_rate * 1.1
+            total_price_uah = listing_price_to_uah(
+                price_value, currency, usd_rate, search_data.get("price_text")
+            )
 
             metrics = compute_price_metrics(
                 total_price_uah=total_price_uah,

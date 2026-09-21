@@ -29,6 +29,7 @@ from data.repositories.unified_listings_repository import UnifiedListingsReposit
 from utils.address_geo_enrichment import build_listing_context, enrich_llm_geo_result
 from utils.district_normalizer import sanitize_llm_address_districts
 from utils.price_metrics import compute_price_metrics
+from business.services.listing_price import listing_price_to_uah
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,12 @@ class AddressCacheReprocessService:
                 except (TypeError, ValueError):
                     land_area_sqm = None
             detail_data["price_metrics"] = compute_price_metrics(
-                total_price_uah=search_data.get("price_value"),
+                total_price_uah=listing_price_to_uah(
+                    search_data.get("price_value"),
+                    search_data.get("currency"),
+                    usd_rate,
+                    search_data.get("price_text"),
+                ),
                 building_area_sqm=total_area_m2,
                 land_area_sqm=land_area_sqm,
                 uah_per_usd=usd_rate,

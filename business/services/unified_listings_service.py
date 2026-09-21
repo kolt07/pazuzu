@@ -15,6 +15,7 @@ from data.repositories.prozorro_auctions_repository import ProZorroAuctionsRepos
 from business.services.geocoding_service import GeocodingService
 from business.services.currency_rate_service import CurrencyRateService
 from utils.price_metrics import compute_price_metrics
+from business.services.listing_price import listing_price_to_uah, normalize_listing_currency
 from utils.address_parser import parse_prozorro_item_address
 from utils.deal_type import deal_type_from_olx_url, deal_type_from_prozorro_data
 
@@ -603,58 +604,53 @@ class UnifiedListingsService:
             "price_uah": None,
             "price_usd": None,
             "currency_rate": None,
+            "price_currency": "UAH",
         }
         
         if source == "olx":
             detail = doc.get("detail", {})
-            search_data = doc.get("search_data", {})
+            search_data = doc.get("search_data", {}) if isinstance(doc.get("search_data"), dict) else {}
             
-            # Спочатку пробуємо з detail.price
             price_value = None
-            currency = "UAH"
+            currency = None
             
-            price = detail.get("price")
+            price = detail.get("price") if isinstance(detail, dict) else None
             if isinstance(price, dict):
                 price_value = price.get("value")
-                currency = price.get("currency", "UAH")
+                currency = price.get("currency")
             elif price is not None:
-                # Якщо price не словник, але не None - можливо це прямий number
                 try:
                     price_value = float(price)
                 except (ValueError, TypeError):
                     pass
             
-            # Якщо не знайшли в detail.price, пробуємо search_data
             if price_value is None:
                 price_value = search_data.get("price_value")
-                currency = search_data.get("currency", "UAH")
+            search_currency = search_data.get("currency")
+            if search_currency:
+                currency = search_currency
+            currency = normalize_listing_currency(currency, search_data.get("price_text"))
+            price_info["price_currency"] = currency
             
-            # Нормалізуємо валюту
-            if isinstance(currency, str):
-                currency = currency.strip().upper() or "UAH"
-            else:
-                currency = "UAH"
-            
-            if currency not in ("UAH", "USD", "EUR"):
-                currency = "UAH"
-            
-            # Обчислюємо ціни
             if price_value is not None:
                 try:
                     price_value_float = float(price_value)
                     if price_value_float > 0:
-                        if currency == "USD" and self._usd_rate:
-                            # Якщо ціна в USD, конвертуємо в UAH
-                            price_info["price_uah"] = price_value_float * self._usd_rate
+                        if currency == "USD":
                             price_info["price_usd"] = price_value_float
-                            price_info["currency_rate"] = self._usd_rate
-                        elif currency == "EUR" and self._usd_rate:
-                            # EUR -> USD -> UAH (приблизно, якщо немає курсу EUR)
-                            # Поки що просто конвертуємо через USD
-                            price_info["price_uah"] = price_value_float * self._usd_rate * 1.1  # Приблизно
-                            price_info["price_usd"] = price_value_float * 1.1
-                            price_info["currency_rate"] = self._usd_rate
-                        elif currency == "UAH":
+                            price_info["price_uah"] = listing_price_to_uah(
+                                price_value_float, currency, self._usd_rate, search_data.get("price_text")
+                            )
+                            if self._usd_rate:
+                                price_info["currency_rate"] = self._usd_rate
+                        elif currency == "EUR":
+                            price_info["price_uah"] = listing_price_to_uah(
+                                price_value_float, currency, self._usd_rate, search_data.get("price_text")
+                            )
+                            if self._usd_rate:
+                                price_info["price_usd"] = price_value_float * 1.1
+                                price_info["currency_rate"] = self._usd_rate
+                        else:
                             price_info["price_uah"] = price_value_float
                             if self._usd_rate:
                                 price_info["price_usd"] = price_value_float / self._usd_rate
@@ -845,6 +841,7 @@ class UnifiedListingsService:
         olx_url: str,
         usd_rate_override: Optional[float] = None,
         *,
+        include_other: bool = False,
         side_effects: bool = True,
     ) -> bool:
         """
@@ -871,7 +868,7 @@ class UnifiedListingsService:
             unified_doc = self._convert_olx_to_unified(olx_doc)
             property_type = unified_doc.get("property_type", "")
             # Не синхронізуємо сміттєві оголошення (не нерухомість, не земля)
-            if property_type == "інше":
+            if property_type == "інше" and not include_other:
                 canonical_url = olx_doc.get("url", olx_url)
                 self.unified_repo.delete_by_source_id("olx", canonical_url)
                 return False
@@ -1014,6 +1011,7 @@ class UnifiedListingsService:
             "deal_type": deal_type_from_olx_url(url),
             "price_uah": price_info["price_uah"],
             "price_usd": price_info["price_usd"],
+            "price_currency": price_info.get("price_currency") or "UAH",
             "price_per_m2_uah": price_metrics.get("price_per_m2_uah"),
             "price_per_m2_usd": price_metrics.get("price_per_m2_usd"),
             "price_per_ha_uah": price_metrics.get("price_per_ha_uah"),
@@ -1126,6 +1124,7 @@ class UnifiedListingsService:
             "deal_type": deal_type_from_prozorro_data(auction_data),
             "price_uah": price_info["price_uah"],
             "price_usd": price_info["price_usd"],
+            "price_currency": price_info.get("price_currency") or "UAH",
             "price_per_m2_uah": price_metrics.get("price_per_m2_uah"),
             "price_per_m2_usd": price_metrics.get("price_per_m2_usd"),
             "price_per_ha_uah": price_metrics.get("price_per_ha_uah"),

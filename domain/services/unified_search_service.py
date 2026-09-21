@@ -72,31 +72,64 @@ def find(
     return data, total
 
 
+def _is_source_field(field: str) -> bool:
+    f = (field or "").strip().lower()
+    if f == "source" or f.endswith(".source"):
+        return True
+    try:
+        return f == str(SourceFieldMapper.get_field_path("source", COLLECTION) or "").strip().lower()
+    except Exception:
+        return False
+
+
+def _source_values_from_element(item: FilterElement) -> Optional[set]:
+    if not _is_source_field(item.field):
+        return None
+    if item.operator == FilterOperator.EQ:
+        raw = [item.value]
+    elif item.operator == FilterOperator.IN:
+        raw = item.value if isinstance(item.value, list) else [item.value]
+    else:
+        return None
+    out = {str(v).strip().lower() for v in raw if v is not None and str(v).strip()}
+    return out or None
+
+
 def _contradictory_source_eq_message(filter_group: Optional[FilterGroup]) -> Optional[str]:
-    """Повідомлення, якщо в рядку одночасно source=olx AND source=prozorro (неможливо)."""
+    """AND(source=olx, source=prozorro) — неможливо. OR тих самих умов — нормально."""
     if not filter_group:
         return None
-    values: List[str] = []
 
-    def walk(group: FilterGroup) -> None:
+    def walk(group: FilterGroup) -> Optional[str]:
+        if group.group_type == FilterGroupType.AND:
+            intersection: Optional[set] = None
+            seen: set = set()
+            for item in group.items:
+                if isinstance(item, FilterElement):
+                    vals = _source_values_from_element(item)
+                    if vals is None:
+                        continue
+                    seen |= vals
+                    intersection = vals if intersection is None else intersection & vals
+                elif isinstance(item, FilterGroup):
+                    nested = walk(item)
+                    if nested:
+                        return nested
+            if intersection is not None and len(intersection) == 0 and len(seen) > 1:
+                return (
+                    "Суперечливі умови по полю «Джерело» в рядку відборів "
+                    f"({', '.join(sorted(seen))}): одне оголошення не може бути в двох джерелах одночасно. "
+                    "Приберіть «Джерело» з рядка і оберіть OLX + ProZorro у полі «Джерело даних» шаблону."
+                )
+            return None
         for item in group.items:
-            if isinstance(item, FilterElement):
-                if item.field == "source" and item.operator == FilterOperator.EQ:
-                    v = item.value
-                    if v is not None and str(v).strip():
-                        values.append(str(v).strip().lower())
-            elif isinstance(item, FilterGroup):
-                walk(item)
+            if isinstance(item, FilterGroup):
+                nested = walk(item)
+                if nested:
+                    return nested
+        return None
 
-    walk(filter_group)
-    unique = set(values)
-    if len(unique) > 1:
-        return (
-            "Суперечливі умови по полю «Джерело» в рядку відборів "
-            f"({', '.join(sorted(unique))}): одне оголошення не може бути в двох джерелах одночасно. "
-            "Приберіть «Джерело» з рядка і оберіть OLX + ProZorro у полі «Джерело даних» шаблону."
-        )
-    return None
+    return walk(filter_group)
 
 
 def _merge_date_and_source(
@@ -367,7 +400,9 @@ def _with_default_deal_type(
 
     if has_deal_type(filter_group):
         return filter_group
-    deal_elem = FilterElement(field=phys, operator=FilterOperator.EQ, value=DEFAULT_DEAL_TYPE_SALE)
+    deal_elem = FilterElement(
+        field=phys, operator=FilterOperator.IN, value=[DEFAULT_DEAL_TYPE_SALE, None]
+    )
     if not filter_group or not filter_group.items:
         return FilterGroup(group_type=FilterGroupType.AND, items=[deal_elem])
     return FilterGroup(group_type=FilterGroupType.AND, items=[deal_elem, filter_group])

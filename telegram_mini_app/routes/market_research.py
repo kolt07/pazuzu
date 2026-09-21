@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """API дослідження ринку (точковий пошук у джерелах + статистична довідка)."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -11,7 +11,8 @@ from telegram_mini_app.auth import validate_telegram_init_data
 router = APIRouter(prefix="/api/market-research", tags=["market-research"])
 
 
-def _get_user_id(request: Request) -> int:
+def _get_user_ctx(request: Request) -> Tuple[int, bool]:
+    """Повертає (user_id, is_admin)."""
     init_data = request.headers.get("X-Telegram-Init-Data")
     if not init_data:
         raise HTTPException(status_code=403, detail="X-Telegram-Init-Data required")
@@ -26,9 +27,10 @@ def _get_user_id(request: Request) -> int:
     if user_id is None:
         raise HTTPException(status_code=403, detail="User id missing")
     user_service = request.app.state.user_service
-    if not user_service.is_user_authorized(int(user_id)):
+    uid = int(user_id)
+    if not user_service.is_user_authorized(uid):
         raise HTTPException(status_code=403, detail="User not authorized")
-    return int(user_id)
+    return uid, user_service.is_admin(uid)
 
 
 def _get_service(request: Request):
@@ -55,6 +57,7 @@ def _http_from_service(result: Dict[str, Any]) -> Dict[str, Any]:
         ERROR_EMPTY_DEAL_TYPES,
         ERROR_FORBIDDEN,
         ERROR_NOT_ACTIVE,
+        ERROR_NOT_DONE,
         ERROR_NOT_FOUND,
     )
 
@@ -77,12 +80,14 @@ def _http_from_service(result: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=403, detail=msg)
     if err == ERROR_NOT_ACTIVE:
         raise HTTPException(status_code=400, detail=msg)
+    if err == ERROR_NOT_DONE:
+        raise HTTPException(status_code=400, detail=msg)
     raise HTTPException(status_code=400, detail=msg)
 
 
 @router.post("")
 def start_research(request: Request, body: StartResearchRequest):
-    user_id = _get_user_id(request)
+    user_id, _ = _get_user_ctx(request)
     svc = _get_service(request)
     result = svc.start(
         user_id=str(user_id),
@@ -96,8 +101,11 @@ def start_research(request: Request, body: StartResearchRequest):
 
 @router.get("")
 def list_research(request: Request, limit: int = Query(30, ge=1, le=100)):
-    user_id = _get_user_id(request)
+    user_id, is_admin = _get_user_ctx(request)
     svc = _get_service(request)
+    if is_admin:
+        user_service = request.app.state.user_service
+        return {"items": svc.list_all(limit=limit, user_service=user_service), "is_admin": True}
     return {"items": svc.list_for_user(str(user_id), limit=limit)}
 
 
@@ -107,10 +115,14 @@ def get_research(
     research_id: str,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
+    source: Optional[str] = Query(None, description="olx | prozorro | усі"),
 ):
-    user_id = _get_user_id(request)
+    user_id, is_admin = _get_user_ctx(request)
     svc = _get_service(request)
-    result = svc.get(research_id, str(user_id), skip=skip, limit=limit)
+    src = (source or "").strip().lower() or None
+    if src and src not in ("olx", "prozorro"):
+        src = None
+    result = svc.get(research_id, str(user_id), skip=skip, limit=limit, source=src, is_admin=is_admin)
     if not result.get("ok"):
         return _http_from_service(result)
     from telegram_mini_app.routes.search import _normalize_unified_doc, _sanitize_json_floats
@@ -133,6 +145,39 @@ def get_research(
 
 @router.post("/{research_id}/cancel")
 def cancel_research(request: Request, research_id: str):
-    user_id = _get_user_id(request)
+    user_id, is_admin = _get_user_ctx(request)
     svc = _get_service(request)
-    return _http_from_service(svc.cancel(research_id, str(user_id)))
+    return _http_from_service(svc.cancel(research_id, str(user_id), is_admin=is_admin))
+
+
+@router.delete("/{research_id}")
+def delete_research(request: Request, research_id: str):
+    user_id, is_admin = _get_user_ctx(request)
+    svc = _get_service(request)
+    return _http_from_service(svc.delete(research_id, str(user_id), is_admin=is_admin))
+
+
+class SendResearchFilesRequest(BaseModel):
+    what: str = "both"
+
+
+@router.post("/{research_id}/send-via-bot")
+def send_research_via_bot(request: Request, research_id: str, body: SendResearchFilesRequest):
+    user_id, is_admin = _get_user_ctx(request)
+    svc = _get_service(request)
+    bot_token = getattr(request.app.state, "bot_token", None) or ""
+    result = svc.send_via_bot(
+        research_id,
+        str(user_id),
+        what=body.what,
+        bot_token=bot_token,
+        is_admin=is_admin,
+    )
+    return _http_from_service(result)
+
+
+@router.post("/{research_id}/repeat")
+def repeat_research(request: Request, research_id: str):
+    user_id, is_admin = _get_user_ctx(request)
+    svc = _get_service(request)
+    return _http_from_service(svc.repeat(research_id, str(user_id), is_admin=is_admin))

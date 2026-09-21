@@ -15,15 +15,11 @@ from utils.deal_type import DEAL_RENT, DEAL_SALE, normalize_deal_types
 LAND_PROPERTY_TYPES = frozenset({
     "Земельна ділянка",
     "Земельна ділянка з нерухомістю",
+    "Землі с/г призначення",
 })
 COMMERCIAL_PROPERTY_TYPES = frozenset({
     "Комерційна нерухомість",
-    "Будівля",
-    "Приміщення",
-    "Квартира",
-    "Будинок",
     "інше",
-    "Інше",
 })
 
 
@@ -45,6 +41,9 @@ class SourceQueryPlan:
     query_text: Optional[str] = None
     has_geo: bool = False
     extra_olx_query_pairs: List[Tuple[str, str]] = field(default_factory=list)
+    olx_price_currency: str = "UAH"
+    statuses: List[str] = field(default_factory=list)
+    property_types: List[str] = field(default_factory=list)
 
 
 def _walk_items(items: List[Dict[str, Any]]):
@@ -136,7 +135,9 @@ def _listing_type_patterns(property_types: List[str]) -> List[str]:
         return []
     want_land = any(p in LAND_PROPERTY_TYPES for p in property_types)
     want_comm = any(p in COMMERCIAL_PROPERTY_TYPES for p in property_types)
-    if want_land and want_comm:
+    # "Земельна ділянка з нерухомістю" входить у LAND, але потребує обох категорій
+    want_both = any(p == "Земельна ділянка з нерухомістю" for p in property_types)
+    if want_both or (want_land and want_comm):
         return []
     if want_land:
         return ["Земл"]
@@ -147,6 +148,10 @@ def _listing_type_patterns(property_types: List[str]) -> List[str]:
 
 def _olx_extra_pairs(plan: SourceQueryPlan) -> List[Tuple[str, str]]:
     pairs: List[Tuple[str, str]] = []
+    if (plan.price_uah_min is not None or plan.price_uah_max is not None) and (
+        str(plan.olx_price_currency or "UAH").upper() == "USD"
+    ):
+        pairs.append(("currency", "USD"))
     if plan.price_uah_min is not None:
         pairs.append(("search[filter_float_price:from]", str(int(plan.price_uah_min))))
     if plan.price_uah_max is not None:
@@ -184,6 +189,7 @@ def build_source_query_plan(
         cutoff = start - timedelta(days=days)
 
     property_types = [str(v) for v in _collect_eq_in(spec, "property_type")]
+    statuses = [str(v) for v in _collect_eq_in(spec, "status")]
     regions = _geo_names(spec, "region")
     settlements = _geo_names(spec, "settlement")
     if not regions:
@@ -197,11 +203,27 @@ def build_source_query_plan(
             if r:
                 extra_regions.append(r)
         regions = extra_regions
+    # Місто з окремим OLX-slug (Київ → /kiev/), не область /ko/
+    try:
+        from scripts.olx_scraper.config import get_olx_region_slugs
+
+        slug_names = get_olx_region_slugs() or {}
+    except Exception:
+        slug_names = {}
+    city_slugs = [s for s in settlements if s in slug_names]
+    if city_slugs:
+        regions = list(dict.fromkeys(city_slugs))
     has_geo = bool(regions or settlements or _geo_names(spec, "city_district"))
 
-    pmin, pmax = _range_bounds(spec, "price_uah")
-    if pmin is None and pmax is None:
-        pmin, pmax = _range_bounds(spec, "price_usd")
+    pmin_uah, pmax_uah = _range_bounds(spec, "price_uah")
+    pmin_usd, pmax_usd = _range_bounds(spec, "price_usd")
+    olx_currency = "UAH"
+    if pmin_uah is not None or pmax_uah is not None:
+        pmin, pmax = pmin_uah, pmax_uah
+    else:
+        pmin, pmax = pmin_usd, pmax_usd
+        if pmin is not None or pmax is not None:
+            olx_currency = "USD"
     bmin, bmax = _range_bounds(spec, "building_area_sqm")
     lmin, lmax = _range_bounds(spec, "land_area_sotky")
     query_text = _text_contains(spec, "title") or _text_contains(spec, "description")
@@ -222,6 +244,9 @@ def build_source_query_plan(
         land_area_sotky_max=lmax,
         query_text=query_text,
         has_geo=has_geo,
+        olx_price_currency=olx_currency,
+        statuses=statuses,
+        property_types=property_types,
     )
     plan.extra_olx_query_pairs = _olx_extra_pairs(plan)
     return plan

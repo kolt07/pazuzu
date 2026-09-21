@@ -115,7 +115,7 @@ llm:
 #   ssh_instance_log_stream: true   # stream stdout/stderr логів інстанса через SSH у app logs
 #   endpoint_timeout_sec: 240  # скільки чекаємо саме публікацію зовнішнього endpoint (ssh/port-forward), далі failover на інший офер
 #   boot_timeout_sec: 1200
-#   ready_timeout_sec: 1200
+#   ready_timeout_sec: 1560  # очікування pull/готовності моделі на орендованому GPU (+30% від 1200)
 #   sleep_wakeup_timeout_sec: 300   # якщо paused instance не прокидається > N сек, оркестратор мігрує сесію на новий інстанс
 #   sleep_migration_enabled: true
 #   sleep_migration_copy_paths: ["/workspace/", "/root/.ollama/"]  # шляхи для copy_direct src->dst

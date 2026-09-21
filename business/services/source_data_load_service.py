@@ -663,7 +663,7 @@ def run_full_pipeline(
             log("[Source load] Phase 2 ProZorro завершено.")
 
         if use_brokered_llm and task_queue and brokered_llm_task_ids:
-            from business.services.task_queue_service import TaskQueueService
+            from business.services.task_queue_service import TaskQueueService, TaskWaitTimeoutError
 
             run_repo.patch_run(run_id, {"status": STATUS_PHASE2_WAITING, "message": "waiting_llm"})
             brokered_llm_task_ids = list(dict.fromkeys(brokered_llm_task_ids))
@@ -685,12 +685,20 @@ def run_full_pipeline(
                     llm_batch_progress_state["processed"] = processed
                     log(f"[Source load] Phase 2 LLM queue: оброблено {processed} з {total}.")
 
-            task_docs = task_queue.wait_for_all(
-                brokered_llm_task_ids,
-                timeout_sec=max(1800, len(brokered_llm_task_ids) * 120),
-                heartbeat_fn=llm_wait_heartbeat_fn,
-                progress_fn=_llm_wait_progress,
-            )
+            try:
+                task_docs = task_queue.wait_for_all(
+                    brokered_llm_task_ids,
+                    timeout_sec=max(1800, len(brokered_llm_task_ids) * 120),
+                    heartbeat_fn=llm_wait_heartbeat_fn,
+                    progress_fn=_llm_wait_progress,
+                )
+            except TaskWaitTimeoutError as e:
+                logger.warning("[Source load] Phase 2 LLM wait interrupted: %s", e)
+                log(
+                    f"[Source load] Phase 2: очікування LLM зупинено ({e.reason}): {e}. "
+                    "Продовжуємо з уже завершеними задачами."
+                )
+                task_docs = e.docs
             olx_success = 0
             prozorro_success = 0
             for doc in task_docs:

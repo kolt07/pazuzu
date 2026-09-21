@@ -7,7 +7,10 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 import logging
+import time
 import requests
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import SSLError, Timeout
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +23,8 @@ GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 DEFAULT_REGION = "ua"
 DEFAULT_LANGUAGE = "uk"  # Відповідь українською (кирилиця), не латиницею
 DEFAULT_TIMEOUT = 15
+GEOCODE_MAX_RETRIES = 3
+GEOCODE_RETRY_BACKOFF_SEC = (1.0, 2.0, 4.0)
 
 # Типи address_components Google API -> ключі в address_structured
 # street_number: premise — fallback для номеру будинку (іноді Google повертає premise замість street_number)
@@ -99,6 +104,29 @@ def _normalize_place(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _is_transient_geocode_error(exc: Exception) -> bool:
+    if isinstance(exc, (SSLError, RequestsConnectionError, Timeout)):
+        return True
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in ("ssl", "connection", "timeout", "eof", "max retries exceeded")
+    )
+
+
+def _format_geocode_request_error(exc: Exception) -> str:
+    """Коротке повідомлення без URL і API key (requests підставляє key= у текст помилки)."""
+    root = exc
+    while getattr(root, "__cause__", None):
+        root = root.__cause__
+    detail = str(root).strip()
+    if "?" in detail:
+        detail = detail.split("?", 1)[0] + "?…"
+    if len(detail) > 160:
+        detail = detail[:160] + "…"
+    return f"{type(exc).__name__}" + (f": {detail}" if detail else "")
+
+
 def _call_google_geocode(
     address: str, api_key: str, region: str = DEFAULT_REGION
 ) -> Tuple[List[Dict[str, Any]], bool]:
@@ -114,16 +142,36 @@ def _call_google_geocode(
         "region": region,
         "language": DEFAULT_LANGUAGE,
     }
-    try:
-        resp = requests.get(GOOGLE_GEOCODE_URL, params=params, timeout=DEFAULT_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.warning(
-            "Google Geocoding API request failed: %s (address=%r)",
-            e, address[:80] if address else "",
-            exc_info=False,
-        )
+    data: Optional[Dict[str, Any]] = None
+    for attempt in range(GEOCODE_MAX_RETRIES):
+        try:
+            resp = requests.get(GOOGLE_GEOCODE_URL, params=params, timeout=DEFAULT_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as e:
+            if attempt < GEOCODE_MAX_RETRIES - 1 and _is_transient_geocode_error(e):
+                delay = GEOCODE_RETRY_BACKOFF_SEC[
+                    min(attempt, len(GEOCODE_RETRY_BACKOFF_SEC) - 1)
+                ]
+                logger.warning(
+                    "Google Geocoding API transient error (attempt %s/%s): %s — "
+                    "retry in %.1fs (address=%r)",
+                    attempt + 1,
+                    GEOCODE_MAX_RETRIES,
+                    _format_geocode_request_error(e),
+                    delay,
+                    address[:80] if address else "",
+                )
+                time.sleep(delay)
+                continue
+            logger.warning(
+                "Google Geocoding API request failed: %s (address=%r)",
+                _format_geocode_request_error(e),
+                address[:80] if address else "",
+            )
+            return [], False
+    if not data:
         return [], False
     status = data.get("status")
     if status != "OK" and status != "ZERO_RESULTS":

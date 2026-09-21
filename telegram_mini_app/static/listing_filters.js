@@ -308,11 +308,10 @@
 
   var PROPERTY_TYPES = [
     "Земельна ділянка",
-    "Будівля",
-    "Приміщення",
-    "Квартира",
-    "Будинок",
-    "Інше"
+    "Земельна ділянка з нерухомістю",
+    "Комерційна нерухомість",
+    "Землі с/г призначення",
+    "інше"
   ];
 
   /**
@@ -428,7 +427,9 @@
             : "search-filter-summary-text";
     var el = document.getElementById(elId);
     if (el) {
-      el.textContent = text || "Відбори не задано";
+      el.textContent = text || (surface === "research"
+        ? "Умови ще не задано — натисніть «Задати умови»"
+        : "Відбори не задано");
     }
   }
 
@@ -536,11 +537,13 @@
           rangeRow("Земля, сотки", "land", f.land_area_sotky)
       ) +
       section(
-        "Джерело та тип",
-        checkboxGroup("source", [
-          { v: "olx", l: "OLX" },
-          { v: "prozorro", l: "ProZorro" }
-        ], f.source) +
+        surface === "research" ? "Тип і статус" : "Джерело та тип",
+        (surface === "research"
+          ? ""
+          : checkboxGroup("source", [
+              { v: "olx", l: "OLX" },
+              { v: "prozorro", l: "ProZorro" }
+            ], f.source)) +
           checkboxGroup(
             "property_type",
             PROPERTY_TYPES.map(function (t) { return { v: t, l: t }; }),

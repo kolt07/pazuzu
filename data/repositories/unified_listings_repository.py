@@ -201,7 +201,17 @@ class UnifiedListingsRepository(BaseRepository):
         pz_ids = [k.get("source_id") for k in keys if (k or {}).get("source") == "prozorro" and k.get("source_id")]
         ors = []
         if olx_ids:
-            ors.append({"source": "olx", "source_id": {"$in": list(dict.fromkeys(olx_ids))}})
+            from utils.olx_url import normalize_olx_listing_url
+
+            expanded: List[str] = []
+            for sid in olx_ids:
+                if not sid:
+                    continue
+                expanded.append(sid)
+                can = normalize_olx_listing_url(str(sid))
+                if can:
+                    expanded.append(can)
+            ors.append({"source": "olx", "source_id": {"$in": list(dict.fromkeys(expanded))}})
         if pz_ids:
             ors.append({"source": "prozorro", "source_id": {"$in": list(dict.fromkeys(pz_ids))}})
         if not ors:

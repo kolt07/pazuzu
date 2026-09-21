@@ -111,10 +111,39 @@ class MarketResearchRepository(BaseRepository):
             doc["_id"] = str(doc["_id"])
         return doc
 
+    def delete_run(self, research_id: str, user_id: str) -> bool:
+        result = self.collection.delete_one({
+            "research_id": str(research_id or "").strip(),
+            "user_id": str(user_id),
+            "status": {"$nin": list(ACTIVE_STATUSES)},
+        })
+        return (result.deleted_count or 0) > 0
+
+    def delete_run_admin(self, research_id: str) -> bool:
+        result = self.collection.delete_one({
+            "research_id": str(research_id or "").strip(),
+            "status": {"$nin": list(ACTIVE_STATUSES)},
+        })
+        return (result.deleted_count or 0) > 0
+
     def list_for_user(self, user_id: str, limit: int = 30) -> List[Dict[str, Any]]:
         self._ensure_indexes()
         cursor = (
             self.collection.find({"user_id": str(user_id)})
+            .sort("created_at", -1)
+            .limit(max(1, int(limit)))
+        )
+        out = []
+        for doc in cursor:
+            if "_id" in doc and hasattr(doc["_id"], "binary"):
+                doc["_id"] = str(doc["_id"])
+            out.append(doc)
+        return out
+
+    def list_all(self, limit: int = 100) -> List[Dict[str, Any]]:
+        self._ensure_indexes()
+        cursor = (
+            self.collection.find()
             .sort("created_at", -1)
             .limit(max(1, int(limit)))
         )

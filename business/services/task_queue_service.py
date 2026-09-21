@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import socket
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, NoReturn, Optional
 
 try:
     from celery.result import AsyncResult
@@ -20,6 +20,25 @@ from data.repositories.background_task_repository import BackgroundTaskRepositor
 from data.repositories.task_queue_controls_repository import TaskQueueControlsRepository
 
 logger = logging.getLogger(__name__)
+
+
+class TaskWaitTimeoutError(TimeoutError):
+    """Очікування фонових задач вичерпано або черга зупинена адміністратором."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        pending_ids: Optional[List[str]] = None,
+        counts: Optional[Dict[str, int]] = None,
+        docs: Optional[List[Dict[str, Any]]] = None,
+        reason: str = "timeout",
+    ) -> None:
+        super().__init__(message)
+        self.pending_ids = list(pending_ids or [])
+        self.counts = dict(counts or {})
+        self.docs = list(docs or [])
+        self.reason = str(reason or "timeout")
 
 
 class TaskQueueService:
@@ -258,6 +277,52 @@ class TaskQueueService:
             response["error"] = str(e)
         return response
 
+    @staticmethod
+    def summarize_wait_state(task_ids: Iterable[str], docs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        ids = [str(task_id).strip() for task_id in list(task_ids or []) if str(task_id).strip()]
+        by_id = {doc.get("task_id"): doc for doc in docs}
+        counts: Dict[str, int] = {}
+        pending_ids: List[str] = []
+        queue_names = set()
+        for task_id in ids:
+            doc = by_id.get(task_id) or {}
+            state = str(doc.get("state") or "missing").strip().lower() or "missing"
+            counts[state] = counts.get(state, 0) + 1
+            qn = str(doc.get("queue_name") or "").strip()
+            if qn:
+                queue_names.add(qn)
+            if state not in TaskQueueService.TERMINAL_STATES:
+                pending_ids.append(task_id)
+        return {
+            "total": len(ids),
+            "done": max(0, len(ids) - len(pending_ids)),
+            "pending_ids": pending_ids,
+            "counts": counts,
+            "queue_names": sorted(queue_names),
+            "docs": docs,
+        }
+
+    @staticmethod
+    def format_wait_progress(snapshot: Dict[str, Any]) -> str:
+        total = int(snapshot.get("total") or 0)
+        done = int(snapshot.get("done") or 0)
+        counts = snapshot.get("counts") or {}
+        parts = ", ".join(f"{state}={n}" for state, n in sorted(counts.items()) if n)
+        suffix = f" ({parts})" if parts else ""
+        return f"{done}/{total}{suffix}"
+
+    def _raise_wait_interrupted(self, snapshot: Dict[str, Any], reason: str, message: str) -> NoReturn:
+        pending = list(snapshot.get("pending_ids") or [])
+        sample = pending[:3]
+        extra = f"; приклади: {', '.join(sample)}" if sample else ""
+        raise TaskWaitTimeoutError(
+            f"{message}{extra}",
+            pending_ids=pending,
+            counts=dict(snapshot.get("counts") or {}),
+            docs=list(snapshot.get("docs") or []),
+            reason=reason,
+        )
+
     def wait_for_all(
         self,
         task_ids: Iterable[str],
@@ -270,17 +335,49 @@ class TaskQueueService:
         if not ids:
             return []
         deadline = time.time() + max(1, int(timeout_sec))
+        last_snapshot: Dict[str, Any] = {
+            "total": len(ids),
+            "done": 0,
+            "pending_ids": ids,
+            "counts": {},
+            "queue_names": [],
+            "docs": [],
+        }
         while time.time() < deadline:
             docs = self._repo.list_by_task_ids(ids)
-            by_id = {doc.get("task_id"): doc for doc in docs}
+            snapshot = self.summarize_wait_state(ids, docs)
+            last_snapshot = snapshot
             if callable(progress_fn):
                 progress_fn(docs, ids)
-            if all(str((by_id.get(task_id) or {}).get("state") or "").lower() in self.TERMINAL_STATES for task_id in ids):
+            if not snapshot["pending_ids"]:
                 return docs
             if callable(heartbeat_fn):
                 heartbeat_fn()
+            for queue_name in snapshot.get("queue_names") or []:
+                control = self.get_queue_control_state(queue_name)
+                if control == "disabled":
+                    self._raise_wait_interrupted(
+                        snapshot,
+                        "disabled",
+                        "Черга "
+                        f"{queue_name} вимкнена, зупинено очікування "
+                        f"(готово {self.format_wait_progress(snapshot)})",
+                    )
+                if control == "paused":
+                    self._raise_wait_interrupted(
+                        snapshot,
+                        "paused",
+                        "Черга "
+                        f"{queue_name} призупинена, зупинено очікування "
+                        f"(готово {self.format_wait_progress(snapshot)})",
+                    )
             time.sleep(max(0.5, float(poll_interval_sec)))
-        raise TimeoutError(f"Timed out waiting for tasks: {', '.join(ids)}")
+        self._raise_wait_interrupted(
+            last_snapshot,
+            "timeout",
+            "Таймаут очікування задач: готово "
+            f"{self.format_wait_progress(last_snapshot)} за {max(1, int(timeout_sec))} с",
+        )
 
     def has_pending_llm_tasks(self) -> bool:
         return self._repo.count_by_queue_states(self.LLM_QUEUE, self.ACTIVE_STATES) > 0

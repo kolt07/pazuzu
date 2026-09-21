@@ -11,7 +11,7 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
-  <link rel="stylesheet" href="/static/styles.css?v=20260710-geo4">
+  <link rel="stylesheet" href="/static/styles.css?v=20260824-matched-only">
 </head>
 <body>
   <div id="root">
@@ -625,42 +625,117 @@
         </div>
       </div>
       <div id="screen-market-research" class="hidden">
-        <p class="intro intro-research">Точковий пошук у OLX і ProZorro за фільтрами, стандартний pipeline і статистична довідка (без LLM-аналітики).</p>
-        <div class="search-results-toolbar">
-          <div class="search-filter-summary">
-            <div id="research-filter-chips" class="filter-chips hidden"></div>
-            <span id="research-filter-summary-text" class="search-filter-summary-text">Відбори не задано</span>
-            <button type="button" id="research-open-facets" class="btn btn-ghost">Фільтри</button>
-            <button type="button" id="research-build-filters" class="btn btn-secondary">Розширені</button>
-            <button type="button" id="research-clear-filters" class="btn btn-ghost">Очистити</button>
+        <div class="research-workspace">
+          <aside class="research-history-panel" aria-labelledby="research-history-title">
+            <div class="research-history-head">
+              <h3 id="research-history-title" class="research-history-title">Список</h3>
+              <button type="button" id="research-new" class="btn btn-primary btn-small">Нове дослідження</button>
+            </div>
+            <div id="research-history" class="research-history-scroll"></div>
+          </aside>
+          <div class="research-main">
+            <section id="research-setup" class="research-setup hidden" aria-labelledby="research-setup-title">
+              <div class="research-setup-head">
+                <h2 id="research-setup-title" class="research-setup-title">Нове дослідження</h2>
+                <button type="button" id="research-setup-close" class="btn btn-ghost btn-small">Скасувати</button>
+              </div>
+              <ol class="research-setup-steps">
+                <li>
+                  <div class="research-step-head">
+                    <span class="research-step-num">1</span>
+                    <span class="research-step-title">Умови пошуку</span>
+                    <button type="button" id="research-open-facets" class="btn btn-secondary btn-small">Задати умови</button>
+                    <button type="button" id="research-build-filters" class="btn btn-ghost btn-small">Розширені</button>
+                    <button type="button" id="research-clear-filters" class="btn btn-ghost btn-small">Скинути</button>
+                  </div>
+                  <div id="research-filter-chips" class="filter-chips hidden"></div>
+                  <p id="research-filter-summary-text" class="research-filter-summary">Умови ще не задано — натисніть «Задати умови»</p>
+                </li>
+                <li>
+                  <div class="research-step-head">
+                    <span class="research-step-num">2</span>
+                    <span class="research-step-title">Угода, джерела, глибина</span>
+                  </div>
+                  <div class="research-setup-grid">
+                    <div class="research-field">
+                      <span class="research-label">Угода</span>
+                      <div class="research-toggles" role="group" aria-label="Тип угоди">
+                        <label class="research-toggle"><input type="checkbox" id="research-deal-sale" checked><span>Продаж</span></label>
+                        <label class="research-toggle"><input type="checkbox" id="research-deal-rent"><span>Оренда</span></label>
+                      </div>
+                    </div>
+                    <div class="research-field">
+                      <span class="research-label">Джерела</span>
+                      <div class="research-toggles" role="group" aria-label="Джерела">
+                        <label class="research-toggle"><input type="checkbox" id="research-src-olx" checked><span>OLX</span></label>
+                        <label class="research-toggle"><input type="checkbox" id="research-src-prozorro" checked><span>ProZorro</span></label>
+                      </div>
+                    </div>
+                    <label class="research-field">
+                      <span class="research-label">Глибина</span>
+                      <select id="research-depth" class="filter-select">
+                        <option value="">без обмежень</option>
+                        <option value="7">7 днів</option>
+                        <option value="30" selected>30 днів</option>
+                        <option value="90">90 днів</option>
+                        <option value="365">365 днів</option>
+                      </select>
+                    </label>
+                  </div>
+                </li>
+              </ol>
+              <div class="research-setup-footer">
+                <button type="button" id="research-start" class="btn btn-primary">Запустити</button>
+              </div>
+            </section>
+            <div id="research-empty" class="research-empty-state">
+              <p>Оберіть дослідження зі списку ліворуч або натисніть <strong>Нове дослідження</strong>.</p>
+            </div>
+            <div id="research-current" class="research-current hidden">
+              <div class="research-current-bar">
+                <button type="button" id="research-cancel" class="btn btn-ghost btn-small hidden">Скасувати</button>
+                <button type="button" id="research-send-listings" class="btn btn-secondary btn-small hidden">Оголошення в бот</button>
+                <button type="button" id="research-send-report" class="btn btn-secondary btn-small hidden">Довідка PDF в бот</button>
+                <button type="button" id="research-delete" class="btn btn-ghost btn-small hidden">Видалити</button>
+              </div>
+              <div id="research-progress" class="research-progress hidden">
+                <ol class="research-steps" id="research-steps" aria-label="Етапи">
+                  <li data-step="queued">Черга</li>
+                  <li data-step="searching_sources">Пошук</li>
+                  <li data-step="processing">Обробка</li>
+                  <li data-step="analyzing">Довідка</li>
+                </ol>
+                <p id="research-status" class="research-status-text" role="status"></p>
+                <div id="research-kpis" class="research-kpis hidden"></div>
+                <div id="research-run-stats" class="research-run-stats hidden" aria-live="polite"></div>
+              </div>
+              <nav class="search-subtabs" role="tablist" aria-label="Результат дослідження">
+                <button type="button" id="research-subtab-listings" class="search-subtab active" role="tab" aria-selected="true" data-tab="listings">Оголошення</button>
+                <button type="button" id="research-subtab-report" class="search-subtab" role="tab" aria-selected="false" data-tab="report">Довідка</button>
+                <button type="button" id="research-subtab-filters" class="search-subtab" role="tab" aria-selected="false" data-tab="filters">Фільтри</button>
+              </nav>
+              <div class="research-tab-scroll">
+                <div id="research-tab-listings" class="search-tab-pane active">
+                  <div class="research-results-bar">
+                    <div id="research-results-count" class="search-results-count hidden"></div>
+                    <div class="research-toggles research-source-filter" role="group" aria-label="Фільтр джерел у результаті">
+                      <button type="button" class="research-src-pill active" data-source="">Усі</button>
+                      <button type="button" class="research-src-pill" data-source="olx">OLX</button>
+                      <button type="button" class="research-src-pill" data-source="prozorro">ProZorro</button>
+                    </div>
+                  </div>
+                  <div id="research-items" class="search-items"></div>
+                  <div id="research-pagination" class="search-pagination"></div>
+                </div>
+                <div id="research-tab-report" class="search-tab-pane">
+                  <div id="research-report" class="research-report"></div>
+                </div>
+                <div id="research-tab-filters" class="search-tab-pane">
+                  <div id="research-applied-filters" class="research-applied-filters"></div>
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
-        <div class="research-extra-filters">
-          <fieldset class="research-deal-types">
-            <legend>Тип угоди</legend>
-            <label><input type="checkbox" id="research-deal-sale" checked> Продаж</label>
-            <label><input type="checkbox" id="research-deal-rent"> Оренда</label>
-          </fieldset>
-          <label class="research-depth">
-            Глибина пошуку
-            <select id="research-depth" class="filter-select">
-              <option value="">без обмежень</option>
-              <option value="7">7 днів</option>
-              <option value="30">30 днів</option>
-              <option value="90">90 днів</option>
-              <option value="365">365 днів</option>
-            </select>
-          </label>
-          <button type="button" id="research-start" class="btn btn-primary">Запустити дослідження</button>
-          <button type="button" id="research-cancel" class="btn btn-ghost hidden">Скасувати</button>
-        </div>
-        <div id="research-status" class="research-status hidden" role="status"></div>
-        <div id="research-history" class="research-history"></div>
-        <div id="research-report" class="research-report hidden"></div>
-        <div id="research-results" class="search-results">
-          <div id="research-results-count" class="search-results-count hidden"></div>
-          <div id="research-items" class="search-items"></div>
-          <div id="research-pagination" class="search-pagination"></div>
         </div>
       </div>
       <div id="screen-map" class="hidden">
@@ -722,7 +797,7 @@
     </div>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
-  <script src="/static/listing_filters.js?v=20260710-geo4"></script>
-  <script src="/static/app.js?v=20260710-geo4"></script>
+  <script src="/static/listing_filters.js?v=20260824-matched-only"></script>
+  <script src="/static/app.js?v=20260824-matched-only"></script>
 </body>
 </html>

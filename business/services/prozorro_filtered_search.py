@@ -18,8 +18,11 @@ from business.services.source_filter_mapper import SourceQueryPlan
 from data.repositories.raw_prozorro_auctions_repository import RawProzorroAuctionsRepository
 from utils.deal_type import DEAL_RENT, DEAL_SALE, deal_type_from_prozorro_data
 from utils.hash_utils import extract_auction_id
-from utils.ukraine_regions import is_special_city_region
-from business.services.llm_processing_regions_service import normalize_region_name
+from utils.ukraine_regions import (
+    is_special_city_region,
+    normalize_region_to_canonical,
+    special_city_from_region,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,24 @@ _METHODS_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "proz
 
 SEARCH_LIMIT = 100
 SEARCH_MAX_PAGES = 50
+
+# Search API: region зберігається як «Львівська область» / «Київ»; коротка «Львівська» дає 0 hits.
+# Статуси unified «активне» → active_* у ProZorro.Sale.
+_ACTIVE_PROCEDURE_STATUSES = [
+    "active_rectification",
+    "active_tendering",
+    "active_auction",
+    "active_qualification",
+    "active_awarded",
+    "active_payment",
+    "pending_payment",
+]
+_INACTIVE_PROCEDURE_STATUSES = [
+    "complete",
+    "cancelled",
+    "unsuccessful",
+    "dissolved",
+]
 
 
 def _load_selling_methods() -> Dict[str, List[str]]:
@@ -48,24 +69,20 @@ def _load_selling_methods() -> Dict[str, List[str]]:
 
 
 def _region_search_values(name: str) -> List[str]:
+    """Лише рядки, які реально індексує Search API (eq/in — точний збіг)."""
     raw = (name or "").strip()
     if not raw:
         return []
-    short = normalize_region_name(raw) or raw
-    values = [raw, short]
-    if is_special_city_region(short) or short in ("Київ", "Севастополь"):
-        values.extend([f"м. {short}", f"місто {short}"])
-    else:
-        if "област" not in short.lower():
-            values.append(f"{short} область")
-    out = []
-    seen = set()
-    for v in values:
-        k = v.strip()
-        if k and k.lower() not in seen:
-            seen.add(k.lower())
-            out.append(k)
-    return out
+    canonical = normalize_region_to_canonical(raw)
+    if is_special_city_region(raw) or is_special_city_region(canonical or ""):
+        city = special_city_from_region(raw) or special_city_from_region(canonical or "") or raw
+        # У Search: region.uk_UA = «Київ», не «м. Київ»
+        return [city]
+    if canonical:
+        return [canonical]
+    if "област" in raw.lower():
+        return [raw]
+    return [f"{raw} область"]
 
 
 def _is_property_auction(svc: ProZorroService, auction_data: Dict[str, Any]) -> bool:
@@ -116,8 +133,13 @@ class ProzorroFilteredSearch:
                 filters.append({"field": "procedure_type", "operator": "in", "value": sale_types})
 
         region_vals: List[str] = []
+        seen_reg = set()
         for r in plan.regions:
-            region_vals.extend(_region_search_values(r))
+            for v in _region_search_values(r):
+                k = v.lower()
+                if k not in seen_reg:
+                    seen_reg.add(k)
+                    region_vals.append(v)
         if region_vals:
             op = "eq" if len(region_vals) == 1 else "in"
             filters.append({
@@ -125,23 +147,57 @@ class ProzorroFilteredSearch:
                 "operator": op,
                 "value": region_vals[0] if op == "eq" else region_vals,
             })
-        if plan.settlements:
-            loc = plan.settlements
-            op = "eq" if len(loc) == 1 else "in"
+        # Якщо в плані є НП і немає окремих областей (місто з slug) — locality;
+        # інакше region уже покриває geo, locality лишаємо лише коли settlements не є «псевдо-регіонами».
+        settlements = [s for s in (plan.settlements or []) if s.strip()]
+        if settlements and not region_vals:
+            op = "eq" if len(settlements) == 1 else "in"
             filters.append({
                 "field": "extended_filters.items_address.locality",
                 "operator": op,
-                "value": loc[0] if op == "eq" else loc,
+                "value": settlements[0] if op == "eq" else settlements,
             })
-        if plan.price_uah_min is not None:
+        elif settlements and region_vals:
+            # Settlement + region (напр. Дніпро + Дніпропетровська): locality звужує вибірку
+            op = "eq" if len(settlements) == 1 else "in"
+            filters.append({
+                "field": "extended_filters.items_address.locality",
+                "operator": op,
+                "value": settlements[0] if op == "eq" else settlements,
+            })
+        if plan.price_uah_min is not None and str(plan.olx_price_currency or "UAH").upper() == "UAH":
             filters.append({"field": "value.amount", "operator": "gte", "value": plan.price_uah_min})
-        if plan.price_uah_max is not None:
+        if plan.price_uah_max is not None and str(plan.olx_price_currency or "UAH").upper() == "UAH":
             filters.append({"field": "value.amount", "operator": "lte", "value": plan.price_uah_max})
         if plan.cutoff_utc is not None:
             iso = plan.cutoff_utc.strftime("%Y-%m-%dT%H:%M:%S")
             filters.append({"field": "datePublished", "operator": "gte", "value": iso})
         if plan.query_text:
             filters.append({"field": "full_text_search", "operator": "match", "value": plan.query_text})
+        elif plan.listing_type_patterns:
+            # Search не має classification filter у зручному вигляді — вузьке full_text для комерції
+            for pat in plan.listing_type_patterns:
+                pl = (pat or "").lower()
+                if "нежитлов" in pl:
+                    filters.append({
+                        "field": "full_text_search",
+                        "operator": "match",
+                        "value": "нежитлове",
+                    })
+                    break
+        statuses = [str(s).strip().lower() for s in (getattr(plan, "statuses", None) or []) if str(s).strip()]
+        if statuses == ["активне"] or (len(statuses) == 1 and statuses[0] == "активне"):
+            filters.append({
+                "field": "status",
+                "operator": "in",
+                "value": list(_ACTIVE_PROCEDURE_STATUSES),
+            })
+        elif statuses == ["неактивне"] or (len(statuses) == 1 and statuses[0] == "неактивне"):
+            filters.append({
+                "field": "status",
+                "operator": "in",
+                "value": list(_INACTIVE_PROCEDURE_STATUSES),
+            })
         return filters
 
     def search_hits(
@@ -158,6 +214,7 @@ class ProzorroFilteredSearch:
                 logger.info("%s", msg)
 
         filters = self.build_filters(plan)
+        log(f"[ProZorro search] filters={filters}")
         hits: List[Dict[str, Any]] = []
         seen = set()
         url = self._search_url()
@@ -201,8 +258,14 @@ class ProzorroFilteredSearch:
                     continue
                 seen.add(key)
                 hits.append({"proc_id": proc_id, "auction_id": auction_id})
-            log(f"[ProZorro search] сторінка {page}: +{len(payload)}, разом {len(hits)}")
             max_page = int(data.get("max_page") or SEARCH_MAX_PAGES)
+            if page == 1:
+                log(
+                    f"[ProZorro search] сторінка 1: +{len(payload)}, разом {len(hits)}"
+                    f" (max_page≈{max_page})"
+                )
+            else:
+                log(f"[ProZorro search] сторінка {page}: +{len(payload)}, разом {len(hits)}")
             if page >= max_page or len(payload) < SEARCH_LIMIT:
                 break
         return hits
@@ -251,6 +314,16 @@ class ProzorroFilteredSearch:
                 continue
             if not _want_deal(auction_data, dts, self.svc):
                 continue
+            if plan.building_area_min is not None or plan.building_area_max is not None:
+                try:
+                    areas = self.svc._extract_areas_from_items(auction_data)
+                    b = float((areas or {}).get("building_area_sqm") or 0)
+                except Exception:
+                    b = 0.0
+                if plan.building_area_min is not None and b < plan.building_area_min:
+                    continue
+                if plan.building_area_max is not None and (b <= 0 or b > plan.building_area_max):
+                    continue
             try:
                 approx = self.svc._get_region_from_auction_data(auction_data)
                 raw_repo.upsert_raw(

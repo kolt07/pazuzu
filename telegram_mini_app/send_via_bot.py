@@ -10,6 +10,34 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def send_message_via_telegram(
+    chat_id: int,
+    text: str,
+    bot_token: str,
+) -> bool:
+    """
+    Відправляє текстове повідомлення користувачу через Telegram Bot API.
+    """
+    if not bot_token or not text:
+        return False
+    try:
+        import requests
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        resp = requests.post(
+            url,
+            data={"chat_id": chat_id, "text": str(text)[:4096]},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            logger.warning("Telegram sendMessage failed: %s %s", resp.status_code, resp.text[:200])
+            return False
+        return True
+    except Exception as e:
+        logger.exception("Помилка відправки повідомлення через бота: %s", e)
+        return False
+
+
 def send_file_via_telegram(
     chat_id: int,
     file_bytes: bytes,

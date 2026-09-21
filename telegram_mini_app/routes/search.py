@@ -483,6 +483,7 @@ def _normalize_unified_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "title": doc.get("title", ""),
         "price": doc.get("price_uah"),
         "price_usd": doc.get("price_usd"),
+        "price_currency": (doc.get("price_currency") or "UAH"),
         "price_per_m2_uah": doc.get("price_per_m2_uah"),
         "price_per_m2_usd": doc.get("price_per_m2_usd"),
         "price_per_ha_uah": doc.get("price_per_ha_uah"),
@@ -564,6 +565,7 @@ def _normalize_olx_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "title": search_data.get("title", ""),
         "price": search_data.get("price_value"),
         "price_text": search_data.get("price_text", ""),
+        "price_currency": (search_data.get("currency") or "").upper() or None,
         "price_usd": price_metrics.get("total_price_usd"),
         "price_per_m2_uah": price_metrics.get("price_per_m2_uah"),
         "price_per_m2_usd": price_metrics.get("price_per_m2_usd"),
@@ -1986,9 +1988,30 @@ def _unified_olx_to_olx_like(unified_doc: Dict[str, Any], url: str) -> Dict[str,
     location_str = " - ".join(location_parts) if location_parts else ""
 
     price_uah = unified_doc.get("price_uah")
-    price_text = f"{int(price_uah):,} грн".replace(",", " ") if price_uah is not None else ""
+    price_usd = unified_doc.get("price_usd")
+    currency = str(unified_doc.get("price_currency") or "UAH").strip().upper() or "UAH"
+    if currency == "USD" and price_usd is not None:
+        listed = price_usd
+        try:
+            price_text = f"{int(price_usd):,} $".replace(",", " ")
+        except (TypeError, ValueError):
+            price_text = f"{price_usd} $"
+    elif currency == "EUR":
+        listed = price_usd if price_usd is not None else price_uah
+        try:
+            price_text = f"{int(listed):,} €".replace(",", " ") if listed is not None else ""
+        except (TypeError, ValueError):
+            price_text = f"{listed} €" if listed is not None else ""
+    else:
+        listed = price_uah
+        try:
+            price_text = f"{int(price_uah):,} грн".replace(",", " ") if price_uah is not None else ""
+        except (TypeError, ValueError):
+            price_text = f"{price_uah} грн" if price_uah is not None else ""
 
     price_metrics = {}
+    if unified_doc.get("price_uah") is not None:
+        price_metrics["total_price_uah"] = unified_doc["price_uah"]
     if unified_doc.get("price_usd") is not None:
         price_metrics["total_price_usd"] = unified_doc["price_usd"]
     if unified_doc.get("price_per_m2_uah") is not None:
@@ -2011,13 +2034,15 @@ def _unified_olx_to_olx_like(unified_doc: Dict[str, Any], url: str) -> Dict[str,
         "search_data": {
             "title": unified_doc.get("title", ""),
             "location": location_str,
-            "price_value": price_uah,
+            "price_value": listed,
             "price_text": price_text,
+            "currency": currency,
             "area_m2": unified_doc.get("building_area_sqm"),
         },
         "detail": {
             "location": location_str,
             "description": unified_doc.get("description", ""),
+            "price": {"value": listed, "currency": currency} if listed is not None else None,
             "price_metrics": price_metrics if price_metrics else None,
             "llm": llm if llm else None,
         },

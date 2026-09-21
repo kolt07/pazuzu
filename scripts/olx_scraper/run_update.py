@@ -34,8 +34,8 @@ from business.services.unified_listings_service import UnifiedListingsService
 from business.services.geocoding_service import GeocodingService
 from business.services.currency_rate_service import CurrencyRateService
 from utils.price_metrics import compute_price_metrics
+from business.services.listing_price import listing_price_to_uah
 from scripts.olx_scraper import config as scraper_config
-from scripts.olx_scraper.fetcher import fetch_page, get_session
 from scripts.olx_scraper.parser import parse_listings_page, parse_detail_page
 
 from scripts.olx_scraper.helpers import (
@@ -67,6 +67,103 @@ def _parse_listed_at_iso(iso_str: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _fetch_olx_list_via_browser(
+    browser_fetcher: Any,
+    url: str,
+    *,
+    log: Callable[[str], None],
+    category_label: str,
+    page: int,
+    max_pages: Optional[int],
+    log_prefix: str = "[OLX raw]",
+    retry_on_empty: bool = True,
+) -> Tuple[bool, bool, List[Dict[str, Any]], Optional[int]]:
+    """
+    List-сторінка OLX лише через Playwright (HTTP requests для списку не використовуються).
+    Returns (stop_pages, fetch_failed, listings, max_pages).
+    """
+    import re
+
+    retry_count = getattr(scraper_config, "RETRY_EMPTY_PAGE_COUNT", 2)
+    listings: List[Dict[str, Any]] = []
+    fetch_failed = False
+    stop_pages = False
+
+    for attempt in range(max(1, retry_count + 1)):
+        response_text = ""
+        try:
+            br = browser_fetcher.get_list_page(url, delay_before=(attempt == 0), delay_after=False)
+            status_code = getattr(br, "status_code", 0) or 0
+            response_text = getattr(br, "text", "") or ""
+            if status_code == 404:
+                log(f"{log_prefix} {category_label}: 404 на сторінці {page} — кінець результатів")
+                stop_pages = True
+                break
+            if status_code == 403 or status_code >= 500:
+                raise RuntimeError(f"Browser list HTTP {status_code}")
+        except Exception as e:
+            err_str = str(e)
+            is_404 = "404" in err_str
+            is_server_error = "502" in err_str or "503" in err_str or "504" in err_str
+            log(f"{log_prefix} Помилка list {url}: {e}")
+            if is_404:
+                log(f"{log_prefix} {category_label}: 404 на сторінці {page} — кінець результатів")
+                stop_pages = True
+                break
+            if attempt < retry_count:
+                delay_sec = scraper_config.get_delay_seconds()
+                if is_server_error:
+                    delay_sec = max(delay_sec, 10)
+                time.sleep(delay_sec)
+                continue
+            log(
+                f"{log_prefix} {category_label}: зупинка категорії на сторінці {page} "
+                f"після {retry_count + 1} спроб"
+            )
+            stop_pages = True
+            fetch_failed = True
+            break
+
+        html_lower = response_text.lower()
+        html_norm = html_lower.replace("\u00a0", " ").replace("\u202f", " ")
+        has_explicit_zero = (
+            "знайшли 0 оголошень" in html_lower
+            or "ми знайшли 0 оголошень" in html_lower
+        )
+        m = re.search(r"знайшли\s+(понад\s+)?([\d\s]+)\s*оголошень", html_norm)
+        is_ponad = bool(m and m.group(1))
+        found_n = int(m.group(2).replace(" ", "")) if m and m.group(2).replace(" ", "").isdigit() else None
+        has_reklamni = "ми нічого не знайшли, тому підібрали рекламні" in html_lower
+        should_stop = has_explicit_zero or (has_reklamni and found_n == 0)
+        if found_n is not None and not is_ponad and found_n > 0 and page == 1:
+            per_page = getattr(scraper_config, "OLX_LISTINGS_PER_PAGE", 50)
+            estimated_pages = max(1, -(-found_n // per_page))
+            if max_pages is None or estimated_pages < max_pages:
+                max_pages = estimated_pages
+                log(
+                    f"{log_prefix} {category_label}: OLX каже {found_n} оголошень → "
+                    f"обмеження пагінації до {max_pages} стор."
+                )
+        if should_stop:
+            log(
+                f"{log_prefix} {category_label}: сторінка показує 0 результатів — "
+                f"зупинка (OLX підставляє ліві оголошення)"
+            )
+            stop_pages = True
+            break
+
+        listings = parse_listings_page(response_text)
+        log(f"{log_prefix} Оголошень на сторінці: {len(listings)}")
+        if listings:
+            break
+        if retry_on_empty and attempt < retry_count:
+            delay_sec = scraper_config.get_delay_seconds()
+            log(f"{log_prefix} 0 оголошень — повторна спроба через {delay_sec:.1f} с...")
+            time.sleep(delay_sec)
+
+    return stop_pages, fetch_failed, listings, max_pages
+
+
 def _process_category(
     get_list_url: Callable[[int], str],
     max_pages: Optional[int],
@@ -78,7 +175,6 @@ def _process_category(
     log_fn: Optional[Callable[[str], None]] = None,
     cutoff_utc: Optional[datetime] = None,
     usd_rate: Optional[float] = None,
-    session: Optional[Any] = None,
     region_name: Optional[str] = None,
     browser_fetcher: Optional[Any] = None,
 ) -> Tuple[int, int, set, List[str]]:
@@ -96,6 +192,9 @@ def _process_category(
         else:
             print(msg, flush=True)
 
+    if browser_fetcher is None:
+        raise RuntimeError("Browser fetcher is required for OLX list and detail pages.")
+
     # ——— Етап 1: сторінки пошуку — збираємо список оголошень ———
     all_listings: List[Dict[str, Any]] = []
     stop_pages = False
@@ -111,60 +210,18 @@ def _process_category(
             log(f"[OLX] {category_label}: URL пошуку (перша сторінка): {url}")
         page_label = f"{page}" if max_pages is None else f"{page}/{max_pages}"
         log(f"[OLX] {category_label}: сторінка пошуку {page_label}")
-        listings = []
-        retry_count = getattr(scraper_config, "RETRY_EMPTY_PAGE_COUNT", 2)
-        fetch_failed = False
-        for attempt in range(max(1, retry_count + 1)):
-            try:
-                response = fetch_page(
-                    url,
-                    delay_before=(attempt == 0),
-                    delay_after=True,
-                    session=session,
-                )
-            except Exception as e:
-                err_str = str(e)
-                is_404 = "404" in err_str
-                is_server_error = "502" in err_str or "503" in err_str or "504" in err_str
-                log(f"[OLX] Помилка запиту {url}: {e}")
-                if is_404:
-                    # 404 = сторінка не існує (менше результатів ніж сторінок) — кінець пагінації
-                    log(f"[OLX] {category_label}: 404 на сторінці {page} — кінець результатів")
-                    stop_pages = True
-                    break
-                if attempt < retry_count:
-                    delay_sec = scraper_config.get_delay_seconds()
-                    if is_server_error:
-                        delay_sec = max(delay_sec, 10)  # 502/503 — довша пауза перед повтором
-                    time.sleep(delay_sec)
-                    continue
-                log(f"[OLX] {category_label}: пропускаємо сторінку {page} після {retry_count + 1} спроб")
-                fetch_failed = True
-                page += 1
-                break
-            # OLX при 0 результатів показує ліві/рекомендовані оголошення. Зупинка лише при явному 0:
-            # - «знайшли 0 оголошень» / «ми знайшли 0 оголошень»
-            # - «ми нічого не знайшли, тому підібрали рекламні» + regex знаходить «знайшли 0 оголошень»
-            # (фраза «рекламні» з’являється й на сторінках з результатами, напр. Донецька — тому перевіряємо обидва).
-            import re
-            html_lower = response.text.lower()
-            html_norm = html_lower.replace("\u00a0", " ").replace("\u202f", " ")
-            has_explicit_zero = (
-                "знайшли 0 оголошень" in html_lower
-                or "ми знайшли 0 оголошень" in html_lower
-            )
-            m = re.search(r"знайшли\s+(?:понад\s+)?([\d\s]+)оголошень", html_norm)
-            found_n = int(m.group(1).replace(" ", "")) if m and m.group(1).replace(" ", "").isdigit() else None
-            has_reklamni = "ми нічого не знайшли, тому підібрали рекламні" in html_lower
-            should_stop = has_explicit_zero or (has_reklamni and found_n == 0)
-            if should_stop:
-                log(f"[OLX] {category_label}: сторінка показує 0 результатів — зупинка (OLX підставляє ліві оголошення)")
-                stop_pages = True
-                break
-            listings = parse_listings_page(response.text)
-            log(f"[OLX] Оголошень на сторінці: {len(listings)}")
-            if listings:
-                break
+        stop_pages, fetch_failed, listings, max_pages = _fetch_olx_list_via_browser(
+            browser_fetcher,
+            url,
+            log=log,
+            category_label=category_label,
+            page=page,
+            max_pages=max_pages,
+            log_prefix="[OLX]",
+            retry_on_empty=False,
+        )
+        if stop_pages and not listings:
+            break
         min_full = getattr(scraper_config, "MIN_LISTINGS_PER_FULL_PAGE", 15)
         if listings and len(listings) < min_full:
             log(f"[OLX] {category_label}: на сторінці менше ніж повна вибірка ({len(listings)} < {min_full}) — остання сторінка, зупинка пагінації")
@@ -213,9 +270,6 @@ def _process_category(
 
     if total_count == 0:
         return 0, 0, search_urls, []
-
-    if browser_fetcher is None:
-        raise RuntimeError("Browser detail fetcher is required for OLX detail pages.")
 
     # ——— Етап 2: завантаження деталей (сирі дані, без LLM). LLM — у Phase 2. ———
     total_detail_fetches = 0
@@ -313,7 +367,12 @@ def _process_category(
                         except (TypeError, ValueError):
                             land_area_sqm = None
                     metrics = compute_price_metrics(
-                        total_price_uah=price_value,
+                        total_price_uah=listing_price_to_uah(
+                            price_value,
+                            search_data.get("currency"),
+                            usd_rate,
+                            search_data.get("price_text"),
+                        ),
                         building_area_sqm=total_area_m2,
                         land_area_sqm=land_area_sqm,
                         uah_per_usd=usd_rate,
@@ -392,16 +451,16 @@ def _process_category_raw_only(
     raw_repo: RawOlxListingsRepository,
     log_fn: Optional[Callable[[str], None]] = None,
     cutoff_utc: Optional[datetime] = None,
-    session: Optional[Any] = None,
     region_name: Optional[str] = None,
     browser_fetcher: Optional[Any] = None,
     start_page: int = 1,
     source_load_run_id: Optional[str] = None,
     on_page_done: Optional[Callable[[int], None]] = None,
     deal_type: Optional[str] = None,
+    include_unchanged_urls: bool = False,
 ) -> Tuple[int, List[str]]:
     """
-    Phase 1 (raw pipeline): list HTTP → одразу detail+upsert по сторінці (streaming, low-RAM).
+    Phase 1 (raw pipeline): list через браузер → detail+upsert по сторінці (streaming, low-RAM).
     start_page: продовження пагінації після resume (last_page+1).
     on_page_done(page): checkpoint після успішної обробки сторінки.
     Повертає (total_count, loaded_urls) — loaded_urls лише змінені/нові в цьому проході.
@@ -413,7 +472,7 @@ def _process_category_raw_only(
             print(msg, flush=True)
 
     if browser_fetcher is None:
-        raise RuntimeError("Browser detail fetcher is required for OLX detail pages.")
+        raise RuntimeError("Browser fetcher is required for OLX list and detail pages.")
 
     stop_pages = False
     page = max(1, int(start_page or 1))
@@ -440,116 +499,18 @@ def _process_category_raw_only(
             log(f"[OLX raw] {category_label}: URL пошуку (сторінка {page}): {url}")
         page_label = f"{page}" if max_pages is None else f"{page}/{max_pages}"
         log(f"[OLX raw] {category_label}: сторінка пошуку {page_label}")
-        listings = []
-        retry_count = getattr(scraper_config, "RETRY_EMPTY_PAGE_COUNT", 2)
-        fetch_failed = False
-        last_was_403 = False
-        for attempt in range(max(1, retry_count + 1)):
-            response_text = ""
-            status_code = 200
-            try:
-                response = fetch_page(
-                    url,
-                    delay_before=(attempt == 0),
-                    delay_after=False,
-                    session=session,
-                )
-                response_text = response.text
-                status_code = getattr(response, "status_code", 200)
-                if status_code == 404:
-                    log(f"[OLX raw] {category_label}: 404 на сторінці {page} — кінець результатів")
-                    stop_pages = True
-                    break
-                if status_code == 403:
-                    raise RuntimeError("HTTP 403 Forbidden")
-                if status_code >= 500:
-                    raise RuntimeError(f"HTTP {status_code}")
-            except Exception as e:
-                err_str = str(e)
-                is_404 = "404" in err_str
-                is_403 = "403" in err_str
-                is_server_error = "502" in err_str or "503" in err_str or "504" in err_str
-                last_was_403 = is_403
-                log(f"[OLX raw] Помилка запиту {url}: {e}")
-                if is_404:
-                    log(f"[OLX raw] {category_label}: 404 на сторінці {page} — кінець результатів")
-                    stop_pages = True
-                    break
-                if attempt < retry_count:
-                    if is_403:
-                        delay_sec = scraper_config.get_403_backoff_seconds()
-                        log(f"[OLX raw] HTTP 403 — backoff {delay_sec:.1f} с перед повтором...")
-                    else:
-                        delay_sec = scraper_config.get_delay_seconds()
-                        if is_server_error:
-                            delay_sec = max(delay_sec, 10)
-                    time.sleep(delay_sec)
-                    continue
-                # Після HTTP-спроб: браузерний fallback на 403 (антибот часто пропускає Playwright)
-                use_browser_list = (
-                    last_was_403
-                    and getattr(scraper_config, "LIST_FALLBACK_BROWSER_ON_403", True)
-                    and browser_fetcher is not None
-                    and hasattr(browser_fetcher, "get_list_page")
-                )
-                if use_browser_list:
-                    log(f"[OLX raw] {category_label}: HTTP 403 після {retry_count + 1} спроб — fallback list через браузер")
-                    try:
-                        br = browser_fetcher.get_list_page(url, delay_before=True, delay_after=False)
-                        status_code = getattr(br, "status_code", 0) or 0
-                        response_text = getattr(br, "text", "") or ""
-                        if status_code == 404:
-                            log(f"[OLX raw] {category_label}: 404 на сторінці {page} — кінець результатів")
-                            stop_pages = True
-                            break
-                        if status_code == 403 or status_code >= 500:
-                            raise RuntimeError(f"Browser list HTTP {status_code}")
-                        last_was_403 = False
-                        # успіх — йдемо парсити response_text нижче (не break з except)
-                    except Exception as be:
-                        log(f"[OLX raw] Browser list fallback не вдався: {be}")
-                        log(
-                            f"[OLX raw] {category_label}: зупинка категорії на сторінці {page} "
-                            f"(антибот 403, не скіпаємо пагінацію)"
-                        )
-                        stop_pages = True
-                        fetch_failed = True
-                        break
-                else:
-                    if last_was_403:
-                        log(
-                            f"[OLX raw] {category_label}: зупинка категорії на сторінці {page} "
-                            f"після {retry_count + 1} спроб (403)"
-                        )
-                        stop_pages = True
-                    else:
-                        log(f"[OLX raw] {category_label}: пропускаємо сторінку {page} після {retry_count + 1} спроб")
-                        page += 1
-                    fetch_failed = True
-                    break
-            import re
-            html_lower = response_text.lower()
-            html_norm = html_lower.replace("\u00a0", " ").replace("\u202f", " ")
-            has_explicit_zero = (
-                "знайшли 0 оголошень" in html_lower
-                or "ми знайшли 0 оголошень" in html_lower
-            )
-            m = re.search(r"знайшли\s+(?:понад\s+)?([\d\s]+)оголошень", html_norm)
-            found_n = int(m.group(1).replace(" ", "")) if m and m.group(1).replace(" ", "").isdigit() else None
-            has_reklamni = "ми нічого не знайшли, тому підібрали рекламні" in html_lower
-            should_stop = has_explicit_zero or (has_reklamni and found_n == 0)
-            if should_stop:
-                log(f"[OLX raw] {category_label}: сторінка показує 0 результатів — зупинка (OLX підставляє ліві оголошення)")
-                stop_pages = True
-                break
-            listings = parse_listings_page(response_text)
-            log(f"[OLX raw] Оголошень на сторінці: {len(listings)}")
-            if listings:
-                break
-            if attempt < retry_count:
-                delay_sec = scraper_config.get_delay_seconds()
-                log(f"[OLX raw] 0 оголошень — повторна спроба через {delay_sec:.1f} с...")
-                time.sleep(delay_sec)
+        stop_pages, fetch_failed, listings, max_pages = _fetch_olx_list_via_browser(
+            browser_fetcher,
+            url,
+            log=log,
+            category_label=category_label,
+            page=page,
+            max_pages=max_pages,
+            log_prefix="[OLX raw]",
+            retry_on_empty=True,
+        )
+        if stop_pages and not listings:
+            break
         min_full = getattr(scraper_config, "MIN_LISTINGS_PER_FULL_PAGE", 15)
         if listings and len(listings) < min_full:
             log(f"[OLX raw] {category_label}: на сторінці менше ніж повна вибірка ({len(listings)} < {min_full}) — остання сторінка, зупинка пагінації")
@@ -595,6 +556,8 @@ def _process_category_raw_only(
             new_hash = calculate_search_data_hash(search_data)
             existing_raw = raw_repo.find_by_url(listing_url)
             if existing_raw and existing_raw.get("search_data_hash") == new_hash:
+                if include_unchanged_urls:
+                    loaded_urls.append(listing_url)
                 continue
             try:
                 detail_result = browser_fetcher.get_detail_page(listing_url)
@@ -637,8 +600,7 @@ def _process_region_raw_only(
     max_pages_override: Optional[int] = None,
     browser_fetcher: Optional[Any] = None,
 ) -> Tuple[int, List[str]]:
-    """Phase 1: одна область — усі категорії, запис лише в raw. Список — requests, деталі — browser_fetcher. Повертає (total_count, loaded_urls)."""
-    session = get_session()
+    """Phase 1: одна область — усі категорії, запис лише в raw. Список і деталі — browser_fetcher. Повертає (total_count, loaded_urls)."""
     total_count = 0
     loaded_urls: List[str] = []
     for cat in categories:
@@ -657,7 +619,6 @@ def _process_region_raw_only(
             raw_repo,
             log_fn=log_fn,
             cutoff_utc=cutoff_utc,
-            session=session,
             region_name=region_name,
             browser_fetcher=browser_fetcher,
             deal_type=cat.get("deal_type"),
@@ -879,6 +840,7 @@ def _phase1_worker(
     browser_fetcher: Optional[Any] = None,
     source_load_run_id: Optional[str] = None,
     unit_state: Optional[Dict[str, Dict[str, Any]]] = None,
+    include_unchanged_urls: bool = False,
 ) -> None:
     """
     Воркер Phase 1: бере завдання з черги (region_name, category_dict), виконує streaming
@@ -890,7 +852,6 @@ def _phase1_worker(
         UNIT_DONE,
     )
 
-    session = get_session()
     run_repo = SourceLoadRunRepository() if source_load_run_id else None
 
     def run_job(region_name: str, cat: Dict[str, Any]) -> Tuple[int, List[str]]:
@@ -938,13 +899,13 @@ def _phase1_worker(
             raw_repo,
             log_fn=log_fn,
             cutoff_utc=cutoff_utc,
-            session=session,
             region_name=region_name,
             browser_fetcher=browser_fetcher,
             start_page=start_page,
             source_load_run_id=source_load_run_id,
             on_page_done=on_page_done,
             deal_type=cat.get("deal_type"),
+            include_unchanged_urls=include_unchanged_urls,
         )
         if run_repo and source_load_run_id:
             run_repo.mark_unit_done(source_load_run_id, unit_key)
@@ -1036,6 +997,9 @@ def run_olx_update_raw_only(
     building_area_max: Optional[float] = None,
     land_area_sotky_min: Optional[float] = None,
     land_area_sotky_max: Optional[float] = None,
+    include_unchanged_urls: bool = False,
+    apply_default_area_filters: bool = True,
+    sort_newest: bool = True,
 ) -> Dict[str, Any]:
     """
     Phase 1 pipeline: завантаження сирих даних OLX лише в raw_olx_listings (без LLM, без olx_listings).
@@ -1089,6 +1053,8 @@ def run_olx_update_raw_only(
         building_area_max=building_area_max,
         land_area_sotky_min=land_area_sotky_min,
         land_area_sotky_max=land_area_sotky_max,
+        apply_default_area_filters=apply_default_area_filters,
+        sort_newest=sort_newest,
     )
     regions_with_cats = _filter_regions_with_categories(
         regions_with_cats,
@@ -1180,6 +1146,7 @@ def run_olx_update_raw_only(
         worker_kwargs = {
             "source_load_run_id": source_load_run_id,
             "unit_state": unit_state if source_load_run_id else None,
+            "include_unchanged_urls": include_unchanged_urls,
         }
         try:
             from scripts.olx_scraper.browser_fetcher import BrowserPagePool
@@ -1287,13 +1254,13 @@ def run_olx_update_raw_only(
                                 raw_repo,
                                 log_fn=log,
                                 cutoff_utc=cutoff_utc,
-                                session=get_session(),
                                 region_name=region_name,
                                 browser_fetcher=browser_fetcher,
                                 start_page=start_page,
                                 source_load_run_id=source_load_run_id,
                                 on_page_done=on_page_done,
                                 deal_type=cat.get("deal_type"),
+                                include_unchanged_urls=include_unchanged_urls,
                             )
                             total_listings += n_list
                             if not source_load_run_id:
@@ -1331,11 +1298,9 @@ def _process_region(
     max_pages_override: Optional[int] = None,
 ) -> Tuple[int, int, List[Dict[str, Any]], set, List[str]]:
     """
-    Обробляє одну область: 2 категорії (нежитлова + земля) з одним HTTP-сеансом.
-    Деталі оголошень завантажуються лише через браузерний fetcher.
+    Обробляє одну область: усі категорії через браузер (list + detail).
     Повертає (total_listings, total_detail_fetches, by_category, search_urls, pending_llm_urls).
     """
-    session = get_session()
     total_listings = 0
     total_detail_fetches = 0
     by_category: List[Dict[str, Any]] = []
@@ -1369,7 +1334,6 @@ def _process_region(
                 log_fn=log_fn,
                 cutoff_utc=cutoff_utc,
                 usd_rate=usd_rate,
-                session=session,
                 region_name=region_name,
                 browser_fetcher=browser_fetcher,
             )
@@ -1485,7 +1449,12 @@ def _process_single_llm_pending_url(
             except (TypeError, ValueError):
                 land_area_sqm = None
         metrics = compute_price_metrics(
-            total_price_uah=price_value,
+            total_price_uah=listing_price_to_uah(
+                price_value,
+                search_data.get("currency"),
+                usd_rate,
+                search_data.get("price_text"),
+            ),
             building_area_sqm=total_area_m2,
             land_area_sqm=land_area_sqm,
             uah_per_usd=usd_rate,
@@ -1617,6 +1586,8 @@ def _get_base_categories(
     building_area_max: Optional[float] = None,
     land_area_sotky_min: Optional[float] = None,
     land_area_sotky_max: Optional[float] = None,
+    apply_default_area_filters: bool = True,
+    sort_newest: bool = True,
 ) -> List[Dict[str, Any]]:
     """Повертає базові категорії: комерційна + земля по типах (без с/г).
 
@@ -1630,24 +1601,28 @@ def _get_base_categories(
     cats: List[Dict[str, Any]] = []
 
     def _comm_fn(dt: str):
-        return lambda p, fn=scraper_config.get_commercial_real_estate_list_url, deal=dt, extra_q=extra, **kw: fn(
+        return lambda p, fn=scraper_config.get_commercial_real_estate_list_url, deal=dt, extra_q=extra, sort_n=sort_newest, **kw: fn(
             p,
             deal_type=deal,
             extra_query_pairs=extra_q,
             area_from_m2=building_area_min,
             area_to_m2=building_area_max,
-            **{k: v for k, v in kw.items() if k in ("region_slug", "sort_newest", "sale_only")},
+            apply_default_area_filters=apply_default_area_filters,
+            sort_newest=sort_n,
+            **{k: v for k, v in kw.items() if k in ("region_slug", "sale_only")},
         )
 
     def _land_fn(dt: str, land_slug: Optional[str]):
-        return lambda p, fn=scraper_config.get_land_list_url, deal=dt, lt=land_slug, extra_q=extra, **kw: fn(
+        return lambda p, fn=scraper_config.get_land_list_url, deal=dt, lt=land_slug, extra_q=extra, sort_n=sort_newest, **kw: fn(
             p,
             land_type_slug=lt,
             deal_type=deal,
             extra_query_pairs=extra_q,
             land_area_from_sotok=land_area_sotky_min,
             land_area_to_sotok=land_area_sotky_max,
-            **{k: v for k, v in kw.items() if k in ("region_slug", "sort_newest")},
+            apply_default_area_filters=apply_default_area_filters,
+            sort_newest=sort_n,
+            **{k: v for k, v in kw.items() if k in ("region_slug",)},
         )
 
     land_slugs = scraper_config.get_olx_land_type_slugs()
@@ -1717,6 +1692,8 @@ def _build_regions_with_categories(
     building_area_max: Optional[float] = None,
     land_area_sotky_min: Optional[float] = None,
     land_area_sotky_max: Optional[float] = None,
+    apply_default_area_filters: bool = True,
+    sort_newest: bool = True,
 ) -> List[Tuple[str, List[Dict[str, Any]]]]:
     """
     Групує категорії по областях. Кожна область має категорії: нежитлова + земля (± оренда).
@@ -1730,6 +1707,8 @@ def _build_regions_with_categories(
         building_area_max=building_area_max,
         land_area_sotky_min=land_area_sotky_min,
         land_area_sotky_max=land_area_sotky_max,
+        apply_default_area_filters=apply_default_area_filters,
+        sort_newest=sort_newest,
     )
     if not slugs:
         return [("Україна", [
@@ -1841,7 +1820,7 @@ def run_olx_update(
                 n_listings, n_details, cat_urls, cat_pending = _process_category(
                     get_list_url, max_pages, label, repo, llm_extractor, geocoding_service,
                     unified_service=unified_service, log_fn=log, cutoff_utc=cutoff_utc,
-                    usd_rate=usd_rate, session=None, region_name=None, browser_fetcher=browser_fetcher,
+                    usd_rate=usd_rate, region_name=None, browser_fetcher=browser_fetcher,
                 )
                 total_listings += n_listings
                 total_detail_fetches += n_details

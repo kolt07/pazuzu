@@ -97,19 +97,8 @@ REQUEST_DETAIL_TIMEOUT = int(os.getenv("OLX_SCRAPER_DETAIL_TIMEOUT", "90"))
 DELAY_AFTER_PAGE_LOAD = float(os.getenv("OLX_SCRAPER_DELAY_AFTER_LOAD", "0"))
 # Короткий jitter після goto detail перед wait_for_selector (с); 0 = без паузи
 DETAIL_POST_GOTO_SETTLE_MAX = float(os.getenv("OLX_SCRAPER_DETAIL_POST_GOTO_SETTLE_MAX", "0.3"))
-# Кількість повторних спроб при 0 оголошень на сторінці
+# Кількість повторних спроб при 0 оголошень на сторінці (browser list)
 RETRY_EMPTY_PAGE_COUNT = int(os.getenv("OLX_SCRAPER_RETRY_EMPTY", "2"))
-
-# HTTP 403 (антибот / WAF): довша пауза перед повтором замість короткого politeness delay
-RETRY_403_BACKOFF_MIN = float(os.getenv("OLX_SCRAPER_403_BACKOFF_MIN", "15"))
-RETRY_403_BACKOFF_MAX = float(os.getenv("OLX_SCRAPER_403_BACKOFF_MAX", "45"))
-# Після вичерпання HTTP-спроб на 403 — один list-fetch через BrowserPagePool (якщо є)
-LIST_FALLBACK_BROWSER_ON_403 = (
-    os.getenv("OLX_SCRAPER_LIST_FALLBACK_BROWSER_ON_403", "1").strip().lower()
-    in ("1", "true", "yes")
-)
-# Макс. паралельних HTTP list-запитів між Phase1-потоками (1 = серіалізація — менше 403)
-LIST_HTTP_CONCURRENCY = max(1, int(os.getenv("OLX_SCRAPER_LIST_HTTP_CONCURRENCY", "1")))
 
 # User-Agent — звичайний браузер, не бот
 USER_AGENT = os.getenv(
@@ -211,13 +200,6 @@ def get_delay_detail_seconds() -> float:
     return random.uniform(DELAY_DETAIL_MIN, DELAY_DETAIL_MAX)
 
 
-def get_403_backoff_seconds() -> float:
-    """Довга пауза після HTTP 403 (антибот), щоб не спалювати спроби за секунди."""
-    lo = max(1.0, float(RETRY_403_BACKOFF_MIN))
-    hi = max(lo, float(RETRY_403_BACKOFF_MAX))
-    return random.uniform(lo, hi)
-
-
 def get_detail_post_goto_settle_seconds() -> float:
     """Короткий jitter після navigation detail (readiness — через wait_for_selector)."""
     max_sec = max(0.0, DETAIL_POST_GOTO_SETTLE_MAX)
@@ -251,22 +233,35 @@ def _build_category_url(
 ) -> str:
     """Збирає URL категорії з опціональними фільтрами.
     OLX: path-суфікс /{region_slug}/ для областей; для землі — /{land_type_slug}/{region_slug}/.
-    extra_query_pairs: додаткові параметри пошуку (напр. search[filter_float_total_area:from]=50)."""
+    currency виносимо на початок query як є (USD), без search[currency] і без зайвого ':'.
+    search[order] не додаємо, якщо sort_newest=False — інакше OLX віддає 403/404.
+    """
+    from urllib.parse import quote
+
     path = base_path.rstrip("/")
     if land_type_slug:
         path = f"{path}/{land_type_slug}"
     if region_slug:
         path = f"{path}/{region_slug}"
     base = f"{BASE_URL.rstrip('/')}{path}/"
-    pairs: List[Tuple[str, str]] = []
-    if page > 1:
-        pairs.append(("page", str(page)))
-    if sort_newest:
-        pairs.append(("search[order]", "created_at:desc"))
+    currency = None
+    search_pairs: List[Tuple[str, str]] = []
     for k, v in extra_query_pairs or []:
-        pairs.append((k, v))
-    if pairs:
-        return base + "?" + urlencode(pairs)
+        if str(k) == "currency":
+            currency = str(v or "").strip().rstrip(":")
+        else:
+            search_pairs.append((k, v))
+    parts: List[str] = []
+    if currency:
+        parts.append("currency=" + quote(currency, safe=""))
+    if page > 1:
+        search_pairs.insert(0, ("page", str(page)))
+    if sort_newest:
+        search_pairs.append(("search[order]", "created_at:desc"))
+    if search_pairs:
+        parts.append(urlencode(search_pairs))
+    if parts:
+        return base + "?" + "&".join(parts)
     return base
 
 
@@ -279,6 +274,7 @@ def get_commercial_real_estate_list_url(
     deal_type: Optional[str] = None,
     area_from_m2: Optional[float] = None,
     area_to_m2: Optional[float] = None,
+    apply_default_area_filters: bool = True,
 ) -> str:
     """
     Повертає URL сторінки списку нежитлової (комерційної) нерухомості.
@@ -288,6 +284,7 @@ def get_commercial_real_estate_list_url(
     region_slug: OLX slug області для фільтрації (напр. kyivskaya, lvivska).
     Додаткові фільтри на OLX: площа від FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2 м²
     (або area_from_m2/area_to_m2 якщо задано).
+    apply_default_area_filters: False — не підставляти дефолтну площу, якщо користувач її не задав.
     """
     dt = (deal_type or "").strip().lower()
     if dt == "rent":
@@ -296,15 +293,16 @@ def get_commercial_real_estate_list_url(
         path = COMMERCIAL_REAL_ESTATE_SALE_PATH
     else:
         path = COMMERCIAL_REAL_ESTATE_PATH
-    area_from = area_from_m2 if area_from_m2 is not None else FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2
-    extra: List[Tuple[str, str]] = [
-        ("search[filter_float_total_area:from]", str(int(area_from))),
-    ]
+    extra: List[Tuple[str, str]] = list(extra_query_pairs or [])
+    area_from = area_from_m2
+    if area_from is None and apply_default_area_filters:
+        area_from = FILTER_REAL_ESTATE_TOTAL_AREA_FROM_M2
+    if area_from is not None:
+        extra.append(("search[filter_float_total_area:from]", str(int(area_from))))
     if area_to_m2 is not None:
         extra.append(("search[filter_float_total_area:to]", str(int(area_to_m2))))
     for slug in get_olx_comm_re_object_type_slugs_include():
         extra.append(("search[filter_enum_comm_re_object_type]", slug))
-    extra.extend(extra_query_pairs or [])
     return _build_category_url(path, page, sort_newest, region_slug, extra_query_pairs=extra)
 
 
@@ -317,12 +315,14 @@ def get_land_list_url(
     deal_type: Optional[str] = None,
     land_area_from_sotok: Optional[float] = None,
     land_area_to_sotok: Optional[float] = None,
+    apply_default_area_filters: bool = True,
 ) -> str:
     """Повертає URL сторінки списку земельних ділянок.
     land_type_slug: фільтр за типом землі (з olx_land_type_slugs) — виключає с/г при використанні.
     deal_type: sale | rent.
     Без land_type_slug і sale — загальна сторінка /zemlya/ (legacy).
-    Додатковий фільтр на OLX: площа від FILTER_LAND_AREA_FROM_SOTOK соток."""
+    Додатковий фільтр на OLX: площа від FILTER_LAND_AREA_FROM_SOTOK соток.
+    apply_default_area_filters: False — не підставляти дефолтну площу, якщо користувач її не задав."""
     dt = (deal_type or "").strip().lower()
     if dt == "rent":
         base = LAND_RENT_PATH
@@ -330,10 +330,12 @@ def get_land_list_url(
         base = LAND_SALE_PATH
     else:
         base = LAND_PATH
-    area_from = land_area_from_sotok if land_area_from_sotok is not None else FILTER_LAND_AREA_FROM_SOTOK
-    extra = [
-        ("search[filter_float_land_area:from]", str(int(area_from))),
-    ]
+    extra: List[Tuple[str, str]] = []
+    area_from = land_area_from_sotok
+    if area_from is None and apply_default_area_filters:
+        area_from = FILTER_LAND_AREA_FROM_SOTOK
+    if area_from is not None:
+        extra.append(("search[filter_float_land_area:from]", str(int(area_from))))
     if land_area_to_sotok is not None:
         extra.append(("search[filter_float_land_area:to]", str(int(land_area_to_sotok))))
     extra.extend(extra_query_pairs or [])

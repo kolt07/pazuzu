@@ -5,9 +5,7 @@
 
 ## Заходи антибот
 
-- **List через HTTP, detail через спільний BrowserPool** — один Chromium, обмежена кількість page-слотів (low-RAM).
-- **Серіалізація HTTP list** — між Phase1-потоками максимум `OLX_SCRAPER_LIST_HTTP_CONCURRENCY` паралельних list-запитів (дефолт 1).
-- **HTTP 403** — довгий backoff (`OLX_SCRAPER_403_BACKOFF_MIN`/`MAX`, дефолт 15–45 с); після вичерпання спроб — **fallback list через браузер** (`BrowserPagePool.get_list_page`), без скіпу сторінок пагінації.
+- **List і detail через спільний BrowserPool** — один Chromium, обмежена кількість page-слотів (low-RAM). HTTP list-запити (requests) **не використовуються**.
 - **Затримка перед list-запитом** — 0.5–1.5 с (випадкова), `OLX_SCRAPER_DELAY_MIN` / `OLX_SCRAPER_DELAY_MAX`.
 - **Затримка перед detail** — 0.5–2 с, `OLX_SCRAPER_DELAY_DETAIL_MIN` / `OLX_SCRAPER_DELAY_DETAIL_MAX`.
 - **Заголовки як у браузера** — User-Agent (Chrome), Accept-Language: uk, Sec-Ch-Ua тощо.
@@ -49,15 +47,12 @@ py scripts/olx_scraper/run_prototype.py
 |--------|------|-------------------|
 | `OLX_SCRAPER_BASE_URL` | Базовий URL сайту | `https://www.olx.ua` |
 | `OLX_SCRAPER_DELAY_MIN` / `OLX_SCRAPER_DELAY_MAX` | Затримка перед list-запитом (с) | 0.5, 1.5 |
-| `OLX_SCRAPER_403_BACKOFF_MIN` / `OLX_SCRAPER_403_BACKOFF_MAX` | Пауза перед повтором після HTTP 403 (с) | 15, 45 |
-| `OLX_SCRAPER_LIST_HTTP_CONCURRENCY` | Макс. паралельних HTTP list між потоками | 1 |
-| `OLX_SCRAPER_LIST_FALLBACK_BROWSER_ON_403` | Fallback list через BrowserPool після 403 | `1` |
-| `OLX_SCRAPER_TIMEOUT` | Таймаут запиту (с) | 25 |
+| `OLX_SCRAPER_TIMEOUT` | Таймаут browser list (с) | 25 |
 | `OLX_SCRAPER_USER_AGENT` | User-Agent | Chrome 120 |
 | `OLX_SCRAPER_OUTPUT_DIR` | Каталог виводу | `output` |
 | `OLX_SCRAPER_OUTPUT_FILE` | Ім’я файлу JSON | `olx_nedvizhimost_page1.json` |
 | `OLX_SCRAPER_DELAY_DETAIL_MIN` / `OLX_SCRAPER_DELAY_DETAIL_MAX` | Затримка перед detail (с) | 0.5, 2 |
-| `OLX_SCRAPER_DELAY_AFTER_LOAD` | Пауза після browser list load (с); HTTP ігнорує | 0 |
+| `OLX_SCRAPER_DELAY_AFTER_LOAD` | Пауза після browser list load (с) | 0 |
 | `OLX_SCRAPER_DETAIL_POST_GOTO_SETTLE_MAX` | Макс. jitter після goto detail перед selector wait (с) | 0.3 |
 | `OLX_SCRAPER_DETAIL_TIMEOUT` | Таймаут запиту сторінки оголошення (с) | 90 |
 | `OLX_SCRAPER_BROWSER_DOCKER_SAFE_ARGS` | Додає docker-safe args для Chromium (`--disable-dev-shm-usage`, `--no-sandbox`) | `1` у Docker, інакше `0` |

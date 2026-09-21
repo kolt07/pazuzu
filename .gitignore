@@ -66,6 +66,9 @@ Thumbs.db
 # Temporary data
 temp/
 
+# MongoDB collection dumps (local backups)
+data/mongo_dumps/
+
 # Configuration files with API keys
 config/config.yaml
 

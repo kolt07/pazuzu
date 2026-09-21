@@ -406,3 +406,41 @@ def sum_billed_usd_last_n_calendar_days(
         dk = (end - timedelta(days=i)).strftime("%Y-%m-%d")
         total += float(billed_by_day.get(dk) or 0.0)
     return round(total, 6)
+
+
+def extract_available_balance_usd(user_payload: Dict[str, Any]) -> float:
+    """
+    Фактично доступний баланс Vast.ai (USD).
+    Пріоритет `credit`, fallback — `balance` (див. vast_runtime_supervisor).
+    """
+    if not isinstance(user_payload, dict):
+        return 0.0
+    credit = user_payload.get("credit")
+    if credit is not None:
+        return float(credit)
+    return float(user_payload.get("balance") or 0.0)
+
+
+def fetch_vast_available_balance_usd(
+    api_key: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Поточний доступний баланс акаунта Vast.ai.
+    Returns: (balance_usd, error_code_or_message).
+    """
+    key = (api_key or "").strip()
+    if not key:
+        try:
+            from business.services.vast_ai_runtime_settings_service import VastRuntimeSettingsService
+
+            key = (VastRuntimeSettingsService().get_settings().get("vast_api_key") or "").strip()
+        except Exception:
+            key = ""
+    if not key:
+        return None, "no_api_key"
+    try:
+        client = VastAiClient(key)
+        user = client.get_current_user()
+        return extract_available_balance_usd(user), None
+    except Exception as e:
+        return None, str(e)[:200]

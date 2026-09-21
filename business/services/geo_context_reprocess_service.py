@@ -21,6 +21,7 @@ from utils.address_geo_enrichment import (
     normalize_olx_detail_location,
 )
 from utils.price_metrics import compute_price_metrics
+from business.services.listing_price import listing_price_to_uah
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +298,12 @@ class GeoContextReprocessService:
                     land_area_sqm = None
             price_value = search_data.get("price_value")
             detail_data["price_metrics"] = compute_price_metrics(
-                total_price_uah=price_value,
+                total_price_uah=listing_price_to_uah(
+                    price_value,
+                    search_data.get("currency"),
+                    usd_rate,
+                    search_data.get("price_text"),
+                ),
                 building_area_sqm=total_area_m2,
                 land_area_sqm=land_area_sqm,
                 uah_per_usd=usd_rate,

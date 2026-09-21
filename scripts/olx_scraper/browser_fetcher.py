@@ -687,9 +687,8 @@ class BrowserPagePool:
         _retries_left: int = 1,
     ) -> PageResult:
         """
-        List-сторінка через той самий BrowserPool (fallback при HTTP 403).
-        delay_before/delay_after — для сумісності з BrowserPageFetcher; пауза перед goto
-        уже є в _fetch_list_with_slot (get_delay_seconds).
+        List-сторінка через BrowserPool (Playwright).
+        delay_before/delay_after — для сумісності; пауза перед goto у _fetch_list_with_slot.
         """
         _ = delay_before
         _ = delay_after
