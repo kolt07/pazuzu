@@ -48,6 +48,12 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
         worker_cancel_long_running_tasks_on_connection_loss=True,
         broker_connection_retry_on_startup=True,
         broker_heartbeat=30,
+        # RabbitMQ 4.3+: transient+non-exclusive черги заборонені (pidbox/events).
+        # Потрібен Celery >=5.6 (інакше ключі ігноруються — тоді див. rabbitmq.conf permit).
+        control_queue_exclusive=True,
+        control_queue_durable=False,
+        event_queue_exclusive=True,
+        event_queue_durable=False,
         task_track_started=True,
         result_expires=3600,
         task_routes={

@@ -27,8 +27,7 @@ COPY requirements.txt .
 # Встановлюємо залежності Python
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir "celery>=5.3.0" && \
-    python -c "import celery; print('celery', celery.__version__)"
+    python -c "import celery,kombu; print('celery', celery.__version__, 'kombu', kombu.__version__)"
 
 # Chromium для OLX (clicker / browser_fetcher): системні залежності + завантаження браузера
 RUN python -m playwright install --with-deps chromium && \

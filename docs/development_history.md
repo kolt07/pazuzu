@@ -1,3 +1,9 @@
+## 2026-09-21 — RabbitMQ 4.3 + Celery: transient_nonexcl_queues
+
+- **Симптом**: `INTERNAL_ERROR - Feature transient_nonexcl_queues is deprecated` при Queue.declare (pidbox); connection lost.
+- **Причина**: RabbitMQ 4.3 за замовчуванням відхиляє durable=false + exclusive=false; старий Celery/Kombu так оголошує control/event черги.
+- **Дії**: `rabbitmq.conf` — `deprecated_features.permit.transient_nonexcl_queues=true`; Celery `control_queue_exclusive`/`event_queue_exclusive=True`; `celery>=5.6.0` у requirements/Dockerfile.
+
 ## 2026-09-21 — Celery: ModuleNotFoundError transport
 
 - **Причина**: після selective `COPY` у Dockerfile і bind-mounts у compose пакет `transport/` не потрапляв у контейнер.

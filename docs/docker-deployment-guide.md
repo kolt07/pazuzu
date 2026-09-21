@@ -178,6 +178,7 @@ git clean -fd
 - **Конфлікти при `git pull`:** вирішіть у файлах, приберіть маркери `<<<<<<<`, `git add`, `git commit`.
 - **ngrok і `ERR_NGROK_4018`:** перевірте `NGROK_AUTHTOKEN` у `.env` і що піднімаєте з `--profile ngrok`. Без токена не запускайте профіль або приберіть сервіс з локального override.
 - **ngrok і `ERR_NGROK_8012` (connection refused):** Mini App слухає інший порт, ніж ngrok. У логах `pazuzu-app` буде `Uvicorn running on http://0.0.0.0:PORT` — цей `PORT` має бути в `.env` як `MINI_APP_PORT` і в `mini_app.port`. Потім `docker compose --profile ngrok up -d ngrok`.
+- **Celery і `transient_nonexcl_queues` / INTERNAL_ERROR 541:** образ `rabbitmq:4` підтягнув 4.3+. Переконайся, що змонтовано `config/rabbitmq.conf` з `deprecated_features.permit.transient_nonexcl_queues = true`, і `docker compose up -d rabbitmq` (потрібен restart брокера). Довгостроково — Celery ≥5.6 з exclusive control/event чергами.
 
 ---
 
