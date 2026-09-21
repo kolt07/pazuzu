@@ -114,6 +114,7 @@ services:
       - ./mcp_servers:/app/mcp_servers
       - ./scripts:/app/scripts
       - ./telegram_mini_app:/app/telegram_mini_app
+      - ./transport:/app/transport
       - ./utils:/app/utils
       - ./main.py:/app/main.py:ro
       - ./data:/app/data
@@ -158,6 +159,7 @@ services:
       - ./mcp_servers:/app/mcp_servers
       - ./scripts:/app/scripts
       - ./telegram_mini_app:/app/telegram_mini_app
+      - ./transport:/app/transport
       - ./utils:/app/utils
       - ./main.py:/app/main.py:ro
       - ./data:/app/data
@@ -204,6 +206,7 @@ services:
       - ./mcp_servers:/app/mcp_servers
       - ./scripts:/app/scripts
       - ./telegram_mini_app:/app/telegram_mini_app
+      - ./transport:/app/transport
       - ./utils:/app/utils
       - ./main.py:/app/main.py:ro
       - ./data:/app/data

@@ -1,3 +1,8 @@
+## 2026-09-21 — Celery: ModuleNotFoundError transport
+
+- **Причина**: після selective `COPY` у Dockerfile і bind-mounts у compose пакет `transport/` не потрапляв у контейнер.
+- **Дії**: `COPY transport/` у Dockerfile; `./transport:/app/transport` для app і обох workers.
+
 ## 2026-09-21 — Celery: warning cancel-on-loss + обрив на mingle
 
 - **Симптом**: `CPendingDeprecationWarning` про `worker_cancel_long_running_tasks_on_connection_loss`; одразу після `Connected to amqp://…` — `Connection to broker lost` у `mingle.hello` / pidbox.

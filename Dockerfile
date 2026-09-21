@@ -42,6 +42,7 @@ COPY domain/ domain/
 COPY mcp_servers/ mcp_servers/
 COPY scripts/ scripts/
 COPY telegram_mini_app/ telegram_mini_app/
+COPY transport/ transport/
 COPY utils/ utils/
 COPY main.py .
 RUN mkdir -p data temp
