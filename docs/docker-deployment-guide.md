@@ -15,9 +15,9 @@
 | **Застосунок** | `pazuzu-app` | `main.py` (Telegram-бот тощо), `TASK_QUEUE_ENABLED=true` |
 | **Celery: source** | `pazuzu-source-worker` | Черга `source_load` |
 | **Celery: LLM** | `pazuzu-llm-worker` | Черга `llm_processing` (паралелізм з `task_queue.llm_worker_threads`) |
-| **ngrok** | `pazuzu-ngrok` | Тунель до `pazuzu-app:8000` (лише з профілем `ngrok`) |
+| **ngrok** | `pazuzu-ngrok` | Тунель до `pazuzu-app:${MINI_APP_PORT:-8000}` (лише з профілем `ngrok`) |
 
-**Порти на хості:** `27017` (MongoDB), `5672` / `15672` (RabbitMQ), `4040` (веб-інспектор ngrok — якщо запущено сервіс ngrok). HTTP застосунку всередині мережі — `pazuzu-app:8000` (для ngrok-команди в compose).
+**Порти на хості:** `27017` (MongoDB), `5672` / `15672` (RabbitMQ), `4040` (веб-інспектор ngrok — якщо запущено сервіс ngrok). HTTP Mini App всередині мережі — `pazuzu-app:${MINI_APP_PORT:-8000}` (має збігатися з `mini_app.port` у `config.yaml`).
 
 Актуальний повний файл — у корені репозиторію: `docker-compose.yml`.
 
@@ -72,6 +72,7 @@ copy config\config.example.yaml config\config.yaml
 | Змінна | Обов’язково? | Примітка |
 |--------|----------------|----------|
 | `NGROK_AUTHTOKEN` | Так, якщо піднімаєте ngrok | [Authtoken](https://dashboard.ngrok.com/get-started/your-authtoken). Без нього контейнер ngrok видасть `ERR_NGROK_4018`. |
+| `MINI_APP_PORT` | Ні (дефолт `8000`) | Порт upstream для ngrok. **Обов’язково** той самий, що `mini_app.port` у `config.yaml` (інакше `ERR_NGROK_8012` / connection refused). |
 | `RABBITMQ_DEFAULT_USER` / `PASS` / `VHOST` | Ні | Якщо не задати, Compose використовує `pazuzu` / `pazuzu` / `pazuzu`. Мають збігатися з очікуваннями у `config.yaml` (секція `task_queue`, якщо розкоментована). |
 
 Приклад фрагмента `.env`:
@@ -176,6 +177,7 @@ git clean -fd
 - **Старі образи:** після змін у `Dockerfile` або `requirements.txt` виконуйте `docker compose build --no-cache` для відповідних сервісів.
 - **Конфлікти при `git pull`:** вирішіть у файлах, приберіть маркери `<<<<<<<`, `git add`, `git commit`.
 - **ngrok і `ERR_NGROK_4018`:** перевірте `NGROK_AUTHTOKEN` у `.env` і що піднімаєте з `--profile ngrok`. Без токена не запускайте профіль або приберіть сервіс з локального override.
+- **ngrok і `ERR_NGROK_8012` (connection refused):** Mini App слухає інший порт, ніж ngrok. У логах `pazuzu-app` буде `Uvicorn running on http://0.0.0.0:PORT` — цей `PORT` має бути в `.env` як `MINI_APP_PORT` і в `mini_app.port`. Потім `docker compose --profile ngrok up -d ngrok`.
 
 ---
 
@@ -306,7 +308,7 @@ services:
       - pazuzu-app
     environment:
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
-    command: ["http", "pazuzu-app:8000"]
+    command: ["http", "pazuzu-app:${MINI_APP_PORT:-8000}"]
     ports:
       - "4040:4040"
 

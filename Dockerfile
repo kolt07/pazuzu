@@ -34,8 +34,17 @@ RUN pip install --no-cache-dir --upgrade pip && \
 RUN python -m playwright install --with-deps chromium && \
     chmod -R a+rx /ms-playwright
 
-# Копіюємо весь код проекту
-COPY . .
+# Лише runtime-код (не venv/дампи/docs — див. .dockerignore).
+# data/ і temp/ — порожні в образі; у compose монтуються з хоста.
+COPY business/ business/
+COPY config/ config/
+COPY domain/ domain/
+COPY mcp_servers/ mcp_servers/
+COPY scripts/ scripts/
+COPY telegram_mini_app/ telegram_mini_app/
+COPY utils/ utils/
+COPY main.py .
+RUN mkdir -p data temp
 
 # Створюємо користувача для безпеки (не root)
 RUN useradd -m -u 1000 appuser && \

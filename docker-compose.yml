@@ -240,7 +240,8 @@ services:
       - pazuzu-app
     environment:
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
-    command: ["http", "pazuzu-app:8000"]
+    # Має збігатися з mini_app.port у config.yaml (на віддаленому часто 8080).
+    command: ["http", "pazuzu-app:${MINI_APP_PORT:-8000}"]
     ports:
       - "4040:4040"
     cpus: "${NGROK_CPUS:-0.25}"

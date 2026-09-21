@@ -1,3 +1,19 @@
+## 2026-09-21 — Celery: warning cancel-on-loss + обрив на mingle
+
+- **Симптом**: `CPendingDeprecationWarning` про `worker_cancel_long_running_tasks_on_connection_loss`; одразу після `Connected to amqp://…` — `Connection to broker lost` у `mingle.hello` / pidbox.
+- **Дії**: у `celery_app` явно `worker_cancel_long_running_tasks_on_connection_loss=True`, `broker_connection_retry_on_startup`, heartbeat; у `celery_worker_runner` — `--without-mingle --without-gossip` (стабільніший старт у Docker).
+
+## 2026-09-21 — ngrok ERR_NGROK_8012: порт Mini App ≠ upstream
+
+- **Проблема**: ngrok → `pazuzu-app:8000`, а Uvicorn слухав `8080` (`mini_app.port` на віддаленому).
+- **Дії**: `docker-compose.yml` — `pazuzu-app:${MINI_APP_PORT:-8000}`; у гайді — узгодження `MINI_APP_PORT` з `config.yaml`.
+
+## 2026-09-21 — Docker build context: прибрати зайве (1.6GB+)
+
+- **Проблема**: `docker compose up --build` тягнув context ~1.6GB; на диску Docker роздувався (образи + шари + TEI bge-m3 + Playwright Chromium).
+- **Причина**: `.dockerignore` не виключав `data/` (дампи Mongo тощо); `COPY . .` пакував усе з каталогу проєкту.
+- **Дії**: розширено `.dockerignore` (`.venv/`, `data/`, `temp/`, `docs/`, кеші); Dockerfile копіює лише runtime-директорії; `.venv/` додано в `.gitignore`.
+
 ## 2026-09-21 — Відновлення колекцій MongoDB з дампу
 
 - **Запит**: скрипт, що з каталогу дампу завантажить дані у Mongo.

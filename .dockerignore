@@ -1,59 +1,88 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+# -*- coding: utf-8 -*-
+# Build context має містити лише код і requirements — не venv, дампи, кеші, IDE.
 
-# Virtual environments
-venv/
-env/
-ENV/
-.venv
-
-# IDE
+# Git / IDE / Cursor
+.git/
+.gitignore
+.cursor/
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# Git
-.git/
-.gitignore
+# Virtual environments (головне джерело роздування context)
+.venv/
+.venv
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
 
-# Docker
-Dockerfile
-.dockerignore
-docker-compose.yml
+# Python junk
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.installed.cfg
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging / local build artifacts
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+
+# Local data — НЕ для образу (монтуються volume'ами)
+data/
+temp/
+tmp/
+*.log
+*.db
+*.sqlite
+
+# Docs / tests / agent artifacts (не потрібні в runtime-образі)
+docs/
+tests/
+*.md
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Logs
-*.log
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Environment variables
+# Secrets / local env
 .env
-.env.local
+.env.*
+!.env.example
+config/config.yaml
+
+# Node (якщо з’явиться в mini-app)
+node_modules/
+npm-debug.log*
+
+# Local browser / model caches (якщо лежать у проєкті)
+ms-playwright/
+.playwright/
+**/huggingface/
+**/.huggingface/
+**/.cache/huggingface/
+
+# Docker meta (dockerfile читається окремо від context)
+.dockerignore

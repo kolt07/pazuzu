@@ -37,6 +37,10 @@ def main() -> int:
         queue,
         "--loglevel=info",
         f"--concurrency={threads}",
+        # Docker/compose: mingle/gossip на старті часто рвуть канал (Connection to broker lost).
+        # Черги фіксовані — синхронізація сусідів не потрібна.
+        "--without-mingle",
+        "--without-gossip",
     ]
     # prefork: кожен child-процес = окремий VllmRuntimeOrchestrator → дубль оренди Vast.
     queue_tokens = [q.strip() for q in queue.split(",") if q.strip()]

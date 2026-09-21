@@ -44,6 +44,10 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
         worker_prefetch_multiplier=1,
         task_acks_late=True,
         task_reject_on_worker_lost=True,
+        # Celery 5.1+: при обриві broker скасовувати late-ack задачі (дефолт True з 6.0).
+        worker_cancel_long_running_tasks_on_connection_loss=True,
+        broker_connection_retry_on_startup=True,
+        broker_heartbeat=30,
         task_track_started=True,
         result_expires=3600,
         task_routes={
