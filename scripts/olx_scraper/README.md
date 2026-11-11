@@ -11,7 +11,7 @@
 - **Заголовки як у браузера** — User-Agent (Chrome), Accept-Language: uk, Sec-Ch-Ua тощо.
 - **Таймаут** — запит пошуку до 25 с (`OLX_SCRAPER_TIMEOUT`); сторінка оголошення — до 90 с (`OLX_SCRAPER_DETAIL_TIMEOUT`).
 - **Підміна куків** — опційно куки з браузера через `OLX_SCRAPER_COOKIES` (JSON) або `OLX_SCRAPER_COOKIES_FILE`.
-- **Виявлення антиботу** — на сторінці шукаються ознаки капчі/Cloudflare/перевірки; при виявленні — одна повторна спроба через 8 с.
+- **Виявлення антиботу** — Cloudflare/challenge/iframe captcha тощо; голий `captchaSiteKey` у JSON-конфігу звичайної сторінки **не** вважається антиботом. При реальному антиботі — одна повторна спроба через 8 с.
 - HTTP list **не** чекає `DELAY_AFTER_PAGE_LOAD` (повний HTML уже в відповіді). Browser list path може використовувати `OLX_SCRAPER_DELAY_AFTER_LOAD` (дефолт 0).
 
 ## Запуск

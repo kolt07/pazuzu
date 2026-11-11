@@ -354,6 +354,9 @@ def detect_antibot_page(html: str) -> Dict[str, Any]:
     """
     Шукає на сторінці ознаки антиботу / перевірки браузера / капчі.
     Повертає {"is_antibot": bool, "hints": [str]} — список підказок для логу.
+
+    Увага: звичайні сторінки OLX містять captchaSiteKey у JSON-конфігу —
+    голий substring «captcha» не вважаємо антиботом, якщо є контент оголошень.
     """
     if not html or not html.strip():
         return {"is_antibot": True, "hints": ["empty_response"]}
@@ -361,9 +364,8 @@ def detect_antibot_page(html: str) -> Dict[str, Any]:
     lower = text.lower()
     hints: List[str] = []
 
-    # Текстові ознаки перевірки / капчі / Cloudflare
+    # Текстові ознаки перевірки / Cloudflare (без голого "captcha" — false positive на captchaSiteKey)
     antibot_phrases = [
-        ("captcha", "captcha"),
         ("cloudflare", "cloudflare"),
         ("перевірка браузера", "browser_check"),
         ("перевірте, що ви не робот", "robot_check"),
@@ -386,6 +388,19 @@ def detect_antibot_page(html: str) -> Dict[str, Any]:
         hints.append("captcha_iframe")
     if re.search(r"data-cy=\"(captcha|challenge|verification)", lower):
         hints.append("data_cy_challenge")
+
+    # «captcha» без урахування captchaSiteKey у JSON-конфігу звичайних сторінок OLX
+    captcha_signal = re.sub(r"captcha[_]?site[_]?key", "", lower)
+    has_listing_content = (
+        'data-cy="l-card"' in html
+        or "ad_description" in html
+        or "ad_description_content" in html
+        or 'data-cy="ad-price"' in html
+    )
+    if "captcha" in captcha_signal:
+        hints.append("captcha")
+    elif "captcha" in lower and not has_listing_content:
+        hints.append("captcha")
 
     # Сторінка дуже коротка і без контенту оголошення — можливо заглушка антиботу
     soup = BeautifulSoup(html, "lxml")

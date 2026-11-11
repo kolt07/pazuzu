@@ -1,3 +1,10 @@
+## 2026-11-11 — OLX scraper smoke: актуальність BrowserPool + false positive captcha
+
+- **Запит**: протестувати механіку завантаження OLX-скрапера; перевірити актуальність / потрібні зміни.
+- **Результат тесту**: BrowserPagePool list+detail працюють (52 картки, detail ~3–5 с з описом/ціною/параметрами). Зависання fetch budget не відтворено на smoke.
+- **Проблеми**: (1) `detect_antibot_page` хибно ловив `captcha` через `captchaSiteKey` у JSON звичайних сторінок → зайвий retry +8 с на кожен list; (2) `run_test.py` / `test_detail_download.py` ще кликали HTTP `fetch_page` для list (RuntimeError після вимкнення HTTP list).
+- **Дії**: уточнено `detect_antibot_page` (ігнор captchaSiteKey при наявності listing/detail контенту); тести переведено на BrowserPagePool; оновлено README.
+
 ## 2026-09-21 — RabbitMQ 4.3 + Celery: transient_nonexcl_queues
 
 - **Симптом**: `INTERNAL_ERROR - Feature transient_nonexcl_queues is deprecated` при Queue.declare (pidbox); connection lost.
