@@ -15,10 +15,12 @@ ENV PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Базові пакети; APT для Chromium додає `playwright install --with-deps`
+# libatomic1 — потрібен самому Node-драйверу Playwright до запуску --with-deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     openssh-client \
     fonts-dejavu-core \
+    libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Копіюємо файл залежностей

@@ -1,3 +1,9 @@
+## 2026-11-11 — Docker: Playwright install fails (libatomic.so.1)
+
+- **Запит**: фікс помилки `docker compose` build — `playwright install --with-deps chromium` падає з `libatomic.so.1: cannot open shared object file`.
+- **Причина**: Node-драйвер Playwright не стартує на `python:3.11-slim` без `libatomic1` (залежності Chromium через `--with-deps` ще не встигають встановитись).
+- **Дії**: додано `libatomic1` у базовий `apt-get install` у Dockerfile.
+
 ## 2026-11-11 — OLX scraper smoke: актуальність BrowserPool + false positive captcha
 
 - **Запит**: протестувати механіку завантаження OLX-скрапера; перевірити актуальність / потрібні зміни.
